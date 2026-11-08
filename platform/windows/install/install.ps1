@@ -175,10 +175,33 @@ if ($PhaseElevated) {
         }
         if ($n -gt 0) { Write-Host "清理诊断日志: $n 个" }
     }
-    # 3) %LOCALAPPDATA%\HuFu 同时存放跟打记录；升级保留整个用户数据目录。
+    # 3) %LOCALAPPDATA%\HuFu：绿色化前旧版程序与用户数据混居此处。
+    #    【白名单清理·深挖 P1-8 2026-11-08】升级安装按白名单精确删除根下
+    #    已知旧程序文件（含 *.old* 腾位残留），trainer\ 子目录、http_port.txt、
+    #    数据\、皮肤\ 等一切非白名单内容一概保留——旧程序文件此前无任何
+    #    自动清理路径，用户手动清理极易连 trainer\ 一起误删。
     $legacyLocal = Join-Path $env:LOCALAPPDATA 'HuFu'
     if (Test-Path $legacyLocal) {
-        Write-Host '已保留用户数据（含跟打记录）: %LOCALAPPDATA%\HuFu'
+        $legacyGone = @()
+        foreach ($legacyName in @('hufu-server.exe','hufu-settings.exe','hufu-trainer.exe',
+                                  'hufu_tsf.dll','hufu_tsf32.dll','hufu-render-helper.exe')) {
+            $legacyFile = Join-Path $legacyLocal $legacyName
+            if (Test-Path $legacyFile) {
+                try { Remove-Item $legacyFile -Force -ErrorAction Stop; $legacyGone += $legacyName }
+                catch { Write-Host "· 旧程序文件被占用，本次未删（下次安装再清）：$legacyName" }
+            }
+        }
+        Get-ChildItem $legacyLocal -Filter '*.old*' -File -Force -ErrorAction SilentlyContinue | ForEach-Object {
+            try { Remove-Item $_.FullName -Force -ErrorAction Stop; $legacyGone += $_.Name } catch {}
+        }
+        if ($legacyGone.Count -gt 0) {
+            Write-Host "清理旧版程序文件（trainer\ 等用户数据已保留）: $($legacyGone -join '、')"
+            try {
+                Add-Content -Path (Join-Path $inst 'install.log') -Encoding UTF8 -Value ("[{0}] LOCALAPPDATA 白名单清理: 删除 {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), ($legacyGone -join '、'))
+            } catch {}
+        } else {
+            Write-Host '已保留用户数据（含跟打记录）: %LOCALAPPDATA%\HuFu'
+        }
     }
     Write-Host '—— 提权阶段：HKLM 机器级注册 ——'
     $ips = "HKLM:\SOFTWARE\Classes\CLSID\$CLSID\InprocServer32"
@@ -260,12 +283,17 @@ $legacy = Join-Path $env:LOCALAPPDATA 'HuFu'
 if (Test-Path (Join-Path $legacy 'hufu-server.exe')) {
     $mb = [math]::Round((Get-ChildItem $legacy -Recurse -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum / 1MB)
     Write-Host "· 检测到旧版安装目录：$legacy（约 ${mb}MB）"
-    Write-Host '  该目录同时存放跟打记录，请保留用户数据，仅手动清理已不用的旧程序文件。'
+    Write-Host '  该目录同时存放跟打记录；安装时将自动清理其中的旧程序文件，trainer\ 等用户数据保留。'
 }
 
 # ── 1) 文件检查（原地运行：不拷贝；数据/模型直接在本目录使用）──
 if (-not (Test-Path $dll)) { Write-Host "✗ 缺少 $dll，请完整解压安装包后重试"; exit 1 }
 if (-not (Test-Path $exe)) { Write-Host "✗ 缺少 $exe，请完整解压安装包后重试"; exit 1 }
+# 【安装链补口·深挖 P2 2026-11-08】跟打器组件缺失只黄字警告不 fail——
+# 输入法优先可用；zip 被裁剪时不再静默缺失。
+if (-not (Test-Path (Join-Path $inst 'hufu-trainer.exe'))) {
+    Write-Host '⚠ 跟打器组件缺失，请重新下载完整安装包（输入法功能不受影响）' -ForegroundColor Yellow
+}
 Write-Host 'OK 文件就位（原地运行，不占用 C 盘额外空间）'
 
 # 【修复标签 2026-09-11】原 1.5)+2) 两段（HKCU 注册表：当前用户 IME 配置）原样
@@ -529,7 +557,10 @@ try {
 }
 
 # ── 6) 启动 server ——【铁律】必须普通权限：提权启动的管道会拒绝普通应用】──
+# 【安装链补口·深挖 P2 2026-11-08】升级杀进程加 hufu-trainer：运行中升级
+# 不杀会因文件占用走 .old 残留（exe 线 iss 已有 RenameOccupiedPEs 腾位）。
 Get-Process hufu-server -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Get-Process hufu-trainer -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 Start-Sleep -Milliseconds 500
 if ($isAdmin) {
     # 本脚本自身被提权运行（如右键管理员）：经 explorer 中转降权启动

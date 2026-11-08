@@ -86,6 +86,13 @@ pub fn fingerprint(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+/// 词提/字提渲染总门面（P2 赛制门禁单点化）：所有词提、字提的渲染入口
+/// **必须**走此函数取值，不得各自手写 `hints_on && !race` 散点——赛制（Race）
+/// 一票否决，防止 UI 各处判断漂移导致赛制残影。
+pub fn hints_effective(hints_on: bool, race: bool) -> bool {
+    hints_on && !race
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CleaningRule {
     pub id: String,
@@ -330,6 +337,11 @@ pub struct RoundMetadata {
     pub cleaned: bool,
     pub pasted: bool,
     pub complete: bool,
+    /// 开打时冻结的词提快照（赛制经 normalized() 恒 false）。
+    /// 结算时成绩单用它打 `[词提开]` 标记（score::race_badge）——练习成绩是否带提示
+    /// 必须可事后甄别（research-digest §B）。旧记录/快照缺省 false。
+    #[serde(default)]
+    pub word_hints: bool,
 }
 
 #[cfg(test)]

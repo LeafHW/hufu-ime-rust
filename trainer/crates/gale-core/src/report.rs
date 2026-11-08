@@ -25,9 +25,18 @@ pub struct RaceSummary {
     pub accuracy: f64,
 }
 impl RaceSummary {
+    /// 聚合一段成绩为整场汇总（总量比，非段均）。
+    /// **<5 硬门**（P1-4 接产线）：字数 < [`crate::score::VALID_MIN_CHARS`] 的记录
+    /// （Esc 弃打的测试段/误触段）不进聚合——与 `ScoreStore::load_valid`、
+    /// `daily_summaries` 同一门槛；原始 records.jsonl 照收不拒写。
+    /// `is_valid=false`（<10字或<10s）的记录当前照常进入；"练习总字数 vs 有效均速"
+    /// 的二分由 UI 消费方按 `ScoreRecord.is_valid` 拆分。
     pub fn from_records<'a>(records: impl IntoIterator<Item = &'a ScoreRecord>) -> Self {
         let mut out = Self::default();
-        for r in records {
+        for r in records
+            .into_iter()
+            .filter(|r| r.chars >= crate::score::VALID_MIN_CHARS)
+        {
             out.segments += 1;
             out.completed_segments += usize::from(r.round.as_ref().is_none_or(|m| m.complete));
             out.chars += r.chars as u64;
@@ -92,11 +101,15 @@ pub enum Range {
     All,
 }
 
-/// 按日期聚合全部记录
+/// 按日期聚合全部记录（**<5 硬门**：字数不足 [`crate::score::VALID_MIN_CHARS`] 的
+/// 记录不进任何日汇总——测试段/误触段不污染均速/均键准；原始记录保留）。
 pub fn daily_summaries(records: &[ScoreRecord]) -> Vec<DaySummary> {
     let mut by_date: BTreeMap<String, DaySummary> = BTreeMap::new();
     let mut accuracy_keys: BTreeMap<String, f64> = BTreeMap::new();
-    for r in records {
+    for r in records
+        .iter()
+        .filter(|r| r.chars >= crate::score::VALID_MIN_CHARS)
+    {
         let e = by_date.entry(r.date.clone()).or_insert_with(|| DaySummary {
             date: r.date.clone(),
             ..Default::default()
@@ -170,6 +183,17 @@ fn range_days(r: Range) -> u32 {
         Range::Month => 30,
         Range::All => u32::MAX / 8,
     }
+}
+
+/// 今日（或指定日）汇总（含 <5 硬门）。产线接线（P1-4）：main/UI 传
+/// `ScoreStore::load_valid()` 的记录 + 目标日期——结算记录即时落盘，
+/// 无需再并入内存 results（main 的 append_score_once 在 finalize 后同步补写）。
+/// 无该日记录时返回全零 DaySummary（date 留空）。
+pub fn day_summary(records: &[ScoreRecord], date: &str) -> DaySummary {
+    daily_summaries(records)
+        .into_iter()
+        .find(|d| d.date == date)
+        .unwrap_or_default()
 }
 
 /// 日期平移（YYYY-MM-DD ± days）—— 纯逻辑 civil 换算
@@ -363,9 +387,14 @@ mod tests {
             accuracy_pro: 95.0,
             waste_codes: 0,
             commit_groups: 0,
+            ding_count: 0,
+            select_count: 0,
             input_method: String::new(),
             time_breakdown: crate::stats::TimeBreakdown::default(),
             jj: 5.0,
+            is_valid: chars >= crate::score::VALID_EFFECTIVE_CHARS
+                && 60000 >= crate::score::VALID_EFFECTIVE_MS,
+            difficulty: None,
             version: "2".into(),
         }
     }
@@ -400,6 +429,40 @@ mod tests {
         assert!((summary.effective_speed - 130.0).abs() < 0.0001);
         let old = rec("2026-11-07", 100, 100.0, 0);
         assert_eq!(summarize(&[a, b, old], Range::Day).chars, 200);
+    }
+
+    /// P1-4：<5 硬门接产线——整场汇总（from_records）与日汇总（daily_summaries）
+    /// 都不再吃字数<5 的记录；is_valid=false 但 ≥5 的记录照常进聚合。
+    #[test]
+    fn min_chars_hard_gate_filters_all_aggregates() {
+        let ok = rec("2026-11-08", 100, 150.0, 1);
+        let mut tiny = rec("2026-11-08", 4, 300.0, 0); // Esc 弃打的 4 字段
+        tiny.time_ms = 3_000;
+        tiny.is_valid = false;
+        let mut nine = rec("2026-11-08", 9, 90.0, 0); // 9 字：过硬门、is_valid=false
+        nine.time_ms = 9_000;
+        nine.is_valid = false;
+        let summary = RaceSummary::from_records([&ok, &tiny, &nine]);
+        assert_eq!(summary.segments, 2); // tiny 被硬门挡掉
+        assert_eq!(summary.chars, 109); // 100 + 9（nine 仍计入练习聚合）
+        let daily = daily_summaries(&[ok, tiny, nine]);
+        assert_eq!(daily.len(), 1);
+        assert_eq!(daily[0].segments, 2);
+        assert_eq!(daily[0].chars, 109);
+    }
+
+    /// 今日汇总 API（P1-4 接线）：按日期取 DaySummary，无记录返回全零。
+    #[test]
+    fn day_summary_picks_requested_date() {
+        let a = rec("2026-11-07", 100, 100.0, 0);
+        let b = rec("2026-11-08", 200, 120.0, 0);
+        let today = day_summary(&[a.clone(), b], "2026-11-08");
+        assert_eq!(today.date, "2026-11-08");
+        assert_eq!(today.chars, 200);
+        assert_eq!(today.segments, 1);
+        let missing = day_summary(&[a], "2026-11-09");
+        assert_eq!(missing.date, "");
+        assert_eq!(missing.chars, 0);
     }
 
     #[test]

@@ -5,13 +5,14 @@
 //! deliberately never used as application data.
 use crate::{
     modals::{Action, FieldSpec, Hit, Modal, Model},
-    session::Session,
+    session::{Phase, Session},
     ui::*,
 };
 use gale_core::{
     compare::{CharState, TimingEvent},
     config::Config,
-    score::ScoreRecord,
+    rules::TrainingMode,
+    score::{race_badge, ScoreRecord, VALID_MIN_CHARS},
     theme::Theme,
 };
 use gale_win::d2d::{DrawCmd, Frame};
@@ -588,20 +589,29 @@ fn draw_result(
             complete,
             t,
         );
+        // P2 赛制标记（任务 6a）：core score::race_badge 单点取用（快照
+        // RoundMetadata 优先；旧记录无快照回退 m），禁止手写 “赛制/练习” 散点。
+        let badge_txt = r
+            .round
+            .as_ref()
+            .map(|z| race_badge(z.mode, z.word_hints))
+            .unwrap_or_else(|| {
+                race_badge(
+                    if race {
+                        TrainingMode::Race
+                    } else {
+                        TrainingMode::Practice
+                    },
+                    m.hints && !race,
+                )
+            });
+        text(f, sx + 9., by + 163., 8., badge_txt, p.muted);
         text(
             f,
             sx + 9.,
-            by + 165.,
-            8.,
-            format!(
-                "{} · {}",
-                if race { "赛制" } else { "练习" },
-                if complete {
-                    "已结算"
-                } else {
-                    "中途停止"
-                }
-            ),
+            by + 176.,
+            7.5,
+            if complete { "已结算" } else { "中途停止" },
             p.muted,
         );
     }
@@ -669,6 +679,9 @@ fn draw_result(
         (r.wrong.to_string(), "错字"),
         (duration(r.time_ms), "用时"),
         (r.backspaces.to_string(), "退格"),
+        // P1-3 选重/标顶（任务 2）：字段同步进结算面板（账=20ms 配对）。
+        (r.select_count.to_string(), "选重"),
+        (r.ding_count.to_string(), "标顶"),
         (r.corrections.to_string(), "回改"),
         (r.chars.to_string(), "本段字数"),
     ];
@@ -684,7 +697,8 @@ fn draw_result(
         mono(f, xx, yy, if cw > 720. { 20. } else { 18. }, value, p.text2);
         text(f, xx, yy + 26., 8., *name, p.muted);
     }
-    let extra_y = gy + if cols == 8 { 66. } else { 119. };
+    // 10 格：宽版 2 行 / 窄版 3 行（原 8 格各多出一行，下方卡片整体下移一行）。
+    let extra_y = gy + if cols == 8 { 123. } else { 176. };
     line(f, cx, extra_y - 17., cw, p.line);
     clipped_text(
         f,
@@ -712,7 +726,19 @@ fn draw_result(
     let preview = [
         format!(
             "虎符跟打 · 单段结算（{}）",
-            if race { "赛制" } else { "练习" }
+            r.round
+                .as_ref()
+                .map(|z| race_badge(z.mode, z.word_hints))
+                .unwrap_or_else(|| {
+                    race_badge(
+                        if race {
+                            TrainingMode::Race
+                        } else {
+                            TrainingMode::Practice
+                        },
+                        m.hints && !race,
+                    )
+                })
         ),
         format!(
             "{} · {} / 共 {} 段 · {} 字",
@@ -804,8 +830,11 @@ fn draw_result(
         clipped_text(f, ex + 39., yy + 6., ew - 52., 8.5, label, p.muted);
     }
     let py = extra_y + 130.;
-    card(f, cx, py, cw, 55., t);
+    // P1-4 LiveStats 接线（任务 5）：整场口径（已结算 ≥5 字硬门 + 当前段实时）
+    // 与“本段”统计分列显示——卡片加高一档放整场实时行。
+    card(f, cx, py, cw, 68., t);
     text(f, cx + 13., py + 8., 8.5, "整场位置", p.muted);
+    let live = sess.live_stats_now();
     let done = sess
         .results
         .iter()
@@ -867,6 +896,20 @@ fn draw_result(
             );
         }
     }
+    // P1-4 整场实时行（任务 5）：LiveStats 整场口径 = 已结算段（≥5 硬门）+
+    // 当前段进行中——与本面板上方“本段”统计分列。
+    clipped_text(
+        f,
+        cx + 13.,
+        py + 52.,
+        cw - 26.,
+        8.,
+        &format!(
+            "整场实时 · 速度{:.1} · 击键{:.2} · 码长{:.2} · 键准{:.1}% · 累计{}字",
+            live.total_speed, live.keys_per_sec, live.code_len, live.accuracy, live.done_chars
+        ),
+        p.muted,
+    );
     end_clip(f);
     let ay = y + ph - 38.;
     let compact = cw <= 650.;
@@ -999,6 +1042,21 @@ fn draw_report(
         p.muted,
     );
     if cw > 750. {
+        // P2 赛制标记（任务 6a）：core score::race_badge 单点取用——最新结算段
+        // 的 RoundMetadata 快照优先（开打时冻结），无快照回退 m。
+        let (mode, word_hints) = rows
+            .iter()
+            .max_by_key(|(_, r)| r.ts)
+            .and_then(|(_, r)| r.round.as_ref())
+            .map(|z| (z.mode, z.word_hints))
+            .unwrap_or((
+                if m.race {
+                    TrainingMode::Race
+                } else {
+                    TrainingMode::Practice
+                },
+                m.hints && !m.race,
+            ));
         right(
             f,
             cx + cw - 45.,
@@ -1006,7 +1064,7 @@ fn draw_report(
             8.5,
             format!(
                 "{} · {} · {} / {} 段已结算",
-                if m.race { "赛制" } else { "练习" },
+                race_badge(mode, word_hints),
                 rows.iter()
                     .max_by_key(|(_, r)| r.ts)
                     .map(|(_, r)| r.date.as_str())
@@ -1049,7 +1107,32 @@ fn draw_report(
         },
         if complete { p.green } else { p.muted },
     );
-    let summaries = [
+    // P1-4 LiveStats 接线（任务 5）：当前段进行中时给出“整场含当前段”实时行
+    //（与上方已结算聚合分列；结算完两者口径重合，不重复显示）。
+    if sess.phase == Phase::Typing && !sess.recorded {
+        let live = sess.live_stats_now();
+        clipped_text(
+            f,
+            cx,
+            by + 161.,
+            cw,
+            8.,
+            &format!(
+                "整场实时（含当前段）· 速度{:.1} · 击键{:.2} · 码长{:.2} · 键准{:.1}% · 累计{}字",
+                live.total_speed, live.keys_per_sec, live.code_len, live.accuracy, live.done_chars
+            ),
+            p.accent,
+        );
+    }
+    // P1-3 选重/标顶合计（任务 2）：与 agg 同一 <5 硬门口径，短段不进合计。
+    let gated: Vec<&ScoreRecord> = rows
+        .iter()
+        .map(|(_, r)| *r)
+        .filter(|r| r.chars >= VALID_MIN_CHARS)
+        .collect();
+    let select_total: u32 = gated.iter().map(|r| r.select_count).sum();
+    let ding_total: u32 = gated.iter().map(|r| r.ding_count).sum();
+    let mut summaries = vec![
         (format!("{:.1}", agg.effective_speed), "有效速度"),
         (duration(agg.time_ms), "总用时"),
         (agg.chars.to_string(), "总字数"),
@@ -1057,6 +1140,11 @@ fn draw_report(
         (format!("{:.1}%", character_accuracy), "字准"),
         (agg.wrong.to_string(), "错字"),
     ];
+    // 选重/标顶合计：窄面板（<620）放不下 8 格时省略，宽面板补齐。
+    if cw > 620. {
+        summaries.push((select_total.to_string(), "选重"));
+        summaries.push((ding_total.to_string(), "标顶"));
+    }
     let sx = cx + if cw > 800. { 228. } else { 207. };
     let sw =
         ((cw - (sx - cx) - if cw > 900. { 260. } else { 0. }) / summaries.len() as f32).max(52.);

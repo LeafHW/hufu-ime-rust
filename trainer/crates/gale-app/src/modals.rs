@@ -378,7 +378,7 @@ fn fit_panel(
     }
 }
 pub(crate) fn label(f: &mut Frame, x: f32, y: f32, s: impl Into<String>, t: &Theme) {
-    text(f, x, y, 9.5, s, tokens(t).muted);
+    text(f, x, y, FONT_HINT, s, tokens(t).muted);
 }
 pub(crate) fn btn(
     f: &mut Frame,
@@ -405,8 +405,8 @@ pub(crate) fn btn(
     text(
         f,
         x + 11.,
-        y + 7.,
-        11.,
+        y + 8.,
+        FONT_HINT,
         s,
         if primary {
             [0.13, 0.09, 0.035, 1.]
@@ -456,7 +456,7 @@ fn small_btn(
         f,
         x + 8.,
         y + 5.,
-        9.5,
+        FONT_HINT,
         s,
         if selected { p.accent } else { p.muted },
     );
@@ -471,7 +471,7 @@ fn small_btn(
 fn disabled(f: &mut Frame, x: f32, y: f32, w: f32, s: &str, t: &Theme) {
     let p = tokens(t);
     round(f, x, y, w, 25., 6., alpha(p.bg2, 0.8), Some(p.line));
-    text(f, x + 7., y + 5., 9., s, alpha(p.muted, 0.5));
+    text(f, x + 7., y + 5., FONT_HINT, s, alpha(p.muted, 0.5));
 }
 fn hit_box(hs: &mut Vec<Hit>, x: f32, y: f32, w: f32, h: f32, action: Action) {
     hs.push(Hit { x, y, w, h, action });
@@ -563,8 +563,8 @@ fn panel_header(f: &mut Frame, hs: &mut Vec<Hit>, m: Modal, x: f32, y: f32, pw: 
         Some(alpha(p.accent, 0.35)),
     );
     icon(f, icon_name, x + 27., y + 22., 18., p.accent);
-    text(f, x + 64., y + 14., 14., title, p.text);
-    text(f, x + 64., y + 35., 9.5, desc, p.muted);
+    text(f, x + 64., y + 13., FONT_LABEL, title, p.text);
+    text(f, x + 64., y + 35., FONT_HINT, desc, p.muted);
     small_btn(
         f,
         hs,
@@ -609,7 +609,7 @@ fn draw_load(
     let body_h = ph - PANEL_HEAD - PANEL_FOOT;
     rect(f, x + 1., y + PANEL_HEAD, side - 1., body_h, p.bg2);
     rect(f, x + side, y + PANEL_HEAD, 1., body_h, p.line);
-    text(f, x + 22., y + 80., 8.5, "来源", p.muted);
+    text(f, x + 22., y + 80., FONT_HINT, "来源", p.muted);
     let draft = m.field("load_text");
     let sources = [
         (
@@ -663,26 +663,26 @@ fn draw_load(
                 p.muted
             },
         );
-        text(f, x + 51., sy + 10., 12., *title, p.text2);
+        text(f, x + 51., sy + 9., FONT_HINT, *title, p.text2);
         text(
             f,
             x + 51.,
             sy + 30.,
-            8.5,
-            elide(sub, ((side - 67.) / 8.5) as usize),
+            FONT_HINT,
+            elide(sub, ((side - 72.) / FONT_HINT) as usize),
             p.muted,
         );
         right(f, x + side - 25., sy + 17., 12., "›", p.muted);
         hit_box(hs, x + 13., sy, side - 26., 52., Action::LoadTab(*tab));
     }
     line(f, x + 22., y + ph - 138., side - 44., p.line);
-    text(f, x + 22., y + ph - 124., 8.5, "当前文档", p.muted);
+    text(f, x + 22., y + ph - 124., FONT_HINT, "当前文档", p.muted);
     text(
         f,
         x + 22.,
         y + ph - 105.,
-        9.5,
-        elide(&sess.title, ((side - 44.) / 9.5) as usize),
+        FONT_HINT,
+        elide(&sess.title, ((side - 44.) / FONT_HINT) as usize),
         p.text2,
     );
     let rx = x + side + 20.;
@@ -709,9 +709,9 @@ fn draw_load(
                 f,
                 rx + 34.,
                 top + 8.,
-                10.5,
+                FONT_HINT,
                 group
-                    .map(|s| elide(s, ((chip_w - 46.) / 10.5) as usize))
+                    .map(|s| elide(s, ((chip_w - 50.) / FONT_HINT) as usize))
                     .unwrap_or_else(|| "剪贴板 / 自定义".into()),
                 p.text2,
             );
@@ -773,7 +773,7 @@ fn draw_load(
                 f,
                 rx + 18.,
                 y + 169.,
-                9.,
+                FONT_HINT,
                 if m.load_editing {
                     "保留标题和段标；纯文本按设置字数切段".into()
                 } else if draft.trim().is_empty() {
@@ -801,7 +801,7 @@ fn draw_load(
                 );
             } else if draft.trim().is_empty() {
                 body_text(f, rx + 18., y + 217., 17., "把想练的文字放在这里", p.text2);
-                text_block(f, rx + 18., y + 259., rw - 36., 12., 25., 4,
+                text_block(f, rx + 18., y + 259., rw - 36., FONT_HINT, 27., 4,
                     "按 Ctrl+V 读取剪贴板，或点击“开始编辑”直接输入。\n本地文库支持打开 TXT；在线来源可从晴发文取文。", p.muted);
                 btn(
                     f,
@@ -844,15 +844,15 @@ fn draw_load(
                     &preview,
                     p.text2,
                 );
-                text(f, rx + 18., y + ph - 170., 8.5, "分段", p.muted);
-                let max_chips = (((rw - 74.) / 90.).floor() as usize).clamp(1, 5);
+                text(f, rx + 18., y + ph - 170., FONT_HINT, "分段", p.muted);
+                let max_chips = (((rw - 60.) / 104.).floor() as usize).clamp(1, 5);
                 for (i, segment) in parsed.segments.iter().take(max_chips).enumerate() {
-                    let sx = rx + 50. + i as f32 * 90.;
+                    let sx = rx + 50. + i as f32 * 104.;
                     round(
                         f,
                         sx,
                         y + ph - 174.,
-                        82.,
+                        96.,
                         22.,
                         5.,
                         if i == 0 { alpha(p.accent, 0.08) } else { p.bg2 },
@@ -861,11 +861,11 @@ fn draw_load(
                     text(
                         f,
                         sx + 7.,
-                        y + ph - 169.,
-                        8.5,
+                        y + ph - 170.,
+                        FONT_HINT,
                         format!(
-                            "{} · {} 字",
-                            elide(&segment.mark, 5),
+                            "{}·{}字",
+                            elide(&segment.mark, 3),
                             segment.text.chars().count()
                         ),
                         if i == 0 { p.accent } else { p.muted },
@@ -876,8 +876,8 @@ fn draw_load(
             text(
                 f,
                 rx + 18.,
-                y + ph - 118.,
-                8.5,
+                y + ph - 119.,
+                FONT_HINT,
                 if m.load_editing {
                     "正在编辑原文 · 点击预览查看分段"
                 } else {
@@ -900,7 +900,7 @@ fn draw_load(
             }
         }
         1 => {
-            text(f, rx, top + 3., 10.5, "本地文库", p.text2);
+            text(f, rx, top + 3., FONT_HINT, "本地文库", p.text2);
             small_btn(
                 f,
                 hs,
@@ -920,8 +920,8 @@ fn draw_load(
                     rx + 18.,
                     y + 184.,
                     rw - 36.,
-                    12.,
-                    24.,
+                    FONT_HINT,
+                    26.,
                     3,
                     "打开一个 TXT 文件，或把文本放进数据目录的文库文件夹。",
                     p.muted,
@@ -948,12 +948,12 @@ fn draw_load(
                     );
                 }
             }
-            text(f, rx, y + 347., 10.5, "单字练习", p.text2);
+            text(f, rx, y + 347., FONT_HINT, "单字练习", p.text2);
             text(
                 f,
                 rx + 76.,
                 y + 349.,
-                8.5,
+                FONT_HINT,
                 "五份内置字表 · 居中行字提",
                 p.muted,
             );
@@ -979,9 +979,9 @@ fn draw_load(
                 f,
                 rx + 12.,
                 top + 8.,
-                10.5,
+                FONT_HINT,
                 bound
-                    .map(|s| elide(s, 30))
+                    .map(|s| elide(s, (((rw - 24.) / FONT_HINT) as usize).max(8)))
                     .unwrap_or_else(|| "尚未选择 QQ 会话".into()),
                 p.text2,
             );
@@ -992,8 +992,8 @@ fn draw_load(
                 rx + 18.,
                 y + 187.,
                 rw - 36.,
-                12.,
-                25.,
+                FONT_HINT,
+                26.,
                 4,
                 "先在 QQ 中打开目标群，再读取当前群文。也可以手动复制赛文，回到剪贴板来源粘贴。",
                 p.text2,
@@ -1025,8 +1025,8 @@ fn draw_load(
                 rx + 18.,
                 y + 352.,
                 rw - 36.,
-                9.5,
-                18.,
+                FONT_HINT,
+                26.,
                 3,
                 "UIA 依赖 QQ 界面结构；不能自动切群。读取失败时可使用剪贴板。",
                 p.muted,
@@ -1065,7 +1065,7 @@ fn draw_load(
             f,
             x + 20.,
             y + ph - 36.,
-            8.5,
+            FONT_HINT,
             "Ctrl V 读取剪贴板 · Esc 返回",
             p.muted,
         );
@@ -1121,7 +1121,7 @@ fn draw_groups(
         f,
         x + 22.,
         y + 82.,
-        8.5,
+        FONT_HINT,
         format!("QQ 群 / 会话   {}", m.groups.len()),
         p.muted,
     );
@@ -1143,8 +1143,8 @@ fn draw_groups(
             x + 24.,
             y + 182.,
             side - 48.,
-            11.,
-            23.,
+            FONT_HINT,
+            26.,
             5,
             "打开 QQ 和目标群后扫描。\n也可以手动复制赛文，按 F2 载入。",
             p.muted,
@@ -1201,15 +1201,15 @@ fn draw_groups(
                 f,
                 x + 66.,
                 gy + 17.,
-                12.,
-                elide(name, ((side - 90.) / 12.) as usize),
+                FONT_HINT,
+                elide(name, ((side - 90.) / FONT_HINT) as usize),
                 p.text2,
             );
             text(
                 f,
                 x + 66.,
                 gy + 39.,
-                8.5,
+                FONT_HINT,
                 if selected {
                     "已选择 · 请在 QQ 手动打开"
                 } else {
@@ -1221,7 +1221,7 @@ fn draw_groups(
         }
     }
     line(f, x + 22., y + ph - 108., side - 44., p.line);
-    text(f, x + 22., y + ph - 92., 8.5, "剪贴板通道始终可用", p.muted);
+    text(f, x + 22., y + ph - 92., FONT_HINT, "剪贴板通道始终可用", p.muted);
     let rx = x + side + 20.;
     let rw = pw - side - 40.;
     let group = m.bound.and_then(|i| m.groups.get(i));
@@ -1251,7 +1251,7 @@ fn draw_groups(
         f,
         rx + 54.,
         y + 107.,
-        8.5,
+        FONT_HINT,
         "只读取当前打开会话；不会自动切群",
         p.muted,
     );
@@ -1281,7 +1281,7 @@ fn draw_groups(
             rect(f, sx, y + 138., 1., 51., p.line);
         }
         mono(f, sx + 10., y + 149., 13., v, p.text2);
-        text(f, sx + 10., y + 171., 8., l, p.muted);
+        text(f, sx + 10., y + 169., FONT_HINT, l, p.muted);
     }
     round(f, rx, y + 201., rw, 69., 10., p.surface, Some(p.line));
     body_text(f, rx + 12., y + 214., 16., "文", p.accent);
@@ -1289,15 +1289,15 @@ fn draw_groups(
         f,
         rx + 44.,
         y + 213.,
-        11.5,
-        elide(&sess.title, ((rw - 64.) / 11.5) as usize),
+        FONT_HINT,
+        elide(&sess.title, ((rw - 64.) / FONT_HINT) as usize),
         p.text2,
     );
     text(
         f,
         rx + 44.,
         y + 237.,
-        8.5,
+        FONT_HINT,
         format!(
             "当前文档 · {} 段 · {} 字",
             sess.total_segments(),
@@ -1309,14 +1309,14 @@ fn draw_groups(
         p.muted,
     );
     round(f, rx, y + 282., rw, 126., 10., p.surface2, Some(p.line));
-    text(f, rx + 12., y + 296., 11.5, "UIA 读取通道", p.text2);
+    text(f, rx + 12., y + 296., FONT_HINT, "UIA 读取通道", p.text2);
     text_block(
         f,
         rx + 12.,
         y + 320.,
         rw - 24.,
-        9.5,
-        18.,
+        FONT_HINT,
+        22.,
         2,
         "从 QQ 当前界面读取赛文；不注入、不修改 QQ 进程。",
         p.muted,
@@ -1336,20 +1336,20 @@ fn draw_groups(
         rx + 20.,
         y + 366.,
         rw - 40.,
-        8.5,
-        14.,
+        FONT_HINT,
+        24.,
         2,
         "QQ 更新可能使 UIA 失效。失败时请手动复制，通过剪贴板载入。",
         p.accent,
     );
     line(f, rx, y + ph - 139., rw, p.line);
-    text(f, rx, y + ph - 126., 8.5, "通道状态", p.muted);
+    text(f, rx, y + ph - 126., FONT_HINT, "通道状态", p.muted);
     text(
         f,
         rx,
         y + ph - 105.,
-        9.,
-        elide(&m.status, (rw / 9.) as usize),
+        FONT_HINT,
+        elide(&m.status, ((rw / FONT_HINT) as usize).max(8)),
         p.text2,
     );
     footer(f, x, y, pw, ph, t);
@@ -1358,7 +1358,7 @@ fn draw_groups(
             f,
             x + 20.,
             y + ph - 35.,
-            8.5,
+            FONT_HINT,
             "发成绩时先复制，再确认目标群并粘贴",
             p.muted,
         );
@@ -1458,7 +1458,7 @@ fn appearance_preview(
         }
         let yy = y + row as f32 * lh;
         let current = sess.comparer.pos;
-        if m.hints && !m.race && current >= offset && current < end {
+        if gale_core::rules::hints_effective(m.hints, m.race) && current >= offset && current < end {
             let highlight = if cfg.hint_style == 1 {
                 (current, 1)
             } else {
@@ -1512,7 +1512,7 @@ fn appearance_preview(
             spans,
             color: p.text2,
         });
-        if m.hints && !m.race && cfg.hint_style != 2 {
+        if gale_core::rules::hints_effective(m.hints, m.race) && cfg.hint_style != 2 {
             for (i, word) in m.words.iter().enumerate() {
                 let visible = if cfg.hint_style == 1 {
                     true
@@ -1572,7 +1572,7 @@ fn draw_appearance(
     let px = x + controls_w;
     rect(f, px, y + 62., preview_w - 1., ph - 124., p.bg2);
     rect(f, px, y + 62., 1., ph - 124., p.line);
-    text(f, cx, y + 79., 8.5, "预设   5 套", p.muted);
+    text(f, cx, y + 79., FONT_HINT, "预设   5 套", p.muted);
     let preset_w = (cw - 36.) / 5.;
     for (i, n) in ["墨玉", "宣纸", "夜巡", "青瓷", "朱砂"].iter().enumerate() {
         let tx = cx + i as f32 * (preset_w + 9.);
@@ -1615,14 +1615,14 @@ fn draw_appearance(
             f,
             tx,
             y + 164.,
-            9.5,
+            FONT_HINT,
             *n,
             if selected { p.accent } else { p.muted },
         );
         hit_box(hs, tx, y + 99., preset_w, 82., Action::Theme(n.to_string()));
     }
     round(f, cx, y + 190., cw, 96., 9., p.surface2, Some(p.line));
-    text(f, cx + 12., y + 202., 8.5, "跟随虎符皮肤", p.muted);
+    text(f, cx + 12., y + 202., FONT_HINT, "跟随虎符皮肤", p.muted);
     small_btn(
         f,
         hs,
@@ -1657,13 +1657,13 @@ fn draw_appearance(
         f,
         cx + 12.,
         y + 269.,
-        8.,
+        FONT_HINT,
         "只映射跟打器配色，不修改虎符原皮肤",
         p.muted,
     );
     let half = (cw - 18.) / 2.;
     let col2 = cx + half + 18.;
-    text(f, cx, y + 301., 8.5, "强调色", p.muted);
+    text(f, cx, y + 301., FONT_HINT, "强调色", p.muted);
     let colors = ["e7b75c", "7fbfa6", "e06a5a", "83abd9", "c3a1c4", "d4d0c6"];
     for (i, s) in colors.iter().enumerate() {
         let sx = cx + i as f32 * 25.;
@@ -1693,7 +1693,7 @@ fn draw_appearance(
             Action::Accent(s.to_string()),
         );
     }
-    text(f, col2, y + 301., 8.5, "材质   三态", p.muted);
+    text(f, col2, y + 301., FONT_HINT, "材质   三态", p.muted);
     small_btn(
         f,
         hs,
@@ -1711,11 +1711,11 @@ fn draw_appearance(
         f,
         col2,
         y + 356.,
-        8.,
+        FONT_HINT,
         "当前构建使用纯色，保证原生输入兼容",
         p.muted,
     );
-    text(f, cx, y + 385., 8.5, "动效强度   四档", p.muted);
+    text(f, cx, y + 385., FONT_HINT, "动效强度   四档", p.muted);
     for (i, s) in ["关", "轻", "标准", "丰富"].iter().enumerate() {
         small_btn(
             f,
@@ -1733,7 +1733,7 @@ fn draw_appearance(
         f,
         cx,
         y + 445.,
-        8.,
+        FONT_HINT,
         if m.reduced_motion {
             "系统减少动态已开启，优先于此处设置"
         } else {
@@ -1741,7 +1741,7 @@ fn draw_appearance(
         },
         p.muted,
     );
-    text(f, col2, y + 385., 8.5, "字号 / 行高", p.muted);
+    text(f, col2, y + 385., FONT_HINT, "字号 / 行高", p.muted);
     let slider_w = (half - 128.).max(30.);
     for (row, (name, value, minus, plus)) in [
         (
@@ -1761,7 +1761,7 @@ fn draw_appearance(
     .enumerate()
     {
         let sy = y + 412. + row as f32 * 32.;
-        text(f, col2, sy + 3., 8.5, name, p.muted);
+        text(f, col2, sy + 3., FONT_HINT, name, p.muted);
         line(f, col2 + 34., sy + 11., slider_w, p.line2);
         let ratio = if row == 0 {
             (cfg.font_size - 24.) / 40.
@@ -1773,9 +1773,9 @@ fn draw_appearance(
         round(f, col2 + 30. + filled, sy + 7., 8., 8., 4., p.accent, None);
         small_btn(f, hs, col2 + half - 88., sy, 23., "−", minus, t, false);
         small_btn(f, hs, col2 + half - 62., sy, 23., "+", plus, t, false);
-        right(f, col2 + half, sy + 4., 9., value, p.text2);
+        right(f, col2 + half, sy + 4., FONT_HINT, value, p.text2);
     }
-    text(f, cx, y + 483., 8.5, "词提样式", p.muted);
+    text(f, cx, y + 483., FONT_HINT, "词提样式", p.muted);
     let hw = (cw - 8.) / 3.;
     for (i, s) in ["词级柔光", "字级编码", "极简下划线"].iter().enumerate() {
         small_btn(
@@ -1794,18 +1794,19 @@ fn draw_appearance(
         f,
         cx,
         y + 544.,
-        8.5,
+        FONT_HINT,
         if m.race {
-            "赛制已关闭词提与字提；切换到练习后生效"
+            // 晴口径（research-digest §B）：赛制只关词提；字提保留、停手 5s 后显示
+            "赛制已关闭词提；字提停手 5 秒后显示"
         } else {
-            "提示只用于练习，赛制会自动关闭"
+            "提示只用于练习，赛制会自动关闭词提"
         },
         p.muted,
     );
     let card_x = px + 14.;
     let card_w = preview_w - 28.;
-    text(f, card_x, y + 79., 8.5, "实时预览", p.muted);
-    right(f, px + preview_w - 14., y + 79., 8., &t.name, p.muted);
+    text(f, card_x, y + 79., FONT_HINT, "实时预览", p.muted);
+    right(f, px + preview_w - 14., y + 79., FONT_HINT, &t.name, p.muted);
     round(
         f,
         card_x,
@@ -1820,7 +1821,7 @@ fn draw_appearance(
         f,
         card_x + 13.,
         y + 115.,
-        8.,
+        FONT_HINT,
         format!("第 {} 段 · 排版示例", sess.current_index() + 1),
         p.muted,
     );
@@ -1850,13 +1851,13 @@ fn draw_appearance(
     for (i, name) in ["字 / 分", "键准", "码长"].iter().enumerate() {
         let sx = card_x + 13. + i as f32 * (card_w - 26.) / 3.;
         mono(f, sx, y + 373., 14., &preview_stats[i], p.text2);
-        text(f, sx, y + 396., 8., *name, p.muted);
+        text(f, sx, y + 395., FONT_HINT, *name, p.muted);
     }
     text(
         f,
         card_x + 13.,
         y + 421.,
-        8.,
+        FONT_HINT,
         "最近已结算成绩；没有成绩时显示 —",
         p.muted,
     );
@@ -1865,10 +1866,14 @@ fn draw_appearance(
         f,
         card_x + 13.,
         y + ph - 151.,
-        8.,
+        FONT_HINT,
         format!(
             "词提{} · {:.0}px · {:.2} · 纯色",
-            if m.hints && !m.race { "开" } else { "关" },
+            if gale_core::rules::hints_effective(m.hints, m.race) {
+                "开"
+            } else {
+                "关"
+            },
             cfg.font_size,
             1. + cfg.line_gap
         ),
@@ -1915,7 +1920,7 @@ fn draw_appearance(
         f,
         x + 20.,
         y + ph - 36.,
-        8.5,
+        FONT_HINT,
         "F7 随时呼出 · 只修改跟打器外观",
         p.muted,
     );
@@ -2044,7 +2049,7 @@ pub fn draw(
     }
     if let Some((msg, at)) = &m.toast {
         if now - at < 3.6 {
-            let tw = (msg.chars().count() as f32 * 12. + 36.).min(w - 40.);
+            let tw = (msg.chars().count() as f32 * 13. + 36.).min(w - 40.);
             round(
                 f,
                 (w - tw) / 2.,
@@ -2059,8 +2064,8 @@ pub fn draw(
                 f,
                 (w - tw) / 2. + 16.,
                 h - 89.,
-                12.,
-                elide(msg, ((tw - 32.) / 12.) as usize),
+                FONT_HINT,
+                elide(msg, ((tw - 32.) / FONT_HINT) as usize),
                 p.text,
             );
         }

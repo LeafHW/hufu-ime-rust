@@ -33,7 +33,8 @@ use windows::Win32::UI::TextServices::{ITfContextComposition, ITfRangeACP};
 use windows::Win32::UI::WindowsAndMessaging::{
     CallWindowProcW, CreateWindowExW, DefWindowProcW, GetCaretPos, GetParent, SendMessageW,
     SetWindowLongPtrW, SetWindowPos, ShowWindow, GWLP_WNDPROC, SWP_NOZORDER, SW_HIDE, SW_SHOWNA,
-    WINDOW_EX_STYLE, WM_CHAR, WM_KEYDOWN, WM_SYSCHAR, WM_SYSKEYDOWN, WS_CHILD, WS_VISIBLE,
+    WINDOW_EX_STYLE, WM_CHAR, WM_KEYDOWN, WM_KEYUP, WM_SYSCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    WS_CHILD, WS_VISIBLE,
 };
 
 // ── RichEdit 常量（windows 0.58 未绑定的部分，手工定义，值与 SDK 一致）──
@@ -128,9 +129,14 @@ static RELAY_HWND: AtomicIsize = AtomicIsize::new(0);
 static LIB_LOADED: AtomicBool = AtomicBool::new(false);
 static COMPOSING: AtomicBool = AtomicBool::new(false);
 static CANCEL_INTENT: AtomicBool = AtomicBool::new(false);
-/// 每键时间戳队列（标顶/选重 20ms 窗判定预留），元素 = (vk, 毫秒)
+/// 每键时间戳队列（统计击键 + 20ms 选重/标顶配对共用），元素 = (vk, 毫秒)。
+/// 生产者：note_key（键泵在 TSF 改写 VK 前调用）；消费者：drain_key_times
+///（统计）与 note_commit（配对判定，只读不消费）。
 static KEY_TIMES: Mutex<Vec<(u32, u64)>> = Mutex::new(Vec::new());
 static PHYSICAL_EVENTS: Mutex<Vec<HostEvent>> = Mutex::new(Vec::new());
+/// EM_SETEDITSTYLE(SES_USECTF) 校验结果（InputHost::create 写入；
+/// false = TSF 桥可能没建立，上层可提示"TSF 输入法可能不可用"）
+static CTF_OK: AtomicBool = AtomicBool::new(true);
 
 /// Observe the queued physical key before TranslateMessage/TSF rewrites VK_PROCESSKEY.
 /// Only the real typing control contributes statistics; modal editors never do.
@@ -233,6 +239,8 @@ pub fn capture_physical_key(msg: &windows::Win32::UI::WindowsAndMessaging::MSG) 
     if !relay {
         return false;
     }
+    // 键时间记账（统计 + 20ms 选重/标顶配对；须在 TSF 改写 VK_PROCESSKEY 之前）
+    note_key(vk, query_tick_ms());
     if ctrl {
         match vk {
             0x25 => push_cmd(CommandKey::CtrlLeft),
@@ -295,100 +303,10 @@ pub fn relay_owns_focus() -> bool {
     }
 }
 
-/// TSF 后端的窗口级键路由：命令键捕获 + 统计键记账。
-/// 返回 Some(LRESULT) = 已处理（返回该值）；None = 放行 DefWindowProc。
-/// 逻辑与 relay_proc 的命令键段一致（F1/F2/F3/F4/F5/F6/F7/F8/F10/Esc/
-/// Enter/Space/Ctrl 箭头/Alt 系/Tab/Shift+Insert），统计键同样记账（组字中也记）。
-/// 键位表（2026-10 lead 裁决）：F1 设置 / F7 发文面板 / F8 单字练习。
-pub fn route_key(wp: usize, _lp: isize) -> Option<LRESULT> {
-    let vk = wp as u32;
-    let ctrl = unsafe { GetKeyState(VK_CONTROL.0 as i32) < 0 };
-    let alt = unsafe { GetKeyState(VK_MENU.0 as i32) < 0 };
-    // 统计键记账（组字状态也记——就是真实按键；虎符重映射 VK 0xE5 由
-    // is_stat_key 区段表覆盖）
-    if StatsEngine::is_stat_key(vk) {
-        if let Ok(mut kt) = KEY_TIMES.lock() {
-            kt.push((vk, query_tick_ms()));
-            if kt.len() > 512 {
-                kt.drain(..256);
-            }
-        }
-    }
-    if alt && !ctrl {
-        // Alt 系全吞防漏字（WM_SYSCHAR 双保险在 main_proc）
-        if vk == 0x45 {
-            push_cmd(CommandKey::AltE);
-        }
-        return Some(LRESULT(0));
-    }
-    if ctrl {
-        return match vk {
-            0x25 => {
-                push_cmd(CommandKey::CtrlLeft);
-                Some(LRESULT(0))
-            }
-            0x27 => {
-                push_cmd(CommandKey::CtrlRight);
-                Some(LRESULT(0))
-            }
-            _ => Some(LRESULT(0)), // 其余 Ctrl 组合吞（防粘贴/复制/全选）
-        };
-    }
-    match vk {
-        0x1B => {
-            push_cmd(CommandKey::Escape);
-            Some(LRESULT(0))
-        }
-        0x70 => {
-            push_cmd(CommandKey::F1);
-            Some(LRESULT(0))
-        }
-        0x71 => {
-            push_cmd(CommandKey::F2);
-            Some(LRESULT(0))
-        }
-        0x72 => {
-            push_cmd(CommandKey::F3);
-            Some(LRESULT(0))
-        }
-        0x73 => {
-            push_cmd(CommandKey::F4);
-            Some(LRESULT(0))
-        }
-        0x74 => {
-            push_cmd(CommandKey::F5);
-            Some(LRESULT(0))
-        }
-        0x75 => {
-            push_cmd(CommandKey::F6);
-            Some(LRESULT(0))
-        }
-        0x76 => {
-            push_cmd(CommandKey::F7);
-            Some(LRESULT(0))
-        }
-        0x77 => {
-            push_cmd(CommandKey::F8);
-            Some(LRESULT(0))
-        }
-        0x79 => {
-            push_cmd(CommandKey::F10);
-            Some(LRESULT(0))
-        }
-        0x0D => {
-            push_cmd(CommandKey::Enter);
-            Some(LRESULT(0))
-        }
-        0x09 => Some(LRESULT(0)), // Tab
-        0x20 => {
-            // 组字中：空格归输入法（选重/顶屏）——但走到这里说明 TSF 泵没吃
-            //（未组字），按段末跳段命令处理
-            push_cmd(CommandKey::Space);
-            Some(LRESULT(0))
-        }
-        _ => None,
-    }
-}
+// TSF 后端窗口级键路由 route_key 已删除（2026-11-08 死代码清理）：
+// 该路径从未被调用——命令键捕获与统计记账统一走 capture_physical_key
+// （键泵预过滤）+ relay_proc（RichEdit 窗口过程），KEY_TIMES 记账由
+// note_key 产品化承接（见下）。保留本注释给读过旧实现的人对齐。
 
 pub fn relay_hwnd() -> isize {
     RELAY_HWND.load(Ordering::Relaxed)
@@ -599,7 +517,10 @@ unsafe fn comp_string(hwnd: HWND) -> String {
     s
 }
 
-// ── 输入诊断日志（GALE_INPUT_LOG=1 时启用；写 exe 旁 输入诊断.log）──
+// ── 输入诊断日志（GALE_INPUT_LOG=1 或 exe 旁 输入诊断.开 文件时启用）──
+// 落点：优先 exe 旁 输入诊断.log（便携目录直写）；写失败（Program Files
+// 只读等）自动切 %LOCALAPPDATA%\HuFu\trainer\logs\input-diagnostic.log 并
+// 永久记住新路径。
 static INPUT_LOG: AtomicBool = AtomicBool::new(false);
 static INPUT_LOG_PATH: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
 
@@ -634,21 +555,53 @@ fn input_log(s: &str) {
         return;
     }
     use std::io::Write;
+    let ts = query_tick_ms() % 86_400_000; // 毫秒级时戳足够诊断
     let Ok(Some(path)) = INPUT_LOG_PATH.lock().map(|g| g.clone()) else {
         return;
     };
-    let ts = query_tick_ms() % 86_400_000; // 毫秒级时戳足够诊断
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&path)
     {
         let _ = writeln!(f, "[+{ts}ms] {s}");
+        return;
     }
+    // exe 旁写失败（Program Files 等）→ 回退 %LOCALAPPDATA%\HuFu\trainer\logs\
+    // input-diagnostic.log；成功后永久记住新路径（后续直写，不再试错）。
+    if let Some(fallback) = localappdata_log_path() {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&fallback)
+        {
+            let _ = writeln!(f, "[+{ts}ms] {s}");
+            if let Ok(mut g) = INPUT_LOG_PATH.lock() {
+                *g = Some(fallback);
+            }
+            eprintln!("[gale] 输入诊断日志：exe 旁不可写，已切换到 %LOCALAPPDATA%\\HuFu\\trainer\\logs\\input-diagnostic.log");
+        }
+    }
+}
+
+/// 诊断日志回退路径：%LOCALAPPDATA%\HuFu\trainer\logs\input-diagnostic.log
+///（目录不存在则创建；LOCALAPPDATA 缺失时返回 None 放弃）
+fn localappdata_log_path() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("LOCALAPPDATA")?;
+    let dir = std::path::PathBuf::from(base)
+        .join("HuFu")
+        .join("trainer")
+        .join("logs");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir.join("input-diagnostic.log"))
 }
 
 /// tsf_focus 模块用的诊断日志出口（同 GALE_INPUT_LOG 开关）
 pub fn diagnostics_enabled() -> bool {
+    input_log_enabled()
+}
+/// UI 提示用：输入诊断日志是否在写（含 LOCALAPPDATA 回退态）
+pub fn diagnostic_enabled() -> bool {
     input_log_enabled()
 }
 pub fn diag_log(s: &str) {
@@ -726,6 +679,13 @@ unsafe extern "system" fn relay_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
     match msg {
         WM_KEYDOWN | WM_SYSKEYDOWN => {
             let vk = wp.0 as u32;
+            // ── 防作弊：训练正文区拦一切右键菜单通道（2026-11-08）──
+            // VK_APPS（菜单键 0x5D）与 Shift+F10（等效菜单键；F10 走
+            // WM_SYSKEYDOWN，Shift 态查 GetKeyState）直接吞。组字中也拦
+            //（训练模式全拦）；随后系统补投的 WM_CONTEXTMENU 由该消息臂兜底。
+            if vk == 0x5D || (vk == 0x79 && GetKeyState(VK_SHIFT.0 as i32) < 0) {
+                return LRESULT(0);
+            }
             let ctrl = GetKeyState(VK_CONTROL.0 as i32) < 0;
             let alt = GetKeyState(VK_MENU.0 as i32) < 0;
             if alt && (vk == 0x73 || vk == 0x20) {
@@ -834,6 +794,13 @@ unsafe extern "system" fn relay_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
                 return LRESULT(0); // Shift+Insert 粘贴
             }
         }
+        WM_KEYUP | WM_SYSKEYUP => {
+            // VK_APPS 弹起也吞（与 keydown 对称，防系统补发菜单消息）
+            if wp.0 as u32 == 0x5D {
+                return LRESULT(0);
+            }
+        }
+        0x007B => return LRESULT(0), // WM_CONTEXTMENU：训练模式全拦（右键/VK_APPS/Shift+F10 的公共出口）
         0x0300 | 0x0301 | 0x0302 | 0x0303 | 0x0304 => return LRESULT(0), // cut/copy/paste/clear/undo are not training commits
         WM_SYSCHAR => return LRESULT(0), // Alt+字母字符直通是疾风1代漏字根源，吞
         _ => {}
@@ -843,6 +810,8 @@ unsafe extern "system" fn relay_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
 
 /// 取走击键时间戳队列（统计引擎消费；TSF 后端也用同一队列——
 /// route_key 记账，主循环 drain）
+/// 取走击键时间戳队列（统计引擎消费；主循环每帧在 poll 之后调，
+/// 保证 note_commit 配对先于清空看到本帧击键）
 pub fn drain_key_times(max: usize) -> Vec<(u32, u64)> {
     match KEY_TIMES.lock() {
         Ok(mut kt) => {
@@ -855,6 +824,135 @@ pub fn drain_key_times(max: usize) -> Vec<(u32, u64)> {
     }
 }
 
+/// 记录一次物理键按下（键泵在 TSF 改写 VK_PROCESSKEY 之前调用；
+/// 统计击键与 20ms 选重/标顶配对共用同一队列）
+pub fn note_key(vk: u32, t_ms: u64) {
+    if let Ok(mut kt) = KEY_TIMES.lock() {
+        kt.push((vk, t_ms));
+        if kt.len() > 512 {
+            kt.drain(..256);
+        }
+    }
+}
+
+/// 上屏归因（对照晴跟打 Pro Score.cs 的 20ms 窗语义）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitCause {
+    /// 顶屏：配对窗内最后按键是编码键延续（字母）——继续打码把首选顶上屏
+    Ding,
+    /// 选重：配对窗内最后按键是数字/选重键（主行 0-9 或小键盘 0-9）
+    Select,
+    /// 无法判定（窗内无键、或最后按键不在两类内）——不计入选重/顶屏统计
+    Unknown,
+}
+
+/// 20ms 配对窗（毫秒）：|commit_ms − key_ms| ≤ 此值视为该键引发的上屏
+const COMMIT_PAIR_WINDOW_MS: u64 = 20;
+
+/// 上屏归因待取队列（drain_commit_causes 消费）
+static COMMIT_CAUSES: Mutex<Vec<CommitCause>> = Mutex::new(Vec::new());
+
+/// 记录一次上屏并做 20ms 配对判定（poll 差分出 Commit 时调用）。
+/// 取配对窗内**最后**一次按键的 vk 分类（晴 Score.cs 语义：编码延续=顶屏、
+/// 数字=选重）。纯 ASCII 直通提交（输入法关/英文模式）不归因——无 IME
+/// 参与就没有选重/顶屏可言。
+pub fn note_commit(t_ms: u64, committed_text: &str) {
+    if committed_text.is_ascii() {
+        return;
+    }
+    let cause = match KEY_TIMES.lock() {
+        Ok(kt) => kt
+            .iter()
+            .rev()
+            .find(|(_, key_ms)| t_ms.abs_diff(*key_ms) <= COMMIT_PAIR_WINDOW_MS)
+            .map(|(vk, _)| classify_commit_cause(*vk))
+            .unwrap_or(CommitCause::Unknown),
+        Err(_) => CommitCause::Unknown,
+    };
+    input_log(&format!("commit 配对 text={committed_text:?} cause={cause:?}"));
+    if let Ok(mut q) = COMMIT_CAUSES.lock() {
+        q.push(cause);
+        if q.len() > 512 {
+            q.drain(..256);
+        }
+    }
+}
+
+/// 配对窗内最后按键的 vk 分类
+fn classify_commit_cause(vk: u32) -> CommitCause {
+    match vk {
+        0x41..=0x5A => CommitCause::Ding, // 字母 = 编码键延续 → 顶屏
+        0x30..=0x39 | 0x60..=0x69 => CommitCause::Select, // 数字 = 选重
+        _ => CommitCause::Unknown,
+    }
+}
+
+/// 取走上屏归因队列（统计层消费；选重率/顶屏率口径由此出）
+pub fn drain_commit_causes() -> Vec<CommitCause> {
+    match COMMIT_CAUSES.lock() {
+        Ok(mut q) => std::mem::take(&mut *q),
+        Err(_) => Vec::new(),
+    }
+}
+
+// ── 退格归属裁决（晴跟打 ImeBackspacePolicy 13 用例语义的独立实现，产品代码）──
+//
+// 规格（_ref\TypeSunny\UI\Modes\ImeBackspacePolicy.cs）：
+// - 组字中的退格 = 清组合，归 IME（不算跟打回改）；
+// - 提交后的退格才算回改（Correction）；
+// - 退格把组合删空后，下一个物理退格仍归 IME（protect 窗口），再往后归跟打区；
+// - 提交清空组合不置 protect（区分"Space 提交瞬间组合清空"与"退格删空"）；
+// - keyup 清 protect。
+// session 层接线口径：HostEvent::Composing(false) 与同批 Commit 同时出现 →
+// on_composition_change(false, true)；只有 Composing(false) → (false, false)。
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackspaceClass {
+    /// 归输入法（清组合；不进跟打统计）
+    ImeDelete,
+    /// 归跟打区（回改判定走比对状态机）
+    Correction,
+}
+
+/// 退格归属裁决器（组字边界状态机；纯逻辑可单测）
+#[derive(Debug, Default)]
+pub struct BackspaceRouter {
+    composing: bool,
+    /// 退格清空组合后置位：下一次退格仍归 IME
+    protect: bool,
+}
+
+impl BackspaceRouter {
+    /// 输入法侧通知组字状态迁移。cleared_by_commit = 组合是否因提交清空
+    ///（同批出现 Commit 事件）——提交清空不置 protect，退格删空才置。
+    pub fn on_composition_change(&mut self, now_composing: bool, cleared_by_commit: bool) {
+        let was = self.composing;
+        self.composing = now_composing;
+        if was && !now_composing {
+            self.protect = !cleared_by_commit;
+        }
+    }
+
+    /// 物理退格按下：裁决归属。now_composing = 按键时刻的实时组字态
+    ///（防御性同步——轮询间隙的迁移以按键时读数为准）。
+    pub fn on_backspace_key(&mut self, now_composing: bool) -> BackspaceClass {
+        self.composing = now_composing;
+        if self.composing {
+            return BackspaceClass::ImeDelete;
+        }
+        if self.protect {
+            self.protect = false; // protect 只护一次
+            return BackspaceClass::ImeDelete;
+        }
+        BackspaceClass::Correction
+    }
+
+    /// 物理退格弹起：清标志（会话边界安全网）
+    pub fn on_backspace_up(&mut self) {
+        self.protect = false;
+    }
+}
+
 /// RichEdit50W 输入宿主（单例持有）
 pub struct InputHost {
     pub hwnd: isize,
@@ -862,6 +960,8 @@ pub struct InputHost {
     pub last_text: String,
     pub last_preedit: String,
     cancellation: CompositionCancellation,
+    /// EM_SETEDITSTYLE(SES_USECTF) 是否成功（false = TSF 输入法可能不可用）
+    ctf_ok: bool,
 }
 
 #[derive(Default)]
@@ -894,6 +994,7 @@ impl InputHost {
                     last_text: String::new(),
                     last_preedit: String::new(),
                     cancellation: CompositionCancellation::default(),
+                    ctf_ok: CTF_OK.load(Ordering::Relaxed),
                 });
             }
             let hinstance = match GetModuleHandleW(None) {
@@ -927,30 +1028,51 @@ impl InputHost {
             );
             SendMessageW(hwnd, 0x435, WPARAM(0), LPARAM(100_000));
             // 显式开启 TSF 支持（RichEdit50W 默认开；显式设确保 CUAS→TSF 桥激活，
-            // 纯 TSF 输入法（虎符）依赖此链路——architecture.md Mandate #1）
-            SendMessageW(
+            // 纯 TSF 输入法（虎符）依赖此链路——architecture.md Mandate #1）。
+            // 返回值校验（2026-11-08）：成功返回旧样式位（小非负值），失败为负
+            // HRESULT——记日志 + CTF_OK=false 供上层提示"TSF 输入法可能不可用"。
+            let ctf_ret = SendMessageW(
                 hwnd,
                 EM_SETEDITSTYLE,
                 WPARAM(SES_USECTF),
                 LPARAM(SES_USECTF as isize),
             );
+            let ctf_ok = ctf_ret.0 >= 0;
+            CTF_OK.store(ctf_ok, Ordering::Relaxed);
+            if !ctf_ok {
+                input_log(&format!(
+                    "EM_SETEDITSTYLE(SES_USECTF) 失败 ret=0x{:X}（TSF 桥可能未建立）",
+                    ctf_ret.0 as usize
+                ));
+                eprintln!(
+                    "[gale] EM_SETEDITSTYLE(SES_USECTF) 失败 ret=0x{:X}",
+                    ctf_ret.0 as usize
+                );
+            }
             let old = SetWindowLongPtrW(hwnd, GWLP_WNDPROC, relay_proc as *const () as isize);
             ORIG_PROC.store(old, Ordering::Relaxed);
             RELAY_HWND.store(hwnd.0 as isize, Ordering::Relaxed);
-            // 视觉隐身（2026-10-01 修订）：不再 SetWindowRgn(1,1)。
-            // 真实键盘实测（发布目录 RichEdit 后端）：1 像素 region 让虎符
-            // （TSF TIP，按目标 rect/可见性决定挂载）不挂编辑上下文 →
-            // imm/ctf 全 false、字母直通、无候选无组字。RichEdit 保持完整
-            // 客户区（place() 每帧贴打字行），视觉由 D2D 自绘层完全覆盖
-            //（渲染顺序：本控件在底、D2D 帧在上，无残影）。
+            // 宿主形态（2026-11-08 如实修订）：RichEdit 是**可见的 2×2 物理像素**
+            // 子窗口，由 place() 每帧贴随绘制光标（rect 去抖，见 place）。
+            // 不能用 1×1 region 或隐藏窗口——实测（2026-10-01）会让虎符（TSF
+            // TIP，按目标 rect/可见性决定挂载）不挂编辑上下文：imm/ctf 全
+            // false、字母直通、无候选无组字。2×2 可见窗口维持 TIP 挂载，
+            // 正文由 D2D 自绘层完全覆盖（本控件在底、D2D 帧在上，无残影）。
             Ok(Self {
                 hwnd: hwnd.0 as isize,
                 composing: false,
                 last_text: String::new(),
                 last_preedit: String::new(),
                 cancellation: CompositionCancellation::default(),
+                ctf_ok,
             })
         }
+    }
+
+    /// EM_SETEDITSTYLE(SES_USECTF) 校验结果。false = TSF 桥可能未建立，
+    /// 上层据此提示"TSF 输入法可能不可用"（虎符等纯 TSF 输入法依赖此链路）。
+    pub fn ctf_ok(&self) -> bool {
+        self.ctf_ok
     }
 
     pub fn focus(&self) {
@@ -971,16 +1093,33 @@ impl InputHost {
         }
     }
 
-    /// 贴到打字光标（客户区物理坐标）
+    /// 贴到打字光标（客户区物理坐标）。宿主保持 2×2 物理像素贴随绘制光标
+    ///（见 create 注释）。2026-11-08 去抖：rect 与上次相同则跳过 SetWindowPos
+    ///——主循环每帧调用不再产生系统调用开销。
     pub fn place(&self, x: i32, y: i32, w: i32, h: i32) {
+        let rect = (x, y + 2, w, h);
+        let skip = PLACE_RECT
+            .lock()
+            .map(|mut last| {
+                if *last == Some(rect) {
+                    true
+                } else {
+                    *last = Some(rect);
+                    false
+                }
+            })
+            .unwrap_or(false);
+        if skip {
+            return;
+        }
         unsafe {
             let _ = SetWindowPos(
                 HWND(self.hwnd as *mut _),
                 None,
-                x,
-                y + 2,
-                w,
-                h,
+                rect.0,
+                rect.1,
+                rect.2,
+                rect.3,
                 SWP_NOZORDER,
             );
         }
@@ -1080,6 +1219,12 @@ impl InputHost {
             ));
         }
         let diff = self.diff_events(&committed);
+        // 20ms 选重/标顶配对（对差分出的每次上屏记一笔；纯 ASCII 内部跳过）
+        for ev in &diff {
+            if let HostEvent::Commit(s) = ev {
+                note_commit(query_tick_ms(), s);
+            }
+        }
         let committed_group = diff.iter().any(|ev| matches!(ev, HostEvent::Commit(_)));
         evs.extend(diff);
         if now_composing && committed_group {
@@ -1130,20 +1275,40 @@ impl InputHost {
 
     // ── 候选窗/组字窗定位（晴跟打 Pro Win32.cs:264-315 同款去抖）──
     //
-    // 背景：gale 的 RichEdit 是空 region 不可见控件，输入法默认把组字窗/候选窗
-    // 贴到控件认为的 caret 位置（可能落在屏幕边缘或旧位置）。真实 caret 坐标
-    // 由渲染层（自绘打字行）掌握，通过 set_ime_anchor 喂进来。
+    // 背景：输入法默认把组字窗/候选窗贴到控件认为的 caret 位置（2×2 宿主
+    // 的"caret"在屏幕上乱漂）。真实 caret 坐标由渲染层（自绘打字行）掌握，
+    // 通过 set_anchor_from_caret 喂进来。
     //
     // 去抖规则（晴跟打实证有效）：
-    // - 坐标变化 > 阈值才真正调 ImmSetCompositionWindow(CFS_FORCE_POSITION) +
-    //   ImmSetCandidateWindow——IME 收到定位调用会重排候选窗（闪），坐标没变
+    // - 坐标或偏移变化 > 阈值才真正调 ImmSetCompositionWindow(CFS_FORCE_POSITION)
+    //   + ImmSetCandidateWindow——IME 收到定位调用会重排候选窗（闪），没变
     //   就调是候选窗抖动根源；
-    // - 坐标是**客户区**物理像素；ImmSet*Window 收的是**屏幕**坐标（内部换算）。
+    // - 输入坐标是**主窗口客户区**物理像素；ImmSet*Window 收**屏幕**坐标（内部换算）。
 
-    /// 把渲染层的光标坐标（主窗口客户区物理像素）设为 IME 组字窗/候选窗锚点。
-    /// 坐标变化超过去抖阈值才会真正下发 Imm 调用。返回 true = 本次下发了定位。
-    pub fn set_ime_anchor(&self, client_x: i32, client_y: i32) -> bool {
-        unsafe { set_ime_anchor_impl(self.hwnd, client_x, client_y) }
+    /// 把渲染层掌握的光标位置设为 IME 组字窗/候选窗锚点（参数单位见各doc）。
+    ///
+    /// - caret_x / caret_y：光标左上角，主窗口客户区**物理像素**（f32 允许
+    ///   亚像素输入，内部四舍五入取整）；
+    /// - line_height_px：光标所在行**行高（物理像素）**——候选窗偏移基准；
+    /// - dpi：当前窗口 DPI——组字窗与候选窗之间留 2 DIP 间隙，
+    ///   gap_px = round(2 × dpi / 96)，下限 1px。
+    ///
+    /// 布局：组字窗贴 (caret_x, caret_y)；候选窗顶 = caret_y + line_height_px
+    /// + gap_px。全部偏移由调用方基于行高/DPI 计算，本层不做任何像素硬编码。
+    /// 坐标（或偏移）变化超过 3px 去抖阈值才真正下发 Imm 调用。
+    /// 返回 true = 本次下发了定位。
+    pub fn set_anchor_from_caret(
+        &mut self,
+        caret_x: f32,
+        caret_y: f32,
+        line_height_px: i32,
+        dpi: u32,
+    ) -> bool {
+        let gap_px = ((dpi.max(96) as f32 / 96.0) * 2.0).round().max(1.0) as i32;
+        let comp_x = caret_x.round() as i32;
+        let comp_y = caret_y.round() as i32;
+        let cand_dy = line_height_px.max(0).saturating_add(gap_px);
+        unsafe { set_ime_anchor_impl(self.hwnd, comp_x, comp_y, cand_dy) }
     }
 
     /// RichEdit 控件自身 caret 的客户区坐标（相对主窗口；探针/E2E 校准用）。
@@ -1206,35 +1371,39 @@ pub fn load_library() {
 
 // ── 候选窗/组字窗定位（晴跟打 Pro Win32.cs:264-315 同款去抖）──
 //
-// 背景：gale 的 RichEdit 是空 region 不可见控件，输入法默认把组字窗/候选窗
-// 贴到控件认为的 caret 位置。真实 caret 坐标由渲染层（自绘打字行）掌握，
-// 通过 InputHost::set_ime_anchor 喂进来。
+// 背景：输入法默认把组字窗/候选窗贴到控件认为的 caret 位置。真实 caret
+// 坐标由渲染层（自绘打字行）掌握，经 InputHost::set_anchor_from_caret 喂入。
 //
-// 去抖规则（晴跟打实证有效）：坐标变化 > 阈值才真正调
+// 去抖规则（晴跟打实证有效）：坐标或候选窗偏移变化 > 阈值才真正调
 // ImmSetCompositionWindow(CFS_FORCE_POSITION) + ImmSetCandidateWindow ——
-// IME 收到定位调用会重排候选窗（闪），坐标没变就调是候选窗抖动根源。
-// 坐标是主窗口客户区物理像素；ImmSet*Window 收屏幕坐标（内部换算）。
+// IME 收到定位调用会重排候选窗（闪），没变就调是候选窗抖动根源。
+// 输入坐标是主窗口客户区物理像素；ImmSet*Window 收屏幕坐标（内部换算）。
 
 /// 坐标去抖阈值（物理像素）：小于此位移不重设候选窗
 const ANCHOR_JITTER_PX: i32 = 3;
-/// 上次设置的锚点（None = 从未设过）
-static LAST_ANCHOR: Mutex<Option<(i32, i32)>> = Mutex::new(None);
+/// 上次设置的锚点 (x, y, cand_dy)（None = 从未设过）。cand_dy 进键：
+/// 行高/字号变了候选窗偏移必须重发（即使光标没动）。
+static LAST_ANCHOR: Mutex<Option<(i32, i32, i32)>> = Mutex::new(None);
+/// 上次 place 的 rect（SetWindowPos 去抖；InputHost 单例 → 进程级缓存）
+static PLACE_RECT: Mutex<Option<(i32, i32, i32, i32)>> = Mutex::new(None);
 
-/// 锚点下发实现（InputHost::set_ime_anchor 的自由函数体）
-unsafe fn set_ime_anchor_impl(hwnd: isize, client_x: i32, client_y: i32) -> bool {
-    // 1) 去抖判定
+/// 锚点下发实现（InputHost::set_anchor_from_caret 的自由函数体）。
+/// cand_dy = 候选窗顶相对组字窗锚点 y 的向下偏移（物理像素，调用方算好）。
+unsafe fn set_ime_anchor_impl(hwnd: isize, client_x: i32, client_y: i32, cand_dy: i32) -> bool {
+    // 1) 去抖判定（坐标与候选偏移任一超阈值即重发）
     {
         let Ok(mut last) = LAST_ANCHOR.lock() else {
             return false;
         };
-        if let Some((lx, ly)) = *last {
+        if let Some((lx, ly, ld)) = *last {
             if (lx - client_x).abs() <= ANCHOR_JITTER_PX
                 && (ly - client_y).abs() <= ANCHOR_JITTER_PX
+                && (ld - cand_dy).abs() == 0
             {
                 return false;
             }
         }
-        *last = Some((client_x, client_y));
+        *last = Some((client_x, client_y, cand_dy));
     }
     // 2) 主窗口客户区 → 屏幕坐标（RichEdit 是子窗口，锚点语义以主窗口为准）
     let host = HWND(hwnd as *mut core::ffi::c_void);
@@ -1256,12 +1425,12 @@ unsafe fn set_ime_anchor_impl(hwnd: isize, client_x: i32, client_y: i32) -> bool
         ..Default::default()
     };
     let ok1 = ImmSetCompositionWindow(himc, &cf);
-    // 4) 候选窗跟在组字窗正下方（晴跟打同款：y + 行高）
+    // 4) 候选窗在组字锚点正下方 cand_dy（= 行高 + 间隙，调用方按行高/DPI 给出）
     let mut cand = CANDIDATEFORM {
         dwStyle: CFS_FORCE_POSITION,
         ptCurrentPos: POINT {
             x: pt.x,
-            y: pt.y + 28,
+            y: pt.y + cand_dy,
         },
         rcArea: windows::Win32::Foundation::RECT::default(),
         ..Default::default()
@@ -1269,11 +1438,13 @@ unsafe fn set_ime_anchor_impl(hwnd: isize, client_x: i32, client_y: i32) -> bool
     let ok2 = ImmSetCandidateWindow(himc, &mut cand);
     let _ = windows::Win32::UI::Input::Ime::ImmReleaseContext(host, himc);
     input_log(&format!(
-        "IME 锚点 → ({}, {}) comp={} cand={}",
+        "IME 锚点 → comp=({}, {}) cand_dy={cand_dy} cand=({}, {}) ok={}/{}",
         pt.x,
         pt.y,
-        ok1.as_bool(),
-        ok2.as_bool()
+        pt.x,
+        pt.y + cand_dy,
+        ok1.as_bool() as u8,
+        ok2.as_bool() as u8
     ));
     ok1.as_bool()
 }
@@ -1297,6 +1468,7 @@ mod tests {
             last_text: String::new(),
             last_preedit: String::new(),
             cancellation: CompositionCancellation::default(),
+            ctf_ok: true,
         };
         let evs = h.diff_events("你好");
         assert!(matches!(&evs[0], HostEvent::Commit(s) if s == "你好"));
@@ -1318,6 +1490,7 @@ mod tests {
             last_text: "甲😀乙".into(),
             last_preedit: String::new(),
             cancellation: CompositionCancellation::default(),
+            ctf_ok: true,
         };
         let ev = h.diff_events("甲🦊乙");
         assert_eq!(ev.len(), 3);
@@ -1335,6 +1508,7 @@ mod tests {
             last_text: String::new(),
             last_preedit: String::new(),
             cancellation: CompositionCancellation::default(),
+            ctf_ok: true,
         };
         let document: Vec<u16> = "j".encode_utf16().collect();
         let (committed, preedit) = split_composition(&document, &[0..1]).unwrap();
@@ -1539,112 +1713,103 @@ mod tests {
         assert!(composing_verdict(true, true), "双通道非空当然组字");
     }
 
-    // ── 退格口径状态机（晴跟打 ImeBackspacePolicy 行为规格的独立实现）──
-    // 规格（_ref\TypeSunny\UI\Modes\ImeBackspacePolicy.cs + 13 用例）：
-    // - 组字中的退格 = 清组合，不算跟打回改（归 IME）；
-    // - 提交后的退格才算回改；
-    // - 退格把组合删空后，下一个物理退格仍归 IME（protect 窗口），
-    //   再往后才归跟打区；
-    // - 提交清空组合不置 protect（区分"Space 提交瞬间组合清空"与"退格清空"）；
-    // - keyup 清 protect/进行中标志。
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum BsVerdict {
-        /// 归输入法（清组合；不进跟打统计）
-        ToIme,
-        /// 归跟打区（回改判定走比对状态机）
-        ToTyping,
-    }
-
-    /// 退格归属裁决器（组字边界状态机；纯逻辑可单测）
-    #[derive(Debug, Default)]
-    struct BackspaceRouter {
-        composing: bool,
-        /// 退格清空组合后置位：下一次退格仍归 IME
-        protect: bool,
-    }
-
-    impl BackspaceRouter {
-        /// 输入法侧通知：组字开始/更新/结束（commit 清空时 clear_kind=Commit）
-        fn notify_composition(&mut self, now_composing: bool, cleared_by_commit: bool) {
-            let was = self.composing;
-            self.composing = now_composing;
-            if was && !now_composing {
-                if cleared_by_commit {
-                    // 提交清空：不 protect，紧随的退格直接归跟打
-                    self.protect = false;
-                } else {
-                    // 非提交清空（退格删空组合）：protect 一个窗口
-                    self.protect = true;
-                }
-            }
-        }
-
-        /// 物理退格按下：裁决归属
-        fn on_backspace(&mut self) -> BsVerdict {
-            if self.composing {
-                return BsVerdict::ToIme;
-            }
-            if self.protect {
-                self.protect = false; // protect 只护一次
-                return BsVerdict::ToIme;
-            }
-            BsVerdict::ToTyping
-        }
-
-        /// 物理退格弹起：清标志（会话边界安全网）
-        fn on_backspace_up(&mut self) {
-            self.protect = false;
-        }
-    }
+    // ── 退格归属裁决（产品 BackspaceRouter；原 13 用例语义回归）──
+    // 实现已上移为产品代码（pub struct BackspaceRouter），此处仅回归行为。
 
     #[test]
     fn backspace_policy_composing_goes_to_ime() {
         let mut r = BackspaceRouter::default();
-        r.notify_composition(true, false); // 组字开始
-        assert_eq!(r.on_backspace(), BsVerdict::ToIme);
-        assert_eq!(r.on_backspace(), BsVerdict::ToIme);
+        r.on_composition_change(true, false); // 组字开始
+        assert_eq!(r.on_backspace_key(true), BackspaceClass::ImeDelete);
+        assert_eq!(r.on_backspace_key(true), BackspaceClass::ImeDelete);
     }
 
     #[test]
     fn backspace_policy_after_commit_goes_to_typing() {
         let mut r = BackspaceRouter::default();
-        r.notify_composition(true, false);
-        r.notify_composition(false, true); // 空格提交，组合清空
-        assert_eq!(r.on_backspace(), BsVerdict::ToTyping);
+        r.on_composition_change(true, false);
+        r.on_composition_change(false, true); // 空格提交，组合清空
+        assert_eq!(r.on_backspace_key(false), BackspaceClass::Correction);
     }
 
     #[test]
     fn backspace_policy_depleted_composition_protects_once() {
         let mut r = BackspaceRouter::default();
-        r.notify_composition(true, false);
-        r.notify_composition(false, false); // 退格把组合删空（非提交）
-        assert_eq!(r.on_backspace(), BsVerdict::ToIme); // protect 窗口
-        assert_eq!(r.on_backspace(), BsVerdict::ToTyping); // 之后归跟打
+        r.on_composition_change(true, false);
+        r.on_composition_change(false, false); // 退格把组合删空（非提交）
+        assert_eq!(r.on_backspace_key(false), BackspaceClass::ImeDelete); // protect 窗口
+        assert_eq!(r.on_backspace_key(false), BackspaceClass::Correction); // 之后归跟打
     }
 
     #[test]
     fn backspace_policy_commit_clear_does_not_protect() {
         // 晴跟打反例回归：提交清空 vs 退格清空必须区分
         let mut r = BackspaceRouter::default();
-        r.notify_composition(true, false);
-        r.notify_composition(false, true); // Commit 清空
-        assert_eq!(r.on_backspace(), BsVerdict::ToTyping);
-        assert_eq!(r.on_backspace(), BsVerdict::ToTyping);
+        r.on_composition_change(true, false);
+        r.on_composition_change(false, true); // Commit 清空
+        assert_eq!(r.on_backspace_key(false), BackspaceClass::Correction);
+        assert_eq!(r.on_backspace_key(false), BackspaceClass::Correction);
     }
 
     #[test]
     fn backspace_policy_keyup_resets_protect() {
         let mut r = BackspaceRouter::default();
-        r.notify_composition(true, false);
-        r.notify_composition(false, false);
+        r.on_composition_change(true, false);
+        r.on_composition_change(false, false);
         r.on_backspace_up(); // 物理弹起
-        assert_eq!(r.on_backspace(), BsVerdict::ToTyping);
+        assert_eq!(r.on_backspace_key(false), BackspaceClass::Correction);
     }
 
     #[test]
     fn backspace_policy_idle_typing() {
         let mut r = BackspaceRouter::default();
-        assert_eq!(r.on_backspace(), BsVerdict::ToTyping);
+        assert_eq!(r.on_backspace_key(false), BackspaceClass::Correction);
+    }
+
+    // ── 20ms 选重/标顶配对（注入时间序列验证）──
+    #[test]
+    fn commit_cause_pairing_within_20ms() {
+        // 隔离：先清两个静态队列（与其它测试共享进程）
+        let _ = drain_key_times(1024);
+        let _ = drain_commit_causes();
+
+        // 字母延续 → 顶屏
+        note_key(0x4A, 1_000);
+        note_commit(1_005, "人");
+        // 数字选重 → 选重
+        note_key(0x32, 2_000);
+        note_commit(2_010, "好");
+        // 窗外（50ms）→ Unknown
+        note_key(0x41, 3_000);
+        note_commit(3_050, "字");
+        // 窗内多键：最后一个键说了算（数字后补字母 → 顶屏）
+        note_key(0x32, 4_000);
+        note_key(0x4A, 4_015);
+        note_commit(4_018, "词");
+        // 边界：恰好 20ms 差 → 配对（数字 → 选重）
+        note_key(0x33, 5_000);
+        note_commit(5_020, "边界");
+        // 窗内但非字母/数字（如 Esc）→ Unknown
+        note_key(0x1B, 6_000);
+        note_commit(6_005, "无类");
+        // 纯 ASCII 直通（IME 关）→ 不入队
+        note_key(0x4A, 7_000);
+        note_commit(7_005, "abc");
+
+        let causes = drain_commit_causes();
+        assert_eq!(
+            causes,
+            vec![
+                CommitCause::Ding,
+                CommitCause::Select,
+                CommitCause::Unknown,
+                CommitCause::Ding,
+                CommitCause::Select,
+                CommitCause::Unknown,
+            ],
+            "配对序列不符: {causes:?}"
+        );
+        assert!(drain_commit_causes().is_empty(), "drain 后应清空");
+        let _ = drain_key_times(1024); // 还原隔离
     }
 }

@@ -68,7 +68,10 @@ if ($leftUp -gt 0 -or @($leftAsm).Count -gt 0) {
 }
 
 # 0-moved) 【防档案重建】列表动刀完毕，现在才杀服务（供下面注册表清理）
+# 【安装链补口·深挖 P2 2026-11-08】跟打器一并停：卸载后不应留本产品进程
+# （trainer 用户数据仍在 %LOCALAPPDATA%\HuFu，不受影响）。
 Get-Process hufu-server -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Get-Process hufu-trainer -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 Stop-Process -Name ctfmon -Force -ErrorAction SilentlyContinue
 Start-Sleep -Seconds 1
 

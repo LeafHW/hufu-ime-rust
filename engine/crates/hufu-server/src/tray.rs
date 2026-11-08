@@ -9,6 +9,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
+use std::time::Duration;
 
 #[link(name = "shell32")]
 extern "system" {
@@ -430,11 +431,21 @@ pub fn refresh_trainer_shortcut() {
     }
 }
 
+/// trainer 开关缓存。【深挖 P2 2026-11-08】WM_HOTKEY 高频路径不得阻塞等锁
+/// （输入高峰热键卡顿）：try_lock 拿到即刷新缓存，拿不到用上次缓存值。
+/// 缓存经 refresh_trainer_shortcut → WM_APP_TRAINER_CONFIG →
+/// apply_trainer_shortcut → trainer_enabled() 在每次配置变化时刷新。
+static TRAINER_ENABLED_CACHED: AtomicBool = AtomicBool::new(false);
+
 fn trainer_enabled() -> bool {
-    SHARED
-        .get()
-        .and_then(|host| host.lock().ok().map(|h| h.engine.config.trainer.enabled))
-        .unwrap_or(false)
+    if let Some(shared) = SHARED.get() {
+        if let Ok(host) = shared.try_lock() {
+            let enabled = host.engine.config.trainer.enabled;
+            TRAINER_ENABLED_CACHED.store(enabled, Ordering::SeqCst);
+            return enabled;
+        }
+    }
+    TRAINER_ENABLED_CACHED.load(Ordering::SeqCst)
 }
 
 unsafe fn apply_trainer_shortcut(hwnd: isize) {
@@ -515,21 +526,37 @@ pub fn open_settings() {
 }
 
 /// Tray and global-hotkey launches have no visible console for error output.
+/// 【非阻塞化·深挖 P2 2026-11-08】无托盘模式（图标从不添加）→ 气泡通知
+/// 不可用，MessageBoxW 仅保留给持久性失败（未安装/已禁用/进程创建失败）。
+/// 「引擎忙」类瞬时错误（try_lock 未拿到）静默重试一次，仍忙则放弃——
+/// 输入高峰按热键不得弹模态框阻塞托盘消息循环（热键/候选窗 reinit 全停）。
 fn open_trainer(hwnd: isize) {
-    let result = SHARED
-        .get()
-        .ok_or_else(|| "输入引擎尚未就绪".to_string())
-        .and_then(|host| crate::trainer::open(host));
+    let launch = || {
+        SHARED
+            .get()
+            .ok_or_else(|| "输入引擎尚未就绪".to_string())
+            .and_then(|host| crate::trainer::open(host))
+    };
+    let mut result = launch();
+    if matches!(&result, Err(e) if e == crate::trainer::BUSY_MESSAGE) {
+        std::thread::sleep(Duration::from_millis(50));
+        result = launch();
+        if matches!(&result, Err(e) if e == crate::trainer::BUSY_MESSAGE) {
+            eprintln!("{}", crate::trainer::BUSY_MESSAGE);
+            return;
+        }
+    }
     if let Err(e) = result {
         eprintln!("{e}");
         let text: Vec<u16> = format!("无法启动虎符跟打。\n\n{e}\0")
             .encode_utf16()
             .collect();
         let caption: Vec<u16> = "虎符跟打 · 启动失败\0".encode_utf16().collect();
-        // MB_OK | MB_ICONERROR | MB_SETFOREGROUND: a native visible error,
-        // including the missing-component or OS process-creation reason.
+        // MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND：无托盘模式下唯一
+        // 可见通道（无图标可挂气泡）；到这里的都是持久性缺件提示（如
+        // 未安装需重下完整包），按告知口径而非错误风暴呈现。
         unsafe {
-            MessageBoxW(hwnd, text.as_ptr(), caption.as_ptr(), 0x10 | 0x10000);
+            MessageBoxW(hwnd, text.as_ptr(), caption.as_ptr(), 0x40 | 0x10000);
         }
     }
 }

@@ -1,8 +1,16 @@
 //! Real RichEdit fields for the native panels. They keep normal TSF, clipboard,
 //! selection, accessibility, and password semantics; no simulated text input.
+use std::collections::HashMap;
+use std::sync::Mutex;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::*;
+
+/// place 去抖缓存（hwnd → 上次物理像素 rect）。主循环每帧 place，
+/// rect 相同则跳过 SetWindowPos + RedrawWindow（2026-11-08）。
+/// 注：不能放实例字段——gale-app 以结构体字面量构造 NativeEdit
+///（main.rs apply_style 的宿主样式包装），加任何字段都会破坏外部构造。
+static PLACE_RECTS: Mutex<Option<HashMap<isize, (i32, i32, i32, i32)>>> = Mutex::new(None);
 
 pub struct NativeEdit {
     pub hwnd: isize,
@@ -59,13 +67,36 @@ impl NativeEdit {
     pub fn place(&self, x: f32, y: f32, w: f32, h: f32) {
         unsafe {
             let s = crate::window::dpi_scale();
-            let _ = SetWindowPos(
-                HWND(self.hwnd as *mut _),
-                None,
+            // 去抖：主循环每帧 place，物理像素 rect 相同则跳过 SetWindowPos
+            // 与 RedrawWindow（缓存键 = hwnd，见 PLACE_RECTS 注释）
+            let rect = (
                 (x * s) as i32,
                 (y * s) as i32,
                 (w * s).max(2.) as i32,
                 (h * s).max(2.) as i32,
+            );
+            let skip = PLACE_RECTS
+                .lock()
+                .map(|mut g| {
+                    let map = g.get_or_insert_with(HashMap::new);
+                    if map.get(&self.hwnd) == Some(&rect) {
+                        true
+                    } else {
+                        map.insert(self.hwnd, rect);
+                        false
+                    }
+                })
+                .unwrap_or(false);
+            if skip {
+                return;
+            }
+            let _ = SetWindowPos(
+                HWND(self.hwnd as *mut _),
+                None,
+                rect.0,
+                rect.1,
+                rect.2,
+                rect.3,
                 SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW,
             );
             // A composition Present does not invalidate the GDI child. Force the
@@ -134,6 +165,15 @@ impl Drop for NativeEdit {
     fn drop(&mut self) {
         unsafe {
             let _ = DestroyWindow(HWND(self.hwnd as *mut _));
+        }
+        // 清去抖缓存：hwnd 会被系统复用，残留条目可能让复用 hwnd 的新窗口
+        // 首次 place 被误跳过（SWP_SHOWWINDOW 不下发 → 编辑框不可见）。
+        // （main.rs apply_style 的样式包装实例走 mem::forget 且从不 place，
+        // 不会写缓存，故不受影响。）
+        if let Ok(mut g) = PLACE_RECTS.lock() {
+            if let Some(map) = g.as_mut() {
+                map.remove(&self.hwnd);
+            }
         }
     }
 }

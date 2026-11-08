@@ -109,6 +109,9 @@ export function TrainerSettings({ data, notify, refresh }: {
           : status.enabled ? '已启用 · Ctrl+Alt+T 打开练习窗口 · 开关立即保存' : '虎符内置入口已关闭 · Ctrl+Alt+T 已停用 · 练习数据保留')}
         {!checking && error && data.online && !unsupported ? <button type="button" className="btn ghost" style={{ marginLeft: 8 }} onClick={() => void checkStatus()}>重新检查</button> : null}
       </div>
+      <div style={{ color: 'var(--text3)', fontSize: 12, marginTop: 8 }}>
+        内置练习语料源自 zhouzhou-typing（Apache-2.0）。
+      </div>
     </section>
   );
 }

@@ -362,7 +362,8 @@ pub struct WenlaiHttpClient<T: HttpTransport> {
 }
 
 /// 默认 UA：Chrome 120（晴跟打 Pro 同款，避免被服务端按非常规客户端拦截）。
-const DEFAULT_UA: &str =
+/// 全端点统一使用；gale-app 的 WinHttpOpen 代理名也取这一份（online.rs）。
+pub const DEFAULT_UA: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
 impl<T: HttpTransport> WenlaiHttpClient<T> {
@@ -403,13 +404,13 @@ impl<T: HttpTransport> WenlaiHttpClient<T> {
     }
 
     pub fn current_user(&self) -> Result<(), String> {
-        let body = self.get("/api/auth/current")?;
+        let body = self.get_idempotent("/api/auth/current")?;
         parse_envelope(&body)?;
         Ok(())
     }
 
     pub fn bookshelf(&self) -> Result<Vec<ShelfBook>, String> {
-        let body = self.get("/api/userBookConfig/list")?;
+        let body = self.get_idempotent("/api/userBookConfig/list")?;
         let data = parse_envelope(&body)?;
         let items = data
             .as_array()
@@ -452,6 +453,26 @@ impl<T: HttpTransport> WenlaiHttpClient<T> {
             body: None,
         };
         self.read_response(self.transport.request(&req))
+    }
+
+    /// 幂等 GET（categories / bookshelf / auth-current 等只读端点）：传输层失败
+    /// （连接建立/发送失败，即 transport 返回 `Err`）时**重试一次**；HTTP 状态
+    /// 错误以 `Ok(HttpResponse)` 进 read_response，不算连接失败、不重试。
+    /// fetch_random / fetch_adjacent 服务端可能推进阅读游标，保持单次 `get`
+    /// （见各端点旁的豁免注释）。
+    fn get_idempotent(&self, path_and_query: &str) -> Result<String, String> {
+        normalize_base_url(&self.base_url)?;
+        let make_req = || HttpRequest {
+            method: HttpMethod::Get,
+            url: format!("{}{}", self.base_url, path_and_query),
+            headers: self.auth_headers(),
+            body: None,
+        };
+        let result = match self.transport.request(&make_req()) {
+            Err(_) => self.transport.request(&make_req()), // 连接类失败重试一次
+            ok => ok,
+        };
+        self.read_response(result)
     }
 
     fn post_json(&self, path: &str, body: Value) -> Result<String, String> {
@@ -603,7 +624,9 @@ impl<T: HttpTransport> WenlaiClient for WenlaiHttpClient<T> {
     }
 
     fn categories(&mut self) -> GaleResult<Vec<(String, String)>> {
-        let body = self.get("/api/categories").map_err(crate::GaleError::Msg)?;
+        let body = self
+            .get_idempotent("/api/categories")
+            .map_err(crate::GaleError::Msg)?;
         let data = parse_envelope(&body).map_err(crate::GaleError::Msg)?;
         let arr = match data.as_array() {
             Some(a) => a,

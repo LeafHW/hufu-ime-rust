@@ -8,16 +8,17 @@
 //! DWM 显示 backdrop（Acrylic/Blur 由 window.rs 的材质调用控制）。
 //!
 //! 文本（疾风1代 fonts.rs 视觉规格的 D2D 复刻）：
-//! - 跟打正文 = 内置 LXGW WenKai GB Screen R（进程私有字体，不依赖安装或外部路径）；
-//! - UI 字 = 系统微软雅黑（msyh → simhei 兜底由系统匹配器处理）；
+//! - 正文/UI = 系统字体探测（与虎符主程序同策略）：进程启动时用
+//!   IDWriteFactory::GetSystemFontCollection 遍历家族本地化名，按优先级
+//!   取第一个存在的霞鹜文楷家族；都没有则回退微软雅黑。探测一次进程内缓存；
 //! - 测宽 = IDWriteTextLayout 簇宽度（逐字符推进量，折行与 1代逐字网格对齐）。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::OnceLock;
 
 use windows::core::w;
 use windows::core::Interface;
-use windows::Win32::Foundation::E_FAIL;
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_RECT_F,
 };
@@ -35,12 +36,11 @@ use windows::Win32::Graphics::DirectComposition::{
     DCompositionCreateDevice, IDCompositionDevice, IDCompositionTarget, IDCompositionVisual,
 };
 use windows::Win32::Graphics::DirectWrite::{
-    DWriteCreateFactory, IDWriteFactory, IDWriteFactory5, IDWriteFontCollection1,
-    IDWriteInMemoryFontFileLoader, IDWriteTextFormat, IDWriteTextLayout,
-    DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_PROPERTY_ID_FAMILY_NAME, DWRITE_FONT_WEIGHT_NORMAL,
-    DWRITE_MEASURING_MODE_NATURAL, DWRITE_PARAGRAPH_ALIGNMENT_NEAR, DWRITE_TEXT_ALIGNMENT_CENTER,
-    DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_TEXT_METRICS,
-    DWRITE_WORD_WRAPPING_NO_WRAP,
+    DWriteCreateFactory, IDWriteFactory, IDWriteFontCollection, IDWriteFontFamily,
+    IDWriteLocalizedStrings, IDWriteTextFormat, IDWriteTextLayout, DWRITE_FACTORY_TYPE_SHARED,
+    DWRITE_FONT_WEIGHT_NORMAL, DWRITE_MEASURING_MODE_NATURAL, DWRITE_PARAGRAPH_ALIGNMENT_NEAR,
+    DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TEXT_ALIGNMENT_TRAILING,
+    DWRITE_TEXT_METRICS, DWRITE_WORD_WRAPPING_NO_WRAP,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
@@ -63,6 +63,134 @@ fn line_break_end(chars: &[char], first: usize, mut end: usize) -> usize {
         end -= 1;
     }
     end
+}
+
+/// 词级重排（词不拆行）：给定 `wrap_text` 产出的行集合与词边界（全局字符下标
+/// `(start, len)`），把跨行的多字词整体移到后一行；标点与单字仍可断行。
+///
+/// 背景：`wrap_text` 是纯像素宽贪心，会把词切断；且应用的布局缓存只在
+/// 段/字号/宽度变化时重算，而词提列表是异步到达的——所以由 UI 层每帧调用
+/// 本函数做修正。位置向量直接复用原行的 DirectWrite 实测推进量
+/// （`pos[k+1] - pos[k]`），下划线、编码提示与光标因此保持像素级精度。
+///
+/// 返回 `None` 表示没有词跨行、输入行集合原样可用（每帧调用的零分配快路径）。
+/// 超过一行宽度的超长词无法整体放下，保持原断行（词长于行时必然被切）。
+pub fn rewrap_words(
+    lines: &[(usize, String, Vec<f32>)],
+    words: &[(usize, usize)],
+) -> Option<Vec<(usize, String, Vec<f32>)>> {
+    let multi: Vec<(usize, usize)> = words.iter().copied().filter(|(_, l)| *l >= 2).collect();
+    if multi.is_empty() || lines.len() < 2 {
+        return None;
+    }
+    let straddle = |out: &[(usize, String, Vec<f32>)], i: usize| -> Option<(usize, usize)> {
+        let n = out[i].1.chars().count();
+        let boundary = out[i].0 + n;
+        if n == 0 || i + 1 >= out.len() || out[i + 1].0 != boundary {
+            return None;
+        }
+        let end2 = out[i + 1].0 + out[i + 1].1.chars().count();
+        multi.iter().copied().find(|&(s, l)| {
+            s >= out[i].0 && s < boundary && s + l > boundary && s + l <= end2
+        })
+    };
+    if (0..lines.len() - 1).all(|i| straddle(lines, i).is_none()) {
+        return None;
+    }
+    let mut out: Vec<(usize, String, Vec<f32>)> = lines.to_vec();
+    // 可用行宽：原贪心排版里最宽的行尾位置（该宽度内的组合原布局已容纳过）
+    let width = out
+        .iter()
+        .map(|l| l.2.last().copied().unwrap_or(0.))
+        .fold(0.0_f32, f32::max);
+    let total: usize = out.iter().map(|l| l.1.chars().count()).sum();
+    let mut budget = total + out.len();
+    while budget > 0 {
+        let mut moved = false;
+        let mut i = 0;
+        while i + 1 < out.len() && budget > 0 {
+            let n = out[i].1.chars().count();
+            let boundary = out[i].0 + n;
+            if n == 0 || out[i + 1].0 != boundary {
+                i += 1;
+                continue;
+            }
+            // 1) 词跨行：把词在本行尾部的字符整体下移
+            if let Some((ws, _)) = straddle(&out, i) {
+                move_chars_down(&mut out, i, boundary - ws);
+                budget -= 1;
+                moved = true;
+                continue; // 行 i 变短，重查本对（可能还有下一个跨行词）
+            }
+            // 2) 行尾超宽（下移挤出来的）：把可断后缀（不在词内的断点）继续下移
+            let end_pos = out[i].2.last().copied().unwrap_or(0.);
+            if end_pos > width + 0.5 {
+                if let Some(k) = breakable_suffix(&out[i], &multi) {
+                    if k > 0 && k < n {
+                        move_chars_down(&mut out, i, k);
+                        budget -= 1;
+                        moved = true;
+                        continue;
+                    }
+                }
+            }
+            i += 1;
+        }
+        if !moved {
+            break;
+        }
+    }
+    Some(out)
+}
+
+/// 把第 i 行末尾 k 个字符移到第 i+1 行行首（两行必须相邻且行 i+1 存在）。
+/// 位置向量按原行实测推进量重建；第 i+1 行的 base 相应前移 k。
+fn move_chars_down(out: &mut [(usize, String, Vec<f32>)], i: usize, k: usize) {
+    let n = out[i].1.chars().count();
+    if i + 1 >= out.len() || k == 0 || k > n {
+        return;
+    }
+    let chars: Vec<char> = out[i].1.chars().collect();
+    let prefix: String = chars[..n - k].iter().collect();
+    let suffix: String = chars[n - k..].iter().collect();
+    // 下移字符的推进量：pos[j+1] - pos[j]（pos 有 n+1 项，全部可测）
+    let suffix_adv: Vec<f32> = (n - k..n).map(|j| out[i].2[j + 1] - out[i].2[j]).collect();
+    out[i].1 = prefix;
+    out[i].2.truncate(n - k + 1);
+    let m = out[i + 1].1.chars().count();
+    if out[i + 1].2.len() < m + 1 {
+        // 位置向量异常：退化为按全宽近似（CJK 全宽场景误差可忽略）
+        let avg = out[i + 1].2.last().copied().unwrap_or(0.) / m.max(1) as f32;
+        out[i + 1].2 = (0..=m).map(|j| j as f32 * avg).collect();
+    }
+    let old_adv: Vec<f32> = (0..m).map(|j| out[i + 1].2[j + 1] - out[i + 1].2[j]).collect();
+    let mut pos = Vec::with_capacity(m + k + 1);
+    pos.push(0.0_f32);
+    let mut acc = 0.0_f32;
+    for a in suffix_adv.iter().chain(old_adv.iter()) {
+        acc += a;
+        pos.push(acc);
+    }
+    out[i + 1].1 = format!("{suffix}{}", out[i + 1].1);
+    out[i + 1].2 = pos;
+    out[i + 1].0 -= k;
+}
+
+/// 行尾超宽时，找最小可下移后缀长度 k（n-k 是最后一个不在多字词内部的断点）。
+/// 单字/标点处可断；词内不可断。整行都在一个词里时返回 None。
+fn breakable_suffix(line: &(usize, String, Vec<f32>), multi: &[(usize, usize)]) -> Option<usize> {
+    let n = line.1.chars().count();
+    if n < 2 {
+        return None;
+    }
+    let inside = |g: usize| multi.iter().any(|&(s, l)| s < g && g < s + l);
+    for k in 1..n {
+        // 断点全局位置 = base + (n - k)；后缀为 [n-k, n)
+        if !inside(line.0 + n - k) {
+            return Some(k);
+        }
+    }
+    None
 }
 
 /// 渲染目标尺寸
@@ -187,106 +315,128 @@ impl Frame {
     }
 }
 
-/// 字体族选择：LXGW = 跟打正文，Ui = 界面（chip/统计/面板）
+/// 字体族选择：Lxgw = 跟打正文，Ui = 界面（chip/统计/面板），Mono = 数字/编码。
+/// Lxgw 与 Ui 都解析到 [`detected_cjk_family`]（霞鹜文楷家族优先、微软雅黑回退），
+/// 仅用途语义有别；Mono 恒为系统等宽（Consolas）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FontFamily {
-    /// 跟打正文（LXGW WenKai；私有集缺失时回退系统雅黑）
+    /// 跟打正文（系统探测：霞鹜文楷家族优先，回退微软雅黑）
     Lxgw,
-    /// UI 字（微软雅黑 UI；1代 fonts.rs 系统族）
+    /// UI 字（与正文同族——跟虎符主程序策略）
     Ui,
     Mono,
 }
 
+// ── 系统字体探测（2026-11-08 用户拍板：去字体嵌入，改系统探测）──
+//
+// 与虎符主程序同策略：已安装霞鹜文楷就用，未安装回退微软雅黑。
+// 遍历 GetSystemFontCollection 的家族本地化名（en-US 与 zh-CN 名都比对，
+// 覆盖只装了中文名族或英文名族的安装形态），按下表优先级取第一个命中；
+// 都没有 → "Microsoft YaHei UI"。探测一次，进程内缓存。
+
+/// 正文/UI 家族优先级表（前 = 优先）。中英文名成对给出，
+/// 对家族的任一本地化名做大小写不敏感比对。
+const CJK_FAMILY_CANDIDATES: [&str; 10] = [
+    "霞鹜文楷 GB Screen",
+    "LXGW WenKai GB Screen",
+    "霞鹜文楷 GB",
+    "LXGW WenKai GB",
+    "霞鹜文楷 Screen",
+    "LXGW WenKai Screen",
+    "霞鹜文楷",
+    "LXGW WenKai",
+    "霞鹜新晰黑",
+    "LXGW WenKai Lite",
+];
+
+/// 家族全缺失时的回退（微软雅黑；系统必装）
+const CJK_FAMILY_FALLBACK: &str = "Microsoft YaHei UI";
+
+/// 探测结果缓存（进程内一次）
+static DETECTED_CJK_FAMILY: OnceLock<String> = OnceLock::new();
+
+/// 取正文/UI 字体家族（系统探测，进程内缓存）。
+/// 返回值直接作 CreateTextFormat 家族名（命中候选表原样返回，未命中返回回退名）。
+pub fn detected_cjk_family() -> &'static str {
+    DETECTED_CJK_FAMILY.get_or_init(detect_cjk_family)
+}
+
+fn detect_cjk_family() -> String {
+    let factory: IDWriteFactory = unsafe {
+        match DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!(
+                    "[d2d] DWriteCreateFactory 失败，正文字体回退 {CJK_FAMILY_FALLBACK}: {e:?}"
+                );
+                return CJK_FAMILY_FALLBACK.to_string();
+            }
+        }
+    };
+    let names = unsafe { system_family_names(&factory) };
+    let Some(names) = names else {
+        eprintln!("[d2d] 系统字体集枚举失败，正文字体回退 {CJK_FAMILY_FALLBACK}");
+        return CJK_FAMILY_FALLBACK.to_string();
+    };
+    for candidate in CJK_FAMILY_CANDIDATES {
+        if names.contains(&candidate.to_lowercase()) {
+            return candidate.to_string();
+        }
+    }
+    CJK_FAMILY_FALLBACK.to_string()
+}
+
+/// 收集系统字体集内全部家族名（小写；含每个家族的全部本地化名）
+unsafe fn system_family_names(factory: &IDWriteFactory) -> Option<HashSet<String>> {
+    let mut collection: Option<IDWriteFontCollection> = None;
+    factory
+        .GetSystemFontCollection(&mut collection, false)
+        .ok()?;
+    let collection = collection?;
+    let count = collection.GetFontFamilyCount();
+    let mut names = HashSet::new();
+    for i in 0..count {
+        let family: IDWriteFontFamily = collection.GetFontFamily(i).ok()?;
+        let localized: IDWriteLocalizedStrings = family.GetFamilyNames().ok()?;
+        for s in 0..localized.GetCount() {
+            if let Some(name) = localized_string(&localized, s) {
+                names.insert(name.to_lowercase());
+            }
+        }
+    }
+    Some(names)
+}
+
+/// 取本地化串第 index 项
+unsafe fn localized_string(ls: &IDWriteLocalizedStrings, index: u32) -> Option<String> {
+    let len = ls.GetStringLength(index).ok()? as usize;
+    let mut buf = vec![0u16; len + 1];
+    ls.GetString(index, &mut buf).ok()?;
+    Some(String::from_utf16_lossy(&buf[..len]))
+}
+
 /// 字体 + 排版工具箱（一个 Renderer 一份）：
-/// - LXGW 私有字体集（InMemoryFontFileLoader，进程内注册）；
+/// - 正文/UI 家族 = [`detected_cjk_family`]（系统探测，首次用到时解析一次）；
 /// - (family, size) → IDWriteTextFormat 缓存（跟打器字号固定档位少，全缓存）；
 /// - 逐簇测宽（折行/贪吃蛇/光标定位的统一真值）。
 pub struct FontKit {
     dwrite: IDWriteFactory,
-    /// LXGW 内存字体集（加载失败 = None，族名走系统回退）
-    lxgw_collection: Option<IDWriteFontCollection1>,
-    /// loader 必须比 collection 活得久（进程内注册，不注销）
-    _loader: Option<IDWriteInMemoryFontFileLoader>,
-    /// LXGW 集内真实族名（CreateTextFormat 用）
-    lxgw_family: String,
     fmt_cache: HashMap<(FontFamily, u32), IDWriteTextFormat>,
     /// 测宽缓存：(family, size_q, ch) → 宽度（跟打器字符集小，命中率高）
     width_cache: HashMap<(FontFamily, u32, char), f32>,
 }
 
 impl FontKit {
-    /// 创建字体工具箱。LXGW 加载失败不致命：正文回退系统雅黑并打日志。
+    /// 创建字体工具箱。系统家族探测惰性完成（首次 CreateTextFormat 时一次）。
     pub fn new() -> Self {
         let dwrite: IDWriteFactory = unsafe {
             DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED).expect("DWriteCreateFactory")
         };
-        let mut kit = Self {
-            dwrite: dwrite.clone(),
-            lxgw_collection: None,
-            _loader: None,
-            lxgw_family: String::new(),
+        Self {
+            dwrite,
             fmt_cache: HashMap::new(),
             width_cache: HashMap::new(),
-        };
-        unsafe {
-            match kit.load_lxgw() {
-                Ok(family) => kit.lxgw_family = family,
-                Err(e) => eprintln!("[d2d] 内置文楷加载失败: {e:?}"),
-            }
         }
-        kit
-    }
-
-    /// 内存加载 LXGW → FontSet → FontCollection1，返回集内真实族名
-    unsafe fn load_lxgw(&mut self) -> windows::core::Result<String> {
-        let data: &'static [u8] = include_bytes!("../../../assets/LXGWWenKaiGBScreenR.ttf");
-        let factory5: IDWriteFactory5 = self.dwrite.cast()?;
-        let loader = factory5.CreateInMemoryFontFileLoader()?;
-        // 进程内注册（不注销，与 Renderer 同生命周期）
-        self.dwrite.RegisterFontFileLoader(&loader)?;
-        let fontfile = loader.CreateInMemoryFontFileReference(
-            &self.dwrite,
-            data.as_ptr() as *const core::ffi::c_void,
-            data.len() as u32,
-            None,
-        )?;
-        let builder = factory5.CreateFontSetBuilder()?;
-        // IDWriteFontSetBuilder1::AddFontFile（接受完整 ttc/ttf）
-        let builder1: windows::Win32::Graphics::DirectWrite::IDWriteFontSetBuilder1 =
-            builder.cast()?;
-        builder1.AddFontFile(&fontfile)?;
-        let fontset = builder1.CreateFontSet()?;
-        // CreateFontCollectionFromFontSet 在 IDWriteFactory3（Deref 链可达）
-        let factory3: windows::Win32::Graphics::DirectWrite::IDWriteFactory3 =
-            self.dwrite.cast()?;
-        let collection: IDWriteFontCollection1 =
-            factory3.CreateFontCollectionFromFontSet(&fontset)?;
-        // 取集内族名（索引 0；单文件单面）
-        if fontset.GetFontCount() == 0 {
-            return Err(windows::core::Error::from(E_FAIL));
-        }
-        let mut family = String::new();
-        let mut values: Option<windows::Win32::Graphics::DirectWrite::IDWriteLocalizedStrings> =
-            None;
-        let mut exists = windows::Win32::Foundation::FALSE;
-        fontset.GetPropertyValues3(
-            0,
-            DWRITE_FONT_PROPERTY_ID_FAMILY_NAME,
-            &mut exists,
-            &mut values,
-        )?;
-        if let Some(ls) = values {
-            let len = ls.GetStringLength(0)? as usize;
-            let mut buf = vec![0u16; len + 1];
-            ls.GetString(0, &mut buf)?;
-            family = String::from_utf16_lossy(&buf[..len]);
-        }
-        if family.is_empty() {
-            return Err(windows::core::Error::from(E_FAIL));
-        }
-        self.lxgw_collection = Some(collection);
-        self._loader = Some(loader);
-        Ok(family)
     }
 
     /// 取（或建）文本格式。size 物理像素字号，量化到 0.25px 减少缓存键。
@@ -309,21 +459,15 @@ impl FontKit {
         family: FontFamily,
         size: f32,
     ) -> windows::core::Result<IDWriteTextFormat> {
-        let (name, collection): (PCWSTRLike, Option<&IDWriteFontCollection1>) = match family {
-            FontFamily::Lxgw => (
-                if self.lxgw_collection.is_some() {
-                    wide_null(&self.lxgw_family)
-                } else {
-                    wide_null("Microsoft YaHei UI")
-                },
-                self.lxgw_collection.as_ref(),
-            ),
-            FontFamily::Ui => (wide_null("Microsoft YaHei UI"), None),
-            FontFamily::Mono => (wide_null("Consolas"), None),
+        // Lxgw/Ui 同族（虎符主程序策略：系统探测霞鹜文楷优先，回退微软雅黑）；
+        // Mono 等宽保持现状（Consolas，系统必有；Cascadia Mono 由 DWrite 匹配器兜底）
+        let name: PCWSTRLike = match family {
+            FontFamily::Lxgw | FontFamily::Ui => wide_null(detected_cjk_family()),
+            FontFamily::Mono => wide_null("Consolas"),
         };
         let fmt = self.dwrite.CreateTextFormat(
             name,
-            collection.map(|c| c as &windows::Win32::Graphics::DirectWrite::IDWriteFontCollection),
+            None,
             DWRITE_FONT_WEIGHT_NORMAL,
             windows::Win32::Graphics::DirectWrite::DWRITE_FONT_STYLE_NORMAL,
             windows::Win32::Graphics::DirectWrite::DWRITE_FONT_STRETCH_NORMAL,
@@ -425,26 +569,6 @@ fn utf16_of(ch: char) -> Vec<u16> {
     let mut buf = [0u16; 2];
     let n = ch.encode_utf16(&mut buf).len();
     buf[..n].to_vec()
-}
-
-fn make_text_format(
-    dwrite: &IDWriteFactory,
-    size: f32,
-) -> windows::core::Result<IDWriteTextFormat> {
-    unsafe {
-        let fmt = dwrite.CreateTextFormat(
-            w!("Microsoft YaHei UI"),
-            None,
-            DWRITE_FONT_WEIGHT_NORMAL,
-            windows::Win32::Graphics::DirectWrite::DWRITE_FONT_STYLE_NORMAL,
-            windows::Win32::Graphics::DirectWrite::DWRITE_FONT_STRETCH_NORMAL,
-            size,
-            w!("zh-CN"),
-        )?;
-        let _ = fmt.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
-        let _ = fmt.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
-        Ok(fmt)
-    }
 }
 
 impl Renderer {
@@ -1038,8 +1162,7 @@ impl Renderer {
         }
         lines
     }
-    fn text_positions(&mut self, text: &str, size: f32) -> Vec<f32> {
-        unsafe {
+    fn text_positions(&mut self, text: &str, size: f32) -> Vec<f32> {        unsafe {
             let mut out = vec![0.];
             let Ok(fmt) = self.fonts.format(FontFamily::Lxgw, size) else {
                 return out;
@@ -1437,6 +1560,55 @@ impl Renderer {
 mod tests {
     use super::*;
 
+    /// rewrap_words：跨行词整体下移、单字词快路径、位置向量按原推进量重建。
+    /// CJK 全宽假设：每字推进 10.0（真实路径来自 DirectWrite，此处只用等差近似验证算法）。
+    fn line(base: usize, text: &str) -> (usize, String, Vec<f32>) {
+        let n = text.chars().count();
+        (base, text.to_string(), (0..=n).map(|i| i as f32 * 10.).collect())
+    }
+
+    #[test]
+    fn rewrap_moves_straddling_word_whole_and_rebuilds_positions() {
+        // 行0 "XYAB" + 行1 "CD"；词 (2,4)="ABCD" 跨行 → ABCD 整词下移
+        let lines = vec![line(0, "XYAB"), line(4, "CD")];
+        let out = rewrap_words(&lines, &[(0, 2), (2, 4)]).expect("有跨行词，应返回重排结果");
+        assert_eq!(out[0].1, "XY");
+        assert_eq!(out[0].0, 0);
+        assert_eq!(out[0].2, vec![0., 10., 20.]);
+        assert_eq!(out[1].1, "ABCD");
+        assert_eq!(out[1].0, 2, "行1 的 base 前移到词首");
+        assert_eq!(out[1].2, vec![0., 10., 20., 30., 40.]);
+    }
+
+    #[test]
+    fn rewrap_pushes_overflow_breakable_suffix_further_down() {
+        // 行宽 50（5 字）。词 (2,6)="CDEFGH" 跨 0/1 行 → 整词下移后行1 溢出，
+        // 尾部单字 "I"（不在词内）继续下移到行2；词本身 6 字宽于行宽，保留溢出
+        // （超长词不拆的既定取舍）。
+        let lines = vec![line(0, "ABCD"), line(4, "EFGHI"), line(9, "J")];
+        let out = rewrap_words(&lines, &[(2, 6)]).expect("有跨行词，应返回重排结果");
+        assert_eq!(out[0].1, "AB");
+        assert_eq!(out[1].1, "CDEFGH");
+        assert_eq!(out[2].1, "IJ");
+        assert_eq!(
+            out.iter().map(|l| l.1.chars().count()).sum::<usize>(),
+            10,
+            "字符守恒"
+        );
+        for w in out.windows(2) {
+            assert_eq!(w[1].0 - w[0].0, w[0].1.chars().count(), "相邻行 base 必须连续");
+        }
+    }
+
+    #[test]
+    fn rewrap_single_char_words_take_fast_path() {
+        let lines = vec![line(0, "AB"), line(2, "CD")];
+        assert!(rewrap_words(&lines, &[(0, 1), (1, 1), (2, 1), (3, 1)]).is_none());
+        // 没有跨行词时也走快路径
+        let lines2 = vec![line(0, "ABCD"), line(4, "EF")];
+        assert!(rewrap_words(&lines2, &[(0, 2), (2, 2), (4, 2)]).is_none());
+    }
+
     #[test]
     #[ignore = "Native D3D/D2D fixture; writes images for visual inspection"]
     fn backdrop_blur_exports_native_fixture_and_survives_resize() {
@@ -1613,13 +1785,10 @@ mod tests {
     }
 
     #[test]
-    fn bundled_wenkai_is_available_without_external_assets() {
-        let kit = FontKit::new();
-        assert!(
-            kit.lxgw_collection.is_some(),
-            "bundled font must load in the delivered binary"
-        );
-        assert!(!kit.lxgw_family.is_empty());
+    fn cjk_family_resolves_without_bundled_assets() {
+        // 字体已去嵌入：家族由系统探测解析（候选表或雅黑回退），无外部资产依赖
+        let family = detected_cjk_family();
+        assert!(!family.is_empty(), "探测结果不得为空");
     }
 
     #[test]
@@ -1697,6 +1866,19 @@ mod tests {
         let ascii = kit.char_width(FontFamily::Lxgw, 64.0, 'a');
         assert!(cjk > ascii, "cjk={cjk} ascii={ascii}");
         assert!(cjk > 50.0 && cjk < 80.0, "64px 中文应≈64 宽，got {cjk}");
+    }
+
+    #[test]
+    fn cjk_family_detection_lands_on_candidate_or_fallback() {
+        // 系统字体探测（真实 DWrite 调用；无头环境可用）：结果必为
+        // 候选表之一（本机装了霞鹜文楷）或微软雅黑回退，且进程内缓存一致。
+        let family = detected_cjk_family();
+        let known = CJK_FAMILY_CANDIDATES.contains(&family) || family == CJK_FAMILY_FALLBACK;
+        assert!(known, "探测结果不在候选表/回退内: {family}");
+        assert_eq!(detected_cjk_family(), family, "探测应进程内缓存");
+        // 探测结果必须真的能建 TextFormat（族名有效）
+        let mut kit = FontKit::new();
+        assert!(kit.format(FontFamily::Lxgw, 24.0).is_ok());
     }
 
     #[test]

@@ -380,7 +380,7 @@ pub fn run_install(out: &mut Out, no_hklm: bool, user_only: bool) -> i32 {
             path_str(&legacy),
             mb
         ));
-        out.line("  该目录同时存放跟打记录，请保留用户数据，仅手动清理已不用的旧程序文件。");
+        out.line("  该目录同时存放跟打记录；安装时将自动清理其中的旧程序文件，trainer\\ 等用户数据保留。");
     }
 
     // install.ps1 L254-257：1) 文件检查（原地运行：不拷贝；缺件 exit 1）
@@ -397,6 +397,11 @@ pub fn run_install(out: &mut Out, no_hklm: bool, user_only: bool) -> i32 {
     if !shell_exe.exists() || !webview_loader.exists() {
         out.line("✗ 缺少 hufu-settings.exe / WebView2Loader.dll，请使用新版安装包");
         return 1;
+    }
+    // 【安装链补口·深挖 P2 2026-11-08】跟打器组件缺失只警告不 fail——
+    // 输入法优先可用；zip 被裁剪时不再静默缺失（与 install.ps1 同款文案）。
+    if !inst.join("hufu-trainer.exe").exists() {
+        out.line("⚠ 跟打器组件缺失，请重新下载完整安装包（输入法功能不受影响）");
     }
     out.line("OK 文件就位（原地运行，不占用 C 盘额外空间）");
 
@@ -784,7 +789,10 @@ pub fn run_install(out: &mut Out, no_hklm: bool, user_only: bool) -> i32 {
 
     // install.ps1 L510-519：6) 启动 server——【铁律】必须普通权限：提权启动的管道会拒绝
     // 普通应用。先杀旧实例 → 500ms → 启动 → 2s。
+    // 【安装链补口·深挖 P2 2026-11-08】杀进程列表加 hufu-trainer：运行中
+    // 升级不杀会因文件占用走 .old 残留（exe 线 iss 已有 RenameOccupiedPEs 腾位）。
     procop::kill_by_name("hufu-server.exe");
+    procop::kill_by_name("hufu-trainer.exe");
     std::thread::sleep(Duration::from_millis(500));
     if is_admin {
         // 本安装器自身被提权运行（如右键管理员）：经 explorer.exe 中转降权启动（参数带引号）
@@ -974,11 +982,49 @@ pub fn run_phase_elevated(out: &mut Out) -> i32 {
         }
     }
 
-    // The trainer stores user data below LocalAppData\HuFu. Upgrades retain
-    // the whole user directory; an old server.exe does not make its data disposable.
+    // The trainer stores user data below LocalAppData\HuFu. 【白名单清理·深挖
+    // P1-8 2026-11-08】Before the portable layout, old program files and user
+    // data coexisted there with no automatic cleanup path. Upgrades now delete
+    // exactly the whitelisted legacy program files (plus *.old* residues) at
+    // the directory root; trainer\, http_port.txt, 数据\, 皮肤\ and any other
+    // non-whitelisted content is retained. Behavior mirrors install.ps1.
     let legacy_local = common::localappdata().join("HuFu");
     if legacy_local.exists() {
-        out.line("已保留用户数据（含跟打记录）: %LOCALAPPDATA%\\HuFu");
+        let mut gone: Vec<String> = Vec::new();
+        for name in [
+            "hufu-server.exe",
+            "hufu-settings.exe",
+            "hufu-trainer.exe",
+            "hufu_tsf.dll",
+            "hufu_tsf32.dll",
+            "hufu-render-helper.exe",
+        ] {
+            let p = legacy_local.join(name);
+            if p.is_file() {
+                if crate::uninstall::remove_forced(&p) {
+                    gone.push(name.to_string());
+                } else {
+                    out.line(&format!("· 旧程序文件被占用，本次未删（下次安装再清）：{name}"));
+                }
+            }
+        }
+        if let Ok(rd) = std::fs::read_dir(&legacy_local) {
+            for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().to_string();
+                if name.contains(".old") && e.path().is_file() && crate::uninstall::remove_forced(&e.path()) {
+                    gone.push(name);
+                }
+            }
+        }
+        if !gone.is_empty() {
+            out.line(&format!(
+                "清理旧版程序文件（trainer\\ 等用户数据已保留）: {}",
+                gone.join("、")
+            ));
+            out.install_log(&format!("LOCALAPPDATA 白名单清理: 删除 {}", gone.join("、")));
+        } else {
+            out.line("已保留用户数据（含跟打记录）: %LOCALAPPDATA%\\HuFu");
+        }
     }
 
     // install.ps1 L171-177：── HKLM 机器级注册：COM InprocServer32 + TIP 描述 ──

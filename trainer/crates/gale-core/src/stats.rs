@@ -10,9 +10,8 @@
 //! - **码长**  = 键数 / 字数（保留 3 位小数，如 1.061）
 //! - **击键**  = 键数 / 用时秒（键/秒）
 //! - **速度**  = 字数 / 用时分钟（字/分）
-//! - **键准**（疾风1代口径）= (键数 − 退格 − 回改 − 错字) / 键数 × 100%
-//!   晴 Pro 精确口径同步产出 `accuracy_pro`：
-//!   (键 − 回改 − 退格×2) / (字数 + 回改) × 字数 / 键 × 100%
+//! - **键准**（晴 Pro 精确口径，**产线**）= (键 − 回改 − 退格×2) / (字数 + 回改) × 字数 / 键 × 100%
+//!   （ScoreRecord.accuracy 直接取该值；`accuracy_simple` 为疾风1代简化对照式，非产线口径）
 //! - **回改**  = 物理退格删除已上屏字符的次数，不论此前对错（见 compare.rs）
 //! - **错字**  = 比对不匹配的上屏字符数
 //! - **有效速度** = 速度 − 错字×5/分钟（晴 Pro "错一罚五" GetValidSpeed 口径，下限 0）
@@ -64,6 +63,13 @@ pub struct StatsEngine {
     /// 上屏键组数（并击口径：每次 IME commit 记一组）
     #[serde(default)]
     pub commit_groups: u32,
+    /// 标顶次数（20ms 键-提交配对：提交由顶屏键完成，research-digest §B.5；
+    /// gale-app 输入宿主 drain_commit_causes → session 转发注入）。旧 JSON 缺省 0。
+    #[serde(default)]
+    pub ding_count: u32,
+    /// 选重次数（20ms 键-提交配对：提交由候选选重键完成）。旧 JSON 缺省 0。
+    #[serde(default)]
+    pub select_count: u32,
     /// 组字会话起点（累计键数；None=未在组字）——运行态，不入 JSON
     #[serde(skip)]
     pub composition_start_keys: Option<u32>,
@@ -98,6 +104,8 @@ impl StatsEngine {
             waste_codes: 0,
             waste_keys: 0,
             commit_groups: 0,
+            ding_count: 0,
+            select_count: 0,
             composition_start_keys: None,
             per_key: Vec::new(),
             last_key_ms: None,
@@ -108,6 +116,16 @@ impl StatsEngine {
     pub fn on_commit_group(&mut self) {
         self.commit_groups = self.commit_groups.saturating_add(1);
         self.settle_pending_keys();
+    }
+
+    /// 20ms 配对账（P1-3 选重/标顶）：标顶一次（顶屏键完成提交）。
+    /// 由 main.rs 消费 drain_commit_causes 后经 Session::on_commit_cause 注入。
+    pub fn note_ding(&mut self) {
+        self.ding_count = self.ding_count.saturating_add(1);
+    }
+    /// 20ms 配对账（P1-3 选重/标顶）：选重一次（候选选重键完成提交）。
+    pub fn note_select(&mut self) {
+        self.select_count = self.select_count.saturating_add(1);
     }
 
     fn settle_pending_keys(&mut self) {
@@ -239,14 +257,14 @@ impl StatsEngine {
         let minutes = elapsed_ms as f64 / 60_000.0;
         let seconds = elapsed_ms as f64 / 1000.0;
         let speed = if minutes > 0.0 { chars / minutes } else { 0.0 };
-        // 键准 = (键数 − 退格 − 回改 − 错字) / 键数
+        // 键准（疾风1代简化对照式，非产线）= (键数 − 退格 − 回改 − 错字) / 键数
         // （疾风1代 records.jsonl 实测回归：196字/208键/6退/2错/回改3 → 94.7115，见 jifeng_record_reproduced）
         let accuracy = if keys > 0.0 {
             ((keys - backspaces - corrections - wrong) / keys * 100.0).clamp(0.0, 100.0)
         } else {
             100.0
         };
-        // 晴跟打 Pro 精确键准（对照公式，见 docs/stats-formula.md §2）：
+        // 键准（晴 Pro 精确口径，**产线**；对照公式，见 docs/stats-formula.md §2）：
         // (Hit − Correction − Backs×2) / (字数 + Correction) × 字数 / Hit
         let accuracy_pro = if keys > 0.0 && chars + corrections > 0.0 {
             ((keys - corrections - backspaces * 2.0) / (chars + corrections) * chars / keys * 100.0)
@@ -262,6 +280,9 @@ impl StatsEngine {
         let (zz_speed, zz_speed2, zz_mc) =
             zz_compute(cmp.pos.min(cmp.states.len()), cmp.wrong, self.keys, seconds);
         let tb = time_breakdown(&cmp.timing_events, chars as usize, cmp.wrong);
+        // 有效性双门槛（score.rs 常量，与 <5 聚合硬门语义分开）：字数≥10 且 用时≥10s。
+        let is_valid = chars as usize >= crate::score::VALID_EFFECTIVE_CHARS
+            && elapsed_ms >= crate::score::VALID_EFFECTIVE_MS;
         SegmentStats {
             chars: chars as usize,
             keys: self.keys,
@@ -271,7 +292,7 @@ impl StatsEngine {
             composing_keys: self.composing_keys,
             elapsed_ms,
             speed,
-            accuracy,
+            accuracy_simple: accuracy,
             accuracy_pro,
             effective_speed,
             code_len,
@@ -279,12 +300,15 @@ impl StatsEngine {
             waste_codes: self.waste_codes,
             waste_keys: self.waste_keys,
             commit_groups: self.commit_groups,
+            ding_count: self.ding_count,
+            select_count: self.select_count,
             zz_speed,
             zz_speed2,
             zz_mc,
             time_breakdown: tb,
             jj: strokes_per_sec,
             para_index_hint: None,
+            is_valid,
         }
     }
 }
@@ -308,9 +332,10 @@ pub struct SegmentStats {
     pub elapsed_ms: u64,
     /// 速度 字/分
     pub speed: f64,
-    /// 键准 %（疾风1代口径：(键-退-改-错)/键）
-    pub accuracy: f64,
-    /// 键准 %（晴跟打 Pro 精确口径，见 docs/stats-formula.md §2）
+    /// 键准 %（疾风1代简化对照式：(键-退-改-错)/键）。**非产线口径**——
+    /// 仅用于疾风1代 records.jsonl 历史对照回归；成绩/聚合一律用 accuracy_pro。
+    pub accuracy_simple: f64,
+    /// 键准 %（晴跟打 Pro 精确口径，**产线**，见 docs/stats-formula.md §2）
     #[serde(default)]
     pub accuracy_pro: f64,
     /// 有效速度 = 速度 − 错字×5/分钟（晴 GetValidSpeed 口径，下限 0）
@@ -328,6 +353,12 @@ pub struct SegmentStats {
     /// 上屏键组数（并击口径：每次 commit 一组）
     #[serde(default)]
     pub commit_groups: u32,
+    /// 标顶次数（顶屏键完成提交；晴成绩单 `标顶N`）。旧 JSON 缺省 0。
+    #[serde(default)]
+    pub ding_count: u32,
+    /// 选重次数（候选选重键完成提交；晴成绩单 `选重N`）。旧 JSON 缺省 0。
+    #[serde(default)]
+    pub select_count: u32,
     // ── 州州增值口径（`_research/stats-and-drill-models.md` §3.2 直译）──
     /// 州州 speed：(字数−错字)×60/秒 —— "已打部分中错的字数"扣除后的裸速度
     #[serde(default)]
@@ -345,6 +376,11 @@ pub struct SegmentStats {
     /// 击键速度 jj（键/秒）——jjC 九级评定的输入（strokes_per_sec 同值，单列避免口径混用）
     #[serde(default)]
     pub jj: f64,
+    /// 有效性（晴 E4 双门槛）：字数≥10 且 用时≥10s（score.rs 常量）。
+    /// is_valid=false 的段仍可计入"练习总字数"，但不进"有效均速/均键准"类指标；
+    /// 与字数<5 的聚合硬门（VALID_MIN_CHARS）语义分开。旧 JSON 缺省 false。
+    #[serde(default)]
+    pub is_valid: bool,
     /// 应用层回填：本段在会话中的段号（F3 重打回滚会话累计时判归属用）
     #[serde(skip)]
     pub para_index_hint: Option<usize>,
@@ -511,9 +547,9 @@ mod tests {
         let s = st.finalize(&cmp, 58_285);
         assert!((s.speed - 201.767).abs() < 0.01, "speed={}", s.speed);
         assert!(
-            (s.accuracy - 94.7115).abs() < 0.01,
-            "accuracy={}",
-            s.accuracy
+            (s.accuracy_simple - 94.7115).abs() < 0.01,
+            "accuracy_simple={}",
+            s.accuracy_simple
         );
         assert!(
             (s.code_len - 1.06122).abs() < 0.0001,
@@ -551,10 +587,23 @@ mod tests {
         let s = st.finalize(&cmp, 132_811);
         assert!((s.speed - 166.703).abs() < 0.01, "speed={}", s.speed);
         assert!(
-            (s.accuracy - 93.985).abs() < 0.01,
-            "accuracy={}",
-            s.accuracy
+            (s.accuracy_simple - 93.985).abs() < 0.01,
+            "accuracy_simple={}",
+            s.accuracy_simple
         );
+    }
+
+    /// 20ms 配对账（P1-3）：note_ding/note_select 计数原样进 SegmentStats。
+    #[test]
+    fn ding_select_counters_flow_into_finalize() {
+        let mut st = StatsEngine::new();
+        st.note_ding();
+        st.note_ding();
+        st.note_select();
+        let cmp = Comparer::new("");
+        let s = st.finalize(&cmp, 10_000);
+        assert_eq!(s.ding_count, 2);
+        assert_eq!(s.select_count, 1);
     }
 
     #[test]
@@ -616,8 +665,9 @@ mod tests {
         let cmp = Comparer::new("");
         let s = st.finalize(&cmp, 0);
         assert_eq!(s.speed, 0.0);
-        assert_eq!(s.accuracy, 100.0);
+        assert_eq!(s.accuracy_simple, 100.0);
         assert_eq!(s.code_len, 0.0);
+        assert!(!s.is_valid); // 0字0s：无效
     }
 
     #[test]
@@ -736,6 +786,27 @@ mod tests {
         cmp.wrong = 50;
         let s = st.finalize(&cmp, 1_000);
         assert_eq!(s.effective_speed, 0.0);
+    }
+
+    /// 有效性双门槛边界（E4/P1-4）：字数≥10 且 用时≥10s 才 is_valid。
+    /// 覆盖 2字/4字/9字9s/9字10s/10字9s/10字10s。
+    #[test]
+    fn is_valid_double_threshold_boundaries() {
+        let cases: &[(&str, u64, bool)] = &[
+            ("甲乙", 1_000, false),                    // 2字：双不过
+            ("甲乙丙丁", 1_000, false),                 // 4字：<字数门（也<5 硬门）
+            ("甲乙丙丁戊己庚辛壬", 9_000, false),        // 9字9s：双不过
+            ("甲乙丙丁戊己庚辛壬", 10_000, false),       // 9字10s：仅字数不过
+            ("甲乙丙丁戊己庚辛壬癸", 9_999, false),      // 10字9.999s：仅用时不过
+            ("甲乙丙丁戊己庚辛壬癸", 10_000, true),      // 10字10s：双过
+        ];
+        for (text, ms, valid) in cases {
+            let st = StatsEngine::new();
+            let mut cmp = Comparer::new(text);
+            cmp.pos = cmp.states.len();
+            let s = st.finalize(&cmp, *ms);
+            assert_eq!(s.is_valid, *valid, "text={text} ms={ms}");
+        }
     }
 
     /// 废码：组字编码被取消 → 整轮组字键数计入退格 + waste（晴 Pro 空上屏分支）

@@ -9,6 +9,16 @@ use gale_core::{
     theme::{Color, Theme},
 };
 use gale_win::d2d::{Align, DrawCmd, FontFamily, Frame};
+
+/// 辅助/描述性文字最小字号（说明行、图例、次要标签、状态行、卡片描述；
+/// 2026-11-08 用户拍板"部分描述字比较小"，10-12 一律提到 13）。
+/// 主标签与正文（cfg.font_size，默认 36）不随之变化；数字等宽小字（编码行）保持。
+pub const FONT_HINT: f32 = 13.0;
+/// 面板/头部主标签字号（标题、面板名）。
+pub const FONT_LABEL: f32 = 14.0;
+/// 赛制下字提行的"停手才显示"门限（毫秒，晴口径 B：赛制词提全关、字提停手 5s 显示）。
+pub const ZITI_IDLE_MS: f64 = 5000.;
+
 pub fn rgba(c: Color) -> [f32; 4] {
     [
         c.0 as f32 / 255.,
@@ -164,8 +174,8 @@ pub fn button(
     text(
         f,
         x + 10.,
-        y + 7.,
-        11.5,
+        y + 8.,
+        FONT_HINT,
         label,
         if selected { p.accent } else { p.text2 },
     );
@@ -190,7 +200,7 @@ pub fn primary_button(
     let p = tokens(t);
     round(f, x, y + 3., w, 32., 8., alpha(p.accent, 0.06), None);
     round(f, x, y, w, 32., 8., p.accent, Some(alpha(p.text, 0.18)));
-    text(f, x + 12., y + 7., 11.5, label, hex("211a10"));
+    text(f, x + 12., y + 8., FONT_HINT, label, hex("211a10"));
     hs.push(Hit {
         x,
         y,
@@ -307,7 +317,7 @@ fn chip(
         f,
         x + 9.,
         y + 4.,
-        10.,
+        FONT_HINT,
         s,
         if on { p.accent } else { p.muted },
     );
@@ -358,16 +368,16 @@ fn draw_chrome(
         rect(f, 38. - dx, 31. - dy, 1., 1., p.accent);
     }
     text(f, 57., 18., 13., "虎符", p.text);
-    text(f, 94., 21., 10., "跟打", p.muted);
+    text(f, 94., 20., FONT_HINT, "跟打", p.muted);
     rect(f, 132., 22., 1., 13., p.line2);
     text(
         f,
         149.,
-        20.,
-        11.5,
+        19.,
+        FONT_LABEL,
         format!(
             "{}  ·  第 {} {}",
-            elide(&sess.title, if w < 1000. { 12 } else { 20 }),
+            elide(&sess.title, if w < 1000. { 11 } else { 18 }),
             sess.index + 1,
             if sess.source == SessionSource::Single {
                 "组"
@@ -409,7 +419,7 @@ fn draw_chrome(
             f,
             cx,
             35.,
-            9.,
+            FONT_HINT,
             if m.race {
                 "词提按规则关闭 · 成绩按赛制记录"
             } else {
@@ -486,7 +496,7 @@ fn draw_chrome(
             f,
             cx,
             35.,
-            9.,
+            FONT_HINT,
             if sess.source == SessionSource::Single {
                 "字提编码下显 · 尾码方点 · 选重以上标位次标记"
             } else if m.race {
@@ -503,8 +513,8 @@ fn draw_chrome(
         text(
             f,
             w - 239.,
-            21.,
-            10.,
+            20.,
+            FONT_HINT,
             format!(
                 "● {} · {}",
                 t.name,
@@ -538,18 +548,19 @@ fn draw_chrome(
     rect(f, 0., h - 37., w, 37., alpha(p.bg2, 0.8));
     line(f, 0., h - 37., w, p.line);
     round(f, 22., h - 20., 4., 4., 2., p.accent, None);
+    let sx = (w / 2. - 154.).max(if w > 1000. { 360. } else { 230. });
     text(
         f,
         34.,
         h - 25.,
-        9.5,
+        FONT_HINT,
         elide(
             if m.paused {
                 "已暂停 · 返回窗口继续"
             } else {
                 &m.status
             },
-            if w > 1100. { 38 } else { 24 },
+            (((sx - 46.) / FONT_HINT) as usize).max(6),
         ),
         p.muted,
     );
@@ -578,8 +589,7 @@ fn draw_chrome(
             ("F9", "规则", Action::Open(Modal::Rules)),
         ]
     };
-    let spacing = if result || report { 88. } else { 61. };
-    let sx = (w / 2. - 154.).max(if w > 1000. { 360. } else { 230. });
+    let spacing = if result || report { 96. } else { 61. };
     for (i, (key, label, a)) in actions.into_iter().enumerate() {
         let xx = sx + i as f32 * spacing;
         let kw = if key == "Enter" { 35. } else { 22. };
@@ -593,8 +603,8 @@ fn draw_chrome(
             alpha(p.text, 0.015),
             Some(p.line2),
         );
-        mono(f, xx + 4., h - 25., 8.5, key, p.text2);
-        text(f, xx + kw + 5., h - 25., 9.5, label, p.muted);
+        mono(f, xx + 4., h - 24., 8.5, key, p.text2);
+        text(f, xx + kw + 5., h - 25., FONT_HINT, label, p.muted);
         hs.push(Hit {
             x: xx,
             y: h - 34.,
@@ -608,7 +618,7 @@ fn draw_chrome(
             f,
             w - 22.,
             h - 25.,
-            9.5,
+            FONT_HINT,
             format!(
                 "今日 {} 字   |   {} / {} 字",
                 cfg.today_chars,
@@ -650,11 +660,11 @@ fn rail(f: &mut Frame, sess: &Session, p: &Palette, x: f32, y: f32, bw: f32) {
             f,
             xx,
             y,
-            8.5,
+            FONT_HINT,
             format!(
                 "{} · {}{}",
                 i + 1,
-                elide(&sess.segments[i].mark, 10),
+                elide(&sess.segments[i].mark, ((sw - 46.) / FONT_HINT) as usize),
                 if done { " ✓" } else { "" }
             ),
             color,
@@ -708,6 +718,26 @@ pub fn build(
     if matches!(m.modal, Modal::Result | Modal::Report) {
         return f;
     }
+    // 词不拆行（P2）：main 的 wrap_text 是纯像素宽贪心、会切断词，且只在
+    // 段/字号/宽度变化时重算（词提是异步到达的）。这里每帧按词边界把跨行
+    // 词整体移到后一行；词内字符推进量取自原行的 DirectWrite 实测位置，
+    // 下划线/编码提示随新行位置自动跟随。单字练习的 words 全是 len=1，
+    // rewrap_words 走快路径返回 None。
+    let owned_lines = if m.words.is_empty() {
+        None
+    } else {
+        gale_win::d2d::rewrap_words(
+            lines,
+            &m.words
+                .iter()
+                .map(|z| (z.start, z.len))
+                .collect::<Vec<_>>(),
+        )
+    };
+    let lines: &[(usize, String, Vec<f32>)] = owned_lines
+        .as_ref()
+        .map(|v| v.as_slice())
+        .unwrap_or(lines);
     let p = tokens(t);
     let single = sess.source == SessionSource::Single;
     let (bw, fs, lh) = body_metrics(sess, cfg, w);
@@ -722,7 +752,7 @@ pub fn build(
             &mut f,
             x,
             80.,
-            10.,
+            FONT_HINT,
             format!(
                 "单字练习   ·   {}   |   第 {} / {} 组",
                 elide(&sess.title, 24),
@@ -735,7 +765,7 @@ pub fn build(
             &mut f,
             x + bw,
             79.,
-            10.,
+            FONT_HINT,
             format!(
                 "{:.1} 字/分   |   {:.2} 键/秒   |   {:.1}% 键准",
                 live.para_speed, live.para_keys_per_sec, live.para_accuracy
@@ -772,11 +802,11 @@ pub fn build(
             &mut f,
             x,
             center - lh - 45.,
-            8.,
+            FONT_HINT,
             "居中行 · 逐字编码",
             p.muted,
         );
-        if m.hints && !m.race {
+        if gale_core::rules::hints_effective(m.hints, m.race) {
             let seal_x = x + bw - 90.;
             round(
                 &mut f,
@@ -806,11 +836,11 @@ pub fn build(
             &mut f,
             x,
             79.,
-            9.5,
+            FONT_HINT,
             format!(
                 "• 第 {} 段 · {} · {}",
                 sess.index + 1,
-                elide(&sess.current_segment().mark, 22),
+                elide(&sess.current_segment().mark, 20),
                 if m.race {
                     "赛制 · 词提关闭"
                 } else {
@@ -823,7 +853,7 @@ pub fn build(
             &mut f,
             x + bw,
             79.,
-            10.,
+            FONT_HINT,
             format!(
                 "本段 {} / {} 字  ·  {:02}:{:04.1}",
                 pos,
@@ -843,12 +873,12 @@ pub fn build(
             speed_text,
             p.text,
         );
-        text(&mut f, x + 170., 137., 9.5, "字/分", p.muted);
+        text(&mut f, x + 170., 136., FONT_HINT, "字/分", p.muted);
         text(
             &mut f,
             x,
-            162.,
-            9.,
+            161.,
+            FONT_HINT,
             if sess.started_ms.is_some() {
                 "实时速度 · 当前段"
             } else {
@@ -881,7 +911,7 @@ pub fn build(
             let xx = sx + i as f32 * 78.;
             rect(&mut f, xx - 15., 139., 1., 32., p.line);
             mono(&mut f, xx, 136., 17., value, color);
-            text(&mut f, xx, 159., 8.5, label, p.muted);
+            text(&mut f, xx, 160., FONT_HINT, label, p.muted);
         }
         rail(&mut f, sess, &p, x, 191., bw);
         top = 268.;
@@ -936,7 +966,7 @@ pub fn build(
             dx = (z * 72.).sin() * 6. * (1. - z / 0.3).max(0.);
         }
         // Word glow and drill-character focus sit behind the actual DirectWrite line.
-        if m.hints && !m.race && cfg.hint_style != 2 {
+        if gale_core::rules::hints_effective(m.hints, m.race) && cfg.hint_style != 2 {
             if single {
                 if li == active {
                     let ci = pos
@@ -1053,7 +1083,7 @@ pub fn build(
                 );
             }
         }
-        if m.hints && !m.race && cfg.hint_style != 2 {
+        if gale_core::rules::hints_effective(m.hints, m.race) && cfg.hint_style != 2 {
             for (zi, z) in m.words.iter().enumerate() {
                 if z.start < *offset || z.start >= offset + line_text.chars().count() {
                     continue;
@@ -1085,26 +1115,13 @@ pub fn build(
                 if let Some(code) = &z.code {
                     let color = hint_color(z, &p);
                     let hx = wx + (ww - code.chars().count() as f32 * 6.3).max(0.) / 2.;
-                    mono(
-                        &mut f,
-                        hx,
-                        yy + fs + 9.,
-                        10.5,
-                        code,
-                        alpha(color, if z.start <= pos { 1. } else { 0.55 }),
-                    );
-                    if !z.tail.is_empty() {
-                        round(
-                            &mut f,
-                            wx + ww - 3.,
-                            yy + 1.,
-                            3.5,
-                            3.5,
-                            0.5,
-                            [0.; 4],
-                            Some(alpha(color, 0.6)),
-                        );
+                    let code_color = alpha(color, if z.start <= pos { 1. } else { 0.55 });
+                    // 隔词交替加粗（晴口径 B：相邻词的编码下显第一词粗、第二词常规循环）：
+                    // D2D 无独立粗体 Mono，用 0.6px 偏移二次描画模拟。
+                    if zi % 2 == 0 {
+                        mono(&mut f, hx + 0.6, yy + fs + 9., 10.5, code.clone(), code_color);
                     }
+                    mono(&mut f, hx, yy + fs + 9., 10.5, code, code_color);
                     if z.rank > 1 {
                         mono(
                             &mut f,
@@ -1115,6 +1132,20 @@ pub fn build(
                             p.red,
                         );
                     }
+                } else if !z.tail.is_empty() && z.tail != "_" {
+                    // 尾码圆点角标：与完整编码下显互斥（有下显不画），且
+                    // tail=="_"（空格上屏）不画。
+                    let color = hint_color(z, &p);
+                    round(
+                        &mut f,
+                        wx + ww - 3.,
+                        yy + 1.,
+                        3.5,
+                        3.5,
+                        0.5,
+                        [0.; 4],
+                        Some(alpha(color, 0.6)),
+                    );
                 }
             }
         }
@@ -1129,7 +1160,7 @@ pub fn build(
         &mut f,
         x,
         ly,
-        8.5,
+        FONT_HINT,
         if single {
             "字提分级"
         } else {
@@ -1147,17 +1178,17 @@ pub fn build(
     .into_iter()
     .enumerate()
     {
-        let xx = x + 64. + i as f32 * 73.;
+        let xx = x + 70. + i as f32 * 82.;
         round(&mut f, xx, ly + 4., 5., 5., 1., c, None);
-        text(&mut f, xx + 10., ly, 9., name, p.muted);
+        text(&mut f, xx + 10., ly, FONT_HINT, name, p.muted);
     }
     if single {
         line(&mut f, x, h - 75., bw, p.line);
         body_text(
             &mut f,
             x,
-            h - 62.,
-            11.,
+            h - 63.,
+            FONT_HINT,
             format!("「{}」", elide(&sess.current_segment().text, 18)),
             p.muted,
         );
@@ -1184,40 +1215,64 @@ pub fn build(
         right(
             &mut f,
             x + bw,
-            h - 62.,
-            9.,
-            format!("第 {} 组 / 共 {} 组", sess.index + 1, total),
+            h - 63.,
+            FONT_HINT,
+            format!("第 {}/{} 组", sess.index + 1, total),
             p.muted,
         );
     }
-    if let Some(z) = m.words.get(hint_cur) {
-        right(
-            &mut f,
-            x + bw,
-            ly,
-            10.,
-            format!(
-                "当前{}  {}  ·  {}{}",
-                if single { "字" } else { "词" },
-                z.text,
-                z.code.clone().unwrap_or_else(|| "—".into()),
-                if z.tail == "_" {
-                    " · 空格上屏"
+    // 字提行口径（research-digest §B 晴口径）：赛制=词提全关（hints_effective==false），
+    // 字提是唯一允许的提示形态，但需**停手 5 秒**才显示（开打前不显示，防起跑泄题）；
+    // 练习=字提跟词提同开同关、立即显示。
+    let idle_ms = (now - anim.last_input).max(0.) * 1000.;
+    let ziti_visible = if m.race {
+        sess.started_ms.is_some() && idle_ms >= ZITI_IDLE_MS
+    } else {
+        gale_core::rules::hints_effective(m.hints, false)
+    };
+    if ziti_visible {
+        if let Some(z) = m.words.get(hint_cur) {
+            right(
+                &mut f,
+                x + bw,
+                ly,
+                FONT_HINT,
+                format!(
+                    "当前{}  {}  ·  {}{}",
+                    if single { "字" } else { "词" },
+                    z.text,
+                    z.code.clone().unwrap_or_else(|| "—".into()),
+                    if z.tail == "_" {
+                        " · 空格上屏"
+                    } else {
+                        ""
+                    }
+                ),
+                p.text2,
+            );
+        } else if !m.status.is_empty() && w > 1000. {
+            right(
+                &mut f,
+                x + bw,
+                ly,
+                FONT_HINT,
+                if m.race {
+                    "字提需当前虎符服务支持"
+                } else if m.hints {
+                    "提示需当前虎符服务支持"
                 } else {
-                    ""
-                }
-            ),
-            p.text2,
-        );
-    } else if !m.status.is_empty() && w > 1000. {
+                    "提示已关闭"
+                },
+                p.muted,
+            );
+        }
+    } else if !m.status.is_empty() && w > 1000. && !m.race {
         right(
             &mut f,
             x + bw,
             ly,
-            9.,
-            if m.race {
-                "赛制已关闭提示"
-            } else if m.hints {
+            FONT_HINT,
+            if m.hints {
                 "提示需当前虎符服务支持"
             } else {
                 "提示已关闭"

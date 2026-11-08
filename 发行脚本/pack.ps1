@@ -783,6 +783,16 @@ foreach ($n in @('hufu_tsf.dll','hufu_tsf32.dll','hufu-server.exe','hufu-trainer
     $all = (Check ($arc.Entries.FullName -contains $n) "包内 $n") -and $all
 }
 $all = (Check ($null -ne ($arc.Entries | Where-Object { $_.FullName -match '数据[/\\]config\.json$' })) '包内 数据\config.json') -and $all
+# 【发行链补口·深挖 P2 2026-11-08】trainer 许可与语料核验：licenses 只核
+# zhouzhou 两件（LXGW 字体两件随字体策略移除后 licenses\trainer 仅剩此二
+# + drills 的 NOTICE.md）；语料 5 件是 gale-core 编译期 include_str! 源——
+# 缺任一件 cargo 构建即失败，此处点名核验避免"语料被裁仍发版"。
+foreach ($lz in @('licenses/trainer/zhouzhou-LICENSE.txt','licenses/trainer/zhouzhou-NOTICE.txt')) {
+    $all = (Check ($arc.Entries.FullName -contains $lz) "包内 $lz") -and $all
+}
+foreach ($dz in @('前1500单字.txt','常用单字前五百.txt','常用单字中五百.txt','常用单字后五百.txt','常用词组前三百.txt')) {
+    $all = (Check (Test-Path (Join-Path $trainerRoot ("drills\" + $dz))) "语料源 drills\$dz") -and $all
+}
 # 【P1-13】渲染小助手体积门禁：0 字节/占位件也算「在包」，server 会静默回退
 # PowerShell 驱动（用户只感到慢）。release 产物实测 ~355KB。
 $eRh = $arc.Entries | Where-Object { $_.FullName -eq 'hufu-render-helper.exe' } | Select-Object -First 1

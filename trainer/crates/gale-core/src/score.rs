@@ -1,7 +1,10 @@
 //! 成绩单格式化 + records.jsonl 持久化。
 //!
-//! 成绩单格式对齐晴跟打 Pro 的 Score.Report 风格（疾风1代 README:21 记载的字段集合）：
-//! 速度/有效速度/击键/键准/码长/字数/用时/错字/退格/回改/总键数。
+//! 成绩单格式对齐晴跟打 Pro 的 Score.Report 逐字节口径（research-digest.md §C.3/C.4；
+//! 疾风1代 README:21 记载的字段集合）：
+//! 速度(罚后/裸速双数字，无括注)/击键/键准(晴精确式)/码长/字数/难度(有数据时)/
+//! 用时(厘秒截断)/错字/退格/废码/选重/标顶/回改/总键数/赛制标记/签名。
+//! 双空格分隔、标签与数值间无空格、**不含尾换行**（消费方自行加）。
 //!
 //! records.jsonl 每行一个 JSON（疾风1代字段超集，可读疾风1代旧文件）：
 //! {"ts":1790555080,"date":"2026-09-28","title":"...","source":"群文","mark":"999",
@@ -37,6 +40,8 @@ pub struct ScoreRecord {
     pub wrong: usize,
     pub time_ms: u64,
     pub speed: f64,
+    /// 键准 %（**产线口径** = 晴 Pro 精确式，from_stats 直接取 accuracy_pro，
+    /// 下限/除零处理见 stats.rs finalize；不再有简化式回退路径）
     pub accuracy: f64,
     pub code_len: f64,
     // —— 2代扩展字段（旧文件缺省可读）——
@@ -58,6 +63,12 @@ pub struct ScoreRecord {
     /// 上屏键组数（并击口径）
     #[serde(default)]
     pub commit_groups: u32,
+    /// 标顶次数（顶屏键完成提交，20ms 键-提交配对；成绩单 `标顶N`）。旧记录缺省 0。
+    #[serde(default)]
+    pub ding_count: u32,
+    /// 选重次数（候选选重键完成提交，20ms 键-提交配对；成绩单 `选重N`）。旧记录缺省 0。
+    #[serde(default)]
+    pub select_count: u32,
     /// 输入法名（晴发文 leaderboard 字段 input_method；由输入层在结算时注入）
     #[serde(default)]
     pub input_method: String,
@@ -67,9 +78,41 @@ pub struct ScoreRecord {
     /// 州州击键速度 jj（键/秒）——jjC 九级评定的历史输入
     #[serde(default)]
     pub jj: f64,
+    /// 有效性（晴 E4 双门槛，见 SegmentStats::is_valid）：字数≥10 且 用时≥10s。
+    /// false 的记录进"练习总字数"、不进"有效均速/均键准"类指标（UI 消费）；
+    /// 与字数<5 聚合硬门（VALID_MIN_CHARS）语义分开。旧记录缺省 false。
+    #[serde(default)]
+    pub is_valid: bool,
+    /// 难度（跟打文《难度》头 / 文来难度；有则进成绩单 `难度{label}({score:.2})`）。
+    /// 旧记录缺省 None。
+    #[serde(default)]
+    pub difficulty: Option<DifficultyTag>,
     /// 版本（区分1代/2代记录）
     #[serde(default = "default_version")]
     pub version: String,
+}
+
+/// 难度标签（成绩单 `难度普(1.84)` 口径：label + 可选数值分）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DifficultyTag {
+    /// 难度名（淼/水/易/普/难/虐 等单字）
+    pub label: String,
+    /// 数值分（晴样本括号部分）；文来只给标签时为 None → 成绩单只写 `难度{label}`
+    #[serde(default)]
+    pub score: Option<f64>,
+}
+
+impl DifficultyTag {
+    /// 解析载文链的难度串：`"普 1.84"` → (普, 1.84)；`"普"` → (普, None)；空/坏 → None。
+    pub fn parse(text: &str) -> Option<Self> {
+        let mut it = text.split_whitespace();
+        let label = it.next()?.trim().to_string();
+        if label.is_empty() {
+            return None;
+        }
+        let score = it.next().and_then(|s| s.parse::<f64>().ok()).filter(|v| v.is_finite());
+        Some(Self { label, score })
+    }
 }
 
 fn default_version() -> String {
@@ -77,6 +120,10 @@ fn default_version() -> String {
 }
 
 impl ScoreRecord {
+    /// 结算构造（产线路径）：accuracy **直接取晴精确式** accuracy_pro（消除新增调用点
+    /// 静默回退简化式的路径——简化对照式在 SegmentStats.accuracy_simple，不进本结构）。
+    /// `difficulty` 为载文链难度（Session 侧持有；无则 None）。
+    #[allow(clippy::too_many_arguments)]
     pub fn from_stats(
         stats: &SegmentStats,
         title: impl Into<String>,
@@ -84,6 +131,7 @@ impl ScoreRecord {
         mark: impl Into<String>,
         para_index: usize,
         ts_unix: u64,
+        difficulty: Option<DifficultyTag>,
     ) -> Self {
         let date = unix_to_date(ts_unix);
         Self {
@@ -100,7 +148,7 @@ impl ScoreRecord {
             wrong: stats.wrong,
             time_ms: stats.elapsed_ms,
             speed: stats.speed,
-            accuracy: stats.accuracy,
+            accuracy: stats.accuracy_pro,
             code_len: stats.code_len,
             corrections: stats.corrections,
             effective_speed: stats.effective_speed,
@@ -109,9 +157,13 @@ impl ScoreRecord {
             accuracy_pro: stats.accuracy_pro,
             waste_codes: stats.waste_codes,
             commit_groups: stats.commit_groups,
+            ding_count: stats.ding_count,
+            select_count: stats.select_count,
             input_method: String::new(),
             time_breakdown: stats.time_breakdown,
             jj: stats.jj,
+            is_valid: stats.is_valid,
+            difficulty,
             version: default_version(),
         }
     }
@@ -179,7 +231,8 @@ pub struct LeaderboardScore {
 
 /// unix 秒 → 本地日期字符串（无 chrono：用纯手写换算，测试覆盖）。
 /// 日期按东八区（跟打器用户群全部为中国时区；疾风1代记录即按北京时间写）。
-fn unix_to_date(ts: u64) -> String {
+/// （P2 今日汇总接线公开：main.rs 用它把当天 records 过滤进 day_summary。）
+pub fn unix_to_date(ts: u64) -> String {
     // days since epoch（+8h 偏移到东八区）→ civil date（Howard Hinnant 算法）
     let days = ((ts + 8 * 3600) / 86400) as i64;
     let (y, m, d) = civil_from_days(days);
@@ -199,7 +252,28 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
-/// 成绩单（发成绩用，对齐晴跟打 Pro 报告串字段与双空格分隔）
+/// 赛制标记（成绩单 / 赛报 / UI 面板统一取用，避免 core 与 secondary_panels 各写一份漂移）：
+/// 赛制 → `【赛制】`；练习 → `【非赛制】`，且开了词提再附 `[词提开]`
+/// （虎魄写法，research-digest §B：带提示的成绩必须可一眼甄别）。
+/// 赛制模式下 word_hints 恒 false（SessionRules::normalized 强制），mode 优先。
+pub fn race_badge(mode: crate::rules::TrainingMode, word_hints: bool) -> &'static str {
+    use crate::rules::TrainingMode;
+    match mode {
+        TrainingMode::Race => "【赛制】",
+        TrainingMode::Practice if word_hints => "【非赛制】[词提开]",
+        TrainingMode::Practice => "【非赛制】",
+    }
+}
+
+/// 成绩单（发成绩用，对齐晴跟打 Pro 报告串逐字节口径，research-digest.md §C.3/C.4）：
+/// - 各项**双空格**连接、标签与数值间无空格（`击键5.12`）、末项恒为签名（APP_NAME）；
+/// - 速度：无错字 `速度{F2}`；有错字 `速度{罚后}/{裸速}` 双数字——**无数值括注**
+///   （晴 ParseReportLine/社群脚本按 token 解析，括注会错位，P1-1）；
+/// - 字准**不进成绩单**（晴字段集无此项，P1-2；字准留在 character_accuracy()/UI）；
+/// - 废码紧跟退格（晴默认成绩顺序 Score.cs:254：…退格,废码,选重…）；
+/// - 选重/标顶紧跟废码（标顶位序为推断——晴样本无标顶字段，按同伴项放选重后）；
+/// - 难度（有数据时）紧跟字数（样本 `难度普(1.84)`）；无数据不输出该字段；
+/// - **不含尾换行**：单条复制与整场赛报逐行拼接（消费方加 '\n'）都不会出现空行（P1-5）。
 pub fn format_score_report(r: &ScoreRecord) -> String {
     let mut s = String::new();
     // 段号项：文来 mark 含 "-"（如 "2-277101"）时晴 Pro 用 "段{mark}"，否则 "第{mark}段"
@@ -209,39 +283,43 @@ pub fn format_score_report(r: &ScoreRecord) -> String {
         format!("第{}段", r.mark)
     };
     let _ = write!(s, "{label}");
-    // 速度：有错字时晴 Pro 输出 "罚后/裸速" 双数字
+    // 速度：有错字时晴 Pro 输出 "罚后/裸速" 双数字（无括注）
     if r.wrong > 0 {
-        let _ = write!(
-            s,
-            "  速度{:.2}/{:.2}（有效/裸速，错一罚五）",
-            r.effective_speed, r.speed
-        );
+        let _ = write!(s, "  速度{:.2}/{:.2}", r.effective_speed, r.speed);
     } else {
         let _ = write!(s, "  速度{:.2}", r.speed);
     }
     // 晴样例无内空格："击键5.12"（E2 勘误：去掉标签后空格与"键/秒"后缀）
     let _ = write!(s, "  击键{:.2}", r.strokes_per_sec);
     let _ = write!(s, "  键准{:.2}%", r.accuracy);
-    let _ = write!(s, "  字准{:.2}%", r.character_accuracy());
     // 码长两位小数（jifeng 样例 "码长2.00"）
     let _ = write!(s, "  码长{:.2}", r.code_len);
     let _ = write!(s, "  字数{}", r.chars);
+    // 难度（有数据才输出；样本序位：字数之后）
+    if let Some(d) = &r.difficulty {
+        match d.score {
+            Some(v) => {
+                let _ = write!(s, "  难度{}({:.2})", d.label, v);
+            }
+            None => {
+                let _ = write!(s, "  难度{}", d.label);
+            }
+        }
+    }
     // 用时裁到厘秒（jifeng 样例 "用时1:23.45"）
     let _ = write!(s, "  用时{}", fmt_duration(r.time_ms));
     let _ = write!(s, "  错字{}", r.wrong);
     let _ = write!(s, "  退格{}", r.backspaces);
+    // 废码（晴默认顺序紧跟退格；数据段 SegmentStats.waste_codes 罚账见 stats.rs）
+    let _ = write!(s, "  废码{}", r.waste_codes);
+    // 选重/标顶（P1-3 20ms 配对账）：晴顺序 …退格,废码,选重…（Score.cs:254）；
+    // 标顶样本未见独立字段——按选重同伴项紧跟选重输出【推断位，2026-11-08】。
+    let _ = write!(s, "  选重{}", r.select_count);
+    let _ = write!(s, "  标顶{}", r.ding_count);
     let _ = write!(s, "  回改{}", r.corrections);
     let _ = write!(s, "  总键数{}", r.keys);
     if let Some(meta) = &r.round {
-        let _ = write!(
-            s,
-            "  {}",
-            if meta.mode == crate::rules::TrainingMode::Race {
-                "赛制"
-            } else {
-                "练习"
-            }
-        );
+        let _ = write!(s, "  {}", race_badge(meta.mode, meta.word_hints));
         if !meta.complete {
             let _ = write!(s, "·未完成");
         }
@@ -254,7 +332,7 @@ pub fn format_score_report(r: &ScoreRecord) -> String {
         // Quote tolerance is an explicitly requested common rule; preserve the group's
         // score template while keeping the exact relaxed count in the local record.
     }
-    let _ = writeln!(s, "  {}", crate::APP_NAME);
+    let _ = write!(s, "  {}", crate::APP_NAME);
     s
 }
 
@@ -427,6 +505,12 @@ pub fn durable_replace(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// 统计有效性门槛（E4）：字数 <5 的段不入汇总（测试段/误触段），原始记录保留。
 pub const VALID_MIN_CHARS: usize = 5;
 
+/// 有效成绩双门槛（晴口径，P1-4）：字数≥10 且 用时≥10s 才算"有效段"
+/// （进有效均速/均键准类指标）。与 VALID_MIN_CHARS 硬门语义分开：
+/// 硬门 = 直接不进任何聚合；is_valid = 进练习字数、不进"有效"指标（UI 消费）。
+pub const VALID_EFFECTIVE_CHARS: usize = 10;
+pub const VALID_EFFECTIVE_MS: u64 = 10_000;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -455,52 +539,178 @@ mod tests {
         cmp.pos = cmp.states.len();
         st.composition_backspaces = cmp.backspaces as u32;
         let s = st.finalize(&cmp, 58_285);
-        ScoreRecord::from_stats(&s, "听的能力", "群文", "999", 0, 1_790_555_080)
+        ScoreRecord::from_stats(&s, "听的能力", "群文", "999", 0, 1_790_555_080, None)
     }
 
+    /// P1-1/P1-2/P1-5 + 全串等值：有错字 → 罚后/裸速双数字、无括注、无「字准」、单行无尾换行。
+    /// 键准走产线精确式：(208−3−6×2)/(196+3)×196/208 = 91.39%。
     #[test]
-    fn report_format() {
+    fn report_full_string_with_wrong_dual_speed_no_parenthetical() {
         let r = sample_record();
         let text = format_score_report(&r);
-        // 晴 Pro 双空格分隔 + 罚后/裸速双数字（有错字时）
-        assert!(text.contains("第999段"), "{text}");
-        assert!(text.contains("速度191.47/201.77"), "{text}");
-        // E2 勘误：标签后无内空格、击键无"键/秒"后缀（晴样例 "击键5.12"）
-        assert!(text.contains("击键3.57"), "{text}");
-        assert!(text.contains("键准94.71%"), "{text}");
-        assert!(text.contains("字准98.98%"), "{text}");
-        assert!(text.contains("有效/裸速，错一罚五"), "{text}");
-        // 码长两位小数（jifeng 样例 "码长2.00"）
-        assert!(text.contains("码长1.06"), "{text}");
-        assert!(text.contains("字数196"), "{text}");
-        assert!(text.contains("错字2"), "{text}");
-        assert!(text.contains("退格6"), "{text}");
-        assert!(text.contains("回改3"), "{text}");
-        assert!(text.contains("总键数208"), "{text}");
-        // 用时厘秒截断（晴 trim_timespan）：58285ms → 0:58.28
-        assert!(text.contains("用时0:58.28"), "{text}");
-        // >10min 样式：723_456ms → 12:03.45
+        assert_eq!(
+            text,
+            "第999段  速度191.47/201.77  击键3.57  键准91.39%  码长1.06  \
+             字数196  用时0:58.28  错字2  退格6  废码0  选重0  标顶0  回改3  总键数208  虎符跟打"
+        );
+        // 协议硬断言：无数值括注（晴 ParseReportLine 按 token 解析）、无字准字段
+        assert!(!text.contains('（'));
+        assert!(!text.contains("字准"));
+        // P1-5：单行、无尾换行（消费方自行加 '\n'）
+        assert!(!text.contains('\n'));
+        assert!(text.ends_with(crate::APP_NAME));
+
+        // 用时样式变体（>10min / ≥1h）仍为全串等值：其余字段为结算快照值，只有用时变
         let mut r10 = sample_record();
         r10.time_ms = 723_456;
-        let t10 = format_score_report(&r10);
-        assert!(t10.contains("用时12:03.45"), "{t10}");
-        // ≥1h 样式：3_723_456ms → 1:02:03.45
+        assert_eq!(
+            format_score_report(&r10),
+            "第999段  速度191.47/201.77  击键3.57  键准91.39%  码长1.06  \
+             字数196  用时12:03.45  错字2  退格6  废码0  选重0  标顶0  回改3  总键数208  虎符跟打"
+        );
         let mut rh = sample_record();
         rh.time_ms = 3_723_456;
-        let th = format_score_report(&rh);
-        assert!(th.contains("用时1:02:03.45"), "{th}");
-        // 双空格分隔（晴 Pro 口径）
-        assert!(text.contains("  速度"), "{text}");
-        assert!(text.contains("  键准"), "{text}");
-        // 不再含偏离格式
-        assert!(!text.contains("键/秒"), "{text}");
-        assert!(!text.contains("码长 1."), "{text}");
-        let mut first_wrong = r;
-        first_wrong.chars = 1;
-        first_wrong.wrong = 1;
-        first_wrong.accuracy = 100.0;
-        let text = format_score_report(&first_wrong);
-        assert!(text.contains("键准100.00%  字准0.00%"), "{text}");
+        assert_eq!(
+            format_score_report(&rh),
+            "第999段  速度191.47/201.77  击键3.57  键准91.39%  码长1.06  \
+             字数196  用时1:02:03.45  错字2  退格6  废码0  选重0  标顶0  回改3  总键数208  虎符跟打"
+        );
+    }
+
+    /// 全串等值：全对（无错字）→ 速度单数字；文来 mark 含 "-" 用 "段2-277101" 格式。
+    #[test]
+    fn report_full_string_no_wrong_single_speed() {
+        let mut st = StatsEngine::new();
+        let mut cmp = Comparer::new("十个字十个字十个");
+        cmp.pos = cmp.states.len(); // 8 字全打完（全对）
+        for _ in 0..14 {
+            st.on_key(&crate::stats::KeyEvent {
+                vk: 0x41,
+                composing: false,
+            });
+        }
+        let s = st.finalize(&cmp, 10_000);
+        let r = ScoreRecord::from_stats(&s, "文来", "文来", "2-277101", 0, 1_790_555_080, None);
+        assert_eq!(
+            format_score_report(&r),
+            "段2-277101  速度48.00  击键1.40  键准100.00%  码长1.75  \
+             字数8  用时0:10.00  错字0  退格0  废码0  选重0  标顶0  回改0  总键数14  虎符跟打"
+        );
+    }
+
+    /// 赛制标记三态（P1-3）：【赛制】/【非赛制】/【非赛制】[词提开]；后缀 ·未完成·清洗·粘贴 保持原样。
+    #[test]
+    fn report_full_string_race_badges() {
+        fn meta(mode: crate::rules::TrainingMode, word_hints: bool, complete: bool) -> crate::rules::RoundMetadata {
+            crate::rules::RoundMetadata {
+                mode,
+                text_hash: String::new(),
+                raw_text_hash: String::new(),
+                rules_hash: String::new(),
+                quote_relaxed: 0,
+                cleaned: false,
+                pasted: false,
+                complete,
+                word_hints,
+            }
+        }
+        use crate::rules::TrainingMode;
+        let mut r = sample_record();
+        // 赛制（word_hints 快照即便为 true 也被 mode 压制）
+        r.round = Some(meta(TrainingMode::Race, true, true));
+        assert!(format_score_report(&r).ends_with("总键数208  【赛制】  虎符跟打"));
+        // 练习 + 词提关
+        r.round = Some(meta(TrainingMode::Practice, false, true));
+        assert!(format_score_report(&r).ends_with("总键数208  【非赛制】  虎符跟打"));
+        // 练习 + 词提开
+        r.round = Some(meta(TrainingMode::Practice, true, true));
+        assert!(
+            format_score_report(&r)
+                .ends_with("总键数208  【非赛制】[词提开]  虎符跟打")
+        );
+        // 练习 + 词提开 + 未完成 + 清洗 + 粘贴（后缀直接接在 badge 后）
+        r.round = Some(meta(TrainingMode::Practice, true, false));
+        r.round.as_mut().unwrap().cleaned = true;
+        r.round.as_mut().unwrap().pasted = true;
+        assert!(format_score_report(&r).ends_with(
+            "总键数208  【非赛制】[词提开]·未完成·清洗·粘贴  虎符跟打"
+        ));
+        // race_badge 单点取用（secondary_panels 同款标记走这里，防两边漂移）
+        assert_eq!(race_badge(TrainingMode::Race, false), "【赛制】");
+        assert_eq!(race_badge(TrainingMode::Practice, true), "【非赛制】[词提开]");
+        assert_eq!(race_badge(TrainingMode::Practice, false), "【非赛制】");
+    }
+
+    /// 选重/标顶（P1-3 20ms 配对账进单）：注入 Ding×2 + Select×1 →
+    /// 成绩单含 `选重1  标顶2`，序位=废码之后、回改之前；无数据恒输出 0（解析器稳定）。
+    #[test]
+    fn report_full_string_select_and_ding() {
+        let mut r = sample_record();
+        r.select_count = 1;
+        r.ding_count = 2;
+        assert!(
+            format_score_report(&r)
+                .contains("废码0  选重1  标顶2  回改3  总键数208"),
+            "{}",
+            format_score_report(&r)
+        );
+        // 缺省（旧记录/未配对）恒输出双 0，字段位置稳定不漂移
+        let zero = sample_record();
+        assert!(format_score_report(&zero).contains("退格6  废码0  选重0  标顶0  回改3"));
+    }
+
+    /// 废码（P1 补字段，序位紧跟退格）与难度（有数据时紧跟字数，样本 `难度普(1.84)`）。
+    #[test]
+    fn report_full_string_waste_codes_and_difficulty() {
+        let mut r = sample_record();
+        r.waste_codes = 3;
+        assert_eq!(
+            format_score_report(&r),
+            "第999段  速度191.47/201.77  击键3.57  键准91.39%  码长1.06  \
+             字数196  用时0:58.28  错字2  退格6  废码3  选重0  标顶0  回改3  总键数208  虎符跟打"
+        );
+        // 难度带数值分（群文《难度》头 "普 1.84"）
+        r.difficulty = Some(DifficultyTag::parse("普 1.84").unwrap());
+        assert_eq!(
+            format_score_report(&r),
+            "第999段  速度191.47/201.77  击键3.57  键准91.39%  码长1.06  \
+             字数196  难度普(1.84)  用时0:58.28  错字2  退格6  废码3  选重0  标顶0  回改3  总键数208  虎符跟打"
+        );
+        // 文来路径只有标签（main 侧只传 label）：`难度普`，无数值括号
+        r.difficulty = Some(DifficultyTag::parse("普").unwrap());
+        assert!(format_score_report(&r).contains("字数196  难度普  用时"));
+        // DifficultyTag 解析边界
+        assert!(DifficultyTag::parse("").is_none());
+        assert!(DifficultyTag::parse("   ").is_none());
+        assert_eq!(
+            DifficultyTag::parse("普 1.84"),
+            Some(DifficultyTag {
+                label: "普".into(),
+                score: Some(1.84)
+            })
+        );
+        assert_eq!(
+            DifficultyTag::parse("难"),
+            Some(DifficultyTag {
+                label: "难".into(),
+                score: None
+            })
+        );
+    }
+
+    /// P2 键准下沉：from_stats 的 accuracy 直接是晴精确式（产线），无简化式回退路径。
+    #[test]
+    fn from_stats_uses_pro_accuracy_as_production_value() {
+        let r = sample_record();
+        // 精确式手算：(208−3−12)/(196+3)×196/208 = 91.3896…
+        assert!((r.accuracy - 91.3896).abs() < 0.01, "{}", r.accuracy);
+        assert_eq!(r.accuracy, r.accuracy_pro);
+        // 与疾风1代简化式（94.71）和字准（98.98）明确区分
+        assert!((r.accuracy - 94.71).abs() > 1.0);
+        assert!((r.accuracy - r.character_accuracy()).abs() > 1.0);
+        // 有效性：196 字 / 58.285s → 有效段
+        assert!(r.is_valid);
+        assert!(!r.difficulty.is_some());
     }
 
     #[test]
@@ -564,26 +774,6 @@ mod tests {
     }
 
     #[test]
-    fn report_format_no_wrong_single_speed() {
-        // 无错字：速度单数字；文来段号 mark 含 "-" 用 "段2-277101" 格式
-        let mut st = StatsEngine::new();
-        let cmp = Comparer::new("十个字十个字十个");
-        for _ in 0..14 {
-            st.on_key(&crate::stats::KeyEvent {
-                vk: 0x41,
-                composing: false,
-            });
-        }
-        let s = st.finalize(&cmp, 10_000);
-        let r = ScoreRecord::from_stats(&s, "文来", "文来", "2-277101", 0, 1_790_555_080);
-        let text = format_score_report(&r);
-        assert!(text.starts_with("段2-277101"), "{text}");
-        // 无错字：速度是单数字（没有 "/"）
-        let speed_zone = &text[text.find("速度").unwrap()..text.find("击键").unwrap()];
-        assert!(!speed_zone.contains('/'), "{text}");
-    }
-
-    #[test]
     fn leaderboard_view_fields() {
         let r = sample_record();
         let lb = r.to_leaderboard();
@@ -592,11 +782,13 @@ mod tests {
         assert!((lb.raw_speed - 201.77).abs() < 0.05);
         assert!((lb.keystroke - 3.57).abs() < 0.01, "{}", lb.keystroke);
         assert!((lb.code_length - 1.0612).abs() < 0.001);
+        // 键准 = 产线精确式（from_stats 下沉后与 r.accuracy 同源）
         assert!(
-            (lb.key_accuracy - 94.71).abs() < 0.05,
+            (lb.key_accuracy - 91.39).abs() < 0.05,
             "{}",
             lb.key_accuracy
         );
+        assert_eq!(lb.key_accuracy, r.accuracy);
         assert_eq!(lb.wrong, 2);
         assert_eq!(lb.word_count, 196);
         assert_eq!(lb.total_keys, 208);
@@ -625,7 +817,10 @@ mod tests {
         let all = store.load_all();
         assert_eq!(all.len(), 2);
         assert_eq!(all[1].corrections, 0); // 旧记录缺省可读
+        assert!(!all[1].is_valid); // 旧记录缺省 false
+        assert!(all[1].difficulty.is_none());
         assert_eq!(all[0].version, "2");
+        assert!(all[0].is_valid); // 196字/58s：有效段
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -38,8 +38,13 @@ impl Drop for Admission {
     }
 }
 
+pub const DISABLED_MESSAGE: &str = "跟打器内置入口已关闭，请先在虎符设置的概览页启用";
+
+/// try_lock 未拿到引擎锁的瞬时失败文案（tray 据此识别为瞬时并静默重试）。
+pub const BUSY_MESSAGE: &str = "输入引擎忙，请稍后重试";
+
 fn snapshot(host: &Mutex<Host>) -> Result<(Schema, Config, bool), &'static str> {
-    let h = host.try_lock().map_err(|_| "输入引擎忙，请稍后重试")?;
+    let h = host.try_lock().map_err(|_| BUSY_MESSAGE)?;
     let state = &h.engine.schema;
     if state.user_dict.entries.len() > 2000
         || state.user_dict.weights.len() > 2000
@@ -119,11 +124,19 @@ fn version(s: &Schema, cfg: &Config, sentence: bool) -> String {
             value.to_bits().hash(&mut h);
         }
     }
+    // 【schema_ver 收敛 2026-11-08 深挖 P2】只哈希影响词提的配置节
+    // （input/candidates/keymap/reverse/opencc——与 Analyzer 实际读取面一致）：
+    // 改皮肤色/音效/trainer 开关等无关项不再无谓失效词提缓存。
     // JSON object order is stable (serde_json's default BTreeMap).
-    serde_json::to_value(cfg)
-        .unwrap_or_default()
-        .to_string()
-        .hash(&mut h);
+    for section in [
+        serde_json::to_value(&cfg.input),
+        serde_json::to_value(&cfg.candidates),
+        serde_json::to_value(&cfg.keymap),
+        serde_json::to_value(&cfg.reverse),
+        serde_json::to_value(&cfg.opencc),
+    ] {
+        section.unwrap_or_default().to_string().hash(&mut h);
+    }
     sentence.hash(&mut h);
     format!("{:016x}", h.finish())
 }
@@ -136,12 +149,10 @@ pub fn executable() -> Option<std::path::PathBuf> {
         .filter(|p| p.is_file())
 }
 
-pub const DISABLED_MESSAGE: &str = "跟打器内置入口已关闭，请先在虎符设置的概览页启用";
-
 pub fn enabled(host: &Mutex<Host>) -> Result<bool, &'static str> {
     host.try_lock()
         .map(|h| h.engine.config.trainer.enabled)
-        .map_err(|_| "输入引擎忙，请稍后重试")
+        .map_err(|_| BUSY_MESSAGE)
 }
 
 pub fn open(host: &Mutex<Host>) -> Result<(), String> {
@@ -1025,6 +1036,40 @@ mod tests {
         let first = version(&s, &c, false);
         s.user_dict.weights.insert(("ab".into(), "乙".into()), 1.1);
         assert_ne!(first, version(&s, &c, false));
+    }
+    #[test]
+    fn version_tracks_hint_sections_only() {
+        let s = schema(vec![("ab", "甲")]);
+        let c = Config::default();
+        let base = version(&s, &c, false);
+        // 无关节：皮肤/外观、音效、通用习惯、trainer 开关、整句参数
+        // （sentence 以独立布尔参与，不重复哈希节）——不应失效词提缓存。
+        let mut unrelated = c.clone();
+        unrelated.appearance.skin = "另一款皮肤".into();
+        unrelated.appearance.font_size = 21.0;
+        unrelated.sound.enabled = !unrelated.sound.enabled;
+        unrelated.general.esc_undo = !unrelated.general.esc_undo;
+        unrelated.trainer.enabled = !unrelated.trainer.enabled;
+        unrelated.sentence.enabled = !unrelated.sentence.enabled;
+        assert_eq!(base, version(&s, &unrelated, false));
+        // 词提相关节：任一变化必须换 version（缓存失效）。
+        let mut hint = c.clone();
+        hint.input.max_code_length += 1;
+        assert_ne!(base, version(&s, &hint, false));
+        let mut hint = c.clone();
+        hint.candidates.second_select = 'z';
+        assert_ne!(base, version(&s, &hint, false));
+        let mut hint = c.clone();
+        hint.keymap.map.insert("a".into(), "clear".into());
+        assert_ne!(base, version(&s, &hint, false));
+        let mut hint = c.clone();
+        hint.reverse.enabled = !hint.reverse.enabled;
+        assert_ne!(base, version(&s, &hint, false));
+        let mut hint = c.clone();
+        hint.opencc.enabled = !hint.opencc.enabled;
+        assert_ne!(base, version(&s, &hint, false));
+        // sentence 标志独立参与（整句模式词提不可用）。
+        assert_ne!(base, version(&s, &c, true));
     }
     #[test]
     fn prefix_index_and_internal_budget_are_bounded() {

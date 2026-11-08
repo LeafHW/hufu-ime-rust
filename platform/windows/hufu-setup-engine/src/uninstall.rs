@@ -98,7 +98,10 @@ pub fn run_uninstall(out: &mut Out, no_hklm: bool) -> i32 {
     }
 
     // ═ 0-moved) uninstall.ps1 L70-73：【防档案重建】列表动刀完毕才杀服务 ─═
+    // 【安装链补口·深挖 P2 2026-11-08】跟打器一并停：卸载后不留本产品进程
+    // （trainer 用户数据仍在 %LOCALAPPDATA%\HuFu，不受影响）。
     kill_by_name("hufu-server.exe");
+    kill_by_name("hufu-trainer.exe");
     kill_by_name("ctfmon.exe");
     std::thread::sleep(Duration::from_secs(1));
 

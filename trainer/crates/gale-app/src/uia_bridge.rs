@@ -3,21 +3,23 @@
 //! NTQQ 是 Electron 窗口，主面板内嵌「会话列表 + 消息区 + ProseMirror 输入框」，
 //! 全部通过 UIA 树暴露。因此**无需弹出独立聊天窗、无需窗口激活、无需按键注入**：
 //! - 列会话：会话列表容器（cls 含 recent-contact-list）下的 recent-contact-item
-//! - 切换会话：对列表项 Invoke()（程序化点击）
 //! - 抓消息：消息区容器（cls 含 chat-msg-area__vlist）内 Text 节点 Name
 //! - 发文/成绩：只复制并打开QQ，由用户确认目标和草稿后手动发送
 //!
+//! 查询策略：能用精确类名走 CreatePropertyCondition(ClassName) 让 UIA 服务端过滤，
+//! 为空再回退带回测的全树 TrueCondition 扫描（Electron 类名可能带版本后缀）。
+//!
 //! 实测（2026-10-01，NTQQ 9.9.36）：会话项名会按字符拆分（“虎码训练”“♂”“营”），
 //! 拼接后匹配；消息文本节点 Name 为整段消息内容，跟打文“-----第N段-----”直接可解析。
-#![allow(dead_code)]
 
 use windows::core::Interface;
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
 };
 use windows::Win32::UI::Accessibility::{
-    CUIAutomation, IUIAutomation, IUIAutomation2, IUIAutomationElement, IUIAutomationInvokePattern,
-    TreeScope_Descendants, UIA_ControlTypePropertyId, UIA_InvokePatternId, UIA_TextControlTypeId,
+    CUIAutomation, IUIAutomation, IUIAutomation2, IUIAutomationCondition, IUIAutomationElement,
+    TreeScope_Descendants, UIA_ClassNamePropertyId, UIA_ControlTypePropertyId,
+    UIA_TextControlTypeId,
 };
 
 /// UIA 实例按线程各持一份（thread_local）：
@@ -99,6 +101,58 @@ fn find_class(
     None
 }
 
+/// 精确类名的服务端过滤查询：每个类名一个 ClassName PropertyCondition，
+/// Or 合并成一次 FindAll（UIA PropertyCondition 只支持精确匹配）。
+/// 结果按文档序返回、上限 10 000；任一精确类名命中即返回，全部为空返回
+/// `None`，调用方回退到带回测的 TrueCondition 扫描（Electron 类名可能带
+/// 版本后缀，如 `chat-msg-area__vlist--vkBD3`）。
+fn find_all_by_class(
+    uia: &IUIAutomation,
+    root: &IUIAutomationElement,
+    exact: &[&str],
+) -> Option<Vec<IUIAutomationElement>> {
+    unsafe {
+        let mut conds: Vec<IUIAutomationCondition> = Vec::new();
+        for cls in exact {
+            if let Ok(c) = uia.CreatePropertyCondition(
+                UIA_ClassNamePropertyId,
+                &windows::core::VARIANT::from(*cls),
+            ) {
+                conds.push(c);
+            }
+        }
+        if conds.is_empty() {
+            return None;
+        }
+        let mut combined = conds.pop()?;
+        while let Some(c) = conds.pop() {
+            combined = uia.CreateOrCondition(&c, &combined).ok()?;
+        }
+        let all = root.FindAll(TreeScope_Descendants, &combined).ok()?;
+        let n = all.Length().unwrap_or(0).min(10_000);
+        let mut out = Vec::with_capacity(n as usize);
+        for i in 0..n {
+            if let Ok(e) = all.GetElement(i) {
+                out.push(e);
+            }
+        }
+        if out.is_empty() {
+            None
+        } else {
+            Some(out)
+        }
+    }
+}
+
+/// 单个精确类名取首个元素（同 `find_all_by_class` 的服务端过滤语义）。
+fn find_by_exact_class(
+    uia: &IUIAutomation,
+    root: &IUIAutomationElement,
+    class: &str,
+) -> Option<IUIAutomationElement> {
+    find_all_by_class(uia, root, &[class]).and_then(|v| v.into_iter().next())
+}
+
 /// 元素下全部 Text 节点 Name 逐行拼接（多行消息体保结构）。
 fn child_texts_joined(uia: &IUIAutomation, el: &IUIAutomationElement) -> String {
     let mut out = String::new();
@@ -135,9 +189,16 @@ fn child_texts_joined(uia: &IUIAutomation, el: &IUIAutomationElement) -> String 
     out
 }
 
-/// 会话列表容器。
+/// 会话列表容器（精确类名优先，带后缀版本回退 contains 扫描）。
 fn session_list(uia: &IUIAutomation, root: &IUIAutomationElement) -> Option<IUIAutomationElement> {
-    find_by_class_contains(uia, root, "recent-contact-list")
+    find_by_exact_class(uia, root, "recent-contact-list")
+        .or_else(|| find_by_class_contains(uia, root, "recent-contact-list"))
+}
+
+/// 消息区虚拟列表容器（同上：精确优先、contains 兜底）。
+fn message_vlist(uia: &IUIAutomation, root: &IUIAutomationElement) -> Option<IUIAutomationElement> {
+    find_by_exact_class(uia, root, "chat-msg-area__vlist")
+        .or_else(|| find_by_class_contains(uia, root, "chat-msg-area__vlist"))
 }
 
 /// 会话项内前 limit 个 Text 子节点 Name 拼接（NTQQ 把“虎码训练♂营”拆成 3 段；
@@ -183,39 +244,42 @@ pub fn list_sessions(hwnd: isize) -> Vec<String> {
         session_list(&uia, &root)
     });
     let Some(list) = list else { return vec![] };
-    unsafe {
-        let Ok(cond) = uia.CreateTrueCondition() else {
-            return vec![];
-        };
-        let Ok(items) = list.FindAll(TreeScope_Descendants, &cond) else {
-            return vec![];
-        };
-        let mut names = Vec::new();
-        for i in 0..items.Length().unwrap_or(0).min(2000) {
-            let Ok(item) = items.GetElement(i) else {
-                continue;
+    // 优先服务端精确类名过滤；为空回退 TrueCondition 扫描（≤2000，防巨树）
+    let items = find_all_by_class(&uia, &list, &["recent-contact-item"]).unwrap_or_else(|| {
+        unsafe {
+            let Ok(cond) = uia.CreateTrueCondition() else {
+                return vec![];
             };
-            if item
-                .CurrentClassName()
-                .ok()
-                .map(|n| n.to_string().starts_with("recent-contact-item"))
-                .unwrap_or(false)
-            {
-                let name = item_texts_joined(&uia, &item, 3).trim().to_string();
-                if !name.is_empty() {
-                    names.push(name);
-                }
-            }
+            let Ok(all) = list.FindAll(TreeScope_Descendants, &cond) else {
+                return vec![];
+            };
+            (0..all.Length().unwrap_or(0).min(2000))
+                .filter_map(|i| all.GetElement(i).ok())
+                .filter(|item| {
+                    item.CurrentClassName()
+                        .ok()
+                        .map(|n| n.to_string().starts_with("recent-contact-item"))
+                        .unwrap_or(false)
+                })
+                .collect()
         }
-        names
+    });
+    let mut names = Vec::new();
+    for item in items.iter().take(2000) {
+        let name = item_texts_joined(&uia, item, 3).trim().to_string();
+        if !name.is_empty() {
+            names.push(name);
+        }
     }
+    names
 }
 
 /// 当前打开会话的标题（chat-header__contact-name 的 Name）。
 pub fn current_session_title(hwnd: isize) -> Option<String> {
     let uia = uia()?;
     let root = panel_root(&uia, hwnd)?;
-    let hdr = find_by_class_prefix(&uia, &root, "chat-header__contact-name")?;
+    let hdr = find_by_exact_class(&uia, &root, "chat-header__contact-name")
+        .or_else(|| find_by_class_prefix(&uia, &root, "chat-header__contact-name"))?;
     unsafe {
         let name = hdr.CurrentName().ok()?.to_string();
         let name = if name.trim().is_empty() {
@@ -231,133 +295,52 @@ pub fn current_session_title(hwnd: isize) -> Option<String> {
     }
 }
 
-/// Select only one exact, unique conversation via its own Invoke pattern.
-/// Never click screen coordinates, inject keyboard events, or use contains(name).
-/// If QQ exposes no safe Invoke pattern, ask the user to open that conversation.
-pub fn switch_session(hwnd: isize, name: &str) -> Option<String> {
-    let uia = uia()?;
-    let root = panel_root(&uia, hwnd)?;
-    let list = session_list(&uia, &root)?;
-    unsafe {
-        let all = list
-            .FindAll(TreeScope_Descendants, &uia.CreateTrueCondition().ok()?)
-            .ok()?;
-        let mut matching = Vec::new();
-        for i in 0..all.Length().ok()?.min(2000) {
-            let item = all.GetElement(i).ok()?;
-            if !item
-                .CurrentClassName()
-                .ok()?
-                .to_string()
-                .starts_with("recent-contact-item")
-            {
-                continue;
-            }
-            if item_texts_joined(&uia, &item, 3).trim() == name.trim() {
-                matching.push(item);
-            }
-        }
-        if matching.len() != 1 {
-            return None;
-        }
-        if current_session_title(hwnd).as_deref() == Some(name.trim()) {
-            return Some(name.trim().to_string());
-        }
-        let invoke = matching[0]
-            .GetCurrentPatternAs::<IUIAutomationInvokePattern>(UIA_InvokePatternId)
-            .ok()?;
-        invoke.Invoke().ok()?;
-        let until = std::time::Instant::now() + std::time::Duration::from_millis(1500);
-        while std::time::Instant::now() < until {
-            let title = current_session_title(hwnd)?;
-            if title.trim() == name.trim() {
-                return Some(title);
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-    }
-    None
-}
-
-/// 抓当前会话消息区全部文本（Text 节点 Name 按行拼接）——“群载文”数据源。
-pub fn read_messages(hwnd: isize) -> Option<String> {
-    let uia = uia()?;
-    let root = panel_root(&uia, hwnd)?;
-    let pane = find_by_class_contains(&uia, &root, "chat-msg-area__vlist")?;
-    let mut lines = vec![];
-    unsafe {
-        let Ok(cond) = uia.CreatePropertyCondition(
-            UIA_ControlTypePropertyId,
-            &windows::core::VARIANT::from(UIA_TextControlTypeId.0),
-        ) else {
-            return None;
-        };
-        let Ok(texts) = pane.FindAll(TreeScope_Descendants, &cond) else {
-            return None;
-        };
-        let mut total = 0usize;
-        for i in 0..texts.Length().unwrap_or(0).min(10_000) {
-            let Ok(te) = texts.GetElement(i) else {
-                continue;
-            };
-            if let Ok(s) = te.CurrentName() {
-                let s = s.to_string();
-                let s = s.trim();
-                if !s.is_empty() {
-                    total = total.saturating_add(s.len());
-                    if total > 1024 * 1024 {
-                        return None;
-                    }
-                    lines.push(s.to_string());
-                }
-            }
-        }
-    }
-    if lines.is_empty() {
-        None
-    } else {
-        Some(lines.join("\n"))
-    }
-}
-
 /// 消息区里逐条消息的**正文**（msg-content-container 下的 Text，天然不含
 /// 发送者名/等级/身份徽章——那些在 message-container 直挂的兄弟 Text 节点上）。
 /// 返回顺序 = 消息区显示顺序（旧→新）。
 pub fn read_message_bodies(hwnd: isize) -> Option<Vec<String>> {
     let uia = uia()?;
     let root = panel_root(&uia, hwnd)?;
-    let pane = find_by_class_contains(&uia, &root, "chat-msg-area__vlist")?;
+    let pane = message_vlist(&uia, &root)?;
     let mut bodies = vec![];
-    unsafe {
-        // Container control types vary across QQ versions; class identifies the body.
-        let Ok(cond) = uia.CreateTrueCondition() else {
-            return None;
-        };
-        let Ok(groups) = pane.FindAll(TreeScope_Descendants, &cond) else {
-            return None;
-        };
-        let mut total = 0usize;
-        for i in 0..groups.Length().unwrap_or(0).min(10_000) {
-            let Ok(el) = groups.GetElement(i) else {
-                continue;
+    // 两种正文容器是精确类名：--others（他人）/ --self（自己）。Or 合并一次
+    // 查询，UIA 服务端过滤且结果保持文档序（他人/自己消息按时间交错）。
+    // 为空时回退 TrueCondition 扫描 + contains 回测（≤10 000，防巨树）。
+    let groups = find_all_by_class(
+        &uia,
+        &pane,
+        &["msg-content-container--others", "msg-content-container--self"],
+    )
+    .unwrap_or_else(|| {
+        unsafe {
+            let Ok(cond) = uia.CreateTrueCondition() else {
+                return vec![];
             };
-            let Ok(cn) = el.CurrentClassName() else {
-                continue;
+            let Ok(all) = pane.FindAll(TreeScope_Descendants, &cond) else {
+                return vec![];
             };
-            let cn = cn.to_string();
-            // 两种正文容器：他人消息 / 自己消息（后缀 --others / --self）
-            if cn.contains("msg-content-container") {
-                let body = child_texts_joined(&uia, &el);
-                if !body.is_empty() {
-                    // Some builds expose nested matching containers. Avoid duplicate bodies.
-                    if bodies.last() != Some(&body) {
-                        total = total.saturating_add(body.len());
-                        if total > 5 * 1024 * 1024 {
-                            return None;
-                        }
-                        bodies.push(body);
-                    }
+            (0..all.Length().unwrap_or(0).min(10_000))
+                .filter_map(|i| all.GetElement(i).ok())
+                .filter(|el| {
+                    el.CurrentClassName()
+                        .ok()
+                        .map(|n| n.to_string().contains("msg-content-container"))
+                        .unwrap_or(false)
+                })
+                .collect()
+        }
+    });
+    let mut total = 0usize;
+    for el in groups.iter().take(10_000) {
+        let body = child_texts_joined(&uia, el);
+        if !body.is_empty() {
+            // Some builds expose nested matching containers. Avoid duplicate bodies.
+            if bodies.last() != Some(&body) {
+                total = total.saturating_add(body.len());
+                if total > 5 * 1024 * 1024 {
+                    return None;
                 }
+                bodies.push(body);
             }
         }
     }
@@ -371,6 +354,8 @@ pub fn read_message_bodies(hwnd: isize) -> Option<Vec<String>> {
 /// Automatic QQ sending is intentionally unavailable: display titles do not prove
 /// group identity, and NTQQ does not expose a safe editor ValuePattern. The UI
 /// offers explicit copy + show QQ; the user reviews the destination and sends.
+/// Kept as the module's documented API boundary even while nothing calls it.
+#[allow(dead_code)]
 pub fn send_message(_hwnd: isize, _text: &str) -> Result<(), String> {
     Err("QQ自动发送未启用：请复制后在目标群手动粘贴发送".into())
 }

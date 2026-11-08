@@ -32,9 +32,9 @@ use std::{
     sync::mpsc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, ReleaseCapture};
 use windows::Win32::{
-    Foundation::{HWND, LPARAM, WPARAM},
+    Foundation::{ERROR_ALREADY_EXISTS, GetLastError, BOOL, HWND, LPARAM, WPARAM},
     UI::WindowsAndMessaging::*,
 };
 pub fn data_dir() -> PathBuf {
@@ -62,6 +62,15 @@ fn unix_secs() -> u64 {
         .unwrap_or_default()
         .as_secs()
 }
+/// P2 今日汇总（任务 6b）：从磁盘成绩库（统计/records.jsonl；load_valid 过
+/// <5 硬门，与聚合口径一致）算今天的字数。ui.rs 的今日卡片读 cfg.today_chars
+///（该文件禁改），数据由 main 侧在启动时 + 每次成绩保存成功后注入。
+fn today_chars_from_dir(dir: &Path) -> u64 {
+    let today = gale_core::score::unix_to_date(unix_secs());
+    gale_core::score::ScoreStore::open(&dir.join("统计"))
+        .map(|store| gale_core::report::day_summary(&store.load_valid(), &today).chars)
+        .unwrap_or(0)
+}
 fn completed_segment_action(command: CommandKey, done: bool, modal: Modal) -> Option<Action> {
     if done
         && matches!(modal, Modal::None | Modal::Result)
@@ -71,6 +80,67 @@ fn completed_segment_action(command: CommandKey, done: bool, modal: Modal) -> Op
     } else {
         None
     }
+}
+
+/// P0 单实例守卫（任务 3）：命名互斥体 `HuFu-Trainer-SingleInstance` 为主判据。
+/// 返回 true = 已有活实例并已唤醒其窗口，调用方应退出（exit 0）。
+/// 正常路径握住互斥体句柄到进程退出（std::mem::forget 防 CloseHandle；OS 进程
+/// 结束自动回收）。window.rs 的 activate_existing_instance（旧版互斥体名）仍
+/// 作为上一代实例的兜底在其后调用。
+fn single_instance_guard() -> bool {
+    use windows::Win32::Foundation::WAIT_EVENT;
+    use windows::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
+    unsafe {
+        let handle = match CreateMutexW(
+            None,
+            true,
+            windows::core::w!("HuFu-Trainer-SingleInstance"),
+        ) {
+            Ok(h) => h,
+            Err(_) => return false, // 创建失败不拦启动（宁可双开也不打不开）
+        };
+        // 判据：CreateMutexW 后 GetLastError==ERROR_ALREADY_EXISTS 且探测未接管
+        //（WAIT_ABANDONED = 旧实例持锁僵死，本实例接管放行——与 window.rs 同解）。
+        let wait: WAIT_EVENT = WaitForSingleObject(handle, 0);
+        let already = GetLastError() == ERROR_ALREADY_EXISTS
+            && wait.0 != 0
+            && wait.0 != 128; /* WAIT_ABANDONED */
+        if already {
+            if let Some(hwnd) = find_existing_hufu_window() {
+                let _ = ShowWindow(hwnd, SW_RESTORE);
+                let _ = SetForegroundWindow(hwnd);
+            }
+            return true;
+        }
+        // 唯一实例：句柄随进程生命周期（windows 0.58 HANDLE 为 Copy 无 Drop，
+        // 不 CloseHandle；进程退出时 OS 自动回收互斥体）。
+        let _ = handle;
+        false
+    }
+}
+/// 找已运行的虎符跟打主窗口：先按主窗口类名（window.rs 只读常量，gale-win
+/// 禁改故此处硬拷贝字面量），找不到再 EnumWindows 按标题模糊匹配（旧版兜底）。
+fn find_existing_hufu_window() -> Option<HWND> {
+    unsafe {
+        if let Ok(hwnd) = FindWindowExW(None, None, windows::core::w!("HuFuTrainerWindow"), None)
+        {
+            return Some(hwnd);
+        }
+        let mut found: Vec<HWND> = Vec::new();
+        let ctx = LPARAM(&mut found as *mut Vec<HWND> as isize);
+        let _ = EnumWindows(Some(collect_hufu_windows), ctx);
+        found.into_iter().next()
+    }
+}
+unsafe extern "system" fn collect_hufu_windows(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    let out = &mut *(lparam.0 as *mut Vec<HWND>);
+    let mut buf = [0u16; 96];
+    let n = GetWindowTextW(hwnd, &mut buf);
+    let title = String::from_utf16_lossy(&buf[..n.max(0) as usize]);
+    if title.contains("虎符跟打") && out.is_empty() {
+        out.push(hwnd);
+    }
+    BOOL(1)
 }
 pub fn timestamp_ms() -> u64 {
     unix_secs().saturating_mul(1000)
@@ -220,6 +290,8 @@ struct App {
     exit: bool,
     online_pending: usize,
     online_logged_in: bool,
+    /// P2：CTF 输入通道自检失败（启动时探测一次）——状态栏持续警示标记。
+    tsf_broken: bool,
 }
 fn main() {
     if let Err(e) = run() {
@@ -235,6 +307,10 @@ fn main() {
     }
 }
 fn run() -> Result<(), String> {
+    // P0 单实例（任务 3）：新命名互斥体主判据；旧版实例由 window.rs 兜底探测。
+    if single_instance_guard() {
+        return Ok(());
+    }
     if gale_win::window::activate_existing_instance().is_some() {
         return Ok(());
     }
@@ -272,6 +348,9 @@ fn run() -> Result<(), String> {
         h: 42,
     })
     .map_err(|e| e.to_string())?;
+    // P2 输入诊断（任务 7）：CTF 不可用 → 持续状态栏警示（见 App.draw 后重申）；
+    // 诊断日志开启 → 启动 toast 提示。
+    let host_ctf_ok = host.ctf_ok();
     let mut sess = Session::restore_snapshot(&dir.join("session.jsonl"))
         .unwrap_or_else(|_| Session::new(cfg.seg_chars));
     if sess.current_segment().text.is_empty() {
@@ -358,6 +437,7 @@ fn run() -> Result<(), String> {
         exit: false,
         online_pending: 0,
         online_logged_in: false,
+        tsf_broken: !host_ctf_ok,
     };
     app.sync_rule_model();
     if app.cfg.theme == "跟随虎符" {
@@ -367,9 +447,23 @@ fn run() -> Result<(), String> {
     app.host.show();
     app.host.focus();
     app.analyze();
+    // P2 输入诊断（任务 7）：诊断日志开启 → 启动提示；CTF 不可用 →
+    // 持续状态栏警示（覆盖默认提示语；analyze 失败文案前缀重申，见 collect_background）。
+    if gale_win::input_host::diagnostic_enabled() {
+        app.toast("输入诊断日志已开启");
+    }
+    if app.tsf_broken {
+        app.model.status = "TSF 输入法可能不可用，正文将无法接收中文输入".into();
+        app.toast("TSF 输入法可能不可用，正文将无法接收中文输入");
+    }
+    // P2 今日汇总（任务 6b）：启动时从磁盘成绩库刷新今日字数。
+    app.cfg.today_chars = today_chars_from_dir(&app.dir);
     gale_win::window::request_frame();
     let mut timer = false;
     let mut last_draw = Instant::now() - Duration::from_secs(1);
+    // P1-6：gale-win 事件泵不透传 keyup——帧级 GetKeyState 边沿观测 VK_BACK
+    // 弹起，通知 session 清 protect 窗（帧粒度；真实退格按压远长于一帧）。
+    let mut bs_down_prev = false;
     let mut last_size = (0, 0);
     let mut status_at = 0u64;
     let mut was_focused = true;
@@ -401,6 +495,11 @@ fn run() -> Result<(), String> {
             app.snapshot_dirty = true;
         }
         if accept_host {
+            // P1-6：Composing(false) 与 Commit 同批 = 提交清空（不置 protect）；
+            // 只有 Composing(false) = 退格删空/Esc 取消（置 protect）。
+            let batch_has_commit = events
+                .iter()
+                .any(|e| matches!(e, HostEvent::Commit(_)));
             for ev in events {
                 match ev {
                     HostEvent::Key { vk } => app.sess.on_key(vk, now),
@@ -410,12 +509,30 @@ fn run() -> Result<(), String> {
                     HostEvent::Backspace => app
                         .sess
                         .feed_input(gale_core::compare::InputEvent::Backspace, now),
-                    HostEvent::Composing(c) => app.sess.set_composing(c),
+                    HostEvent::Composing(c) => {
+                        app.sess.set_composing_from_host(c, batch_has_commit)
+                    }
                     HostEvent::Preedit(p) => app.sess.set_preedit(p),
                     HostEvent::Cancelled => app.sess.cancel_composition(),
                 }
             }
         }
+        // P1-3 选重/标顶（任务 2）：每帧 poll 之后立即 drain 20ms 配对结果
+        //（input_host 顺序契约：必须在 poll 之后），Ding→标顶/Select→选重/
+        // Unknown 忽略；模态打开时只清队列不记账。
+        if accept_host {
+            for cause in gale_win::input_host::drain_commit_causes() {
+                app.sess.on_commit_cause(cause);
+            }
+        } else {
+            let _ = gale_win::input_host::drain_commit_causes();
+        }
+        // P1-6：VK_BACK 弹起边沿（帧粒度观测，见 bs_down_prev 注释）
+        let bs_down = unsafe { GetKeyState(0x08) } as u16 & 0x8000 != 0;
+        if bs_down_prev && !bs_down {
+            app.sess.on_backspace_up();
+        }
+        bs_down_prev = bs_down;
         let paused = (!focused || app.model.modal != Modal::None) && !app.model.race;
         app.sess.set_paused(paused, now);
         if paused != app.model.paused {
@@ -849,7 +966,7 @@ impl App {
                 (ph - (lh - 48.).min(ph)).max(0.)
             },
         );
-        let (bw, fs, _) = ui::body_metrics(&self.sess, &self.cfg, lw);
+        let (bw, fs, lheight) = ui::body_metrics(&self.sess, &self.cfg, lw);
         let key = (self.generation, fs.to_bits(), bw.to_bits());
         if self.layout_key != key {
             self.layout = self
@@ -893,6 +1010,17 @@ impl App {
                 ((cy + fs).clamp(60., lh - 50.) * sc) as i32,
                 2,
                 2,
+            );
+            // P2 组字窗/候选窗锚点（任务 8）：把绘制光标坐标 + 当前行行高
+            //（DIP→物理像素 ×DPI）每帧下发给 IME 锚点（内部 3px 去抖）；
+            // NativeEdit 2×2 贴层保留不动（双层：光标载体 + IME 锚点）。
+            // 光标矩形顶 = 行顶 + 5（ui.rs caret 绘制几何）。
+            let dpi = (sc * 96.).round() as u32;
+            let _ = self.host.set_anchor_from_caret(
+                cx.clamp(8., lw - 8.) * sc,
+                (cy + 5.).clamp(60., lh - 50.) * sc,
+                (lheight * sc).round() as i32,
+                dpi,
             );
             self.host.show();
         }
@@ -941,7 +1069,7 @@ impl App {
         let hwnd = self.win.hwnd;
         let generation = self.generation;
         let text = self.sess.current_segment().text.clone();
-        let hints = self.sess.rules.word_hints && !self.model.race;
+        let hints = gale_core::rules::hints_effective(self.sess.rules.word_hints, self.model.race);
         let single = self.sess.source == session::SessionSource::Single || self.cfg.hint_style == 1;
         let known_version = if self.model.words.is_empty() {
             String::new()
@@ -1018,6 +1146,13 @@ impl App {
                                 self.model.status = format!("词提暂不可用 · {e}");
                             }
                         }
+                        // CTF 自检失败的持续警示：任何状态文案都带上前缀（任务 7）
+                        if self.tsf_broken {
+                            self.model.status = format!(
+                                "TSF 输入法可能不可用 · {}",
+                                self.model.status
+                            );
+                        }
                     }
                     self.analyze();
                 }
@@ -1081,6 +1216,9 @@ impl App {
                         Ok(()) => {
                             self.pending_scores.pop_front();
                             self.score_retry_ms = 0;
+                            // P2 今日汇总（任务 6b）：成绩落盘后刷新今日字数
+                            //（ui.rs 今日卡片读 cfg.today_chars，数据由这里注入）。
+                            self.cfg.today_chars = today_chars_from_dir(&self.dir);
                         }
                         Err(e) => {
                             self.score_retry_ms = self.ms() + 2000;
@@ -1380,10 +1518,12 @@ impl App {
     }
     fn race_text(&self) -> String {
         let a = self.sess.aggregate();
+        // 段数取 a.segments（<5 硬门口径，与整场聚合一致——原 results 计数
+        // 会把 Esc 弃打的短段也算进去，与下面的字数/速度口径打架）。
         let mut s = format!(
             "《{}》 整场赛报\n{}段 / {}字 / {:0.2}秒 / 总速度{:0.2}\n",
             self.sess.title,
-            self.sess.results.iter().flatten().count(),
+            a.segments,
             a.chars,
             a.time_ms as f64 / 1000.,
             a.speed
@@ -1980,7 +2120,14 @@ impl App {
                     }
                     self.sess.load_group(gale_core::segment::ParsedGroupText {
                         title: a.title,
-                        difficulty: Some(a.difficulty.label().into()),
+                        // P2 难度带分值（任务 6d）：文来 API 的 difficulty_score
+                        //（0=无分值）拼成 "普 1.84" 风格——DifficultyTag::parse
+                        // 在 session.load_group 内解析，结算进成绩单 难度普(1.84)。
+                        difficulty: Some(if a.difficulty_score > 0. {
+                            format!("{} {}", a.difficulty.label(), a.difficulty_score)
+                        } else {
+                            a.difficulty.label().to_string()
+                        }),
                         segments: vec![gale_core::segment::Segment {
                             mark: a.seg_mark,
                             text: a.text,

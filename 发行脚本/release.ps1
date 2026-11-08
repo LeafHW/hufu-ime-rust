@@ -54,8 +54,16 @@ function Verify([string]$tag) {
         try {
             $za = [System.IO.Compression.ZipFile]::OpenRead($zip)
             $names = @($za.Entries | ForEach-Object { $_.FullName })
-            foreach ($need in @('hufu-server.exe','hufu-trainer.exe','hufu_tsf.dll','install.ps1','hufu-render-helper.exe')) {
+            # 【发行链补口·深挖 P2 2026-11-08】licenses/trainer 核 zhouzhou 两件
+            # （LXGW 字体两件随字体策略移除后仅剩此二 + drills 的 NOTICE.md）；
+            # 语料 5 件是 gale-core 编译期 include_str! 源（不随包发行）——产本
+            # 包的仓库必须五件齐全，防"语料被裁的仓库照发版"。
+            foreach ($need in @('hufu-server.exe','hufu-trainer.exe','hufu_tsf.dll','install.ps1','hufu-render-helper.exe',
+                    'licenses/trainer/zhouzhou-LICENSE.txt','licenses/trainer/zhouzhou-NOTICE.txt')) {
                 [void](VCheck ($names -contains $need) "zip 内 $need")
+            }
+            foreach ($dz in @('前1500单字.txt','常用单字前五百.txt','常用单字中五百.txt','常用单字后五百.txt','常用词组前三百.txt')) {
+                [void](VCheck (Test-Path (Join-Path $RepoRoot ("trainer\drills\" + $dz))) "语料源 trainer\drills\$dz")
             }
             $ve = $za.Entries | Where-Object { $_.FullName -eq 'version.txt' } | Select-Object -First 1
             if ($ve) {

@@ -626,7 +626,7 @@ pub fn clear_size_rebuild_callback() {
 // ── 焦点归还开关（模态面板期暂停 relay）──
 // 模态打开时主窗口需要持有焦点（面板上的 Esc/F 键按模态语义处理，不进 RichEdit）；
 // 关闭模态时恢复自动归还。默认 true（跟打常态：焦点永远在 RichEdit 宿主）。
-// imm32 后端：主窗口就是输入面，启用时调用方设 false（relay 永不触发）。
+// （历史 imm32 后端注释随模块删除；现输入层恒为 RichEdit 宿主。）
 static FOCUS_RELAY_ENABLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
 
@@ -688,16 +688,11 @@ fn wndproc_min() -> bool {
     MIN.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// 主窗口过程：纯容器 —— 渲染承载 + 输入后端钩子 + 焦点归还 + 尺寸/销毁。
+/// 主窗口过程：纯容器 —— 渲染承载 + 焦点归还 + 尺寸/销毁。
 ///
-/// 【输入层】ime_imm 后端（主通道）时：所有消息先过 ime_imm::wnd_proc_hook
-/// （拦四条 WM_IME_* + 键盘裁决），Some = 已处理直接返回；None = 走原逻辑。
-/// RichEdit 后端时钩子未启用，零开销直落。
+/// 输入层固定为 RichEdit 宿主（input_host）；自建 HIMC 的 ime_imm 后端
+/// 已删除（probe-imm REPORT 证伪：CUAS 桥拆不掉、自建上下文挂不稳）。
 unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
-    // IMM32 输入后端钩子（未启用时返回 None，零开销）
-    if let Some(r) = crate::ime_imm::wnd_proc_hook(hwnd.0 as isize, msg, wp.0, lp.0) {
-        return r;
-    }
     // ★ 诊断开关 GALE_WNDPROC_MIN=1（2026-10-06 "打不了字"二分定位）：
     //   除 WM_DESTROY/WM_TIMER 外全部直落 DefWindowProc——绕开所有
     //   自定义消息臂（NCHITTEST/NCCALCSIZE/DPICHANGED/GETMINMAXINFO/
@@ -729,7 +724,7 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             //   WS_EX_NOACTIVATE 窗口做鼠标激活——别的程序拿到焦点后点回
             //   跟打器，键盘/输入法仍归别人 = "点不进来打不了字"。
             //   每次点击若焦点不在本窗则 SetFocus 拉回（已聚焦时跳过，
-            //   不做 NULL 重入——那会拆 CUAS 桥，见 ime_imm 血泪注释）。
+            //   不做 NULL 重入——那会拆 CUAS 桥（历史 ime_imm 实测教训，模块已删）。
             unsafe {
                 if windows::Win32::UI::Input::KeyboardAndMouse::GetFocus().0 as isize
                     != hwnd.0 as isize
@@ -765,8 +760,8 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             LRESULT(0)
         }
         WM_SETFOCUS => {
-            // 焦点归还：主窗口只在 RichEdit 宿主不存在（启动前/销毁后/
-            // imm32 后端）时持有焦点；模态面板打开时（set_focus_relay(false)）
+            // 焦点归还：主窗口只在 RichEdit 宿主不存在（启动前/销毁后）时
+            // 持有焦点；模态面板打开时（set_focus_relay(false)）
             // 主窗口合法持有焦点。
             if !focus_relay_enabled() {
                 return DefWindowProcW(hwnd, msg, wp, lp);

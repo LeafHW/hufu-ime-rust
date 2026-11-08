@@ -3,12 +3,25 @@ use gale_core::compare::{normalize_newlines, Comparer, InputEvent};
 use gale_core::rules::{
     clean_body, fingerprint, CleaningPreset, RoundMetadata, SessionRules, TrainingMode,
 };
-use gale_core::score::ScoreRecord;
+use gale_core::score::{DifficultyTag, ScoreRecord, VALID_MIN_CHARS};
 use gale_core::segment::{split_smart, ParsedGroupText, Segment};
 use gale_core::single::SingleSession;
 use gale_core::stats::{SegmentStats, StatsEngine};
+use gale_win::input_host::{BackspaceClass, BackspaceRouter, CommitCause};
 use serde::{Deserialize, Serialize};
 static SNAPSHOT_IO: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// `BackspaceRouter` 的可 Clone 包装：Session 整体派生 Clone/Debug（快照
+/// 序列化前克隆），gale-win 原类型只派生 Default/Debug。克隆语义 = 复位初始
+/// 态——protect 窗是 20ms 级瞬时状态，克隆仅用于序列化快照，真实路由器由
+/// 主实例驱动。
+#[derive(Default, Debug)]
+struct RouterCell(BackspaceRouter);
+impl Clone for RouterCell {
+    fn clone(&self) -> Self {
+        Self(BackspaceRouter::default())
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Phase {
@@ -50,6 +63,10 @@ pub struct Session {
     pub results: Vec<Option<ScoreRecord>>,
     pub cleaned: bool,
     pub pasted: bool,
+    /// 载文难度（群文《难度》头 / 文来难度；结算时随成绩入 ScoreRecord.difficulty，
+    /// 成绩单输出 `难度普(1.84)`）。旧快照缺省 None。
+    #[serde(default)]
+    pub difficulty: Option<gale_core::score::DifficultyTag>,
     default_seg_chars: usize,
     frozen_text_hash: String,
     #[serde(default)]
@@ -57,6 +74,10 @@ pub struct Session {
     last_clock_ms: u64,
     paused_at: Option<u64>,
     paused_ms: u64,
+    /// 退格归属裁决器（P1-6 protect 窗）：物理退格先经它分类——ImeDelete 归
+    /// “组字期退格”账、Correction 归“回改”账。纯运行态，不入快照。
+    #[serde(skip)]
+    bs_router: RouterCell,
 }
 impl Session {
     pub fn new(seg_chars: usize) -> Self {
@@ -89,12 +110,14 @@ impl Session {
             results: vec![None],
             cleaned: false,
             pasted: false,
+            difficulty: None,
             default_seg_chars: seg_chars.clamp(10, 10000),
             frozen_text_hash: String::new(),
             frozen_raw_text_hash: String::new(),
             last_clock_ms: 0,
             paused_at: None,
             paused_ms: 0,
+            bs_router: RouterCell::default(),
         }
     }
     fn loaded(&mut self) {
@@ -103,6 +126,7 @@ impl Session {
         self.normalize_working_newlines();
         self.results = vec![None; self.segments.len()];
         self.cleaned = false;
+        self.difficulty = None;
         self.recount();
         self.reset_current();
     }
@@ -121,6 +145,8 @@ impl Session {
         self.source = SessionSource::Group;
         self.segments = parsed.segments;
         self.loaded();
+        // 群文《难度》头（"普 1.84"）/文来标签——载入时解析，结算时随成绩进成绩单
+        self.difficulty = parsed.difficulty.as_deref().and_then(DifficultyTag::parse);
     }
     pub fn load_book(&mut self, title: &str, text: &str) {
         self.segments = split_smart(text, self.default_seg_chars);
@@ -167,6 +193,8 @@ impl Session {
         self.paused_ms = 0;
         self.pasted = false;
         self.last_clock_ms = 0;
+        // protect 窗随段清零：换段/重打后第一个退格按裸状态裁决
+        self.bs_router = RouterCell::default();
     }
     fn recount(&mut self) {
         let a = self.aggregate();
@@ -291,6 +319,9 @@ impl Session {
         if matches!(ev, InputEvent::Commit { .. }) && !out.is_empty() {
             self.stats.on_commit(out.len(), active_now);
             self.stats.end_composition();
+            // 提交清空组合：BackspaceRouter 不得置 protect（区分“空格提交瞬间
+            // 组合清空”与“退格删空”，见 gale-win input_host BackspaceRouter 注释）
+            self.bs_router.0.on_composition_change(false, true);
             self.composing = false;
             self.preedit.clear();
         }
@@ -305,21 +336,63 @@ impl Session {
         }
         let now = self.clock(now_ms);
         self.begin(now);
+        // P1-6 protect 窗：物理退格先经 BackspaceRouter 裁决——ImeDelete 归
+        // “组字期退格”账（composing=true 计账，含删空后 protect 窗内的那一次），
+        // Correction 走 composing=false 的既有回改路径（Comparer 侧另记 corrections）。
+        let composing = if vk == 0x08 {
+            matches!(
+                self.bs_router.0.on_backspace_key(self.composing),
+                BackspaceClass::ImeDelete
+            )
+        } else {
+            self.composing
+        };
         self.stats
-            .on_key_timed(vk, self.composing, now.saturating_sub(self.paused_ms));
+            .on_key_timed(vk, composing, now.saturating_sub(self.paused_ms));
+    }
+    /// 20ms 配对账（P1-3 选重/标顶）：Ding→标顶、Select→选重、Unknown 忽略。
+    /// main.rs 在每帧 poll 之后 drain_commit_causes 并逐条转发到这里；
+    /// 仅 Typing 记账，换段/重打随 reset_current 清零。
+    pub fn on_commit_cause(&mut self, cause: CommitCause) {
+        if self.phase == Phase::Typing {
+            match cause {
+                CommitCause::Ding => self.stats.note_ding(),
+                CommitCause::Select => self.stats.note_select(),
+                CommitCause::Unknown => {}
+            }
+        }
+    }
+    /// 物理退格弹起（main.rs 帧循环对 VK_BACK 的按下态边沿观测）：清 protect。
+    /// gale-win 事件泵不透传 keyup，这里是弹起信息的唯一来源。
+    pub fn on_backspace_up(&mut self) {
+        self.bs_router.0.on_backspace_up();
     }
     pub fn set_preedit(&mut self, p: String) {
         self.preedit = p;
     }
     pub fn set_composing(&mut self, c: bool) {
+        self.set_composing_from_host(c, false);
+    }
+    /// host 批次感知通道（main.rs 事件循环）：`Composing(false)` 与 Commit 同批
+    /// 出现时 batch_has_commit=true——提交清空不置 protect；只有 Composing(false)
+    /// （退格删空/Esc 取消）才置 protect（下一次退格仍归 IME）。
+    pub fn set_composing_from_host(&mut self, c: bool, batch_has_commit: bool) {
         if c && !self.composing {
             self.stats.begin_composition();
+        }
+        if self.composing != c {
+            let cleared_by_commit = !c && batch_has_commit;
+            self.bs_router.0.on_composition_change(c, cleared_by_commit);
         }
         self.composing = c;
     }
     /// Hosts call this only for an explicitly cancelled composition, never for a normal
     /// END notification which may arrive before its commit notification.
     pub fn cancel_composition(&mut self) {
+        if self.composing {
+            // Esc/退格删空的显式取消 = 非提交清空 → 置 protect
+            self.bs_router.0.on_composition_change(false, false);
+        }
         self.stats.cancel_composition();
         self.composing = false;
         self.preedit.clear();
@@ -391,8 +464,8 @@ impl Session {
             &self.current_segment().mark,
             self.index,
             unix_secs,
+            self.difficulty.clone(),
         );
-        rec.accuracy = st.accuracy_pro;
         let rules = self.frozen_rules.as_ref().unwrap_or(&self.rules);
         rec.round = Some(RoundMetadata {
             mode: rules.mode,
@@ -403,6 +476,8 @@ impl Session {
             cleaned: self.cleaned,
             pasted: self.pasted,
             complete: self.comparer.is_done(),
+            // 开打时冻结的词提快照（frozen_rules 即 begin() 冻结）；成绩单 [词提开] 标记引用
+            word_hints: rules.word_hints,
         });
         self.results[self.index] = Some(rec.clone());
         self.recorded = true;
@@ -428,6 +503,9 @@ impl Session {
     pub fn live_stats(&self, now_ms: u64) -> LiveStats {
         let st = self.stats.finalize(&self.comparer, self.elapsed_ms(now_ms));
         let in_para = !self.recorded;
+        // 整场口径 == aggregate()（<5 硬门后的 RaceSummary）+ 当前段实时 stats，
+        // 与整场赛报同源、不重复实现：done_* 来自 recount()→aggregate()，
+        // 回改同样只累计过硬门的已结算段，避免短段污染整场键准。
         let chars = self.done_chars + if in_para { st.chars as u64 } else { 0 };
         let keys = self.done_keys + if in_para { st.keys as u64 } else { 0 };
         let bs = self.done_bs + if in_para { st.backspaces as u64 } else { 0 };
@@ -435,6 +513,7 @@ impl Session {
             .results
             .iter()
             .flatten()
+            .filter(|r| r.chars >= VALID_MIN_CHARS)
             .map(|r| r.corrections as u64)
             .sum::<u64>()
             + if in_para { st.corrections as u64 } else { 0 };
@@ -458,6 +537,12 @@ impl Session {
             code_len: if c > 0.0 { k / c } else { 0.0 },
             done_chars: chars,
         }
+    }
+
+    /// 面板通道（P1-4）：secondary_panels::draw 拿不到墙钟参数——用最近一次
+    /// 事件时钟（last_clock_ms）冻结的整场实时口径（打开面板瞬间的读数）。
+    pub fn live_stats_now(&self) -> LiveStats {
+        self.live_stats(self.last_clock_ms)
     }
     /// Serialize through a bounded writer, before allocation can exceed the limit.
     pub fn snapshot_bytes_bounded(&self) -> std::io::Result<Vec<u8>> {
@@ -586,6 +671,10 @@ impl Session {
                     ]
                     .iter()
                     .any(|v| !v.is_finite())
+                    || r
+                        .difficulty
+                        .as_ref()
+                        .is_some_and(|d| d.label.chars().count() > 32 || d.score.is_some_and(|v| !v.is_finite()))
                 {
                     return false;
                 }
@@ -594,7 +683,7 @@ impl Session {
         if let Some(st) = &self.last_stats {
             if [
                 st.speed,
-                st.accuracy,
+                st.accuracy_simple,
                 st.accuracy_pro,
                 st.code_len,
                 st.effective_speed,
@@ -652,19 +741,23 @@ impl Session {
 }
 #[derive(Debug, Clone, Copy, Default)]
 pub struct LiveStats {
-    /// Settled segments plus the current segment, without counting it twice.
+    /// 整场速度（字/分）：已结算段（过 <5 硬门）+ 当前段实时，不重复计数。
+    /// 口径与 aggregate()/整场赛报同源（总量比，非段均）。UI 接线待接（P1-4）。
     pub total_speed: f64,
     /// Current segment only, including its final values until the next reset.
     pub para_speed: f64,
     pub para_accuracy: f64,
     pub para_keys_per_sec: f64,
     pub para_code_len: f64,
-    /// Whole-session Pro key efficiency; use para_accuracy for current-segment UI.
+    /// 整场键准 %（晴 Pro 精确式，总量比）。当前段用 para_accuracy（已接线：secondary_panels 结算/赛报面板）。
     pub accuracy: f64,
-    /// Whole-session keystrokes / elapsed seconds.
+    /// 整场击键（键/秒）：总键数 / 总用时秒。UI 接线待接（P1-4）。
     pub keys_per_sec: f64,
-    /// Whole-session keystrokes / committed characters.
+    /// 整场码长（键/字）：总键数 / 总字数。UI 接线待接（P1-4）。
     pub code_len: f64,
+    /// 整场累计字数：已结算段（≥5 字硬门口径）+ 当前段进行中实时计入。
+    /// is_valid=false 的段也计入这里（练习总量）；"有效均速"类指标由 UI 按
+    /// ScoreRecord.is_valid 另行拆分（已接线：secondary_panels）。
     pub done_chars: u64,
 }
 
@@ -673,25 +766,28 @@ mod tests {
     use super::*;
     fn session() -> Session {
         let mut s = Session::new(100);
+        // 5 字段保证结算记录过 <5 硬门，可进整场聚合（2 字用例见 validity_gate_*）
         s.load_group(ParsedGroupText {
             title: "test".into(),
             difficulty: None,
             segments: vec![
                 Segment {
                     mark: "1".into(),
-                    text: "甲乙".into(),
+                    text: "甲乙丙丁戊".into(),
                 },
                 Segment {
                     mark: "2".into(),
-                    text: "丙丁".into(),
+                    text: "己庚辛壬癸".into(),
                 },
             ],
         });
         s
     }
+    /// 逐字一键 + 末尾整段 commit：首键开表（started=start），elapsed = end−start。
     fn round(s: &mut Session, start: u64, end: u64, text: &str) {
-        s.on_key(0x41, start);
-        s.on_key(0x42, start + 100);
+        for (i, _) in text.chars().enumerate() {
+            s.on_key(0x41 + i as u32 % 26, start + i as u64 * 100);
+        }
         s.feed_input(InputEvent::Commit { chars: text.into() }, end);
     }
     #[test]
@@ -727,13 +823,15 @@ mod tests {
         assert_eq!(r.commit_groups, 1);
         assert_eq!(s.stats.commit_attributions[0].keys, 2);
         assert_eq!(r.ts, 1234567890);
-        assert_eq!(s.live_stats(1100).done_chars, 2);
+        // 2 字段 <5 硬门：记录在（原始保留），但不进整场聚合
+        assert_eq!(s.live_stats(1100).done_chars, 0);
         assert!(s.finalize_current(1200).is_none());
     }
     #[test]
     fn current_segment_metrics_do_not_inherit_previous_segments() {
+        // 5 字段（≥5 硬门）保证已结算段进整场统计；2 字段见 validity_gate_* 测试
         let mut s = session();
-        round(&mut s, 100, 1100, "甲乙");
+        round(&mut s, 100, 1100, "甲乙丙丁戊");
         s.finalize_current_at(1100, 1).unwrap();
         s.next_segment();
 
@@ -742,14 +840,15 @@ mod tests {
         assert_eq!(idle.para_accuracy, 100.);
         assert_eq!(idle.para_keys_per_sec, 0.);
         assert_eq!(idle.para_code_len, 0.);
-        assert_eq!(idle.total_speed, 120.);
-        assert_eq!(idle.keys_per_sec, 2.);
+        // 第 1 段：5 字 / 1s / 5 键
+        assert_eq!(idle.total_speed, 300.);
+        assert_eq!(idle.keys_per_sec, 5.);
         assert_eq!(idle.code_len, 1.);
 
         s.on_key(0x41, 2000);
         s.feed_input(
             InputEvent::Commit {
-                chars: "丙".into()
+                chars: "己".into()
             },
             2500,
         );
@@ -758,37 +857,40 @@ mod tests {
         s.on_key(0x42, 4000);
         s.feed_input(
             InputEvent::Commit {
-                chars: "丙".into()
+                chars: "己".into()
             },
             4500,
         );
         s.on_key(0x43, 5000);
         s.feed_input(
             InputEvent::Commit {
-                chars: "丁".into()
+                chars: "庚".into()
             },
             6000,
         );
 
+        // 当前段（2 字 / 4s / 4 键 / 回改1）；整场 = 第1段 + 当前段（7字 / 5s / 9键 / 回改1）
         let before = s.live_stats(6000);
         assert_eq!(before.para_speed, 30.);
         assert_eq!(before.para_accuracy, 50.);
         assert_eq!(before.para_keys_per_sec, 1.);
         assert_eq!(before.para_code_len, 2.);
-        assert_eq!(before.total_speed, 48.);
-        assert!((before.accuracy - 200. / 3.).abs() < 1e-9);
-        assert_eq!(before.keys_per_sec, 1.2);
-        assert_eq!(before.code_len, 1.5);
+        assert_eq!(before.total_speed, 84.);
+        assert!((before.accuracy - 700. / 9.).abs() < 1e-9);
+        assert_eq!(before.keys_per_sec, 1.8);
+        assert!((before.code_len - 9. / 7.).abs() < 1e-9);
 
         let record = s.finalize_current_at(6000, 2).unwrap();
         let after = s.live_stats(10000);
         assert_eq!(after.para_accuracy, record.accuracy);
         assert_eq!(after.para_keys_per_sec, record.strokes_per_sec);
         assert_eq!(after.para_code_len, record.code_len);
-        assert_eq!(after.total_speed, before.total_speed);
-        assert_eq!(after.accuracy, before.accuracy);
-        assert_eq!(after.keys_per_sec, before.keys_per_sec);
-        assert_eq!(after.code_len, before.code_len);
+        // 本段仅 2 字，<5 硬门把它从整场剔除：整场回到仅第 1 段（口径 == aggregate()）
+        assert_eq!(after.total_speed, 300.);
+        assert_eq!(after.accuracy, 100.);
+        assert_eq!(after.keys_per_sec, 5.);
+        assert_eq!(after.code_len, 1.);
+        assert_eq!(s.aggregate().chars, 5);
 
         s.jump(1);
         let retry = s.live_stats(11000);
@@ -796,14 +898,14 @@ mod tests {
         assert_eq!(retry.para_accuracy, 100.);
         assert_eq!(retry.para_keys_per_sec, 0.);
         assert_eq!(retry.para_code_len, 0.);
-        assert_eq!(retry.total_speed, 120.);
-        assert_eq!(retry.keys_per_sec, 2.);
+        assert_eq!(retry.total_speed, 300.);
+        assert_eq!(retry.keys_per_sec, 5.);
         assert_eq!(retry.code_len, 1.);
     }
     #[test]
     fn current_keystroke_rate_advances_before_first_commit() {
         let mut s = session();
-        round(&mut s, 100, 1100, "甲乙");
+        round(&mut s, 100, 1100, "甲乙丙丁戊");
         s.finalize_current_at(1100, 1).unwrap();
         s.next_segment();
         s.on_key(0x41, 2000);
@@ -813,27 +915,121 @@ mod tests {
         assert_eq!(live.para_speed, 0.);
         assert_eq!(live.para_keys_per_sec, 0.5);
         assert_eq!(live.para_code_len, 0.);
-        assert_eq!(live.total_speed, 40.);
-        assert_eq!(live.keys_per_sec, 1.);
-        assert_eq!(live.code_len, 1.5);
+        // 整场 = 第1段（5字/1s/5键）+ 当前段（1键/2s）：5字/3s、6键/3s、6/5
+        assert_eq!(live.total_speed, 100.);
+        assert_eq!(live.keys_per_sec, 2.);
+        assert!((live.code_len - 1.2).abs() < 1e-9);
     }
     #[test]
     fn cross_segment_retries_replace_only_their_slot() {
         let mut s = session();
-        round(&mut s, 100, 1100, "甲乙");
+        round(&mut s, 100, 1100, "甲乙丙丁戊");
         s.finalize_current(1100).unwrap();
         s.next_segment();
-        round(&mut s, 2000, 4000, "丙丁");
+        round(&mut s, 2000, 4000, "己庚辛壬癸");
         s.finalize_current(4000).unwrap();
-        assert_eq!(s.aggregate().chars, 4);
+        assert_eq!(s.aggregate().chars, 10);
         assert_eq!(s.aggregate().time_ms, 3000);
         s.jump(0);
-        assert_eq!(s.aggregate().chars, 2);
-        round(&mut s, 5000, 7000, "甲乙");
+        assert_eq!(s.aggregate().chars, 5);
+        round(&mut s, 5000, 7000, "甲乙丙丁戊");
         s.finalize_current(7000).unwrap();
-        assert_eq!(s.aggregate().chars, 4);
+        assert_eq!(s.aggregate().chars, 10);
         assert_eq!(s.aggregate().time_ms, 4000);
-        assert!((s.aggregate().speed - 60.0).abs() < 1e-9);
+        assert!((s.aggregate().speed - 150.0).abs() < 1e-9);
+    }
+
+    /// P1-4 有效性门槛边界（is_valid 双门槛 + <5 聚合硬门并存，语义分开）：
+    /// 2字/4字 → 硬门挡出聚合且 is_valid=false；9字9s/9字10s/10字9s → 进聚合但
+    /// is_valid=false（进练习字数、不进有效均速）；10字10s → is_valid=true。
+    #[test]
+    fn validity_gate_boundaries_mark_records_and_gate_aggregate() {
+        let cases: &[(&str, u64, bool, u64)] = &[
+            ("甲乙", 1_000, false, 0),                  // 2字：硬门 + 无效
+            ("甲乙丙丁", 1_000, false, 0),               // 4字：硬门 + 无效
+            ("甲乙丙丁戊己庚辛壬", 9_000, false, 9),      // 9字9s：进聚合、无效
+            ("甲乙丙丁戊己庚辛壬", 10_000, false, 9),     // 9字10s：仅字数门不过
+            ("甲乙丙丁戊己庚辛壬癸", 9_999, false, 10),    // 10字9.999s：仅用时门不过
+            ("甲乙丙丁戊己庚辛壬癸", 10_000, true, 10),    // 10字10s：双过
+        ];
+        for &(text, ms, valid, agg_chars) in cases {
+            let mut s = Session::new(100);
+            s.load_book("t", text);
+            let end = 100 + ms;
+            round(&mut s, 100, end, text);
+            let r = s.finalize_current_at(end, 1).unwrap();
+            assert_eq!(r.chars, text.chars().count(), "case {text}");
+            assert_eq!(r.is_valid, valid, "is_valid {text}/{ms}ms");
+            assert_eq!(s.aggregate().chars, agg_chars, "aggregate {text}/{ms}ms");
+            assert_eq!(s.live_stats(end).done_chars, agg_chars);
+        }
+    }
+
+    /// P1-3 词提快照：RoundMetadata.word_hints 冻结开打时的规则；
+    /// 赛制经 normalized() 强制关词提；成绩单 badge 走 gale_core::score::race_badge。
+    #[test]
+    fn round_metadata_freezes_word_hints_and_badge_uses_snapshot() {
+        // 练习 + 词提开：开打后规则冻结，成绩引用快照
+        let mut s = Session::new(100);
+        s.load_book("t", "甲乙丙丁戊");
+        let mut rules = SessionRules::default();
+        rules.word_hints = true;
+        s.set_rules(rules).unwrap();
+        round(&mut s, 100, 1100, "甲乙丙丁戊");
+        let meta = s.finalize_current_at(1100, 1).unwrap().round.unwrap();
+        assert!(meta.word_hints);
+        assert_eq!(
+            gale_core::score::race_badge(meta.mode, meta.word_hints),
+            "【非赛制】[词提开]"
+        );
+        // 赛制：normalized() 强制 word_hints=false，快照与 badge 一致
+        let mut s2 = Session::new(100);
+        s2.load_book("t", "甲乙丙丁戊");
+        let mut race = SessionRules::default();
+        race.mode = TrainingMode::Race;
+        race.word_hints = true; // 会被 normalized 关掉
+        s2.set_rules(race).unwrap();
+        assert!(!s2.rules.word_hints);
+        round(&mut s2, 100, 1100, "甲乙丙丁戊");
+        let m2 = s2.finalize_current_at(1100, 2).unwrap().round.unwrap();
+        assert!(!m2.word_hints);
+        assert_eq!(
+            gale_core::score::race_badge(m2.mode, m2.word_hints),
+            "【赛制】"
+        );
+    }
+
+    /// 难度链路：群文《难度》头随 load_group 进 Session，结算随成绩进
+    /// ScoreRecord.difficulty（成绩单 `难度普(1.84)`）。
+    #[test]
+    fn group_difficulty_flows_into_record() {
+        let mut s = Session::new(100);
+        s.load_group(ParsedGroupText {
+            title: "t".into(),
+            difficulty: Some("普 1.84".into()),
+            segments: vec![Segment {
+                mark: "1".into(),
+                text: "甲乙丙丁戊".into(),
+            }],
+        });
+        assert_eq!(
+            s.difficulty,
+            Some(DifficultyTag {
+                label: "普".into(),
+                score: Some(1.84)
+            })
+        );
+        round(&mut s, 100, 1100, "甲乙丙丁戊");
+        let r = s.finalize_current_at(1100, 1).unwrap();
+        assert_eq!(r.difficulty.as_ref().unwrap().label, "普");
+        assert!((r.difficulty.as_ref().unwrap().score.unwrap() - 1.84).abs() < 1e-9);
+        assert!(
+            gale_core::score::format_score_report(&r)
+                .contains("字数5  难度普(1.84)  用时")
+        );
+        // 换载文（无难度头）清空
+        s.load_book("plain", "甲乙丙丁戊甲乙丙丁戊");
+        assert!(s.difficulty.is_none());
     }
     #[test]
     fn partial_round_does_not_claim_untyped_chars() {
@@ -896,7 +1092,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("hufu-session-{}.jsonl", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let mut s = session();
-        round(&mut s, 100, 1100, "甲乙");
+        round(&mut s, 100, 1100, "甲乙丙丁戊");
         s.finalize_current_at(1100, 123456).unwrap();
         s.save_snapshot(&path).unwrap();
         let mut bad = s.clone();
@@ -914,8 +1110,8 @@ mod tests {
         file.write_all(b"{\"bad\":").unwrap();
         drop(file);
         let restored = Session::restore_snapshot(&path).unwrap();
-        assert_eq!(restored.comparer.pos, 2);
-        assert_eq!(restored.aggregate().chars, 2);
+        assert_eq!(restored.comparer.pos, 5);
+        assert_eq!(restored.aggregate().chars, 5);
         std::fs::remove_file(path).ok();
     }
     #[test]
@@ -1107,5 +1303,82 @@ mod tests {
             vec![1, 1]
         );
         assert_eq!(s.elapsed_ms(1400), 300);
+    }
+
+    /// P1-6 protect 窗端到端：组字中退格（ImeDelete→组字期退格账）→ 组合被
+    /// 该退格删空（非提交清空，protect 置位）→ 下一个退格仍归 IME（protect
+    /// 只护一次）→ 弹起后再退格才走 Correction（回改账，Comparer 记 corrections）。
+    /// 语义与 gale-win input_host BackspaceRouter 13 用例回归一致。
+    #[test]
+    fn backspace_protect_window_routes_ime_delete_then_correction() {
+        let mut s = session();
+        s.on_key(0x41, 100);
+        s.feed_input(InputEvent::Commit { chars: "甲".into() }, 150);
+        assert_eq!(s.comparer.pos, 1);
+        // 第二字组字中
+        s.set_composing(true);
+        s.on_key(0x42, 200);
+        // 组字中的退格：ImeDelete → 组字期退格账，不动跟打区
+        s.on_key(0x08, 250);
+        assert_eq!(s.stats.composition_backspaces, 1);
+        assert_eq!(s.comparer.corrections, 0);
+        // 该退格把组合删空：Composing(false) 同批无 Commit → protect 置位
+        s.set_composing_from_host(false, false);
+        // 下一个物理退格：protect 窗内仍 ImeDelete（清 IME 残迹）
+        s.on_key(0x08, 300);
+        assert_eq!(s.stats.composition_backspaces, 2);
+        assert_eq!(s.comparer.corrections, 0);
+        assert_eq!(s.comparer.pos, 1);
+        // 弹起清 protect；再退格 → Correction：进回改账（删掉已上屏的“甲”）
+        s.on_backspace_up();
+        s.on_key(0x08, 350);
+        assert_eq!(s.stats.composition_backspaces, 2);
+        s.feed_input(InputEvent::Backspace, 360);
+        assert_eq!(s.comparer.corrections, 1);
+        assert_eq!(s.comparer.pos, 0);
+    }
+
+    /// P1-6 反例：提交清空组合（Composing(false) 与 Commit 同批）**不**置
+    /// protect——紧接着的退格直接 Correction，与“退格删空”严格区分。
+    #[test]
+    fn commit_clear_does_not_arm_protect_window() {
+        let mut s = session();
+        s.on_key(0x41, 100);
+        s.set_composing(true);
+        s.on_key(0x42, 150);
+        s.feed_input(InputEvent::Commit { chars: "甲".into() }, 200);
+        // feed_input 的 Commit 分支已通知 router(false, true)；主循环的
+        // Composing(false) 同批补一次 (false, true) 幂等无害
+        s.set_composing_from_host(false, true);
+        s.on_key(0x08, 250);
+        assert_eq!(s.stats.composition_backspaces, 0, "提交后退格不进组字账");
+        s.feed_input(InputEvent::Backspace, 260);
+        assert_eq!(s.comparer.corrections, 1);
+    }
+
+    /// P1-3 选重/标顶：Ding×2 + Select×1（Unknown 忽略）→ 结算记录计数
+    /// ding=2/select=1，成绩单输出 `选重1  标顶2`。
+    #[test]
+    fn commit_causes_count_into_record_and_report() {
+        let mut s = session();
+        s.on_key(0x41, 100);
+        s.on_commit_cause(CommitCause::Ding);
+        s.on_commit_cause(CommitCause::Ding);
+        s.on_commit_cause(CommitCause::Select);
+        s.on_commit_cause(CommitCause::Unknown);
+        s.feed_input(
+            InputEvent::Commit {
+                chars: "甲乙丙丁戊".into(),
+            },
+            200,
+        );
+        let r = s.finalize_current_at(300, 123).unwrap();
+        assert_eq!(r.ding_count, 2);
+        assert_eq!(r.select_count, 1);
+        assert!(
+            gale_core::score::format_score_report(&r).contains("选重1  标顶2"),
+            "{}",
+            gale_core::score::format_score_report(&r)
+        );
     }
 }

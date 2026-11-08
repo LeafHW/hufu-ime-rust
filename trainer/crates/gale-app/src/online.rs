@@ -563,7 +563,9 @@ impl HttpTransport for WinHttpTransport {
             headers.push_str("\r\n");
         }
         let started = Instant::now();
-        let agent = wide("HuFu-Trainer/0.1");
+        // 代理名与请求头 UA 统一取 gale-core 的 DEFAULT_UA（Chrome 120）：
+        // 晴服务端按 UA 甄别客户端，两处不一致可能被拦。
+        let agent = wide(gale_core::wenlai::DEFAULT_UA);
         let host = wide(host);
         let object = wide(object);
         let method = wide(if req.method == HttpMethod::Post {
