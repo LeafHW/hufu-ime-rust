@@ -25,6 +25,9 @@ use std::sync::{Arc, Mutex};
 
 mod model03;
 
+#[cfg(test)]
+mod prob_cache_tests;
+
 /// 语言模型统一入口：三阶 NM02（含 NM04 量化变体）或五阶 NM03。
 /// 【NM03 接入 2026-09-25】历史状态统一为码点数组（beam 侧存 4 字符）；
 /// 三阶路径忽略前两位（行为与旧实现逐位一致），五阶走完整回退链。
@@ -547,8 +550,9 @@ impl SentenceEngine {
     /// resume=Some((buckets, start_pos)) 时增量：复用前部桶、从 start_pos
     /// 续算（segs 与主循环都只跑尾部）。返回 (结果, 过程桶)——桶供下次
     /// 增量复用；n==0 或超 max_raw_length 时返回 None（不可复用）。
+    /// CACHE_PROBS=false keeps the uncached reference for differential tests.
     #[allow(clippy::type_complexity)]
-    fn decode_internal(
+    fn decode_internal<const CACHE_PROBS: bool>(
         &self,
         raw: &str,
         resume: Option<(Vec<Bucket>, usize, usize)>,
@@ -586,7 +590,56 @@ impl SentenceEngine {
                 false,
             );
         }
+        // Very narrow beams have too little repeated LM work to repay hashing.
+        let cache_probs = CACHE_PROBS
+            && n > 16
+            && matches!(self.model, Lm::Five(_))
+            && w.beam_width >= 4
+            && if resume.is_some() {
+                inc_tail_beam() >= 4
+            } else {
+                !quick || self.quick_beam >= 4
+            };
+        if cache_probs {
+            self.decode_prepared::<true>(parsed, base, resume, quick)
+        } else {
+            self.decode_prepared::<false>(parsed, base, resume, quick)
+        }
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn decode_prepared<const CACHE_PROBS: bool>(
+        &self,
+        parsed: hufu_engine::RankLocks,
+        base: Vec<char>,
+        resume: Option<(Vec<Bucket>, usize, usize)>,
+        quick: bool,
+    ) -> (SentenceDecode, Option<Vec<Bucket>>, bool) {
+        let n = base.len();
+        let w = &self.weights;
         let start_pos = resume.as_ref().map(|(_, s, _)| *s).unwrap_or(0);
+        // Reuse the original f32 probability for identical events in this decode.
+        // Full history matters for NM03, including BOS/EOS. Keep the existing
+        // clamp/ln and accumulation order at every call site. Short codes and
+        // the cheaper trigram model bypass the cache. The 16-key threshold avoids
+        // cache overhead on short inputs; clear at 4096 entries and reuse capacity.
+        // Do not even construct RandomState on the uncached specialization.
+        let mut probs = CACHE_PROBS.then(HashMap::<([u32; 4], u32), f32>::new);
+        let mut step_prob = |history: [u32; 4], cp: u32| {
+            if let Some(probs) = probs.as_mut() {
+                if let Some(&p) = probs.get(&(history, cp)) {
+                    return p;
+                }
+                let p = self.model.step_prob(&history, cp);
+                if probs.len() == 4096 {
+                    probs.clear();
+                }
+                probs.insert((history, cp), p);
+                p
+            } else {
+                self.model.step_prob(&history, cp)
+            }
+        };
         // 【mass 双计修复 2026-10-28】skip_upto = 保留区末位（split）：
         // 增量恢复期落点 ≤ split 的展开是旧路径复刻，结构性跳过（见
         // 主循环内注释）。全量解码 None = 不跳。
@@ -935,7 +988,7 @@ impl SentenceEngine {
                         ns.mass += w.emitted_character_reward;
                         for c in text.chars() {
                             let cp = c as u32;
-                            let p3 = self.model.step_prob(&ns.history(), cp);
+                            let p3 = step_prob(ns.history(), cp);
                             ns.score += (p3.max(1e-12).ln()) as f64;
                             ns.mass += (p3.max(1e-12).ln()) as f64;
                             ns.prev4 = ns.prev3;
@@ -1018,7 +1071,7 @@ impl SentenceEngine {
         let mut hits: Vec<SentenceHit> = finals
             .iter()
             .map(|st| {
-                let eos = (self.model.step_prob(&st.history(), EOS).max(1e-12).ln()) as f64;
+                let eos = (step_prob(st.history(), EOS).max(1e-12).ln()) as f64;
                 let iso = iso_of(&st.text);
                 SentenceHit {
                     score: st.score + eos - iso,
@@ -1050,7 +1103,7 @@ impl SentenceEngine {
             if st.text.is_empty() {
                 continue;
             }
-            let eos = (self.model.step_prob(&st.history(), EOS).max(1e-12).ln()) as f64;
+            let eos = (step_prob(st.history(), EOS).max(1e-12).ln()) as f64;
             let iso = iso_of(&st.text);
             let conf = st.mass + eos - iso + st.supp_bonus;
             let score = st.score + eos - iso;
@@ -1094,7 +1147,7 @@ impl SentenceEngine {
                     if st.text.is_empty() {
                         continue;
                     }
-                    let eos = (self.model.step_prob(&st.history(), EOS).max(1e-12).ln()) as f64;
+                    let eos = (step_prob(st.history(), EOS).max(1e-12).ln()) as f64;
                     let iso = iso_of(&st.text);
                     let conf = st.mass + eos - iso + st.supp_bonus;
                     let score = st.score + eos - iso;
@@ -1239,7 +1292,7 @@ impl SentenceEngine {
         // resume 不变（尾窗本就 min(inc_tail)）。上限只在严格低于档位
         // 束宽时实际降档。
         let quick = self.two_stage && resume.is_none();
-        let (out, buckets, quick_bound) = self.decode_internal(raw, resume, quick);
+        let (out, buckets, quick_bound) = self.decode_internal::<true>(raw, resume, quick);
         let out = Arc::new(out);
         // full = 该结果与全量档等效：quick 上限未实际降档时恒真（虎整句
         // 方案 beam_width=200 < quick 1500，截断两档同样发生、重解无
@@ -1288,7 +1341,7 @@ impl SentenceEngine {
         } else if gate_dbg {
             eprintln!("[gate] miss: raw={raw} prev=None");
         }
-        let (out, buckets, _quick_bound) = self.decode_internal(raw, None, false);
+        let (out, buckets, _quick_bound) = self.decode_internal::<true>(raw, None, false);
         let out = Arc::new(out);
         cache.last = Some((raw.to_string(), out.clone(), true));
         if let Some(b) = buckets {
