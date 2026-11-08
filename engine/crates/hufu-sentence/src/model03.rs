@@ -48,6 +48,8 @@ pub struct FivegramModel {
     /// 码点 → 字频名次（1 起，按 unigram 概率降序；未收录 usize::MAX）
     freq_rank: HashMap<u32, usize>,
     unigram_p: Vec<f64>,
+    #[cfg(test)]
+    test_queries: std::sync::atomic::AtomicUsize,
 }
 
 #[derive(Clone, Copy)]
@@ -235,6 +237,8 @@ impl FivegramModel {
             cp2id,
             freq_rank,
             unigram_p,
+            #[cfg(test)]
+            test_queries: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -255,6 +259,8 @@ impl FivegramModel {
     /// 单字符事件打分（线性域概率），等价 Lua score_history：
     /// 从最长可用历史（≤4）逐级回退。
     pub fn step_prob(&self, h: &[u32], cp: u32) -> f64 {
+        #[cfg(test)]
+        self.test_queries.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let target = self.id_of(cp);
         let n = h.len().min(4);
         // 每个事件最多四字历史。各阶共用同一栈上 id 尾巴，避免每阶
@@ -399,6 +405,139 @@ fn read_q(d: &[u8], off: usize, qbytes: usize) -> u32 {
     } else {
         rd_u16(d, off) as u32
     }
+}
+
+#[cfg(test)]
+impl FivegramModel {
+    pub(crate) fn reset_test_queries(&self) {
+        self.test_queries.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn test_queries(&self) -> usize {
+        self.test_queries.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// A real NM03/Q8 file with all backoff orders, four-character context
+/// dependence, special tokens, and an astral character. Keep this in memory so
+/// sentence cache tests do not depend on an installed model or temporary files.
+#[cfg(test)]
+pub(crate) fn probability_cache_test_model() -> FivegramModel {
+    fn put32(d: &mut [u8], at: usize, value: u32) {
+        d[at..at + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    fn put64(d: &mut [u8], at: usize, value: u64) {
+        d[at..at + 8].copy_from_slice(&value.to_le_bytes());
+    }
+    type Record = (Vec<u16>, u8, Vec<(u16, u8)>);
+    let orders: [Vec<Record>; 4] = [
+        vec![
+            (vec![1], 41, vec![(3, 240), (8, 230)]),
+            (vec![3], 51, vec![(3, 220), (4, 230)]),
+            (vec![4], 61, vec![(5, 210)]),
+            (vec![5], 71, vec![(6, 200)]),
+            (vec![6], 81, vec![(7, 180)]),
+            (vec![7], 91, vec![(2, 170), (8, 190)]),
+            (vec![12], 31, vec![(13, 150)]),
+        ],
+        vec![
+            (vec![1, 1], 41, vec![(3, 235), (8, 225)]),
+            (vec![3, 4], 51, vec![(5, 245)]),
+            (vec![8, 4], 61, vec![(5, 205)]),
+            (vec![4, 5], 71, vec![(6, 215)]),
+        ],
+        vec![
+            (vec![1, 1, 1], 41, vec![(3, 250), (8, 240)]),
+            (vec![3, 4, 5], 51, vec![(6, 240)]),
+            (vec![8, 4, 5], 61, vec![(6, 220)]),
+            (vec![4, 5, 6], 71, vec![(2, 120), (7, 190)]),
+        ],
+        vec![
+            (vec![1, 1, 1, 1], 41, vec![(3, 245), (8, 235)]),
+            (vec![1, 1, 1, 3], 51, vec![(4, 230)]),
+            (vec![1, 1, 1, 8], 61, vec![(4, 225)]),
+            (vec![3, 4, 5, 6], 71, vec![(2, 70), (7, 250)]),
+            (vec![8, 4, 5, 6], 81, vec![(2, 180), (7, 100)]),
+            (vec![4, 5, 6, 7], 91, vec![(2, 210)]),
+        ],
+    ];
+    let tokens = ["<unk>", "<s>", "</s>", "甲", "乙", "丙", "丁", "戊", "己", "庚", "辛", "壬", "癸", "𠀀"];
+    let mut d = vec![0; HEADER_SIZE + 4 * 256 * BUCKET_META];
+    d[..8].copy_from_slice(MAGIC);
+    put32(&mut d, 8, 2);
+    put32(&mut d, 12, HEADER_SIZE as u32);
+    put32(&mut d, 24, 5);
+    put32(&mut d, 28, tokens.len() as u32);
+    put32(&mut d, 32, 256);
+    put32(&mut d, 36, 2);
+    d[58..60].copy_from_slice(&1u16.to_le_bytes());
+    d[60..62].copy_from_slice(&2u16.to_le_bytes());
+    for i in 0..5 {
+        put32(&mut d, 160 + i * 16, (-40_000_000i32) as u32);
+        put32(&mut d, 164 + i * 16, 10_000_000);
+        put32(&mut d, 168 + i * 16, (-10_000_000i32) as u32);
+        put32(&mut d, 172 + i * 16, 10_000_000);
+    }
+    let vocab = d.len();
+    for (id, token) in tokens.iter().enumerate() {
+        d.extend_from_slice(&(token.len() as u16).to_le_bytes());
+        d.extend_from_slice(token.as_bytes());
+        d.extend_from_slice(&[if id == 0 { 5 } else { 100 + id as u8 }, 0]);
+    }
+    let vocab_bytes = d.len() - vocab;
+    put64(&mut d, 40, vocab as u64);
+    put64(&mut d, 48, vocab_bytes as u64);
+    for (o, records) in orders.into_iter().enumerate() {
+        let directory = HEADER_SIZE + o * 256 * BUCKET_META;
+        put64(&mut d, 64 + o * 24, directory as u64);
+        put64(&mut d, 72 + o * 24, records.len() as u64);
+        put64(&mut d, 80 + o * 24, records.iter().map(|r| r.2.len() as u64).sum());
+        let mut buckets: std::collections::BTreeMap<u16, Vec<Record>> = Default::default();
+        for record in records {
+            buckets.entry(record.0[0] % 256).or_default().push(record);
+        }
+        for (first, mut records) in buckets {
+            records.sort_by(|a, b| a.0.cmp(&b.0));
+            let block = d.len();
+            let mut indices = Vec::new();
+            let mut successors = 0;
+            for (i, (context, backoff, mut targets)) in records.iter().cloned().enumerate() {
+                if i % 2 == 0 {
+                    indices.push((context.clone(), d.len()));
+                }
+                for id in context { d.extend_from_slice(&id.to_le_bytes()); }
+                d.push(backoff);
+                d.extend_from_slice(&(targets.len() as u16).to_le_bytes());
+                successors += targets.len();
+                targets.sort_unstable_by_key(|&(id, _)| id);
+                for (id, prob) in targets {
+                    d.extend_from_slice(&id.to_le_bytes());
+                    d.push(prob);
+                }
+            }
+            let index = d.len();
+            for (context, offset) in &indices {
+                let entry = d.len();
+                d.resize(entry + INDEX_ENTRY, 0);
+                for (i, id) in context.iter().enumerate() {
+                    d[entry + i * 2..entry + i * 2 + 2].copy_from_slice(&id.to_le_bytes());
+                }
+                put64(&mut d, entry + 8, *offset as u64);
+            }
+            let meta = directory + first as usize * BUCKET_META;
+            put64(&mut d, meta, block as u64);
+            put64(&mut d, meta + 8, (index - block) as u64);
+            put64(&mut d, meta + 16, index as u64);
+            put32(&mut d, meta + 24, indices.len() as u32);
+            put32(&mut d, meta + 28, records.len() as u32);
+            put64(&mut d, meta + 32, successors as u64);
+        }
+    }
+    let len = d.len();
+    put64(&mut d, 16, len as u64);
+    let mut map = memmap2::MmapMut::map_anon(d.len()).unwrap();
+    map.copy_from_slice(&d);
+    FivegramModel::build(map.make_read_only().unwrap()).unwrap()
 }
 
 #[inline]
