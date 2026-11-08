@@ -1110,7 +1110,7 @@ fn draw_groups(
             p.muted,
         );
     }
-    // 【群三件套】自动发成绩开关（cfg.auto_send_score，默认开）
+    // 勾选项：打完自动发成绩（唯一入口——勾了就自动发，无手动按钮）
     round(
         f,
         rx,
@@ -1129,23 +1129,47 @@ fn draw_groups(
             p.line
         }),
     );
+    // 复选框：12×12 方框 + 勾
+    let cb_x = rx + 14.;
+    let cb_y = y + 502.;
+    round(
+        f,
+        cb_x,
+        cb_y,
+        14.,
+        14.,
+        3.,
+        if cfg.auto_send_score {
+            p.accent
+        } else {
+            p.surface
+        },
+        Some(if cfg.auto_send_score {
+            p.accent
+        } else {
+            p.line
+        }),
+    );
+    if cfg.auto_send_score {
+        text(f, cb_x + 2., cb_y + 0., 13., "✓", p.bg);
+    }
     text(
         f,
-        rx + 12.,
-        y + 506.,
+        cb_x + 24.,
+        y + 505.,
         14.,
-        "打完自动发成绩到群",
+        "打完一段自动发成绩到群",
         if cfg.auto_send_score { p.text } else { p.muted },
     );
     text(
         f,
-        rx + 12.,
-        y + 522.,
+        cb_x + 24.,
+        y + 521.,
         FONT_HINT,
         if cfg.auto_send_score {
             "晴兼容成绩单 · 发送前校验目标群"
         } else {
-            "关闭后仅复制成绩，可手动粘贴"
+            "不勾则不发（仍可复制成绩手动粘贴）"
         },
         p.muted,
     );
@@ -1157,22 +1181,11 @@ fn draw_groups(
             x + 20.,
             y + ph - 35.,
             FONT_HINT,
-            "发文 = 把当前段按晴发文格式发到群，随后可 F4 读回",
+            "勾选后打完一段自动发成绩；发文 = 把当前段按晴发文格式发到群",
             p.muted,
         );
     }
     let fy = y + ph - 47.;
-    btn(
-        f,
-        hs,
-        x + pw - 442.,
-        fy,
-        96.,
-        "发成绩到群",
-        Action::SendScoreToGroup,
-        t,
-        false,
-    );
     btn(
         f,
         hs,
