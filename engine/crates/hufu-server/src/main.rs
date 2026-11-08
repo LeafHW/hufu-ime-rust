@@ -154,7 +154,6 @@ fn attach_console_for_dev(force: bool, dev_attach: bool) {
 /// （取证生命线——出事时先看这两项是否真的生效）。
 #[cfg(windows)]
 fn anti_freeze_guards(data_dir: &std::path::Path) {
-    const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn GetCurrentProcess() -> isize;
@@ -195,10 +194,16 @@ fn anti_freeze_guards(data_dir: &std::path::Path) {
         } else {
             mask_line = "affinity SKIP (query fail)".into();
         }
-        // 2) 优先级 BelowNormal：全进程默认级（现有/新建线程继承；
-        //    打分专用池另有每线程再降 + EcoQoS）。
-        if SetPriorityClass(h, BELOW_NORMAL_PRIORITY_CLASS) != 0 {
-            prio_line = "priority ok BelowNormal".into();
+        // 2) 优先级 AboveNormal（2026-11-08 高负载卡键修复）：按键路径
+        //    =宿主 UI 线程同步等本进程响应（ipc 稳态上限 1200ms），进程
+        //    级 BelowNormal 会在整机高负载时把按键响应排到一切 Normal
+        //    进程之后（用户实测"跑点东西打字就卡"）。提级 AboveNormal
+        //    只越过普通负载进程、仍低于 High/Realtime 关键进程；推理打
+        //    分失控风险不回退——专用池仍有每线程 BelowNormal + EcoQoS
+        //    + 打字让键 + 半核亲和四重独立抑制（rerank/model.rs:70-76）。
+        const ABOVE_NORMAL_PRIORITY_CLASS: u32 = 0x0000_8000;
+        if SetPriorityClass(h, ABOVE_NORMAL_PRIORITY_CLASS) != 0 {
+            prio_line = "priority ok AboveNormal".into();
         } else {
             prio_line = format!("priority FAIL (err {})", std::io::Error::last_os_error().raw_os_error().unwrap_or(0));
         }
