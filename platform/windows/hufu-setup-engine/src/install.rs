@@ -380,7 +380,7 @@ pub fn run_install(out: &mut Out, no_hklm: bool, user_only: bool) -> i32 {
             path_str(&legacy),
             mb
         ));
-        out.line("  本次安装完成后确认输入法正常，即可删除该目录释放空间。");
+        out.line("  该目录同时存放跟打记录，请保留用户数据，仅手动清理已不用的旧程序文件。");
     }
 
     // install.ps1 L254-257：1) 文件检查（原地运行：不拷贝；缺件 exit 1）
@@ -765,6 +765,22 @@ pub fn run_install(out: &mut Out, no_hklm: bool, user_only: bool) -> i32 {
     } else {
         out.line("OK 开机自启已设置（开始菜单快捷方式失败，可忽略）");
     }
+    if inst.join("hufu-trainer.exe").is_file() {
+        let trainer_link = std::env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .map(|p| p.join(r"Microsoft\Windows\Start Menu\Programs\HuFu 虎符跟打器.lnk"));
+        if let Some(path) = trainer_link {
+            if !lnk::create_app_shortcut(
+                &path,
+                &inst.join("hufu-trainer.exe"),
+                "",
+                &inst,
+                &icon,
+            ) {
+                out.line("· 跟打器快捷方式创建失败，可从设置页打开");
+            }
+        }
+    }
 
     // install.ps1 L510-519：6) 启动 server——【铁律】必须普通权限：提权启动的管道会拒绝
     // 普通应用。先杀旧实例 → 500ms → 启动 → 2s。
@@ -811,7 +827,7 @@ pub fn run_install(out: &mut Out, no_hklm: bool, user_only: bool) -> i32 {
             None => String::new(), // PS：$mb 未定义时插值为空
         };
         out.line(&format!(
-            "  · 记得删除旧版目录释放 {}：{}",
+            "  · 旧目录约 {}，内含用户数据，请勿整目录删除：{}",
             mb_str,
             path_str(&legacy)
         ));
@@ -958,16 +974,11 @@ pub fn run_phase_elevated(out: &mut Out) -> i32 {
         }
     }
 
-    // install.ps1 L161-170：── 升级清理 3) 早期版本残留 %LOCALAPPDATA%\HuFu（绿色化前旧版
-    // 数据目录；被占用则提示下次再清）──
+    // The trainer stores user data below LocalAppData\HuFu. Upgrades retain
+    // the whole user directory; an old server.exe does not make its data disposable.
     let legacy_local = common::localappdata().join("HuFu");
     if legacy_local.exists() {
-        normalize_tree_attrs(&legacy_local);
-        if remove_entry(&legacy_local).is_ok() {
-            out.line("清理早期版本数据: %LOCALAPPDATA%\\HuFu");
-        } else {
-            out.line("· %LOCALAPPDATA%\\HuFu 被占用，下次安装再清");
-        }
+        out.line("已保留用户数据（含跟打记录）: %LOCALAPPDATA%\\HuFu");
     }
 
     // install.ps1 L171-177：── HKLM 机器级注册：COM InprocServer32 + TIP 描述 ──

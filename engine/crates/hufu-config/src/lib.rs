@@ -23,6 +23,7 @@ pub struct Config {
     pub opencc: OpenCcSection,
     pub user: UserSection,
     pub keymap: KeymapSection,
+    pub trainer: TrainerSection,
 }
 
 impl Default for Config {
@@ -41,7 +42,21 @@ impl Default for Config {
             opencc: OpenCcSection::default(),
             user: UserSection::default(),
             keymap: KeymapSection::default(),
+            trainer: TrainerSection::default(),
         }
+    }
+}
+
+/// 跟打器入口开关；关闭不删除独立保存的练习数据。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TrainerSection {
+    pub enabled: bool,
+}
+
+impl Default for TrainerSection {
+    fn default() -> Self {
+        Self { enabled: true }
     }
 }
 
@@ -849,6 +864,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn trainer_toggle_persists_and_legacy_config_keeps_entry() {
+        let mut cfg: Config = serde_json::from_str("{}").unwrap();
+        assert!(cfg.trainer.enabled);
+        let path =
+            std::env::temp_dir().join(format!("hufu-trainer-config-{}.json", std::process::id()));
+        cfg.trainer.enabled = false;
+        cfg.save(&path).unwrap();
+        assert!(!Config::load(&path).unwrap().trainer.enabled);
+        cfg.trainer.enabled = true;
+        cfg.save(&path).unwrap();
+        assert!(Config::load(&path).unwrap().trainer.enabled);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn default_roundtrip_and_partial_load() {
         let cfg = Config::default();
         assert_eq!(cfg.input.max_code_length, 4);
@@ -969,7 +999,10 @@ mod tests {
         let legacy = "{\"keymap\": {\"map\": {\"[\": \"text:？\"}}}\n";
         let cfg3: Config = serde_json::from_str(legacy).unwrap();
         assert_eq!(cfg3.keymap.map["["], "text:？");
-        assert!(cfg3.keymap.map_idle.is_empty(), "旧配置 map_idle 空（回落 map）");
+        assert!(
+            cfg3.keymap.map_idle.is_empty(),
+            "旧配置 map_idle 空（回落 map）"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

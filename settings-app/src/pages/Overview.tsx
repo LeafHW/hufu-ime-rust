@@ -10,6 +10,7 @@ import { Badge, PageHead } from '../components/ui';
 import { useBodyLight } from '../hooks';
 import { skinSwatch } from '../skinSwatch';
 import { SEARCH_ITEMS } from './searchIndex';
+import { TrainerSettings } from '../components/TrainerSettings';
 
 const shortName = (n: string) => n.replace(/（.*?）|\(.*?\)/g, '').trim() || n;
 
@@ -41,10 +42,12 @@ export function Overview({
   data,
   notify,
   navigate,
+  refresh,
 }: {
   data: Bootstrap;
   notify: (msg: string) => void;
   navigate: (r: Route, sub?: string) => void;
+  refresh: () => Promise<unknown>;
 }) {
   const [syncing, setSyncing] = useState(false);
   /* 【检查更新 2026-11-01】概览行与关于页同款：真实调 /api/update/check；
@@ -218,6 +221,8 @@ export function Overview({
           </>
         }
       />
+
+      <TrainerSettings data={data} notify={notify} refresh={refresh} />
 
       <div className="status-grid">
         <div

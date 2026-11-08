@@ -36,6 +36,7 @@ export interface EngineState {
 }
 
 export interface Config {
+  trainer?: { enabled?: boolean };
   appearance?: {
     anim?: boolean;
     anim_flash?: boolean;

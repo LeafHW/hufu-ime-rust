@@ -1,0 +1,23 @@
+州州跟打器 (zhouzhou-typing)
+Copyright 2026 4613615@qq.com
+
+This product includes software derived from:
+
+  添雨跟打器 (tygdq) v0.94
+  Copyright (C) taliove
+  https://github.com/taliove/tygdq
+  Licensed under the Apache License, Version 2.0
+
+Reused components include but are not limited to:
+  - bm.txt 编码词典（已 GBK→UTF-8 转码）
+  - Resources/TXT 内置练习文章
+  - 跟打核心算法思路（KeyHook、TypeReport、统计公式）
+
+Modifications by 4613615@qq.com:
+  - WinForms → WPF (HandyControl) 完全重写 UI
+  - 移除 QQ / 比赛 / 检查更新 相关功能
+  - 字典查询从 O(n) 线性扫描改为反向索引最长匹配
+  - 新增 IME (TSF) 兼容处理
+  - 新增 OxyPlot 实时面积曲线
+  - 词组下划线从动态 Label 控件改为 Run.TextDecorations
+  - 全局静态 Glob 拆分为 TypingSession 等领域模型

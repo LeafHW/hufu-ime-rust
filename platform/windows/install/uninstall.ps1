@@ -2,7 +2,7 @@
 # 【2026-09-07 残留清除强化】一次跑完全清：
 #   每用户注册+语言列表+自启+快捷方式 + 机器级注册+分类库
 #   + SystemIME（含 .oldN 腾位链，x64/SysWOW64 双位）
-#   + ProgramData + %LOCALAPPDATA% 早期版本数据 + 安装目录本体。
+#   + ProgramData；安装目录和 %LOCALAPPDATA%\HuFu 用户数据保留。
 # 关键顺序：先杀 ctfmon 再清注册（后杀会在重启时用缓存档案重建
 # HKCU TIP——实测残留根因）；全部清完最后再拉起 ctfmon。
 param([switch]$NoHKLM)   # 测试用：仅每用户清理（不提权、不动 HKLM）
@@ -93,12 +93,10 @@ Get-ChildItem $asm -ErrorAction SilentlyContinue | Where-Object {
 Remove-Item "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\HuFu 虎符输入法设置.lnk" -Force -ErrorAction SilentlyContinue
 Get-ChildItem "$env:APPDATA\Microsoft\Windows\Start Menu\Programs" -Filter '*HuFu*' -ErrorAction SilentlyContinue |
     Remove-Item -Force -Recurse -ErrorAction SilentlyContinue
-# 【早期版本残留】%LOCALAPPDATA%\HuFu（旧版数据目录——绿色化前版本使用）
+# %LOCALAPPDATA%\HuFu 同时存放跟打文章、成绩和设置，普通卸载保留用户数据。
 $legacyLocal = Join-Path $env:LOCALAPPDATA 'HuFu'
 if (Test-Path $legacyLocal) {
-    Remove-Item $legacyLocal -Recurse -Force -ErrorAction SilentlyContinue
-    if (Test-Path $legacyLocal) { Write-Host '· %LOCALAPPDATA%\HuFu 部分被占用，重启后再跑一次卸载可清' }
-    else { Write-Host '已清早期版本数据: %LOCALAPPDATA%\HuFu' }
+    Write-Host '已保留用户数据（含跟打记录）: %LOCALAPPDATA%\HuFu'
 }
 
 # 5) HKLM 清理（提权时；普通用户跳过——无害残留）
@@ -154,7 +152,7 @@ if (Test-Path "HKCU:\Software\Microsoft\CTF\TIP\$CLSID") {
 }
 
 # 7) 【数据保留 2026-09-07 用户拍板】卸载=解除注册+停进程+C 盘安装产物
-#    清干净（SystemIME/ProgramData/LOCALAPPDATA 旧版数据/临时日志）；
+#    清干净（SystemIME/ProgramData/临时日志），LOCALAPPDATA 用户数据保留；
 #    安装目录与其中数据（配置/用户调整/码表导出）一概不删——去留由
 #    用户决定，卸载完成输出里给出数据位置与手动清理指引。
 
@@ -202,5 +200,7 @@ if ($inst -and (Test-Path $inst)) {
         $dataTips | ForEach-Object { Write-Host "    · $_" }
         Write-Host '  （重装同版后再放回原位即可恢复）'
     }
-    Write-Host "  确认不要了，手动删整个文件夹即彻底清理：$inst"
+    Write-Host "  确认不再需要时，可手动清理安装目录中的数据：$inst"
 }
+Write-Host '  跟打文章、成绩和在线登录凭据另存于 %LOCALAPPDATA%\HuFu\trainer，仍予保留。'
+Write-Host '  确认不再需要时，可另行手动清理跟打数据目录。'

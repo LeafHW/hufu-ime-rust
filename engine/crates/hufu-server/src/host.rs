@@ -1252,6 +1252,10 @@ impl Host {
         // 所有 apply_config 调用方（HTTP/pipe/import/sync）共用 CAS 版本，
         // 否则 HTTP 的旧快照能静默覆盖刚从管道或同步应用的配置。
         crate::bump_config_rev();
+        #[cfg(windows)]
+        if old_config.trainer.enabled != self.engine.config.trainer.enabled {
+            crate::tray::refresh_trainer_shortcut();
+        }
         Ok((sentence_changed || schema_changed, schema_changed))
     }
 

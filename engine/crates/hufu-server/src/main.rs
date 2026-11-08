@@ -23,6 +23,7 @@ mod pipe;
 mod platform;
 mod ssf;
 mod sync;
+mod trainer;
 #[cfg(windows)]
 mod tray;
 
@@ -2770,6 +2771,9 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             return Response::err(403, "跨源请求被拒绝");
         }
     }
+    if req.path.starts_with("/api/trainer/") {
+        return trainer::route(host, req);
+    }
     // 【新设置页 2026-10-31】静态资源先于 Host 锁分发；GET only。
     if req.method == "GET" {
         if let Some(resp) = next_static(req.path.as_str()) {
@@ -4376,6 +4380,10 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             let Some(cfg_v) = v.get("config") else {
                 return Response::err(400, "设置文件缺 config 节");
             };
+            let imports_trainer_enabled = cfg_v
+                .get("trainer")
+                .and_then(|section| section.get("enabled"))
+                .is_some();
             let cfg: hufu_config::Config = match serde_json::from_value(cfg_v.clone()) {
                 Ok(c) => c,
                 Err(e) => return Response::err(400, &format!("config 节无效: {e}")),
@@ -4522,6 +4530,11 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             } else {
                 None
             };
+            // Old backups predate the trainer switch. Preserve the current local
+            // choice rather than silently re-enabling an explicitly disabled entry.
+            if !imports_trainer_enabled {
+                cfg.trainer = host.engine.config.trainer.clone();
+            }
             match host.apply_config(cfg, pre) {
                 Ok((need_sentence, teardown)) => {
                     if need_sentence {

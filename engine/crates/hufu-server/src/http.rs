@@ -61,6 +61,8 @@ fn status_text(code: u16) -> &'static str {
         400 => "Bad Request",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        413 => "Payload Too Large",
+        429 => "Too Many Requests",
         403 => "Forbidden",
         500 => "Internal Server Error",
         503 => "Service Unavailable",
@@ -339,19 +341,17 @@ where
                 None
             });
             if let Some(req) = request {
-                let resp = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    handler(&req)
-                }))
-                .unwrap_or_else(|payload| {
-                    // 不把 panic 细节回给浏览器（可能含路径等），只进日志。
-                    eprintln!(
-                        "HTTP handler panic（{} {}）: {}",
-                        req.method,
-                        req.path,
-                        panic_text(&*payload)
-                    );
-                    Response::err(500, "internal error: handler panic")
-                });
+                let resp = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(&req)))
+                    .unwrap_or_else(|payload| {
+                        // 不把 panic 细节回给浏览器（可能含路径等），只进日志。
+                        eprintln!(
+                            "HTTP handler panic（{} {}）: {}",
+                            req.method,
+                            req.path,
+                            panic_text(&*payload)
+                        );
+                        Response::err(500, "internal error: handler panic")
+                    });
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     write_response(&mut stream, &resp)
                 }));
@@ -363,6 +363,20 @@ where
         }
     }
     Ok(())
+}
+
+/// Finite real-HTTP fixture: no process singleton, pipe, tray, or global port file.
+#[cfg(test)]
+pub(crate) fn serve_test_requests<F>(listener: TcpListener, handler: F, count: usize)
+where
+    F: Fn(&Request) -> Response,
+{
+    for stream in listener.incoming().take(count) {
+        let mut stream = stream.expect("fixture accept");
+        let req = read_request(&mut stream).expect("fixture HTTP request");
+        write_response(&mut stream, &handler(&req));
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+    }
 }
 
 #[cfg(test)]

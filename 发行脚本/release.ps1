@@ -16,15 +16,18 @@ param(
     # 发完包后自动同步到 Gitee（附件 + 更新清单 + 站点）；失败只告警不阻断发行
     [switch]$NoGitee,
     # 【P2-27】应急开关：日志顶部不含本版本时默认直接失败（护栏，不是提示）
-    [switch]$SkipChangelogCheck
+    [switch]$SkipChangelogCheck,
+    [string]$ReleaseRoot = 'E:\DSH-KF\hufu-发行'
 )
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-$rel  = 'E:\DSH-KF\hufu-发行'
+$ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } elseif ($PSCommandPath) { Split-Path -Parent $PSCommandPath } else { throw '无法确定脚本路径，请使用 -File 运行当前仓库的 release.ps1' }
+$RepoRoot = [IO.Path]::GetFullPath((Join-Path $ScriptDir '..'))
+$rel  = [IO.Path]::GetFullPath($ReleaseRoot)
 $zip  = Join-Path $rel "HuFu虎符输入法-v$Version-无模型.zip"
 $exe  = Join-Path $rel "HuFuSetup-$Version.exe"
-$pack = 'E:\DSH-KF\hufu\发行脚本\pack.ps1'
-$setup= 'E:\DSH-KF\hufu\platform\windows\setup\build-setup.ps1'
+$pack = Join-Path $ScriptDir 'pack.ps1'
+$setup= Join-Path $RepoRoot 'platform\windows\setup\build-setup.ps1'
 
 # 【P2-27 2026-11-04】核验升级：原来 -VerifyOnly 只查「文件在不在 + 哈希」，
 # 版本号写错、zip 里装的是上一版、装了个空壳 exe 都验不出来（护栏只是提示）。
@@ -51,7 +54,7 @@ function Verify([string]$tag) {
         try {
             $za = [System.IO.Compression.ZipFile]::OpenRead($zip)
             $names = @($za.Entries | ForEach-Object { $_.FullName })
-            foreach ($need in @('hufu-server.exe','hufu_tsf.dll','install.ps1','hufu-render-helper.exe')) {
+            foreach ($need in @('hufu-server.exe','hufu-trainer.exe','hufu_tsf.dll','install.ps1','hufu-render-helper.exe')) {
                 [void](VCheck ($names -contains $need) "zip 内 $need")
             }
             $ve = $za.Entries | Where-Object { $_.FullName -eq 'version.txt' } | Select-Object -First 1
@@ -60,7 +63,7 @@ function Verify([string]$tag) {
             }
             [void](VCheck ($zipVer -eq $Version) "zip 内 version.txt = '$zipVer'（应为 $Version）")
             # 关键指纹：zip 内 install.ps1 必须与仓内单一事实源逐字节一致（漂移检出）
-            $repoInst = 'E:\DSH-KF\hufu\platform\windows\install\install.ps1'
+            $repoInst = Join-Path $RepoRoot 'platform\windows\install\install.ps1'
             $ie = $za.Entries | Where-Object { $_.FullName -eq 'install.ps1' } | Select-Object -First 1
             if ((Test-Path $repoInst) -and $ie) {
                 $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("hufu-verify-" + [guid]::NewGuid().ToString('N') + ".ps1")
@@ -70,7 +73,7 @@ function Verify([string]$tag) {
                 Remove-Item $tmp -Force -EA SilentlyContinue
                 [void](VCheck ($h1 -eq $h2) "zip 内 install.ps1 = 仓内单一事实源（SHA256 $($h1.Substring(0,12))…）")
             } else {
-                Write-Host '  [SKIP] 仓内 install.ps1 不在（他机校验）——跳过脚本指纹比对' -ForegroundColor Yellow
+                [void](VCheck $false '当前仓库或zip缺少 install.ps1，无法核实同源脚本指纹')
             }
             $za.Dispose()
         } catch {
@@ -112,9 +115,9 @@ Write-Host '—— [0/2] 同步更新日志（仓内主副本 → 打包源）�
 # 【防漂移 2026-10-18】更新日志唯一事实源在仓内（发行脚本\更新日志.txt，
 # git 跟踪）；打包前自动覆盖打包源副本——此前日志只活在打包源、无 git
 # 记账，v1.8.7 曾整版漏写随包发行。
-$changelog = 'E:\DSH-KF\hufu\发行脚本\更新日志.txt'
+$changelog = Join-Path $ScriptDir '更新日志.txt'
 if (Test-Path $changelog) {
-    Copy-Item $changelog 'E:\DSH-KF\hufu-发行\打包源\更新日志.txt' -Force
+    Copy-Item $changelog (Join-Path $rel '打包源\更新日志.txt') -Force
     $first = (Get-Content $changelog -TotalCount 1 -Encoding UTF8)
     Write-Host "  已同步，当前最新条目：$first"
     if ($first -notmatch [regex]::Escape($Version)) {
@@ -128,16 +131,16 @@ if (Test-Path $changelog) {
         Write-Host "  [警告] 日志顶部条目不含本版本 $Version——已按 -SkipChangelogCheck 放行（应急，发行报告需说明）" -ForegroundColor Yellow
     }
 } else {
-    Write-Host '  [警告] 仓内无更新日志主副本，沿用打包源现有版' -ForegroundColor Yellow
+    throw "当前仓库缺少更新日志主副本，禁止沿用旧打包源日志：$changelog"
 }
 
 Write-Host '—— [1/2] zip 发行线（pack.ps1）——' -ForegroundColor Cyan
-& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $pack -Version $Version -NoModel
+& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $pack -Version $Version -NoModel -ReleaseRoot $rel
 if ($LASTEXITCODE -ne 0) { Write-Host '✗ zip 线失败，发行中止' -ForegroundColor Red; exit 1 }
 
 # ── 2) exe 线（必须 rust 轨——ps1 轨是回滚轨，装时弹蓝窗） ──
 Write-Host '—— [2/2] exe 发行线（build-setup.ps1 -Engine rust）——' -ForegroundColor Cyan
-& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $setup -Version $Version -Engine rust
+& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $setup -Version $Version -Engine rust -ReleaseRoot $rel
 if ($LASTEXITCODE -ne 0) { Write-Host '✗ exe 线失败，发行中止' -ForegroundColor Red; exit 1 }
 
 Verify '打包后'
@@ -147,10 +150,10 @@ Verify '打包后'
 # 2026-11-03：国内直连 GitHub 只有几十 KB/s，Gitee 实测 2 MB/s。
 if (-not $NoGitee) {
     Write-Host '—— [附加] 同步到 Gitee：Release 附件 + 更新清单 + 站点 ——' -ForegroundColor Cyan
-    $pub = Join-Path $PSScriptRoot 'publish-gitee.ps1'
+    $pub = Join-Path $ScriptDir 'publish-gitee.ps1'
     if (Test-Path $pub) {
         try {
-            & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $pub -Version $Version -PublishSite
+            & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $pub -Version $Version -ExePath $exe -PublishSite
             if ($LASTEXITCODE -ne 0) {
                 Write-Host '  [警告] Gitee 同步非零退出；发行本身已完成，可稍后单独重跑 publish-gitee.ps1' -ForegroundColor Yellow
             }

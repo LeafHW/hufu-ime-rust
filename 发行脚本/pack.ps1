@@ -1,9 +1,9 @@
-﻿param([string]$Version = '1.4.7', [string]$ElevMark = '', [switch]$NoModel, [switch]$PreflightOnly)
+﻿param([string]$Version = '1.4.7', [string]$ElevMark = '', [switch]$NoModel, [switch]$PreflightOnly, [string]$ReleaseRoot = 'E:\DSH-KF\hufu-发行')
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 # HuFu 虎符输入法 · 固化打包脚本（唯一合法打包入口）
 # ────────────────────────────────────────────────────────────
-# 【铁律】本脚本与「打包源」「基线包」同在 E:\DSH-KF\hufu-发行，
-# 打包产物只落在本目录。禁止再出现临时脚本/漂移路径打包。
+# 【铁律】源码与构建产物来自当前仓库；「打包源」「基线包」和发行产物
+# 位于 ReleaseRoot（默认 E:\DSH-KF\hufu-发行）。禁止混用其他仓库产物。
 #
 # 流程（顺序固定）：
 #   0) 前置断言：打包源在位、关键脚本特征在位
@@ -17,10 +17,22 @@
 #
 # 用法：powershell -ExecutionPolicy Bypass -File pack.ps1 [-Version 1.4.2]
 $ErrorActionPreference = 'Stop'
-$REL  = 'E:\DSH-KF\hufu-发行'
-# 【2026-10-12】scriptblock 调用（IEX/[scriptblock]::Create）下 $PSScriptRoot
-# 为空（PS5.1 无 BOM 脚本不能 -File 直跑的替代通道）——显式回退到本脚本目录。
-$ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { 'E:\DSH-KF\hufu\发行脚本' }
+$REL  = [IO.Path]::GetFullPath($ReleaseRoot)
+# 所有源码与构建产物必须来自执行本脚本的同一仓库，worktree 不回退到原仓。
+$ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } elseif ($PSCommandPath) { Split-Path -Parent $PSCommandPath } else { throw '无法确定脚本路径，请使用 -File 运行当前仓库的 pack.ps1' }
+$RepoRoot = [IO.Path]::GetFullPath((Join-Path $ScriptDir '..'))
+$BuildTarget = 'x86_64-pc-windows-gnu'
+$tsfDir = Join-Path $RepoRoot 'platform\windows'
+$tsfTarget = Join-Path $tsfDir 'target-slim'
+$settingsDir = Join-Path $tsfDir 'hufu-settings'
+$settingsTarget = Join-Path $settingsDir 'target'
+$engineDir = Join-Path $RepoRoot 'engine'
+$engineTarget = Join-Path $engineDir 'target-slim'
+$trainerRoot = Join-Path $RepoRoot 'trainer'
+$trainerTarget = Join-Path $trainerRoot 'target-release'
+foreach ($manifest in @('engine\Cargo.toml','platform\windows\Cargo.toml','platform\windows\hufu-settings\Cargo.toml','trainer\Cargo.toml','settings-app\package.json')) {
+    if (-not (Test-Path (Join-Path $RepoRoot $manifest))) { throw "当前仓库缺少构建来源：$manifest（$RepoRoot）" }
+}
 $SRC  = "$REL\打包源"
 $BASE = "$REL\基线包"
 $LOGD = "$REL\日志"
@@ -43,14 +55,24 @@ function Check($ok, [string]$what) {
     $ok
 }
 
+function Invoke-CargoBuild([string[]]$CargoArgs) {
+    # PS5.1 将重定向的原生 stderr 包装成 ErrorRecord；进度不能触发 Stop。
+    $cargoEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & cargo build --locked @CargoArgs 2>&1 | ForEach-Object { Write-Host "  $_" }
+        $cargoExit = $LASTEXITCODE
+    } finally { $ErrorActionPreference = $cargoEap }
+    if ($cargoExit -ne 0) { throw "构建失败（$cargoExit）：cargo build --locked $($CargoArgs -join ' ')" }
+}
+
 # ── 0) 前置断言 ──
 if (-not (Test-Path "$SRC\install.ps1")) { throw '打包源缺失（从上一版 zip 解压重建到 打包源\）' }
 # 【T9·单一事实源 2026-10-06】安装/卸载脚本以仓内 platform\windows\install\
 # 为准——打包时自动同步进打包源。此前是反向的手工拉平（打包源为主、仓内
 # 为镜像），出过 6 天/23 天漂移事故：修了仓库忘了打包源=修复进不了包。
-# 仓库侧缺失（他机打包）沿用打包源现有版并黄字提示；同步后下方语义特征
-# 断言照常把关（防仓库侧回退/漂移）。
-$repoInst = 'E:\DSH-KF\hufu\platform\windows\install'
+# 仓库侧缺失直接失败；同步后下方语义特征断言把关（防仓库侧回退/漂移）。
+$repoInst = Join-Path $RepoRoot 'platform\windows\install'
 if (Test-Path "$repoInst\install.ps1") {
     # 【B1 复审修复 2026-11-05】bat 三件套同样以仓内为单一事实源
     # （此前只同步 ps1，修了仓内 bat 忘打包源=修复进不了 zip）。
@@ -68,7 +90,7 @@ if (Test-Path "$repoInst\install.ps1") {
         }
     }
 } else {
-    Write-Host '  [警告] 仓内 install 目录缺失——沿用打包源现有脚本（他机打包回退）' -ForegroundColor Yellow
+    throw "当前仓库 install 目录缺失，禁止沿用其他仓库或旧打包源的安装脚本：$repoInst"
 }
 $t = [System.IO.File]::ReadAllText("$SRC\install.ps1", [System.Text.Encoding]::UTF8)
 $ok0 = $true
@@ -143,7 +165,7 @@ foreach ($bf in @('卸载.bat', '安装.bat', '设置.bat')) {
 # NEXT_INDEX 为空，/next 404、设置页回落 278KB 旧页。修法：server 编译前
 # 无条件重建 dist（缺 npm/缺 node_modules/构建非 0 一律停发），编译后按
 # 资产名 + index.html 全文做内嵌校验（等价 /api/about 的 ui_build 口径）。
-$appDir  = 'E:\DSH-KF\hufu\settings-app'
+$appDir  = Join-Path $RepoRoot 'settings-app'
 $distDir = Join-Path $appDir 'dist'
 if (-not (Test-Path (Join-Path $appDir 'package.json'))) { throw "设置页源码缺失：$appDir" }
 if (-not (Test-Path (Join-Path $appDir 'node_modules'))) {
@@ -188,24 +210,23 @@ if ($PreflightOnly) {
 # debuginfo/符号不进发布包；平时 target 目录保持 debug=true 供冻结
 # 取证不受影响）。增量编译：无源码变化时秒级跳过。
 Write-Host '—— 瘦身构建（target-slim）——'
+$savedBuildEnv = @{}
+foreach ($envName in @('CARGO_TARGET_DIR','CARGO_PROFILE_RELEASE_DEBUG','CARGO_PROFILE_RELEASE_STRIP')) { $savedBuildEnv[$envName] = [Environment]::GetEnvironmentVariable($envName, 'Process') }
+try {
 $env:CARGO_PROFILE_RELEASE_DEBUG = '0'
 $env:CARGO_PROFILE_RELEASE_STRIP = 'symbols'
-$env:CARGO_TARGET_DIR = 'E:\DSH-KF\hufu\platform\windows\target-slim'
-$tsfDir = 'E:\DSH-KF\hufu\platform\windows'
+$env:CARGO_TARGET_DIR = $tsfTarget
 $builds = @(
-    @{ dir = $tsfDir; args = @('--release', '--target', 'x86_64-pc-windows-gnu', '-p', 'hufu-tsf') },
+    @{ dir = $tsfDir; args = @('--release', '--target', $BuildTarget, '-p', 'hufu-tsf') },
     # 【2026-10-12】i686 必须带 llvm-mingw-entry：本地 llvm-mingw 工具链
     # 无 gcc 链接器，DllEntryPoint 用 feature 内 stub；上游 3070da9 起
     # 该 stub 已 feature 化——漏带 = 链接失败/入口缺失。
     @{ dir = $tsfDir; args = @('--release', '--target', 'i686-pc-windows-gnu', '-p', 'hufu-tsf', '--features', 'llvm-mingw-entry') },
-    @{ dir = $tsfDir; args = @('--release', '-p', 'hufu-tsf-smoke') }
+    @{ dir = $tsfDir; args = @('--release', '--target', $BuildTarget, '-p', 'hufu-tsf-smoke') }
 )
 foreach ($b in $builds) {
     Push-Location $b.dir
-    cmd /c "cargo build $($b.args -join ' ') 2>&1" | ForEach-Object { Write-Host "  $_" }
-    $code = $LASTEXITCODE
-    Pop-Location
-    if ($code -ne 0) { throw "瘦身构建失败: cargo build $($b.args -join ' ')" }
+    try { Invoke-CargoBuild -CargoArgs $b.args } finally { Pop-Location }
 }
 # hufu-settings 是独立 workspace（不在 platform\windows 成员里），必须单独构建，
 # 否则打包源会留着旧 exe（端口自探测修复曾因此进不了包）。
@@ -213,17 +234,14 @@ foreach ($b in $builds) {
 # platform\windows\target-slim：cargo 会把 hufu-settings 产物也写进
 # target-slim\release，而下面复制的是本 crate 的 target\release（旧 exe）。
 # v1.9.9.1 因此把「黑边修复」发丢了——构建前必须清掉/恢复该环境变量。
-Push-Location 'E:\DSH-KF\hufu\platform\windows\hufu-settings'
+Push-Location $settingsDir
 $savedTargetDir = $env:CARGO_TARGET_DIR
-Remove-Item Env:CARGO_TARGET_DIR -ErrorAction SilentlyContinue
-cmd /c 'cargo build --release 2>&1' | ForEach-Object { Write-Host "  $_" }
-$code = $LASTEXITCODE
-if ($savedTargetDir) { $env:CARGO_TARGET_DIR = $savedTargetDir }
-Pop-Location
-if ($code -ne 0) { throw '瘦身构建失败: hufu-settings' }
+$env:CARGO_TARGET_DIR = $settingsTarget
+try { Invoke-CargoBuild -CargoArgs @('--release','--target',$BuildTarget) }
+finally { $env:CARGO_TARGET_DIR = $savedTargetDir; Pop-Location }
 # 新鲜度门禁：exe 不能比 src 旧，否则就是构建目录/缓存错位——宁可停发，不再发旧 exe。
-$settingsExe = 'E:\DSH-KF\hufu\platform\windows\hufu-settings\target\release\hufu-settings.exe'
-$settingsSrcNewest = (Get-ChildItem 'E:\DSH-KF\hufu\platform\windows\hufu-settings\src' -Recurse -File |
+$settingsExe = Join-Path $settingsTarget "$BuildTarget\release\hufu-settings.exe"
+$settingsSrcNewest = (Get-ChildItem (Join-Path $settingsDir 'src') -Recurse -File |
     Measure-Object -Property LastWriteTime -Maximum).Maximum
 if (-not (Test-Path $settingsExe)) { throw "hufu-settings.exe 不存在：$settingsExe" }
 $settingsExeTime = (Get-Item $settingsExe).LastWriteTime
@@ -231,26 +249,37 @@ if ($settingsExeTime -lt $settingsSrcNewest) {
     throw "hufu-settings.exe 比源码旧（exe=$settingsExeTime，src=$settingsSrcNewest）——构建目录/缓存错位，禁止打包旧 exe"
 }
 
-$env:CARGO_TARGET_DIR = 'E:\DSH-KF\hufu\engine\target-slim'
-Push-Location 'E:\DSH-KF\hufu\engine'
+$env:CARGO_TARGET_DIR = $engineTarget
+Push-Location $engineDir
 # 【P1-13 2026-11-04】hufu-render-helper（SSF 实时框出图小助手）与本线
 # 一起构建：此前 pack/setup 都不复制它，server 侧只能用 PowerShell+Add-Type
 # 回退驱动（2~3s 出图，用户实锤「生效慢」）。单 crate、零外部依赖，增量秒级。
-cmd /c 'cargo build --release -p hufu-server -p hufu-render-helper 2>&1' | ForEach-Object { Write-Host "  $_" }
-$code = $LASTEXITCODE
-Pop-Location
-Remove-Item Env:CARGO_TARGET_DIR, Env:CARGO_PROFILE_RELEASE_DEBUG, Env:CARGO_PROFILE_RELEASE_STRIP
-if ($code -ne 0) { throw '瘦身构建失败: hufu-server / hufu-render-helper' }
+try { Invoke-CargoBuild -CargoArgs @('--release','--target',$BuildTarget,'-p','hufu-server','-p','hufu-render-helper') } finally { Pop-Location }
+$env:CARGO_TARGET_DIR = $trainerTarget
+Push-Location $trainerRoot
+try {
+    Invoke-CargoBuild -CargoArgs @('--release','--target',$BuildTarget,'--manifest-path',(Join-Path $trainerRoot 'Cargo.toml'),'-p','gale-app','--bin','hufu-trainer')
+} finally { Pop-Location }
+$trainerExe = Join-Path $trainerTarget "$BuildTarget\release\hufu-trainer.exe"
+if (-not (Test-Path $trainerExe)) { throw "跟打器产物缺失：$trainerExe" }
+} finally {
+    foreach ($envName in $savedBuildEnv.Keys) { [Environment]::SetEnvironmentVariable($envName, $savedBuildEnv[$envName], 'Process') }
+}
 Write-Host '  [OK] 瘦身构建完成'
+Copy-Item $trainerExe (Join-Path $SRC 'hufu-trainer.exe') -Force
+$trainerLicenseDir = Join-Path $SRC 'licenses\trainer'
+New-Item -ItemType Directory -Force -Path $trainerLicenseDir | Out-Null
+Copy-Item (Join-Path $trainerRoot 'drills\NOTICE.md') $trainerLicenseDir -Force
+Copy-Item (Join-Path $trainerRoot 'licenses\*') $trainerLicenseDir -Force
 $copies = @(
-    @('E:\DSH-KF\hufu\platform\windows\target-slim\x86_64-pc-windows-gnu\release\hufu_tsf.dll', (Join-Path $SRC 'hufu_tsf.dll')),
-    @('E:\DSH-KF\hufu\platform\windows\target-slim\i686-pc-windows-gnu\release\hufu_tsf.dll', (Join-Path $SRC 'hufu_tsf32.dll')),
-    @('E:\DSH-KF\hufu\engine\target-slim\release\hufu-server.exe', (Join-Path $SRC 'hufu-server.exe')),
-    @('E:\DSH-KF\hufu\platform\windows\target-slim\release\hufu-tsf-smoke.exe', (Join-Path $SRC 'hufu-tsf-smoke.exe')),
-    @('E:\DSH-KF\hufu\platform\windows\hufu-settings\target\release\hufu-settings.exe', (Join-Path $SRC 'hufu-settings.exe')),
+    @((Join-Path $tsfTarget "$BuildTarget\release\hufu_tsf.dll"), (Join-Path $SRC 'hufu_tsf.dll')),
+    @((Join-Path $tsfTarget 'i686-pc-windows-gnu\release\hufu_tsf.dll'), (Join-Path $SRC 'hufu_tsf32.dll')),
+    @((Join-Path $engineTarget "$BuildTarget\release\hufu-server.exe"), (Join-Path $SRC 'hufu-server.exe')),
+    @((Join-Path $tsfTarget "$BuildTarget\release\hufu-tsf-smoke.exe"), (Join-Path $SRC 'hufu-tsf-smoke.exe')),
+    @($settingsExe, (Join-Path $SRC 'hufu-settings.exe')),
     # 【P1-13】server 侧探测 C:\Windows\SystemIME\HuFu\hufu-render-helper.exe
     # （main.rs ssf_render_inner），安装器负责拷进 SystemIME；zip 里必须带。
-    @('E:\DSH-KF\hufu\engine\target-slim\release\hufu-render-helper.exe', (Join-Path $SRC 'hufu-render-helper.exe'))
+    @((Join-Path $engineTarget "$BuildTarget\release\hufu-render-helper.exe"), (Join-Path $SRC 'hufu-render-helper.exe'))
 )
 foreach ($c in $copies) {
     if (Test-Path $c[0]) { Copy-Item $c[0] $c[1] -Force; [void](Check $true "同步 $($c[1].Split([char]92)[-1])") }
@@ -262,10 +291,10 @@ foreach ($c in $copies) {
 # 图标版 exe 洗回裸版（1.9.8 二轮重打曾中招：target-slim 被重编后图标
 # 丢失）。现统一在复制后对 hufu-server.exe / hufu-settings.exe 嵌图标
 # （整数资源 ID 方案，embed-icon.py，PrivateExtractIconsW 验收口径）。
-$embedPy = Join-Path $PSScriptRoot 'embed-icon.py'
-$icoPath  = 'E:\DSH-KF\hufu\platform\windows\install\hufu-current.ico'
+$embedPy = Join-Path $ScriptDir 'embed-icon.py'
+$icoPath  = Join-Path $RepoRoot 'platform\windows\install\hufu-current.ico'
 if ((Test-Path $embedPy) -and (Test-Path $icoPath)) {
-    foreach ($exeName in @('hufu-server.exe', 'hufu-settings.exe')) {
+    foreach ($exeName in @('hufu-server.exe', 'hufu-settings.exe', 'hufu-trainer.exe')) {
         $exePath = Join-Path $SRC $exeName
         if (Test-Path $exePath) {
             cmd /c "python -X utf8 `"$embedPy`" `"$exePath`" `"$icoPath`" 2>&1" | ForEach-Object { Write-Host "  $_" }
@@ -323,7 +352,7 @@ $personalVia = ''
 foreach($cand in @(
     @{ p = $liveMa;                                             tag = "安装目录 $liveMa" },
     @{ p = 'D:\HuFu\码表';                                      tag = '开发部署 D:\HuFu\码表' },
-    @{ p = (Get-ChildItem 'E:\DSH-KF\hufu-发行' -Directory -Filter '用户数据备份-*卸载前' -EA SilentlyContinue |
+    @{ p = (Get-ChildItem $REL -Directory -Filter '用户数据备份-*卸载前' -EA SilentlyContinue |
         Sort-Object Name -Descending | Select-Object -First 1 | ForEach-Object { Join-Path $_.FullName '码表' });
                                                                 tag = '最近卸载前备份' }
 )) {
@@ -750,7 +779,7 @@ Add-Type -AssemblyName System.IO.Compression.FileSystem
 # ── 3) 核验 A：存在性 ──
 $arc = [System.IO.Compression.ZipFile]::OpenRead($tmpZip)
 $all = $true
-foreach ($n in @('hufu_tsf.dll','hufu_tsf32.dll','hufu-server.exe','hufu-tsf-smoke.exe','install.ps1','uninstall.ps1','安装.bat','卸载.bat','设置.bat','使用说明.txt','更新日志.txt','图标.ico','TigerClaw.Sentence.Native.dll')) {
+foreach ($n in @('hufu_tsf.dll','hufu_tsf32.dll','hufu-server.exe','hufu-trainer.exe','hufu-tsf-smoke.exe','install.ps1','uninstall.ps1','安装.bat','卸载.bat','设置.bat','使用说明.txt','更新日志.txt','图标.ico','TigerClaw.Sentence.Native.dll')) {
     $all = (Check ($arc.Entries.FullName -contains $n) "包内 $n") -and $all
 }
 $all = (Check ($null -ne ($arc.Entries | Where-Object { $_.FullName -match '数据[/\\]config\.json$' })) '包内 数据\config.json') -and $all
@@ -762,7 +791,7 @@ $all = (Check ($null -ne $eRh -and $eRh.Length -gt 50000) "渲染小助手 hufu-
 # PowerShell/cmd 解释器。二进制级查 powershell/pwsh 调用特征（cmd.exe
 # 裸串为 Rust std 处理 .bat 参数的内建字符串、无法从产物中消除，故不在
 # 二进制级查它，由源码级门禁兜住）。检出即 FAIL 阻断发版。
-$ziBins = @('hufu-server.exe','hufu-settings.exe','hufu_tsf.dll','hufu_tsf32.dll','hufu-render-helper.exe')
+$ziBins = @('hufu-server.exe','hufu-settings.exe','hufu-trainer.exe','hufu_tsf.dll','hufu_tsf32.dll','hufu-render-helper.exe')
 foreach ($zin in $ziBins) {
     $e = $arc.Entries | Where-Object { $_.FullName -eq $zin } | Select-Object -First 1
     $bad = $null
@@ -785,9 +814,8 @@ foreach ($zin in $ziBins) {
 # spawn（首参非字面量）逐一列出，无 zi-ok: 豁免注释即 FAIL——豁免注释
 # 写在 Command::new 同一行，注明目标是什么、为何非解释器；③源码目录从
 # $PSScriptRoot 推导（硬编码绝对路径在仓挪位后静默空转），目录缺失即 FAIL。
-$ziRoot = (Resolve-Path (Join-Path $ScriptDir '..')).Path
-# 【复审 N3 2026-11-07】$ScriptDir（:23 定义）带 scriptblock 通道的硬编码
-# 回退——直取 $PSScriptRoot 在 IEX/[scriptblock]::Create 调用下为空，报错误导。
+$ziRoot = $RepoRoot
+# ScriptDir 必须来自当前脚本的真实路径，无法确定时在入口处直接失败。
 # 【B2 复审修复 2026-11-05】列举固定 4 个叶子 src 有盲区（新增 crate
 # 不进网）。改通配：engine\crates\*\src 与 platform\windows\*\src
 # 全部叶子 crate 的 src 递归进网，新增 crate 自动纳入；无 src 的目录
@@ -796,7 +824,8 @@ $ziRoot = (Resolve-Path (Join-Path $ScriptDir '..')).Path
 # UTF-16 扫描；本门禁与编译器共同构成双保险。
 $ziSrcDirs = @(
     @(Get-ChildItem (Join-Path $ziRoot 'engine\crates') -Directory | ForEach-Object { Join-Path $_.FullName 'src' }),
-    @(Get-ChildItem (Join-Path $ziRoot 'platform\windows') -Directory | ForEach-Object { Join-Path $_.FullName 'src' })
+    @(Get-ChildItem (Join-Path $ziRoot 'platform\windows') -Directory | ForEach-Object { Join-Path $_.FullName 'src' }),
+    @(Get-ChildItem (Join-Path $ziRoot 'trainer\crates') -Directory | ForEach-Object { Join-Path $_.FullName 'src' })
 ) | ForEach-Object { $_ } | Where-Object { Test-Path $_ }
 # 【B2 死守卫修复 2026-11-07】Where-Object 已滤掉不存在目录，循环内
 # Test-Path 恒真=死代码；改为循环外断言枚举数量下限（当前仓库 15 个 src），
@@ -913,7 +942,7 @@ if ($NoModel) {
 #    即无模型版，本段跳过——曾经在此发生 $szip==$zip 自删事故）──
 if (-not $NoModel) {
 $szipName = "HuFu虎符输入法-v$Version-无模型.zip"
-$szip = Join-Path $ScriptDir $szipName
+$szip = Join-Path $REL $szipName
 $sall = $true
 if (Test-Path $szip) { Remove-Item $szip -Force }
 Copy-Item $zip $szip -Force

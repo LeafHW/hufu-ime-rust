@@ -16,6 +16,7 @@ platform/windows/target-verify/
 target-slim/
 target159/
 target-build/
+target-release/
 platform/windows/install/install.log
 _tmp
 

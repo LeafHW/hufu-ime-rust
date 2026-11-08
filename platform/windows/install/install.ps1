@@ -175,15 +175,10 @@ if ($PhaseElevated) {
         }
         if ($n -gt 0) { Write-Host "清理诊断日志: $n 个" }
     }
-    # 3) 【早期版本残留 2026-09-07】%LOCALAPPDATA%\HuFu（绿色化前旧版
-    #    数据目录——新版数据全部在安装目录，此目录属残留，安装时清除）
+    # 3) %LOCALAPPDATA%\HuFu 同时存放跟打记录；升级保留整个用户数据目录。
     $legacyLocal = Join-Path $env:LOCALAPPDATA 'HuFu'
     if (Test-Path $legacyLocal) {
-        try {
-            Get-ChildItem $legacyLocal -Recurse -Force -ErrorAction SilentlyContinue | ForEach-Object { $_.Attributes = 'Normal' }
-            Remove-Item $legacyLocal -Recurse -Force -ErrorAction Stop
-            Write-Host '清理早期版本数据: %LOCALAPPDATA%\HuFu'
-        } catch { Write-Host '· %LOCALAPPDATA%\HuFu 被占用，下次安装再清' }
+        Write-Host '已保留用户数据（含跟打记录）: %LOCALAPPDATA%\HuFu'
     }
     Write-Host '—— 提权阶段：HKLM 机器级注册 ——'
     $ips = "HKLM:\SOFTWARE\Classes\CLSID\$CLSID\InprocServer32"
@@ -265,7 +260,7 @@ $legacy = Join-Path $env:LOCALAPPDATA 'HuFu'
 if (Test-Path (Join-Path $legacy 'hufu-server.exe')) {
     $mb = [math]::Round((Get-ChildItem $legacy -Recurse -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum / 1MB)
     Write-Host "· 检测到旧版安装目录：$legacy（约 ${mb}MB）"
-    Write-Host '  本次安装完成后确认输入法正常，即可删除该目录释放空间。'
+    Write-Host '  该目录同时存放跟打记录，请保留用户数据，仅手动清理已不用的旧程序文件。'
 }
 
 # ── 1) 文件检查（原地运行：不拷贝；数据/模型直接在本目录使用）──
@@ -521,7 +516,14 @@ try {
     $lnk.WorkingDirectory = $inst
     $lnk.IconLocation = $icon
     $lnk.Save()
-    Write-Host 'OK 开机自启 + 开始菜单快捷方式「HuFu 虎符输入法设置」'
+    if (Test-Path (Join-Path $inst 'hufu-trainer.exe')) {
+        $trainerLink = $ws.CreateShortcut((Join-Path $sm 'HuFu 虎符跟打器.lnk'))
+        $trainerLink.TargetPath = (Join-Path $inst 'hufu-trainer.exe')
+        $trainerLink.WorkingDirectory = $inst
+        $trainerLink.IconLocation = $icon
+        $trainerLink.Save()
+    }
+    Write-Host 'OK 开机自启 + 开始菜单快捷方式「HuFu 虎符输入法设置」「HuFu 虎符跟打器」'
 } catch {
     Write-Host 'OK 开机自启已设置（开始菜单快捷方式失败，可忽略）'
 }
@@ -569,7 +571,7 @@ Write-Host '  · 卸载：运行「卸载.bat」后把本文件夹整个删除�
 Write-Host '=========================================='
 Write-Host '  · 无需重启/注销；正在运行的应用重开后才加载新输入法'
 if ($legacy -and (Test-Path (Join-Path $legacy 'hufu-server.exe'))) {
-    Write-Host "  · 记得删除旧版目录释放 ${mb}MB：$legacy"
+    Write-Host "  · 旧目录约 ${mb}MB，内含用户数据，请勿整目录删除：$legacy"
 }
 $perUserFull = $NoHKLM -and (Test-Path $sysdll) -and (Test-Path "HKLM:\SOFTWARE\Microsoft\CTF\TIP\$CLSID")
 if (-not (Test-Path $sysdll)) { Write-Host '  · 本机未做机器级注册：开始菜单/UWP 暂不可用（下次以管理员运行安装器一次即可）' }

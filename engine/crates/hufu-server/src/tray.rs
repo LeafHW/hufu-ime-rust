@@ -326,6 +326,7 @@ extern "system" {
     ) -> isize;
     fn DefWindowProcW(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> isize;
     fn RegisterHotKey(hwnd: isize, id: i32, modifiers: u32, vk: u32) -> i32;
+    fn UnregisterHotKey(hwnd: isize, id: i32) -> i32;
     fn RegisterClassW(lpwcx: *const WNDCLASSW) -> u16;
     fn CreatePopupMenu() -> isize;
     fn AppendMenuW(hmenu: isize, uflags: u32, idm: usize, text: *const u16) -> i32;
@@ -340,6 +341,7 @@ extern "system" {
     ) -> i32;
     fn GetCursorPos(lppoint: *mut POINT) -> i32;
     fn SetForegroundWindow(hwnd: isize) -> i32;
+    fn MessageBoxW(hwnd: isize, text: *const u16, caption: *const u16, typ: u32) -> i32;
     fn DestroyMenu(hmenu: isize) -> i32;
     fn PostQuitMessage(exitcode: i32);
     fn PostMessageW(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> i32;
@@ -402,6 +404,8 @@ const WM_HOTKEY: u32 = 0x0312;
 const WM_TIMER: u32 = 0x0113;
 /// 「输入法激活态变化」投递消息（wparam=1 激活 / 0 未激活）
 const WM_APP_IME: u32 = 0x8001;
+const WM_APP_TRAINER_CONFIG: u32 = 0x8004;
+const HOTKEY_ID_TRAINER: i32 = 0x4848;
 /// 激活消失防抖定时器 id（进程切换焦点时旧进程 Deactivate 与新进程
 /// Activate 交错，先 false 后 true——延时确认再隐藏，避免图标闪烁）
 const TIMER_IME_HIDE: usize = 1;
@@ -414,6 +418,30 @@ static IME_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// tray 隐藏窗口句柄（candwin 死窗重建请求用）
 pub fn tray_hwnd() -> isize {
     TRAY_HWND.load(Ordering::SeqCst)
+}
+
+/// Post only: configuration callers may still hold the engine lock.
+pub fn refresh_trainer_shortcut() {
+    let hwnd = tray_hwnd();
+    if hwnd != 0 {
+        unsafe {
+            let _ = PostMessageW(hwnd, WM_APP_TRAINER_CONFIG, 0, 0);
+        }
+    }
+}
+
+fn trainer_enabled() -> bool {
+    SHARED
+        .get()
+        .and_then(|host| host.lock().ok().map(|h| h.engine.config.trainer.enabled))
+        .unwrap_or(false)
+}
+
+unsafe fn apply_trainer_shortcut(hwnd: isize) {
+    let _ = UnregisterHotKey(hwnd, HOTKEY_ID_TRAINER);
+    if trainer_enabled() {
+        let _ = RegisterHotKey(hwnd, HOTKEY_ID_TRAINER, 0x2 | 0x1 | 0x4000, 0x54);
+    }
 }
 
 /// DLL 侧 Activate/Deactivate 经管道上报（pipe.rs op "ime" 转发至此）。
@@ -441,6 +469,7 @@ const MF_POPUP: u32 = 0x10;
 const MF_CHECKED: u32 = 0x8;
 
 const IDM_SETTINGS: usize = 1;
+const IDM_TRAINER: usize = 4;
 const IDM_QUIT: usize = 3;
 /// 方案子菜单命令 id 基址：100+序号（上限 40 个方案）
 const IDM_SCHEMA_BASE: i32 = 100;
@@ -482,6 +511,26 @@ pub fn open_settings() {
     }
     if let Some(tx) = OPEN_SETTINGS.get() {
         let _ = tx.send(());
+    }
+}
+
+/// Tray and global-hotkey launches have no visible console for error output.
+fn open_trainer(hwnd: isize) {
+    let result = SHARED
+        .get()
+        .ok_or_else(|| "输入引擎尚未就绪".to_string())
+        .and_then(|host| crate::trainer::open(host));
+    if let Err(e) = result {
+        eprintln!("{e}");
+        let text: Vec<u16> = format!("无法启动虎符跟打。\n\n{e}\0")
+            .encode_utf16()
+            .collect();
+        let caption: Vec<u16> = "虎符跟打 · 启动失败\0".encode_utf16().collect();
+        // MB_OK | MB_ICONERROR | MB_SETFOREGROUND: a native visible error,
+        // including the missing-component or OS process-creation reason.
+        unsafe {
+            MessageBoxW(hwnd, text.as_ptr(), caption.as_ptr(), 0x10 | 0x10000);
+        }
     }
 }
 /// 引擎宿主（托盘右键「切换方案」直调，与 HTTP 路由同源逻辑）
@@ -541,6 +590,10 @@ fn switch_schema(name: &str) {
 extern "system" fn wnd_proc(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> isize {
     unsafe {
         match msg {
+            WM_APP_TRAINER_CONFIG => {
+                apply_trainer_shortcut(hwnd);
+                0
+            }
             // 候选窗重建（宿主退出销毁了子窗口时由 pipe 线程请求）
             0x8003 => {
                 crate::candwin::reinit_if_dead();
@@ -554,6 +607,9 @@ extern "system" fn wnd_proc(hwnd: isize, msg: u32, wparam: usize, lparam: isize)
                 // Ctrl+Shift+H → 只聚焦已开的设置窗（不开新窗）
                 if wparam == 0x4847 {
                     crate::sys_win::raise_settings_window();
+                }
+                if wparam == HOTKEY_ID_TRAINER as usize && trainer_enabled() {
+                    open_trainer(hwnd);
                 }
                 0
             }
@@ -589,6 +645,20 @@ extern "system" fn wnd_proc(hwnd: isize, msg: u32, wparam: usize, lparam: isize)
                         let s1: Vec<u16> = "打开设置页\u{0}".encode_utf16().collect();
                         let s2: Vec<u16> = "退出 HuFu\u{0}".encode_utf16().collect();
                         AppendMenuW(hmenu, MF_STRING, IDM_SETTINGS, s1.as_ptr());
+                        let enabled = trainer_enabled();
+                        let trainer: Vec<u16> = if enabled {
+                            "打开跟打器 (Ctrl+Alt+T)\0"
+                        } else {
+                            "跟打器已关闭（在设置页启用）\0"
+                        }
+                        .encode_utf16()
+                        .collect();
+                        AppendMenuW(
+                            hmenu,
+                            MF_STRING | if enabled { 0 } else { 0x1 },
+                            IDM_TRAINER,
+                            trainer.as_ptr(),
+                        );
                         AppendMenuW(hmenu, MF_SEPARATOR, 0, std::ptr::null());
                         AppendMenuW(hmenu, MF_STRING, IDM_QUIT, s2.as_ptr());
                         let mut pt = POINT { x: 0, y: 0 };
@@ -610,6 +680,8 @@ extern "system" fn wnd_proc(hwnd: isize, msg: u32, wparam: usize, lparam: isize)
                             switch_schema(&submenu_names[(cmd - IDM_SCHEMA_BASE) as usize]);
                         } else if cmd == IDM_SETTINGS as i32 {
                             open_settings();
+                        } else if cmd == IDM_TRAINER as i32 {
+                            open_trainer(hwnd);
                         } else if cmd == IDM_QUIT as i32 {
                             ASK_QUIT.store(true, Ordering::SeqCst);
                             PostQuitMessage(0);
@@ -769,9 +841,9 @@ pub fn spawn(
             0x48, /*'H'*/
         );
         let _ = hk; // 注册失败（被占用）不致命：托盘菜单/设置.bat 仍在
-        // 【设置窗聚焦热键 2026-10-10】Ctrl+Shift+H：已开的设置窗被
-        // 最小化/被盖住时弹到最前（用户规格）。与 Ctrl+Alt+H 分开：
-        // 本键只聚焦不开新窗；注册失败不致命。
+                    // 【设置窗聚焦热键 2026-10-10】Ctrl+Shift+H：已开的设置窗被
+                    // 最小化/被盖住时弹到最前（用户规格）。与 Ctrl+Alt+H 分开：
+                    // 本键只聚焦不开新窗；注册失败不致命。
         const HOTKEY_ID_FOCUS: i32 = 0x4847; // "HG"
         let hk2 = RegisterHotKey(
             hwnd,
@@ -780,9 +852,12 @@ pub fn spawn(
             0x48, /*'H'*/
         );
         let _ = hk2;
-                    // 【无托盘模式】（用户定稿）：不显示任何托盘图标。设置入口=
-                    // Ctrl+Alt+H 全局热键（+ 设置.bat/开始菜单快捷方式）。消息
-                    // 窗口与热键必须保留（WM_HOTKEY 靠窗口接收）。
+        // Failure is harmless when another app owns the shortcut; settings
+        // and the installed executable remain available.
+        apply_trainer_shortcut(hwnd);
+        // 【无托盘模式】（用户定稿）：不显示任何托盘图标。设置入口=
+        // Ctrl+Alt+H 全局热键（+ 设置.bat/开始菜单快捷方式）。消息
+        // 窗口与热键必须保留（WM_HOTKEY 靠窗口接收）。
         let _ = GetCurrentThreadId();
         // 越进程候选窗：在 tray 线程创建（消息循环共用）——沉浸式
         // 宿主（开始菜单搜索）里 DLL 自绘窗被 DWM cloaked，server 代画

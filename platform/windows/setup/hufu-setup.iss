@@ -78,13 +78,13 @@ chinesesimplified.WildRemnant=检测到本机有虎符的残留注册信息（�
 chinesesimplified.EngineFailed=系统注册引擎执行失败（退出码 %s）。详细日志：%s。输入法文件已就位，但注册可能不完整；请重新运行本安装程序，或把日志发给开发者。
 chinesesimplified.DataCopyFailed=数据文件安装出现问题（退出码 %s）。程序与注册仍会继续，但码表可能不完整；请重新运行安装程序。详见：%s
 chinesesimplified.DirChanged=检测到旧版安装在其它目录，本次已按你的选择安装到新目录。%n%n旧目录未做任何改动；如需迁移数据，请手动把旧目录中的 码表\、数据\、模型\、码表导出\ 复制到新目录后重跑安装。
-chinesesimplified.UninstBackupAsk=卸载前请确认数据已备份（码表\、码表导出\、数据\、模型\ 都在安装目录，建议复制到别处保存）。%n%n【是】= 已备份，开始卸载%n【否】= 先不卸了，我先去备份（将打开文件夹并退出卸载）
+chinesesimplified.UninstBackupAsk=卸载前请确认数据已备份（码表\、码表导出\、数据\、模型\ 都在安装目录；跟打文章和成绩在 %LOCALAPPDATA%\HuFu\trainer，建议分别复制到别处保存）。%n%n【是】= 已备份，开始卸载%n【否】= 先不卸了，我先去备份（将打开安装文件夹并退出卸载）
 chinesesimplified.UninstAborted=已退出卸载（未做任何更改）。备份完成后可再次运行卸载。
 chinesesimplified.UpgradeFound=已找到老版虎符，将升级安装，不会影响到码表和个人设置、皮肤等。
 chinesesimplified.UninstDoneKeep=卸载完成。
 chinesesimplified.UninstOldLeft=另有少量被占用的文件（*.old*）重启后自动清理，未清掉的可手动删除。
 chinesesimplified.UninstRebootAsk=是否现在重启？
-chinesesimplified.PurgeDoneInfo=已按你的选择彻底删除全部用户数据。
+chinesesimplified.PurgeDoneInfo=已按你的选择清理安装目录中的用户数据。%n%n跟打文章、成绩和在线登录凭据仍保留在 %LOCALAPPDATA%\HuFu\trainer；确认不再需要时，可手动清理该目录。
 
 [Messages]
 ; 内置消息覆盖（必须在此段；写在 [CustomMessages] 无效——2026-10-13 实锤）
@@ -109,6 +109,7 @@ Type: files; Name: "{app}\设置.bat"
 ; ---------- 程序文件（进卸载日志：卸载时删除） ----------
 Source: "staging\hufu-server.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "staging\hufu-settings.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "staging\hufu-trainer.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "staging\WebView2Loader.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "staging\hufu_tsf.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "staging\hufu_tsf32.dll"; DestDir: "{app}"; Flags: ignoreversion
@@ -153,7 +154,7 @@ Source: "staging\hufu-files-upgrade.lst"; DestDir: "{tmp}"; Flags: deleteafterin
 const
   CLSID = '{8F5C2A10-3E77-4B9C-A1D4-9E0B7C2F5A88}';
   PROFILEGUID = '{8F5C2A11-3E77-4B9C-A1D4-9E0B7C2F5A88}';
-  PEFiles = 'hufu-server.exe,hufu_tsf.dll,hufu_tsf32.dll,hufu-tsf-smoke.exe,TigerClaw.Sentence.Native.dll,hufu-render-helper.exe';
+  PEFiles = 'hufu-server.exe,hufu-trainer.exe,hufu_tsf.dll,hufu_tsf32.dll,hufu-tsf-smoke.exe,TigerClaw.Sentence.Native.dll,hufu-render-helper.exe';
 
 var
   UpgradeMode: Boolean;
@@ -1000,7 +1001,7 @@ begin
         '（4=HKLM 残留，详见 setup-tools.log）');
 #endif
 
-    // 3) 彻底删数据（仅当用户明确选择 /PURGEDATA 或界面勾选）
+    // 3) 清理安装目录中的数据（仅 /PURGEDATA；独立的跟打数据保留）
     if PurgeDataFlag then begin
 #ifdef RUST_ENGINE
       Exec(AppDir + '\hufu-setup-engine.exe',
@@ -1057,7 +1058,9 @@ begin
       '你的数据仍保留在下面这个文件夹（没有删除）：' + #13#10#13#10 +
       AppDir + #13#10#13#10 +
       '里面有：' + #13#10 + DataList + #13#10 +
-      '确认不再需要时，手动删除上面这个文件夹即可彻底清理。';
+      '跟打文章、成绩和在线登录凭据另存并保留于：' + #13#10 +
+      '%LOCALAPPDATA%\HuFu\trainer' + #13#10#13#10 +
+      '确认不再需要时，可分别手动清理上述目录。';
     if UninstallNeedRestart() then begin
       Msg := Msg + #13#10#13#10 + ExpandConstant('{cm:UninstOldLeft}') + #13#10#13#10 + ExpandConstant('{cm:UninstRebootAsk}');
       if MsgBox(Msg, mbInformation, MB_YESNO) = IDYES then begin

@@ -11,6 +11,7 @@ export interface SearchItem {
 }
 
 export const SEARCH_ITEMS: SearchItem[] = [
+  { title: '跟打练习', desc: '启用或关闭跟打器、打开练习窗口', route: 'overview', group: '练习', icon: 'keyboard', keys: '跟打器 跟打 练习 打字 测速 成绩 开关 启用 禁用 ctrl alt t' },
   // 常用入口
   { title: '中英切换', desc: 'Shift / Ctrl+空格 / Caps 行为 / Esc 撤回', route: 'input', group: '输入', icon: 'keyboard', keys: '中英 英文 中文 切换 shift caps ctrl 空格 esc 撤回 上屏 切换英文时保留已输入编码并上屏', sub: 'switch' },
   { title: '编码与上屏', desc: '编码字母表、最大码长、自动上屏、混输', route: 'input', group: '输入', icon: 'keyboard', keys: '编码 码长 上屏 混输 自动 字母表 顶屏 自动上屏', sub: 'input' },

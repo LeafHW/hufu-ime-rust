@@ -2025,6 +2025,20 @@ mod tests {
         assert_eq!(merged["font_family"], "宋体");
     }
 
+    #[test]
+    fn trainer_preference_survives_old_remote_and_merges_explicit_changes() {
+        let full = json!({"trainer":{"enabled":false}, "general":{"autostart":true}});
+        let mut local = full.clone();
+        sanitize_config(&mut local);
+        assert_eq!(local["trainer"]["enabled"], false);
+        let old_remote = json!({"general":{}});
+        assert_eq!(three_way_merge(&full, &local, &local, &old_remote)["trainer"]["enabled"], false);
+        let enabled_remote = json!({"trainer":{"enabled":true}});
+        assert_eq!(three_way_merge(&full, &local, &local, &enabled_remote)["trainer"]["enabled"], true);
+        let old_base = json!({"trainer":{"enabled":true}});
+        assert_eq!(three_way_merge(&full, &local, &old_base, &enabled_remote)["trainer"]["enabled"], false);
+    }
+
     /// manifest 键转义：方案名含 / 时 pointer 安全。
     #[test]
     fn pointer_escape_slash() {

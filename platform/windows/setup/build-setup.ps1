@@ -5,6 +5,7 @@
 #   .\build-setup.ps1 -Version 1.8.2
 # 可选：-PkgSource <打包源>（默认 E:\DSH-KF\hufu-发行\打包源）
 #        -DistDir   <输出目录>（默认 E:\DSH-KF\hufu-发行）
+#        -ReleaseRoot <发行目录>（同时改变上述两个默认值）
 #        -SkipCompile（只做 staging 与清单生成，供检查）
 # 产物：DistDir\HuFuSetup-<版本>.exe（+ SHA256）
 #
@@ -14,8 +15,9 @@
 # ============================================================================
 param(
     [Parameter(Mandatory = $true)][string]$Version,
-    [string]$PkgSource = 'E:\DSH-KF\hufu-发行\打包源',
-    [string]$DistDir = 'E:\DSH-KF\hufu-发行',
+    [string]$PkgSource = '',
+    [string]$DistDir = '',
+    [string]$ReleaseRoot = 'E:\DSH-KF\hufu-发行',
     # 引擎轨（2026-10-14）：ps1=血律 PowerShell（回滚轨）；rust=hufu-setup-engine
     # 编译版接管 install/uninstall/postboot/purge（安装全程零 PowerShell 子进程）。
     # 【轨护栏 2026-10-18】不再给默认值——v1.8.7 事故（漏参出 PS 轨、
@@ -42,6 +44,9 @@ if ($Engine -eq 'ps1') {
 }
 
 $ErrorActionPreference = 'Stop'
+$ReleaseRoot = [IO.Path]::GetFullPath($ReleaseRoot)
+if ([string]::IsNullOrWhiteSpace($PkgSource)) { $PkgSource = Join-Path $ReleaseRoot '打包源' } else { $PkgSource = [IO.Path]::GetFullPath($PkgSource) }
+if ([string]::IsNullOrWhiteSpace($DistDir)) { $DistDir = $ReleaseRoot } else { $DistDir = [IO.Path]::GetFullPath($DistDir) }
 $setupRoot = $PSScriptRoot
 $staging   = Join-Path $setupRoot 'staging'
 $helper    = Join-Path $setupRoot 'helper'
@@ -53,7 +58,7 @@ function Ok([string]$msg)   { Write-Host "OK $msg" -ForegroundColor Green }
 if ($Version -notmatch '^\d+\.\d+\.\d+(\.\d+)?$') { Fail("版本号格式应为 x.y.z 或 x.y.z.w，收到：$Version") }
 
 $needFromPkg = @(
-    'hufu-server.exe','hufu-tsf-smoke.exe','hufu-settings.exe','WebView2Loader.dll',
+    'hufu-server.exe','hufu-trainer.exe','hufu-tsf-smoke.exe','hufu-settings.exe','WebView2Loader.dll',
     'hufu_tsf.dll','hufu_tsf32.dll',
     # 【P1-13 2026-11-04】SSF 实时框出图小助手：server 侧只探测
     # D:\HuFu\ 与 C:\Windows\SystemIME\HuFu\ 两处；exe 轨由
@@ -119,17 +124,21 @@ if ($Engine -eq 'rust') {
     $cargoRoot = Join-Path $setupRoot '..'   # platform\windows（cargo workspace）
     # cargo 把编译进度写 stderr；本脚本 EAP=Stop 下 2>&1 会把首行 ErrorRecord
     # 升级成终止错误——围绕调用临时降为 Continue（真失败由 $LASTEXITCODE 判）。
+    $buildTarget = 'x86_64-pc-windows-gnu'
+    $engineTarget = Join-Path $cargoRoot 'target'
     $prevEap = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
-    & cargo build -p hufu-setup-engine --release --quiet --manifest-path (Join-Path $cargoRoot 'Cargo.toml') 2>&1 | Tee-Object -Variable cargoOut | Out-Null
-    $cargoExit = $LASTEXITCODE
-    $ErrorActionPreference = $prevEap
+    Push-Location $cargoRoot
+    try {
+        & cargo build --locked -p hufu-setup-engine --release --quiet --target $buildTarget --target-dir $engineTarget --manifest-path (Join-Path $cargoRoot 'Cargo.toml') 2>&1 | Tee-Object -Variable cargoOut | Out-Null
+        $cargoExit = $LASTEXITCODE
+    } finally { Pop-Location; $ErrorActionPreference = $prevEap }
     if ($cargoExit -ne 0) {
         $cargoOut | Select-Object -Last 30 | Write-Host
         Fail("cargo 构建 hufu-setup-engine 失败（退出码 $cargoExit）")
     }
-    $engineBuilt = Join-Path $cargoRoot 'target\release\hufu-setup-engine.exe'
-    if (-not (Test-Path $engineBuilt)) { Fail('cargo 报告成功但未找到 target\release\hufu-setup-engine.exe') }
+    $engineBuilt = Join-Path $engineTarget "$buildTarget\release\hufu-setup-engine.exe"
+    if (-not (Test-Path $engineBuilt)) { Fail("cargo 报告成功但未找到 $engineBuilt") }
     Copy-Item $engineBuilt $staging -Force
     Ok(("Rust 引擎已入包：hufu-setup-engine.exe（{0:N0} KB）" -f ((Get-Item $engineBuilt).Length/1KB)))
 }
@@ -142,11 +151,11 @@ if (-not (Test-Path $brandIco)) { Fail('缺少 icons\虎符.ico（先跑 icons\m
 Copy-Item $brandIco "$staging\图标.ico" -Force
 $rcedit = Join-Path $setupRoot 'tools\rcedit-x64.exe'
 if (-not (Test-Path $rcedit)) { Fail('缺少 tools\rcedit-x64.exe（github electron/rcedit releases）') }
-foreach ($pe in @('hufu-server.exe','hufu_tsf.dll','hufu_tsf32.dll','hufu-tsf-smoke.exe')) {
+foreach ($pe in @('hufu-server.exe','hufu-trainer.exe','hufu_tsf.dll','hufu_tsf32.dll','hufu-tsf-smoke.exe')) {
     & $rcedit (Join-Path $staging $pe) --set-icon $brandIco 2>&1 | Out-Null
     if ($LASTEXITCODE -ne 0) { Fail("rcedit 打图标失败：$pe（退出码 $LASTEXITCODE）") }
 }
-Ok('图标已应用：安装器/卸载器 + 图标.ico + 4 个 PE')
+Ok('图标已应用：安装器/卸载器 + 图标.ico + 5 个 PE')
 
 # stub bat 字节卫生：不得 UTF-8 BOM、必须 CRLF（血律：cmd 中文安全）
 foreach ($bat in @("$staging\卸载.bat", "$staging\设置.bat")) {

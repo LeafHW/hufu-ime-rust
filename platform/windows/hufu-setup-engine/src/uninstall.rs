@@ -140,6 +140,7 @@ pub fn run_uninstall(out: &mut Out, no_hklm: bool) -> i32 {
     if let Some(appdata) = std::env::var_os("APPDATA") {
         let programs = PathBuf::from(appdata).join(r"Microsoft\Windows\Start Menu\Programs");
         remove_forced(&programs.join("HuFu 虎符输入法设置.lnk"));
+        remove_forced(&programs.join("HuFu 虎符跟打器.lnk"));
         if let Ok(rd) = std::fs::read_dir(&programs) {
             for e in rd.flatten() {
                 let name = e.file_name().to_string_lossy().to_lowercase();
@@ -150,15 +151,11 @@ pub fn run_uninstall(out: &mut Out, no_hklm: bool) -> i32 {
         }
     }
 
-    // ── uninstall.ps1 L96-102：【早期版本残留】%LOCALAPPDATA%\HuFu ──
+    // %LOCALAPPDATA%\HuFu now also owns trainer articles, scores and settings.
+    // Ordinary uninstall must retain user data, including early-version data.
     let legacy_local = localappdata().join("HuFu");
     if legacy_local.exists() {
-        remove_forced(&legacy_local);
-        if legacy_local.exists() {
-            out.line("· %LOCALAPPDATA%\\HuFu 部分被占用，重启后再跑一次卸载可清");
-        } else {
-            out.line("已清早期版本数据: %LOCALAPPDATA%\\HuFu");
-        }
+        out.line("已保留用户数据（含跟打记录）: %LOCALAPPDATA%\\HuFu");
     }
 
     // ═ 5) uninstall.ps1 L104-147：HKLM 清理（提权时；普通用户跳过——无害残留）═
@@ -422,10 +419,13 @@ pub fn run_uninstall(out: &mut Out, no_hklm: bool) -> i32 {
         }
         // ── uninstall.ps1 L205 ──
         out.line(&format!(
-            "  确认不要了，手动删整个文件夹即彻底清理：{}",
+            "  确认不再需要时，可手动清理安装目录中的数据：{}",
             inst.display()
         ));
     }
+
+    out.line("  跟打文章、成绩和在线登录凭据另存于 %LOCALAPPDATA%\\HuFu\\trainer，仍予保留。");
+    out.line("  确认不再需要时，可另行手动清理跟打数据目录。");
 
     // ═ tools.ps1 L502-509：退出码（HKLM 残留 → 4，否则 0）═══════════════
     if hklm_leftover > 0 {

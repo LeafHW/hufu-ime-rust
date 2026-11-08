@@ -641,7 +641,7 @@ export default function App() {
         />
         <main className="main" ref={mainRef}>
           <section className="screen" id="s-overview">
-            {mountedPages.has('overview') ? <OverviewView data={data} notify={notify} navigate={navigate} /> : null}
+            {mountedPages.has('overview') ? <OverviewView data={data} notify={notify} navigate={navigate} refresh={refresh} /> : null}
           </section>
           <section className="screen" id="s-schemes">
             {mountedPages.has('schemes') ? <SchemesView data={data} notify={notify} /> : null}

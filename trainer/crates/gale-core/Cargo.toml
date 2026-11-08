@@ -1,0 +1,13 @@
+[package]
+name = "gale-core"
+version = "2.0.0"
+edition = "2021"
+description = "疾风2代跟打器 - 平台无关核心逻辑（比对/统计/成绩/文库/报告/主题/配置）"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+# 网络隔离期：toml crate 依赖链(kstring等)无法离线拉取，改用自带 mini_toml（见 lib.rs）
+thiserror = { workspace = true }
+regex = "1"
+sha2 = "0.10"

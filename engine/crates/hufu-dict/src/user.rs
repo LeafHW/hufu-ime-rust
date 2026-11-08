@@ -65,6 +65,14 @@ fn is_circled_word(s: &str) -> bool {
 }
 
 impl UserAdjust {
+    /// Constant-time admission check for read-only background snapshots.
+    pub fn operation_count(&self) -> usize { self.log.len() }
+
+    /// Only call after operation_count has passed a small bound.
+    pub fn snapshot_bytes(&self) -> usize {
+        self.log.iter().map(|e|e.code.len().saturating_add(e.word.len())).sum::<usize>()
+            .saturating_add(self.weights.keys().map(|(c,w)|c.len().saturating_add(w.len())).sum::<usize>())
+    }
     pub fn parse(lines: &[String]) -> Self {
         let mut adj = UserAdjust::default();
         for line in lines {
