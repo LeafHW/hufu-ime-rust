@@ -5,9 +5,10 @@
 //! 与 HTTP API 共享 Host 与 parse_key。
 
 use crate::host::{parse_key, Host};
-#[cfg(windows)]
-use std::io::ErrorKind;
 use std::sync::Mutex;
+#[cfg(windows)]
+#[path = "pipe_io.rs"]
+mod win_io;
 
 #[cfg(windows)]
 const PIPE_NAME: &str = r"\\.\pipe\hufu-ime";
@@ -29,6 +30,10 @@ pub fn dispatch(
     req: &serde_json::Value,
     client_exe: Option<&str>,
 ) -> serde_json::Value {
+    // Serialize skin edits before taking Host. Readers and ordinary input never
+    // enter this lock, including while a settings purge scans other skin files.
+    let _skin_edit = (req.get("op").and_then(|v| v.as_str()) == Some("skin_font_delta"))
+        .then(crate::skin_files::edit_lock);
     // 【防回归修复(10-reg P2) 2026-11-07】保留锁引用供 cand 换肤首帧
     // 的锁外装载段重取（guard 遮蔽参数名，同 route() 的 host_cell）。
     let host_cell: &Mutex<Host> = host;
@@ -108,6 +113,8 @@ pub fn dispatch(
                 let mut r = host.process_key(k);
                 host.candidate_export.owner = owner;
                 export_candidates(&mut host, req, &mut r["state"]);
+                r["state"]["skin_ver"] = serde_json::json!(host.skin_ver);
+                r["state"]["current_schema"] = serde_json::json!(host.engine.config.schema.current);
                 // Ctrl+M 切方案：落盘 + 后台重装整句（与 HTTP /api/schema
                 // 行为一致；旧 setup_sentence 持锁载模型秒级卡全机打字）
                 if host.engine.config.schema.current != schema_before {
@@ -441,19 +448,17 @@ pub fn dispatch(
             let v = req.get("config").cloned().unwrap_or(serde_json::Value::Null);
             match serde_json::from_value::<hufu_config::Config>(v) {
                 Ok(cfg) => {
-                    // 【流畅度二批 2026-11-07】schema 变更段锁外预装载
-                    //（原 apply_config 锁内装载 0.05-2s 顶全机键）。
-                    let need_load = cfg.schema.current != host.engine.config.schema.current
+                    // Preload both schema and global annotations/splits outside
+                    // Host; an assets-only settings edit can be equally expensive.
+                    let schema_changed = cfg.schema.current != host.engine.config.schema.current
                         || cfg.schema.dir != host.engine.config.schema.dir;
-                    let pre = if need_load && !cfg.schema.current.is_empty() {
+                    let pre = if host.config_needs_preparation(&cfg) {
                         let data_dir = host.data_dir.clone();
                         let orig = host.engine.config.schema.current.clone();
-                        let d = cfg.schema.dir.clone();
-                        let c = cfg.schema.current.clone();
                         drop(host);
-                        let loaded = hufu_engine::Engine::load_schema_for(&data_dir, &d, &c);
+                        let prepared = Host::prepare_config(&data_dir, orig, &cfg, schema_changed);
                         host = host_cell.lock().unwrap_or_else(|p| p.into_inner());
-                        Some((orig, loaded))
+                        Some(prepared)
                     } else {
                         None
                     };
@@ -540,6 +545,7 @@ pub fn dispatch(
             let p = crate::ssf::ssf_cache_root(&host.data_dir)
                 .join(id)
                 .join(image.to_lowercase());
+            drop(host);
             match std::fs::read(&p) {
                 Ok(bytes) => match crate::b64::encode(&bytes) {
                     Ok(b) => serde_json::json!({"ok": true, "b64": b}),
@@ -553,9 +559,11 @@ pub fn dispatch(
         // 肤而不是「当前上位」皮肤。仅供 dump 驱动进程调用；真实打字
         // 进程走 "skin"（op 面小、无副作用，不设白名单）。
         "skin_for_render" => {
+            let data_dir = host.data_dir.clone();
+            drop(host);
             let id = req.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string();
             let resp = if !id.is_empty() {
-                crate::ssf::skin_payload(&host.data_dir, &id)
+                crate::ssf::skin_payload(&data_dir, &id)
                     .ok()
                     .map(|(mut sv, _)| {
                         // 实时框只画候选窗本体；挂件由设置页 UI 叠画
@@ -571,19 +579,25 @@ pub fn dispatch(
             resp.unwrap_or_else(|| serde_json::json!({"error": "皮肤不可用"}))
         }
         "skin" => {
-            let id = host.engine.config.appearance.skin.clone();
+            // One coherent snapshot: skin parsing/stat/overrides may hit disk,
+            // and none of them requires serializing unrelated key requests.
+            let config = host.engine.config.clone();
+            let data_dir = host.data_dir.clone();
+            let skins_dir = host.skins_dir();
+            drop(host);
+            let id = config.appearance.skin.clone();
             // 【独立皮肤设置 2026-10-16】SSF 时序号开关可被 per-skin 覆盖
             //（载荷 layout.show_index 同步注入——DLL 双路可读）。
-            let show_index = if host.engine.config.appearance.skin_kind == "ssf" {
+            let show_index = if config.appearance.skin_kind == "ssf" {
                 crate::ssf::SsfOverrides::load_cached(
-                    &crate::ssf::ssf_cache_root(&host.data_dir).join(&id),
+                    &crate::ssf::ssf_cache_root(&data_dir).join(&id),
                 )
                     .show_index
-                    .unwrap_or(host.engine.config.candidates.show_index)
+                    .unwrap_or(config.candidates.show_index)
             } else {
-                host.engine.config.candidates.show_index
+                config.candidates.show_index
             };
-            let delay_show_ms = host.engine.config.candidates.delay_show_ms;
+            let delay_show_ms = config.candidates.delay_show_ms;
             // 【逐候选字号 2026-10】全局（跨皮肤）候选字号阶梯：开关 + 两个
             // 比例。注入皮肤对象 layout（DLL 侧 layout_f/双形态读法直接消费，
             // 与 font_point 同通道）；比例是「×基准字号」的纯倍数，不进皮肤
@@ -594,7 +608,7 @@ pub fn dispatch(
             // 跟随当前高亮项（高亮=first、其余=rest）；false=旧行为（钉
             // 第 1 候选）。与 pcf 共用两档比例，必须同注入、同进指纹。
             let (pcf_on, hl_on, pcf_k1, pcf_k2) = {
-                let a = &host.engine.config.appearance;
+                let a = &config.appearance;
                 (
                     a.per_cand_font,
                     a.hl_font_scale,
@@ -626,27 +640,23 @@ pub fn dispatch(
             // 颜色已转 "#RRGGBBAA"（DLL color_f 序）。解包失败 → 落到
             // 下方默认 JSON 皮路径（与 JSON 皮肤加载失败同款回退——
             // 坏皮绝不弄坏输入）。
-            if host.engine.config.appearance.skin_kind == "ssf" {
+            if config.appearance.skin_kind == "ssf" {
                 // 【流畅度二批 2026-11-07】skin_payload 出锁：bundle 内存
                 // 缓存 miss 时含 MB 级 .ssf 解包（几十-上百 ms 顶键——
-                // 换皮/换版本后首次 poll 场景）；命中时零读盘，回锁后
-                // 只剩 µs 级 json 组装。与 cand op 换肤首帧出锁装载
+                // 换皮/换版本后首次 poll 场景）；使用本请求的配置快照
+                // 组装，避免锁外加载后把两代配置混合。与 cand op 出锁装载
                 //（pipe.rs 10-reg P2 先例）同款模式。
-                let data_dir = host.data_dir.clone();
-                let id_snap = id.clone();
-                drop(host);
-                let payload = crate::ssf::skin_payload(&data_dir, &id_snap);
-                host = host_cell.lock().unwrap_or_else(|p| p.into_inner());
+                let payload = crate::ssf::skin_payload(&data_dir, &id);
                 if let Ok((sv_src, src_fp)) = payload {
-                    let anim = host.engine.config.appearance.anim;
-                    let anim_speed = host.engine.config.appearance.anim_speed;
-                    let anim_flash = host.engine.config.appearance.anim_flash;
+                    let anim = config.appearance.anim;
+                    let anim_speed = config.appearance.anim_speed;
+                    let anim_flash = config.appearance.anim_flash;
                     // 指纹全覆盖（与 JSON 路径同口径）：源内容指纹 + 注入
                     // 字段全部参与（pcf_fp 含 per_cand_font/hl_font_scale/
                     // 两比例）——DLL have_fp 命中即 {"same":true} 微载荷。
                     let fp = format!(
                         "ssf|{id}|{src_fp}|{show_index}|{delay_show_ms}|{anim}|{anim_speed}|{anim_flash}|{}{pcf_fp}",
-                        host.engine.config.schema.current
+                        config.schema.current
                     );
                     if let Some(h) = req.get("have_fp").and_then(|x| x.as_str()) {
                         if !h.is_empty() && h == fp {
@@ -661,7 +671,7 @@ pub fn dispatch(
                         o.insert(
                             "first_show_slide".into(),
                             serde_json::json!(
-                                !host.engine.config.schema.current.contains("整句")
+                                !config.schema.current.contains("整句")
                             ),
                         );
                     }
@@ -675,7 +685,7 @@ pub fn dispatch(
                 }
                 eprintln!("ssf 皮肤 {id} 加载失败，候选窗回默认 JSON 皮肤");
             }
-            let p = host.skins_dir().join(format!("{id}.json"));
+            let p = skins_dir.join(format!("{id}.json"));
             // 【皮肤指纹 2026-11】挂件大图皮肤 JSON 可达 11MB——DLL 每
             // 2.5s 例行重拉在打字线程全量解析（40-80ms 停顿，QQ 抖动
             // 观感的放大器，违「首键要快」）。响应内容=皮肤文件+注入
@@ -689,10 +699,10 @@ pub fn dispatch(
                 "{id}|{:?}|{}|{show_index}|{delay_show_ms}|{}|{}|{}|{}{pcf_fp}",
                 meta.as_ref().and_then(|m| m.modified().ok()),
                 meta.as_ref().map(|m| m.len()).unwrap_or(0),
-                host.engine.config.appearance.anim,
-                host.engine.config.appearance.anim_speed,
-                host.engine.config.appearance.anim_flash,
-                host.engine.config.schema.current,
+                config.appearance.anim,
+                config.appearance.anim_speed,
+                config.appearance.anim_flash,
+                config.schema.current,
             );
             if let Some(h) = req.get("have_fp").and_then(|x| x.as_str()) {
                 if !h.is_empty() && h == fp {
@@ -701,12 +711,12 @@ pub fn dispatch(
             }
             // 【动效全局开关+速度 2026-09-11】注入皮肤对象顶层（DLL 读
             // /skin/anim 或顶层 anim——两形态都认）；设置页·皮肤页控件
-            let anim = host.engine.config.appearance.anim;
-            let anim_speed = host.engine.config.appearance.anim_speed;
+            let anim = config.appearance.anim;
+            let anim_speed = config.appearance.anim_speed;
             // 【选重暂留开关 2026-11】独立于总开关：数字选重上屏的确认
             // 暂留（高亮滑向选中项+~0.15s 收场）。DLL 闪帧门同源读法
             //（/skin/anim_flash 或顶层，缺省 true）。
-            let anim_flash = host.engine.config.appearance.anim_flash;
+            let anim_flash = config.appearance.anim_flash;
             // 【二十四修·动效大瘦身 2026-10-09】入场/退场/上屏停留全线
             // 退役（用户拍板只留平移/尺寸/高亮滑动）——DLL 侧不再消费
             // entrance_anim/commit_hold，注入一并移除。
@@ -727,7 +737,7 @@ pub fn dispatch(
                         // 不滑（旧缓存皮肤安全退化瞬显）。
                         o.insert(
                             "first_show_slide".into(),
-                            serde_json::json!(!host.engine.config.schema.current.contains("整句")),
+                            serde_json::json!(!config.schema.current.contains("整句")),
                         );
                     }
                     put_cand_font(&mut sv);
@@ -743,7 +753,7 @@ pub fn dispatch(
                         o.insert("anim_flash".into(), serde_json::json!(anim_flash));
                         o.insert(
                             "first_show_slide".into(),
-                            serde_json::json!(!host.engine.config.schema.current.contains("整句")),
+                            serde_json::json!(!config.schema.current.contains("整句")),
                         );
                     }
                     put_cand_font(&mut sv);
@@ -772,18 +782,27 @@ pub fn dispatch(
         "skin_font_delta" => {
             let delta = req.get("delta").and_then(|x| x.as_i64()).unwrap_or(1) as i32;
             let id = host.engine.config.appearance.skin.clone();
+            let is_ssf = host.engine.config.appearance.skin_kind == "ssf";
+            let cache_dir = crate::ssf::ssf_cache_root(&host.data_dir).join(&id);
+            let p = host.skins_dir().join(format!("{id}.json"));
+            // The edit guard was acquired before Host. Keep it while loading
+            // and saving the skin selected when this wheel request began, but
+            // let unrelated input proceed throughout the file work.
+            drop(host);
             // 【SSF 滚轮字号 2026-10-16】独立皮肤无 .json 皮肤文件——旧
             // 路径 load 失败直接吞掉滚轮。SSF 分支：per-skin overrides
             // 的 font_pt ±1（基准=现值或 16），写回+指纹推进（skin_ver
             // +载荷 fp 含 overrides → DLL 下次重拉拿到新字号）。
-            if host.engine.config.appearance.skin_kind == "ssf" {
-                let cache_dir = crate::ssf::ssf_cache_root(&host.data_dir).join(&id);
+            if is_ssf {
                 let mut ov = crate::ssf::SsfOverrides::load(&cache_dir);
                 let np = ((ov.font_pt.unwrap_or(16.0) as i32) + delta).clamp(10, 36);
                 ov.font_pt = Some(np as f32);
-                return match ov.save(&cache_dir) {
+                let saved = serde_json::to_vec_pretty(&ov)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+                    .and_then(|bytes| crate::skin_files::write_atomic(&cache_dir.join("overrides.json"), &bytes));
+                return match saved {
                     Ok(()) => {
-                        host.skin_ver += 1;
+                        host_cell.lock().unwrap_or_else(|p| p.into_inner()).skin_ver += 1;
                         serde_json::json!({"font_point": np})
                     }
                     Err(e) => {
@@ -792,7 +811,6 @@ pub fn dispatch(
                     }
                 };
             }
-            let p = host.skins_dir().join(format!("{id}.json"));
             match hufu_skin::Skin::load(&p) {
                 Ok(mut s) => {
                     let op = s.layout.font_point;
@@ -811,9 +829,18 @@ pub fn dispatch(
                     }
                     s.layout.font_point = np as f32;
                     let nl = s.layout.label_font_point;
-                    match s.save(&p) {
+                    // Preserve Skin::save's glass normalization. Atomic
+                    // replacement lets lock-free readers see a complete file.
+                    if s.material.kind == hufu_skin::Material::Glass {
+                        s.layout.shadow_offset_x = 0.0;
+                        s.layout.shadow_offset_y = 0.0;
+                    }
+                    let saved = serde_json::to_vec_pretty(&s)
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+                        .and_then(|bytes| crate::skin_files::write_atomic(&p, &bytes));
+                    match saved {
                         Ok(()) => {
-                            host.skin_ver += 1;
+                            host_cell.lock().unwrap_or_else(|p| p.into_inner()).skin_ver += 1;
                             serde_json::json!({"font_point": np, "label_font_point": nl})
                         }
                         Err(e) => {
@@ -890,12 +917,10 @@ pub fn dispatch(
         // 进程级状态：全局串行 + 用毕 FreeConsole 还原。
         "console_caret" => {
             let pid = req.get("pid").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            drop(host);
             match console_caret_rect_via_attach(pid) {
-                Some([l, t, r, b]) => serde_json::json!({ "rect": [l, t, r, b] }),
-                None => {
-                    let err = console_caret_last_err();
-                    serde_json::json!({ "rect": null, "err": err })
-                }
+                Ok([l, t, r, b]) => serde_json::json!({ "rect": [l, t, r, b] }),
+                Err(err) => serde_json::json!({ "rect": null, "err": err }),
             }
         }
         // 语言栏「中/英」右键菜单数据：码表清单 + 当前方案。
@@ -903,10 +928,11 @@ pub fn dispatch(
         // schema_snapshot 二次锁同一把 Mutex（曾死锁管道线程拖死全机
         // 打字）；这里按 HTTP GET /api/schemas 同源逻辑直算。
         "schemas" => {
-            let dir = hufu_engine::Engine::resolve_data_sub(
-                &host.data_dir,
-                &host.engine.config.schema.dir,
-            );
+            let data_dir = host.data_dir.clone();
+            let schema_dir = host.engine.config.schema.dir.clone();
+            let current = host.engine.config.schema.current.clone();
+            drop(host);
+            let dir = hufu_engine::Engine::resolve_data_sub(&data_dir, &schema_dir);
             let mut names: Vec<String> = std::fs::read_dir(&dir)
                 .map(|rd| {
                     rd.flatten()
@@ -916,7 +942,6 @@ pub fn dispatch(
                 })
                 .unwrap_or_default();
             names.sort();
-            let current = host.engine.config.schema.current.clone();
             serde_json::json!({"schemas": names, "current": current})
         }
         // 语言栏菜单选码表（与 POST /api/schema 同逻辑：换方案 + 清
@@ -930,10 +955,10 @@ pub fn dispatch(
             let name = req.get("name").and_then(|v| v.as_str()).unwrap_or("");
             if !name.is_empty() {
                 let data_dir = host.data_dir.clone();
-                let schema_dir = host.engine.config.schema.dir.clone();
+                let config = host.engine.config.clone();
                 let target = crate::SchemaWatchTarget::capture(&host);
                 drop(host);
-                let loaded = hufu_engine::Engine::load_schema_for(&data_dir, &schema_dir, name);
+                let loaded = hufu_engine::Engine::prepare_schema_for(&data_dir, &config, name);
                 host = host_cell.lock().unwrap_or_else(|p| p.into_inner());
                 if let Ok(schema) = loaded {
                     if crate::apply_preloaded_schema(&mut host, &target, name, schema).unwrap_or(false) {
@@ -947,6 +972,8 @@ pub fn dispatch(
                 &host.data_dir,
                 &host.engine.config.schema.dir,
             );
+            let current = host.engine.config.schema.current.clone();
+            drop(host);
             let mut names: Vec<String> = std::fs::read_dir(&dir)
                 .map(|rd| {
                     rd.flatten()
@@ -956,7 +983,6 @@ pub fn dispatch(
                 })
                 .unwrap_or_default();
             names.sort();
-            let current = host.engine.config.schema.current.clone();
             serde_json::json!({"schemas": names, "current": current})
         }
         // 【2026-09-05·2026-11 演进】原语言栏右键「重载码表」入口已删
@@ -968,10 +994,10 @@ pub fn dispatch(
             //（原 dispatch 持锁内同步 switch_schema 0.05-1s 顶全机键）。
             let name = host.engine.config.schema.current.clone();
             let data_dir = host.data_dir.clone();
-            let schema_dir = host.engine.config.schema.dir.clone();
+            let config = host.engine.config.clone();
             let target = crate::SchemaWatchTarget::capture(&host);
             drop(host);
-            let loaded = hufu_engine::Engine::load_schema_for(&data_dir, &schema_dir, &name);
+            let loaded = hufu_engine::Engine::prepare_schema_for(&data_dir, &config, &name);
             host = host_cell.lock().unwrap_or_else(|p| p.into_inner());
             let ok = match loaded {
                 Ok(schema) => {
@@ -994,6 +1020,7 @@ pub fn dispatch(
                 &host.engine.config.schema.dir,
             )
             .join(&name);
+            drop(host);
             if dir.is_dir() {
                 crate::platform::open_path(&dir);
             }
@@ -1164,7 +1191,9 @@ pub fn dispatch(
             }
             let vol = host.engine.config.sound.volume;
             let pack = host.engine.config.sound.pack.trim().to_string();
-            let p = crate::sound_wav_path(&host.data_dir, &pack, tag);
+            let data_dir = host.data_dir.clone();
+            drop(host);
+            let p = crate::sound_wav_path(&data_dir, &pack, tag);
             match std::fs::read(&p) {
                 Ok(bytes) => serde_json::json!({
                     "data": base64_encode(&bytes),
@@ -1176,10 +1205,12 @@ pub fn dispatch(
         }
         // 【音效包 2026-10-30】包清单 + 当前选中（设置页下拉数据源；DLL 端
         // 不用——键响应已随行包名）
-        "sound_packs" => serde_json::json!({
-            "packs": crate::sound_pack_list(&host.data_dir),
-            "current": host.engine.config.sound.pack.trim(),
-        }),
+        "sound_packs" => {
+            let data_dir = host.data_dir.clone();
+            let current = host.engine.config.sound.pack.trim().to_owned();
+            drop(host);
+            serde_json::json!({"packs": crate::sound_pack_list(&data_dir), "current": current})
+        }
         "clipboard" => {
             // {exe} → {text}：白名单校验 + 读剪贴板（Ctrl+Shift+V 剪贴板上屏）
             let cfg = host.engine.config.clipboard.clone();
@@ -1194,6 +1225,9 @@ pub fn dispatch(
             if !cfg.allows(exe) {
                 return serde_json::json!({"text": null, "reason": "whitelist"});
             }
+            // Delayed clipboard rendering can synchronously wait on its owner.
+            // Authorization is checked against the coherent config snapshot above.
+            drop(host);
             #[cfg(windows)]
             let text = crate::clipboard::read_text();
             #[cfg(not(windows))]
@@ -1254,30 +1288,7 @@ mod imp {
             sd: *mut *mut core::ffi::c_void,
             returned: *mut u32,
         ) -> i32;
-        fn ConnectNamedPipe(pipe: isize, overlapped: *mut core::ffi::c_void) -> i32;
-        fn PeekNamedPipe(
-            h: isize,
-            buf: *mut core::ffi::c_void,
-            buf_size: u32,
-            read: *mut u32,
-            avail: *mut u32,
-            left: *mut u32,
-        ) -> i32;
         fn DisconnectNamedPipe(pipe: isize) -> i32;
-        fn ReadFile(
-            h: isize,
-            buf: *mut u8,
-            len: u32,
-            read: *mut u32,
-            overlapped: *mut core::ffi::c_void,
-        ) -> i32;
-        fn WriteFile(
-            h: isize,
-            buf: *const u8,
-            len: u32,
-            written: *mut u32,
-            overlapped: *mut core::ffi::c_void,
-        ) -> i32;
         fn CloseHandle(h: isize) -> i32;
     }
 
@@ -1329,109 +1340,22 @@ mod imp {
         }
     }
 
-    /// 【三十六修·对等防护】PeekNamedPipe 等数据到达：deadline 内有数
-    /// 据=继续，管道断/超时=false。客户端侧（ipc.rs call_on）早有同款
-    /// 轮询体系，服务端此前纯阻塞 ReadFile——建连后不发帧的僵尸连接
-    /// （本机进程开 255 个静默连接占满 PIPE_UNLIMITED_INSTANCES）会让
-    /// 监听线程 CreateNamedPipe 永败、合法 DLL 连不进。
-    fn wait_avail(h: isize, deadline: Option<std::time::Instant>) -> bool {
-        // 【流畅度二批 2026-11-07】旧实现空闲期固定 sleep(2ms)：键帧
-        // 到达平均白等 ~1ms（最坏 2ms）才开始读——每键的单项最大确
-        // 定性浪费。改 DLL 侧 ipc.rs wait_response 已验证的分级等待
-        //（600µs 自旋→4ms 前 yield→20ms 前 1ms 短睡→之后 10ms）：
-        // 键帧（稳态 dispatch <3ms）几乎全部落在自旋/yield 段即时接
-        // 起；空转唤醒频率也从 500 次/秒降到长闲时的 100 次/秒。
-        let start = std::time::Instant::now();
-        loop {
-            let mut avail: u32 = 0;
-            let ok = unsafe {
-                PeekNamedPipe(
-                    h,
-                    std::ptr::null_mut(),
-                    0,
-                    std::ptr::null_mut(),
-                    &mut avail,
-                    std::ptr::null_mut(),
-                )
-            };
-            if ok == 0 {
-                return false;
-            }
-            if avail > 0 {
-                return true;
-            }
-            match deadline {
-                Some(d) if std::time::Instant::now() >= d => return false,
-                _ => {}
-            }
-            let el = start.elapsed();
-            if el.as_micros() < 600 {
-                for _ in 0..32 {
-                    std::hint::spin_loop();
-                }
-            } else if el.as_millis() < 4 {
-                std::thread::yield_now();
-            } else if el.as_millis() < 20 {
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            } else {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-        }
-    }
+    // Established connections wait indefinitely only while wholly idle. Once
+    // a header starts, its remainder must arrive within the same 2s frame budget.
+    const FRAME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
-    /// 读 n 字节。deadline=Some 时，数据未到位的等待受其约束（数据一
-    /// 旦可见，阻塞 ReadFile 立即返回可用字节，不再受 deadline 影响）。
-    fn read_exact_dl(
-        h: isize,
-        n: usize,
-        deadline: Option<std::time::Instant>,
-    ) -> std::io::Result<Vec<u8>> {
-        let mut buf = vec![0u8; n];
-        let mut done = 0usize;
-        while done < n {
-            if !wait_avail(h, deadline) {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "等待管道数据超时/断开",
-                ));
-            }
-            let mut got = 0u32;
-            let ok = unsafe {
-                ReadFile(
-                    h,
-                    buf.as_mut_ptr().add(done),
-                    (n - done) as u32,
-                    &mut got,
-                    std::ptr::null_mut(),
-                )
-            };
-            if ok == 0 || got == 0 {
-                return Err(std::io::Error::new(ErrorKind::UnexpectedEof, "管道关闭"));
-            }
-            done += got as usize;
-        }
-        Ok(buf)
+    fn read_exact_dl(h: isize, n: usize, deadline: Option<std::time::Instant>) -> std::io::Result<Vec<u8>> {
+        win_io::read_exact(h, n, deadline, None)
     }
 
     fn write_all(h: isize, buf: &[u8]) -> std::io::Result<()> {
-        let mut done = 0usize;
-        while done < buf.len() {
-            let mut wrote = 0u32;
-            let ok = unsafe {
-                WriteFile(
-                    h,
-                    buf.as_ptr().add(done),
-                    (buf.len() - done) as u32,
-                    &mut wrote,
-                    std::ptr::null_mut(),
-                )
-            };
-            if ok == 0 {
-                return Err(std::io::Error::new(ErrorKind::BrokenPipe, "管道写入失败"));
-            }
-            done += wrote as usize;
-        }
-        Ok(())
+        win_io::write_all(h, buf, std::time::Instant::now() + FRAME_TIMEOUT)
+    }
+
+    struct Connection(win_io::OwnedHandle);
+
+    impl Drop for Connection {
+        fn drop(&mut self) { unsafe { DisconnectNamedPipe(self.0.0); } }
     }
 
     /// 单连接处理：读帧 → 派发 → 写帧，直至断开。
@@ -1439,7 +1363,9 @@ mod imp {
     /// 建连即发帧且 head+body 一次写出——两个窗口只拦「建连不发帧」
     /// 与「只发帧头的半包」两类僵尸连接。既有通信史后的空闲等待不受限
     ///（keep-alive 常驻语义不变，deadline=None 阻塞如旧）。
-    fn serve_conn(h: isize, host: &Mutex<Host>) {
+    fn serve_conn(pipe: Connection, host: &Mutex<Host>) {
+        crate::scheduling::input_thread();
+        let h = pipe.0.0;
         // 对端进程名：本连接生命周期内不变，一次反查全程使用
         let client_exe = client_process_exe(h);
         let connect_at = std::time::Instant::now();
@@ -1451,7 +1377,7 @@ mod imp {
                 } else {
                     None
                 };
-                match read_exact_dl(h, 4, dl) {
+                match win_io::read_exact(h, 4, dl, Some(FRAME_TIMEOUT)) {
                     Ok(b) => b,
                     Err(_) => break,
                 }
@@ -1520,14 +1446,11 @@ mod imp {
                 break;
             }
         }
-        unsafe {
-            DisconnectNamedPipe(h);
-            CloseHandle(h);
-        }
     }
 
     /// 阻塞运行管道服务（每实例一线程）。
     pub fn run(host: std::sync::Arc<Mutex<Host>>) -> std::io::Result<()> {
+        crate::scheduling::input_thread();
         let name = wide(PIPE_NAME);
         // 管道 DACL（SDDL）：显式授 Everyone + ALL APPLICATION PACKAGES
         // 读写——默认 DACL（仅创建者/管理员）会拒绝 AppContainer 宿主
@@ -1572,7 +1495,7 @@ mod imp {
             let h = unsafe {
                 CreateNamedPipeW(
                     name.as_ptr(),
-                    PIPE_ACCESS_DUPLEX,
+                    PIPE_ACCESS_DUPLEX | 0x4000_0000, // FILE_FLAG_OVERLAPPED
                     PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
                     PIPE_UNLIMITED_INSTANCES,
                     64 * 1024,
@@ -1591,29 +1514,23 @@ mod imp {
                 std::thread::sleep(std::time::Duration::from_millis(100));
                 continue;
             }
-            if unsafe { ConnectNamedPipe(h, std::ptr::null_mut()) } == 0 {
-                let err = std::io::Error::last_os_error();
-                // ERROR_NO_DATA=232：客户端已断开，继续接受下一连接
-                if err.raw_os_error() == Some(232) {
-                    unsafe { CloseHandle(h) };
-                    continue;
+            let pipe = Connection(win_io::OwnedHandle(h));
+            if let Err(err) = win_io::connect(h, None) {
+                // A disappearing client is normal; the RAII guard closes this
+                // instance. Other failures never kill the accept loop.
+                if err.raw_os_error() != Some(232) {
+                    eprintln!("管道连接异常: {err}，50ms 后继续");
+                    std::thread::sleep(std::time::Duration::from_millis(50));
                 }
-                // ERROR_PIPE_CONNECTED=535：客户端在 Create 与 Connect 之间已连上（竞态），
-                // 视为已连接，正常服务 —— 之前当致命错误退出，会把监听线程带崩。
-                if err.raw_os_error() == Some(535) {
-                    let host = host.clone();
-                    std::thread::spawn(move || serve_conn(h, &host));
-                    continue;
-                }
-                // 其他错误：日志 + 短歇再战，绝不退出（管道是输入法生命线，
-                // 任何单次异常都不能杀掉监听）
-                eprintln!("管道连接异常: {err}，50ms 后继续");
-                unsafe { CloseHandle(h) };
-                std::thread::sleep(std::time::Duration::from_millis(50));
                 continue;
             }
             let host = host.clone();
-            std::thread::spawn(move || serve_conn(h, &host));
+            if let Err(err) = std::thread::Builder::new().name("hufu-pipe".into())
+                .spawn(move || serve_conn(pipe, &host))
+            {
+                // Failed spawn drops the closure and therefore its pipe handle.
+                eprintln!("管道工作线程启动失败: {err}");
+            }
         }
     }
 }
@@ -1695,14 +1612,10 @@ pub use unix_imp::run as run_pipe;
 /// 进程号。conhost 的父进程 = 该控制台的客户端（cmd 等）→ AttachConsole
 /// 挂上 → GetConsoleScreenBufferInfo 光标格 + GetCurrentConsoleFont 格度
 /// + GetConsoleWindow/ClientToScreen 换算屏幕像素。用毕 FreeConsole。
-/// 进程级全局串行（Attach 是进程状态）。失败任一步 → None（DLL 落标准
-/// 链，不钉位）。客户端父进程可能已退（conhost 收尾期）→ Toolhelp 查
-/// 不到 → None。
+/// 进程级全局串行（Attach 是进程状态）。失败返回本次诊断（DLL 落标准
+/// 链，不钉位）。客户端父进程可能已退（conhost 收尾期）→ Toolhelp 查不到。
 #[cfg(windows)]
-static LAST_CARET_ERR: Mutex<Option<&'static str>> = Mutex::new(None);
-
-#[cfg(windows)]
-fn console_caret_rect_via_attach(conhost_pid: u32) -> Option<[i32; 4]> {
+fn console_caret_rect_via_attach(conhost_pid: u32) -> Result<[i32; 4], &'static str> {
     use windows::Win32::Foundation::{POINT, RECT};
     use windows::Win32::System::Console::{
         AttachConsole, FreeConsole, GetConsoleScreenBufferInfo, GetConsoleWindow,
@@ -1718,10 +1631,9 @@ fn console_caret_rect_via_attach(conhost_pid: u32) -> Option<[i32; 4]> {
 
     static ATTACH_LOCK: Mutex<()> = Mutex::new(());
     let _g = ATTACH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let note = |s: &'static str| -> Option<[i32; 4]> {
-        *LAST_CARET_ERR.lock().unwrap_or_else(|e| e.into_inner()) = Some(s);
-        None
-    };
+    // Return this request's diagnostic with its result; a global last-error
+    // slot could race once independent requests no longer hold the Host lock.
+    let note = |s: &'static str| -> Result<[i32; 4], &'static str> { Err(s) };
 
     // conhost → 父进程（= 控制台客户端）
     let parent = unsafe {
@@ -1800,27 +1712,17 @@ fn console_caret_rect_via_attach(conhost_pid: u32) -> Option<[i32; 4]> {
         let _ = FreeConsole();
         match result {
             Some((_p, cell, rect)) => {
-                *LAST_CARET_ERR.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 let _ = cell; // 细节诊断保留位
-                Some(rect)
+                Ok(rect)
             }
             None => note("read_fail"),
         }
     }
 }
 
-/// console_caret 失败原因（诊断回传给 DLL）。
-#[cfg(windows)]
-fn console_caret_last_err() -> &'static str {
-    LAST_CARET_ERR
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .unwrap_or("unknown")
-}
-
 #[cfg(not(windows))]
-fn console_caret_rect_via_attach(_conhost_pid: u32) -> Option<[i32; 4]> {
-    None
+fn console_caret_rect_via_attach(_conhost_pid: u32) -> Result<[i32; 4], &'static str> {
+    Err("unsupported")
 }
 
 fn export_candidates(host: &mut Host, req: &serde_json::Value, state: &mut serde_json::Value) {
@@ -1847,6 +1749,71 @@ fn export_candidates(host: &mut Host, req: &serde_json::Value, state: &mut serde
 mod candidate_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn skin_font_edits_preserve_files_and_do_not_hold_host_while_waiting_for_an_editor() {
+        use std::sync::{Arc, mpsc};
+        use std::time::Duration;
+        let root = std::env::temp_dir().join(format!("hufu-font-delta-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("码表/T")).unwrap();
+        std::fs::create_dir_all(root.join("数据")).unwrap();
+        std::fs::write(root.join("码表/T/main.txt"), "#hufu-dict v1 name=t\na\t甲\n").unwrap();
+        std::fs::write(root.join("数据/config.json"), r#"{"schema":{"dir":"码表","current":"T"}}"#).unwrap();
+        let mut h = Host::new(&root.join("数据")).unwrap();
+        h.engine.config.appearance.skin = "font-test".into();
+        h.skin_ver = 10;
+        let skin_path = h.skins_dir().join("font-test.json");
+        std::fs::create_dir_all(skin_path.parent().unwrap()).unwrap();
+        let mut skin = hufu_skin::Skin::default();
+        skin.layout.font_point = 16.0;
+        skin.layout.label_font_point = 8.0;
+        skin.layout.shadow_offset_x = 5.0;
+        skin.layout.shadow_offset_y = 6.0;
+        skin.material.kind = hufu_skin::Material::Glass;
+        std::fs::write(&skin_path, serde_json::to_vec(&skin).unwrap()).unwrap();
+        let cache_dir = crate::ssf::ssf_cache_root(&h.data_dir).join("font-test");
+        let host = Arc::new(Mutex::new(h));
+
+        // A long settings edit may delay another editor, but must leave the
+        // independent Host available to ordinary input requests.
+        let edit_guard = crate::skin_files::edit_lock();
+        let (started, ready) = mpsc::channel();
+        let edit_host = host.clone();
+        let editor = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            dispatch(&edit_host, &json!({"op":"skin_font_delta","delta":2}), None)
+        });
+        ready.recv().unwrap();
+        let (sent, received) = mpsc::channel();
+        let key_host = host.clone();
+        let key = std::thread::spawn(move || sent.send(dispatch(&key_host, &json!({"op":"ping"}), None)).unwrap());
+        let ping = received.recv_timeout(Duration::from_secs(1));
+        drop(edit_guard);
+        assert_eq!(ping.unwrap()["ok"], true);
+        key.join().unwrap();
+        assert_eq!(editor.join().unwrap()["font_point"], 18);
+        let saved = hufu_skin::Skin::load(&skin_path).unwrap();
+        assert_eq!(saved.layout.font_point, 18.0);
+        assert_eq!(saved.layout.label_font_point, 9.0);
+        assert_eq!(saved.layout.shadow_offset_x, 0.0);
+        assert_eq!(saved.layout.shadow_offset_y, 0.0);
+        assert_eq!(host.lock().unwrap().skin_ver, 11);
+
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let mut overrides = crate::ssf::SsfOverrides::default();
+        overrides.font_pt = Some(20.0);
+        overrides.overlay = Some(json!({"image":"preserved"}));
+        overrides.save(&cache_dir).unwrap();
+        host.lock().unwrap().engine.config.appearance.skin_kind = "ssf".into();
+        assert_eq!(dispatch(&host, &json!({"op":"skin_font_delta","delta":-1}), None)["font_point"], 19);
+        let saved = crate::ssf::SsfOverrides::load(&cache_dir);
+        assert_eq!(saved.font_pt, Some(19.0));
+        assert_eq!(saved.overlay, overrides.overlay);
+        assert_eq!(host.lock().unwrap().skin_ver, 12);
+        assert_eq!(std::fs::read_dir(&cache_dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn candidate_dispatch_animation_pages_query_and_cost() {
         let root =
@@ -1865,9 +1832,12 @@ mod candidate_tests {
         .unwrap();
         let mut h = Host::new(&root.join("数据")).unwrap();
         h.engine.config.candidates.page_size = 2;
+        h.skin_ver = 42;
         let host = Mutex::new(h);
         let request = |key: &str| json!({"op":"key","key":key,"candidate_ui":{"protocol":1,"context":"field-a"}});
         let a = dispatch(&host, &request("a"), None);
+        assert_eq!(a["state"]["skin_ver"], 42);
+        assert_eq!(a["state"]["current_schema"], "T");
         assert_eq!(a["state"]["candidate_ui"]["menu"]["pages"], json!([0, 2]));
         let query = json!({"op":"state","candidate_ui":{"protocol":1,"context":"field-a",
             "instance":a["state"]["candidate_ui"]["instance"],"version":a["state"]["candidate_ui"]["version"]}});

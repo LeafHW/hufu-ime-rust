@@ -235,16 +235,9 @@ fn tl_cand_show(
             *slot = CandidateWindowV2::new();
         }
         if let Some(c) = slot.as_mut() {
-            // 【词框入场动效·二十五修】用户实锤「弹窗候选没动效」——
-            // 入场长大（首出 72%→100%）被 server 注入的 entrance_anim
-            // 门控（仅整句方案 true），词框方案非整句→首显直接全尺寸。
-            // 词框候选窗是刻意弹出的新窗，与主窗观感对齐：本地注入
-            // entrance_anim=true（只影响 TL 实例，不动皮肤文件/设置）。
-            let mut skin_tl = skin.clone();
-            if let Some(obj) = skin_tl.as_object_mut() {
-                obj.insert("entrance_anim".to_string(), serde_json::json!(true));
-            }
-            c.show(cands, raw, &skin_tl, anchor, selected);
+            // entrance_anim 已随入场长大退役，show 不再读取该字段；
+            // 不为一个无消费者的注入复制整份挂件图片。
+            c.show(cands, raw, skin, anchor, selected);
         }
     });
 }
@@ -302,7 +295,7 @@ pub struct Shared {
     pub cand_ui_active: bool,
     /// true=宿主经 UIElement 画；false=server 代画
     pub cand_ui_host_draws: bool,
-    pub skin: serde_json::Value,
+    pub skin: std::sync::Arc<serde_json::Value>,
     /// 会话结束后重新拉皮肤
     pub skin_stale: bool,
     /// 【焦点代际 2026-09-09】每次 OnSetFocus（真实焦点变化）+1——
@@ -320,6 +313,10 @@ pub struct Shared {
     /// 生效（用户实测「反应慢」根因：连续拖动内缓存未过期，弹的
     /// 还是旧参数窗）。
     pub skin_ver_last: u64,
+    /// 只在成功完整拉取/指纹续期后更新；失败不得把旧快照当成新版本。
+    skin_ver_loaded: Option<u64>,
+    skin_schema_loaded: String,
+    skin_failed_at: Option<std::time::Instant>,
     /// 皮肤刚重拉、待按新皮肤重绘一次（poll 消费即清——签名未变
     /// 时的预览刷新通道；绝非常驻标志，防每 40ms 白绘）。
     pub skin_repaint: bool,
@@ -695,12 +692,15 @@ impl Shared {
             cand_ui_id: 0,
             cand_ui_active: false,
             cand_ui_host_draws: false,
-            skin: serde_json::Value::Null,
+            skin: std::sync::Arc::new(serde_json::Value::Null),
             skin_stale: true,
             focus_epoch: 0,
             skin_loaded_at: std::time::Instant::now(), // skin=null 首拉兜底
             skin_fp: String::new(),
             skin_ver_last: 0,
+            skin_ver_loaded: None,
+            skin_schema_loaded: String::new(),
+            skin_failed_at: None,
             skin_repaint: false,
             srv_skin_ver_pushed: u64::MAX,
             last_schema_seen: String::new(),
@@ -793,6 +793,9 @@ impl Shared {
     }
 
     fn load_skin(&mut self) {
+        if !crate::skin_snapshot::skin_retry_ready(self.skin_failed_at, std::time::Instant::now()) {
+            return;
+        }
         // 皮肤过期四通道：①首次 ②raw 空（断段）③拉取后超 2.5s
         // ④server 皮肤版本变化（poll 比对 skin_ver，强制绕过时限——
         // 【打字中热更新】③是关键：旧逻辑只在 raw 空时置 stale，打字
@@ -813,10 +816,21 @@ impl Shared {
             }
             if let Some(v) = ipc::call(&req) {
                 if v.get("same").and_then(|x| x.as_bool()).unwrap_or(false) {
+                    if self.skin.is_null() {
+                        self.skin_failed_at = Some(std::time::Instant::now());
+                        return; // 无快照不能把畸形 same 响应当成已载入。
+                    }
                     // 内容未变：皮肤/overlay/注入字段全部沿用，仅续期
                     self.skin_stale = false;
                     self.skin_loaded_at = std::time::Instant::now();
+                    self.skin_ver_loaded = Some(self.skin_ver_last);
+                    self.skin_schema_loaded = self.last_schema_seen.clone();
+                    self.skin_failed_at = None;
                     return;
+                }
+                if !v.get("skin").is_some_and(serde_json::Value::is_object) {
+                    self.skin_failed_at = Some(std::time::Instant::now());
+                    return; // 错误/畸形响应不覆盖有效快照，也不推进已载版本。
                 }
                 self.delay_show_ms =
                     v.get("delay_show_ms").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
@@ -828,9 +842,14 @@ impl Shared {
                     .and_then(|x| x.as_str())
                     .unwrap_or("")
                     .to_string();
-                self.skin = v;
+                self.skin = std::sync::Arc::new(v);
                 self.skin_stale = false;
                 self.skin_loaded_at = std::time::Instant::now();
+                self.skin_ver_loaded = Some(self.skin_ver_last);
+                self.skin_schema_loaded = self.last_schema_seen.clone();
+                self.skin_failed_at = None;
+            } else {
+                self.skin_failed_at = Some(std::time::Instant::now());
             }
         }
     }
@@ -7880,7 +7899,24 @@ pub(crate) fn update_ui(shared: SharedRef, commit: String, state: serde_json::Va
         let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
         // 【皮肤首键】inline 判定依赖皮肤——首键无皮肤时先拉取（原在
         // op 决策之后，会让 inline_preedit=false 的皮肤首键先建组段）。
-        if g.skin.is_null() {
+        let version = state.get("skin_ver").and_then(|v| v.as_u64());
+        let schema = state.get("current_schema").and_then(|v| v.as_str());
+        let refresh = crate::skin_snapshot::key_skin_refresh_needed(
+            g.skin_ver_loaded, version, &g.skin_schema_loaded, schema,
+            state.get("schema_changed").and_then(|v| v.as_bool()).unwrap_or(false), false,
+        );
+        if let Some(version) = version {
+            if version != g.skin_ver_last || schema.is_some_and(|s| s != g.last_schema_seen) {
+                g.skin_failed_at = None; // 新版本/方案不继承旧失败的冷却。
+            }
+            g.skin_ver_last = version;
+            if let Some(schema) = schema {
+                g.last_schema_seen = schema.to_string();
+            }
+        }
+        if refresh {
+            g.load_skin_forced();
+        } else if g.skin.is_null() {
             g.load_skin();
         }
         let raw = state.get("raw").and_then(|v| v.as_str()).unwrap_or("");
@@ -8364,19 +8400,12 @@ pub(crate) fn update_ui(shared: SharedRef, commit: String, state: serde_json::Va
     // 拉否则无皮肤可渲染。此后 2.5s 过期拉取全部挪到 poll_tick 的
     // 断段分支（raw 空）：改皮肤在下一组段生效，键路径零管道往返
     //（「响应速度变慢」的修复——过期拉取曾在每键路径上同步等管道）。
-    // 【八十二修·首显强制拉 2026-09-14】「改皮肤几秒才生效」收口：
-    // 组段首显（cand_shown_this_segment=false 且有内容）且皮肤缓存
-    // 超 500ms 时强制重拉——「候选窗显示的永远是最新皮肤」成为不
-    // 变量。为什么 500ms 而非每次首显：连打族段间隔常 <500ms（逐字
-    // 上屏流），每段首键都拉=键路径重回管道往返（2026-09-08 教训）；
-    // 改皮肤的场景（设置页操作）段间隔必然秒级——500ms 窗精确区分
-    // 两者：连打零额外往返（每键均摊 0），换肤后首显必新（1-4ms 一次）。
-    // 打字中改皮肤的主通道仍是 poll 的 skin_ver 比对（110ms），此处
-    // 只兜「失焦改皮→回窗首显」的缝——失焦期 poll 静默（窗已收无需
-    // 检测），回焦首帧即本路径渲染。
+    // 新 server 的每键 skin_ver 已在编辑会话前核对；版本/方案未变时
+    // 首显免一次 BG 往返。老 server 没该字段仍保留500ms首显复查。
     if g.skin.is_null() {
         g.load_skin();
-    } else if !g.cand_shown_this_segment
+    } else if state.get("skin_ver").and_then(|v| v.as_u64()).is_none()
+        && !g.cand_shown_this_segment
         && !cands.is_empty()
         && g.skin_loaded_at.elapsed() > std::time::Duration::from_millis(500)
     {
@@ -8506,7 +8535,8 @@ pub(crate) fn update_ui(shared: SharedRef, commit: String, state: serde_json::Va
             return Ok(());
         }
         // ↓ 与常规宿主同一条显示路径（共用锚点链/抑制逻辑/show）
-        let mut skin = g.skin.clone();
+        let skin = g.skin.clone();
+        let mut first_show_unit = None;
         let preview_anchor = state.get("preview_anchor").cloned();
         // 【七十二修·虎魄光标跟随】七十一修补2 曾对虎魄跳过 gui 兜底
         //（Qt 光标线旧值污染）——七十二修后虎魄锚恒=GUITHREADINFO 插
@@ -8649,12 +8679,7 @@ pub(crate) fn update_ui(shared: SharedRef, commit: String, state: serde_json::Va
                         ));
                     }
                     if unit > 0.5 {
-                        if let Some(ro) = skin.as_object_mut() {
-                            ro.insert(
-                                "first_show_unit".into(),
-                                serde_json::json!(unit),
-                            );
-                        }
+                        first_show_unit = Some(unit as f64);
                     }
                 }
                 // 【流畅度二批 2026-11-07】组段镜像：show 前刷给窗口
@@ -8662,7 +8687,7 @@ pub(crate) fn update_ui(shared: SharedRef, commit: String, state: serde_json::Va
                 let alive = g.comp_alive();
                 if let Some(c) = g.cand2.as_mut() {
                     c.comp_alive.set(alive);
-                    c.show(&cands, &raw_disp, &skin, caret.as_ref(), sel);
+                    c.show_with_first_unit(&cands, &raw_disp, &skin, caret.as_ref(), sel, first_show_unit);
                 }
             }
             // 【流畅度二批 2026-11-07】last_show Arc 化：写点包 Arc
@@ -9145,7 +9170,7 @@ pub(crate) fn update_ui(shared: SharedRef, commit: String, state: serde_json::Va
         // 首显那一滑）。每键宽=est 校准值（无基线=不注入，该段稳退瞬
         // 显）；整句由 skin.sentence_active 门控（server 注入，跟方案
         // 走）；小窗线程（加词/加权弹窗候选）与设置页预览不滑。
-        let mut skin = skin;
+        let mut first_show_unit = None;
         // 【三十修·迟到免滑】抑制等待过的首显不注入每键宽=不臂入场滑
         //（等待即入场，迟到再滑=拖尾卡感）。
         if first_show_of_seg && !g.entered_late && !is_preview && !crate::addword::in_window_thread() {
@@ -9189,12 +9214,7 @@ pub(crate) fn update_ui(shared: SharedRef, commit: String, state: serde_json::Va
                 ));
             }
             if unit > 0.5 {
-                if let Some(ro) = skin.as_object_mut() {
-                    ro.insert(
-                        "first_show_unit".into(),
-                        serde_json::json!(unit),
-                    );
-                }
+                first_show_unit = Some(unit as f64);
             }
         }
         if !content_empty {
@@ -9209,7 +9229,7 @@ pub(crate) fn update_ui(shared: SharedRef, commit: String, state: serde_json::Va
                 match g.cand2.as_mut() {
                     Some(c) => {
                         c.comp_alive.set(alive);
-                        c.show(&cands, &raw_disp, &skin, caret.as_ref(), sel)
+                        c.show_with_first_unit(&cands, &raw_disp, &skin, caret.as_ref(), sel, first_show_unit)
                     }
                     None => {}
                 }
@@ -11580,14 +11600,6 @@ fn poll_tick() {
         // 放 raw_empty 判定前——预览流程 reset（断段）与打 w 之间的
         // 任意一拍都会走到这里。skin_repaint 置位：签名未变时也按
         // 新皮肤重绘一次（一次性，下方消费清除）。
-        let sv = state.get("skin_ver").and_then(|v| v.as_u64()).unwrap_or(0);
-        if sv != g.skin_ver_last {
-            g.skin_ver_last = sv;
-            if !g.skin.is_null() {
-                g.load_skin_forced();
-                g.skin_repaint = true;
-            }
-        }
         // 【方案变更兜底 2026-09-11】state 常带 current_schema：比对变
         // 化即置皮肤失效——entrance_anim 等方案相关字段即时跟随
         //（覆盖设置页/langbar 切方案；Ctrl+M 键路径另有即时标记）。
@@ -11598,9 +11610,20 @@ fn poll_tick() {
             crate::langbar::set_current_schema_hint(cs);
             if !cs.is_empty() && cs != g.last_schema_seen {
                 g.last_schema_seen = cs.to_string();
+                g.skin_failed_at = None;
                 if !g.skin.is_null() {
                     g.skin_stale = true;
                 }
+            }
+        }
+        // 先记录本帧方案再拉取，成功快照与其方案保持一致，避免下键重复拉。
+        let sv = state.get("skin_ver").and_then(|v| v.as_u64()).unwrap_or(0);
+        if sv != g.skin_ver_last {
+            g.skin_ver_last = sv;
+            g.skin_failed_at = None;
+            if !g.skin.is_null() {
+                g.load_skin_forced();
+                g.skin_repaint = true;
             }
         }
         // 【Ctrl+M/Space 预判门控 2026-11】同步两开关镜像（TestDown

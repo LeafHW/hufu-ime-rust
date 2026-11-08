@@ -30,6 +30,7 @@ mod langbar;
 // 只读候选窗最终矩形取位，不碰候选窗锚点/几何代码。
 mod overlaywin;
 mod sound;
+mod skin_snapshot;
 mod ssfwin;
 mod tsf;
 
@@ -675,7 +676,7 @@ extern "system" fn hufu_test_anim_scales() -> i32 {
         {
             let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
             g.cand2 = Some(w);
-            g.skin = skin.clone();
+            g.skin = std::sync::Arc::new(skin.clone());
             // 稳态窄窗：首显直接全尺寸（无入场动效）
             g.last_show = Some(std::sync::Arc::new((narrow.clone(), "nih".to_string(), 0)));
             if let Some(c) = g.cand2.as_mut() {
@@ -1038,7 +1039,7 @@ extern "system" fn hufu_test_fs_frames(step_ms: u32) -> i32 {
     {
         let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
         g.cand2 = Some(w);
-        g.skin = skin.clone();
+        g.skin = std::sync::Arc::new(skin.clone());
         g.caret = Some(anchor);
     }
     // 起帧：sel=0 稳态。readback（离屏转储）模式窗口恒不显示，
@@ -1285,7 +1286,7 @@ extern "system" fn hufu_test_stretch_corner() -> i32 {
         let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
         g.cand2 = Some(w);
         g.last_show = Some(std::sync::Arc::new((narrow.clone(), "ni".to_string(), 0)));
-        g.skin = skin.clone();
+        g.skin = std::sync::Arc::new(skin.clone());
         if let Some(c) = g.cand2.as_mut() {
             c.last_hide_at.set(None);
             c.size_ms = 1; // 稳态阶段动效近零（show 会以皮肤 layout.size_ms 再覆盖）
@@ -1397,7 +1398,7 @@ extern "system" fn hufu_test_stretch_corner() -> i32 {
     {
         let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
         g.last_show = Some(std::sync::Arc::new((wide.clone(), "nih".to_string(), 0)));
-        g.skin = skin_slow.clone();
+        g.skin = std::sync::Arc::new(skin_slow.clone());
         if let Some(c) = g.cand2.as_mut() {
             c.show(&wide, "nih", &skin_slow, Some(&anchor), 0);
         }

@@ -1037,23 +1037,20 @@ fn do_sync(s: &SyncSettings) -> Result<String, String> {
                 // 【流畅度二批 2026-11-07】schema 变更段锁外预装载：原
                 // apply_config 锁内装载 0.05-2s 顶全机键——云同步每
                 // 2min 归并落远端方案名时可在打字中无预警触发。装载
-                // 窗口内本地配置漂移由 apply_config 的 orig 守卫兜底
-                //（现值≠发起时 → 放弃 schema 切换只存其余配置）；快照
-                // 漂移（full2≠full）走既有 abandoned 分支。
+                // Full snapshot drift abandons this merge before apply; the
+                // prepared-resource guard also rejects stale schema selection.
                 let need_load = cfg.schema.current != full["schema"]["current"].as_str().unwrap_or("")
                     || cfg.schema.dir != full["schema"]["dir"].as_str().unwrap_or("");
-                let pre = if need_load && !cfg.schema.current.is_empty() {
-                    let (data_dir, orig) = {
-                        let h = shared.lock().unwrap_or_else(|p| p.into_inner());
-                        (
-                            h.data_dir.clone(),
-                            h.engine.config.schema.current.clone(),
-                        )
-                    };
-                    let d = cfg.schema.dir.clone();
-                    let c = cfg.schema.current.clone();
-                    let loaded = hufu_engine::Engine::load_schema_for(&data_dir, &d, &c);
-                    Some((orig, loaded))
+                let (need_prepare, data_dir, orig) = {
+                    let h = shared.lock().unwrap_or_else(|p| p.into_inner());
+                    (
+                        h.config_needs_preparation(&cfg),
+                        h.data_dir.clone(),
+                        h.engine.config.schema.current.clone(),
+                    )
+                };
+                let pre = if need_prepare {
+                    Some(Host::prepare_config(&data_dir, orig, &cfg, need_load))
                 } else {
                     None
                 };
