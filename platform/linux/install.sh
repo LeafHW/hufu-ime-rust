@@ -59,16 +59,14 @@ BUILD_DIR="$ROOT/platform/linux/build"
 #          ③ 都拿不到时按 GNUInstallDirs 惯例推断（/usr/lib64 存在且 /usr/lib 不存在）
 resolve_addon_dir() {
     if [[ -n "${FCITX_INSTALL_ADDONDIR:-}" ]]; then
-        printf '%s\n' "$FCITX_INSTALL_ADDONDIR"
+        normalize_addon_dir "$FCITX_INSTALL_ADDONDIR"
         return 0
     fi
     local ci="$BUILD_DIR/cmake_install.cmake" dest=""
     if [[ -f "$ci" ]]; then
         dest="$(sed -n 's/.*DESTINATION "\([^"]*\/fcitx5\)".*/\1/p' "$ci" | head -1)"
         if [[ -n "$dest" ]]; then
-            dest="$(printf '%s' "$dest" | sed 's/\${CMAKE_INSTALL_PREFIX}//')"   # 去掉前缀变量
-            if [[ "$dest" == /* ]]; then dest="/usr$dest"; fi   # 本仓库固定 -DCMAKE_INSTALL_PREFIX=/usr
-            printf '%s\n' "$dest"
+            normalize_addon_dir "$dest"
             return 0
         fi
     fi
@@ -78,7 +76,15 @@ resolve_addon_dir() {
         printf '/usr/lib/fcitx5\n'
     fi
 }
-ADDON_DIR="$(resolve_addon_dir)"
+
+normalize_addon_dir() {
+    local dest="$1"
+    case "$dest" in
+        '${CMAKE_INSTALL_PREFIX}'/*) printf '/usr/%s\n' "${dest#*/}" ;;
+        /*) printf '%s\n' "$dest" ;;
+        *) printf '/usr/%s\n' "$dest" ;;
+    esac
+}
 
 # 防呆：整个脚本不要用 sudo 跑——用户级部分会装进 /root（systemd user 服务
 # 也会因 root 无用户会话被跳过）。系统级 addon 由脚本内部单独调 sudo。
@@ -129,9 +135,9 @@ hint() { printf '%s%s%s\n' "$C_ORANGE" "$*" "$C_OFF"; }      # 橙色：中文�
 show_code() { printf '%s%s%s\n' "$C_GREEN" "$*" "$C_OFF"; }  # 绿色：网址 / 命令
 
 # 模型（整句 / 神经重排）体积大，不随仓库分发——安装结束时给出获取地址。
-MODEL_URL='https://github.com/LeafHW/hufu-ime-rust/releases/tag/模型'
+MODEL_URL='https://www.modelscope.cn/models/leafyin/hufu-ime/resolve/master/模型.rar?view=false'
 model_hint() {
-    hint '模型（整句与神经重排，约 880MB）不随安装包分发，需要时请手动获取：'
+    hint '模型包（约 525MB）不随安装包分发，需要时请手动获取：'
     show_code "手动获取模型网址：$MODEL_URL"
     hint "下载解压后把「模型」文件夹整个放进 $HUFU_ROOT/（引擎自动探测装载；缺模型即纯码表模式）"
 }
@@ -208,6 +214,10 @@ if [[ "$DO_BUILD" == 1 ]]; then
         -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr
     run cmake --build "$BUILD_DIR" -j "$(nproc)"
 fi
+
+# 首装必须等 CMake 生成真实安装落点后再解析；提前解析会永久用兜底目录，
+# 在 lib64 / Debian multiarch 系统上装到 fcitx5 不扫描的位置。
+ADDON_DIR="$(resolve_addon_dir)"
 
 SERVER_BIN="$ROOT/engine/target/release/hufu-server"
 ADDON_SO="$BUILD_DIR/libhufu.so"

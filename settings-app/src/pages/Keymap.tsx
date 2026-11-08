@@ -795,18 +795,17 @@ export function KeymapPage({ data, notify }: { data: Bootstrap; notify: (msg: st
   const persist = async (next: KeymapDraft, okMsg: string): Promise<boolean> => {
     setSaving(true);
     try {
-      const fresh = await getConfig();
-      const base: Dict = { ...(fresh as unknown as Dict) };
-      const freshKm = asDict(fresh.keymap);
-      base.keymap = {
-        ...freshKm,
-        map: next.map,
-        map_idle: next.map_idle,
-        shift_symbols: next.shift_symbols,
-        shift_letters_always: next.shift_letters_always,
-      };
-      // 【P1-15】配置写入走统一 updateConfig（带 rev 的 CAS）。
-      await updateConfig(base);
+      // 整表替换可真正删除 map/map_idle 的键；深度 patch 会把删掉的旧键补回来。
+      await updateConfig((fresh) => ({
+        ...(fresh as unknown as Dict),
+        keymap: {
+          ...asDict(fresh.keymap),
+          map: next.map,
+          map_idle: next.map_idle,
+          shift_symbols: next.shift_symbols,
+          shift_letters_always: next.shift_letters_always,
+        },
+      }));
       setDraft(next);
       ignorePropsUntil.current = Date.now() + 15000;
       notify(okMsg);

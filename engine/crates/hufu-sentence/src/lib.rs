@@ -127,13 +127,14 @@ pub struct SentenceEngine {
 impl SentenceEngine {
     /// 热更新用户词表（code, text）。清空传空即可。
     pub fn set_user_words(&self, words: Vec<(String, String)>) {
-        if let Ok(mut g) = self.user_words.write() {
+        {
+            let mut g = self.user_words.write().unwrap_or_else(|p| p.into_inner());
             *g = words;
         }
         // 解码缓存失效：last/prefix 桶是旧词图的结果，不含新词
-        if let Ok(mut c) = self.cache.lock() {
-            *c = EngineCache::default();
-        }
+        // 解码入口允许中毒锁恢复，这里也必须失效其旧词图缓存。
+        let mut c = self.cache.lock().unwrap_or_else(|p| p.into_inner());
+        *c = EngineCache::default();
     }
 }
 
@@ -657,7 +658,8 @@ impl SentenceEngine {
             // rank=1（长句 rank1 放行——用户词与码表首选并列首选，ngram
             // 拍板排序）；exact=true（码=消耗键数）。一简禁令、锁边界与
             // 码表段同规则。码表已有同码同词时跳过（去重）。
-            if let Ok(uw) = self.user_words.read() {
+            {
+                let uw = self.user_words.read().unwrap_or_else(|p| p.into_inner());
                 if !uw.is_empty() {
                     // 【修复 segs O(n²) 2026-09-11】同上：复用尾串切片，
                     // 不再每个 pos 重建 tail_s 整串（O(n-pos)×n）。
@@ -1655,5 +1657,17 @@ mod tests {
         // 提交档（decode_full）同样不因中毒 panic
         let full = e.decode_full("ab");
         assert!(!full.hits.is_empty(), "中毒后 decode_full 仍可用");
+        let poisoned_words = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = e.user_words.write().unwrap();
+            panic!("poison user words");
+        }));
+        assert!(poisoned_words.is_err());
+        e.set_user_words(vec![("ab".into(), "更新词".into())]);
+        let cache = e.cache.lock().unwrap_or_else(|p| p.into_inner());
+        assert!(cache.last.is_none(), "中毒后更新用户词仍须清除旧结果");
+        assert!(cache.prefix.is_none(), "中毒后更新用户词仍须清除旧增量桶");
+        drop(cache);
+        let updated = e.decode_to_strings("ab");
+        assert!(updated.iter().any(|s| s == "更新词"), "新用户词应进入词图: {updated:?}");
     }
 }

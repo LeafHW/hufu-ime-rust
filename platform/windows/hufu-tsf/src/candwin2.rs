@@ -945,6 +945,10 @@ extern "system" fn cand2_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
     // DefWindowProc 的激活路径；窗口操作仅发生在用户主动交互的
     // 消息路径（非 TSF 焦点回调），无死锁面。
     match msg {
+        WM_NCDESTROY => {
+            anim_boost_disarm(hwnd);
+            anim_tick_post_complete(hwnd);
+        }
         0x21 => {
             // WM_MOUSEACTIVATE → MA_NOACTIVATE(3)：显式挡激活链。
             // 【候选窗焦点矫正 2026-10-12】WS_EX_NOACTIVATE 只挡"前台
@@ -1331,6 +1335,9 @@ extern "system" fn cand2_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
         // 与 WM_TIMER 同一处理（fade_tick_shared 时间基准幂等），帧数
         // ≈3×——入场/逐键/高亮滑动的「一顿一顿」根治点。
         crate::candwin2::WM_APP_ANIM => {
+            // 自定义 posted 消息不会像 WM_TIMER 自动合并。先释放待处理
+            // 标记，渲染期间最多允许再排一拍，慢 Present 后不追过期消息。
+            anim_tick_post_complete(hwnd);
             unsafe { fade_tick_shared(hwnd) };
             return LRESULT(0);
         }
@@ -1722,8 +1729,51 @@ pub(crate) fn fs_plan(c: &FsCtx) -> Option<FsPlan> {
 pub(crate) struct FsTier {
     pub body: Option<IDWriteTextFormat>,
     pub small: Option<IDWriteTextFormat>,
-    /// 光学垂直补偿（该 k 档；dy 段回填）
-    pub dy: f32,
+    /// 光学补偿依赖布局行高；行槽高度仅依赖本档字体。
+    pub dy: Option<(u32, f32)>,
+    pub row_height: Option<(u32, f32)>,
+}
+
+/// 字体档寿命内复用成功的探测结果；临时 DirectWrite 失败不缓存，
+/// 下帧仍可恢复。key 表示影响该度量的布局条件（光学补偿为行高）。
+fn cached_font_metric(
+    cache: &mut Option<(u32, f32)>,
+    key: u32,
+    probe: impl FnOnce() -> Option<f32>,
+) -> Option<f32> {
+    if let Some((old_key, value)) = *cache {
+        if old_key == key {
+            return Some(value);
+        }
+    }
+    let value = probe()?;
+    *cache = Some((key, value));
+    Some(value)
+}
+
+#[cfg(test)]
+mod font_metric_cache_tests {
+    use super::cached_font_metric;
+
+    #[test]
+    fn unchanged_font_metrics_skip_probes_and_changed_line_height_reprobes() {
+        let mut cache = None;
+        assert_eq!(cached_font_metric(&mut cache, 24f32.to_bits(), || Some(1.5)), Some(1.5));
+        for _ in 0..100 {
+            assert_eq!(cached_font_metric(&mut cache, 24f32.to_bits(), || panic!("cached metric reprobed")), Some(1.5));
+        }
+        assert_eq!(cached_font_metric(&mut cache, 28f32.to_bits(), || Some(2.0)), Some(2.0));
+        assert_eq!(cached_font_metric(&mut cache, 28f32.to_bits(), || panic!("new line height not cached")), Some(2.0));
+    }
+
+    #[test]
+    fn failed_metric_probe_does_not_poison_the_next_frame() {
+        let mut cache = None;
+        assert_eq!(cached_font_metric(&mut cache, 1, || None), None);
+        assert_eq!(cached_font_metric(&mut cache, 1, || Some(12.0)), Some(12.0));
+        assert_eq!(cached_font_metric(&mut cache, 2, || None), None);
+        assert_eq!(cached_font_metric(&mut cache, 2, || Some(15.0)), Some(15.0));
+    }
 }
 
 /// 字体档缓存：基础键（字体/正文 pt/序号 pt）不变时跨帧复用各 k 档；
@@ -5466,7 +5516,7 @@ impl CandidateWindowV2 {
                         let _ = t.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
                     }
                 }
-                tf_tiers.insert(kb, FsTier { body, small, dy: 0.0 });
+                tf_tiers.insert(kb, FsTier { body, small, ..Default::default() });
                 created_any = true;
             }
             if tf_label.is_none() {
@@ -5496,12 +5546,6 @@ impl CandidateWindowV2 {
             let tf_small = rest_tier.small;
             let tf_first = first_tier.body;
             let tf_first_small = first_tier.small;
-            tf_cache_out = Some(TfCache {
-                base: tf_base,
-                label: tf_label.clone(),
-                tiers: tf_tiers.clone(),
-            });
-
             // 【2026-11-03 M4】字体格式有新建 → 清静态布局/测量缓存
             //（旧格式释放后指针可能被复用，防错配旧布局）。
             if created_any {
@@ -5625,11 +5669,11 @@ impl CandidateWindowV2 {
             let probe_dy =
                 |probe: &dyn Fn(&str, &Option<IDWriteTextFormat>) -> Option<(f32, f32)>,
                  t: &Option<IDWriteTextFormat>|
-                 -> f32 {
+                 -> Option<f32> {
                     if let Some((top_slack, bot_slack)) = probe("永", t) {
-                        ((bot_slack - top_slack) * 0.5).clamp(-6.0, 6.0)
+                        Some(((bot_slack - top_slack) * 0.5).clamp(-6.0, 6.0))
                     } else {
-                        0.0
+                        None
                     }
                 };
             let dy;
@@ -5653,11 +5697,19 @@ impl CandidateWindowV2 {
                             None => None,
                         }
                     };
-                let base = measure_row(&tf).unwrap_or(font_pt * 96.0 / 72.0 * 1.35);
+                let base_metric = match tf_tiers.get_mut(&fs_k_key(k_rest)) {
+                    Some(tier) => cached_font_metric(&mut tier.row_height, 0, || measure_row(&tf)),
+                    None => measure_row(&tf),
+                };
+                let base = base_metric.unwrap_or(font_pt * 96.0 / 72.0 * 1.35);
                 let first = if (k_first - k_rest).abs() < 0.001 {
                     base
                 } else {
-                    measure_row(&tf_first).unwrap_or(base * k_first / k_rest.max(0.01))
+                    let metric = match tf_tiers.get_mut(&fs_k_key(k_first)) {
+                        Some(tier) => cached_font_metric(&mut tier.row_height, 0, || measure_row(&tf_first)),
+                        None => measure_row(&tf_first),
+                    };
+                    metric.unwrap_or(base * k_first / k_rest.max(0.01))
                 };
                 (base, first)
             };
@@ -5668,11 +5720,13 @@ impl CandidateWindowV2 {
                 std::collections::HashMap::new();
             for k in &need_k {
                 let kb = fs_k_key(*k);
-                let body = tf_tiers.get(&kb).and_then(|t| t.body.clone());
-                let d = probe_dy(&probe_slack, &body);
-                if let Some(t) = tf_tiers.get_mut(&kb) {
-                    t.dy = d;
-                }
+                let d = if let Some(tier) = tf_tiers.get_mut(&kb) {
+                    let body = &tier.body;
+                    cached_font_metric(&mut tier.dy, line_h.max(8.0).to_bits(), || probe_dy(&probe_slack, body))
+                        .unwrap_or(0.0)
+                } else {
+                    0.0
+                };
                 dy_by_k.insert(kb, d);
             }
             dy = *dy_by_k.get(&fs_k_key(k_rest)).unwrap_or(&0.0);
@@ -5825,6 +5879,13 @@ impl CandidateWindowV2 {
                 };
                 (width, text_x, cmt_x, cmt_w)
             };
+            // 探测结果完成后再保存字体档；之前在 probe 前 clone 出去，
+            // 会丢掉回填的度量，导致所有动画帧重新 CreateTextLayout。
+            tf_cache_out = Some(TfCache {
+                base: tf_base,
+                label: tf_label.clone(),
+                tiers: tf_tiers,
+            });
             (
                 tf,
                 tf_first,
@@ -9447,7 +9508,7 @@ pub const MOTION_SLOW_MS: u32 = 180;
 /// 16ms 网格的最小公倍节奏=每 24ms 才对齐一次（实测 SWP 24ms 主导=
 /// 入场滑动掉到 ~42fps，比旧版更差）。多余早到 tick 由网格门幂等吸收。
 fn anim_tick_ms(hwnd: HWND) -> u32 {
-    ((morph_frame_interval_ms(hwnd) * 45 / 100) as u32).clamp(FADE_TICK_MIN_MS, FADE_TICK_MAX_MS)
+    (450 / morph_refresh_hz(hwnd)).clamp(FADE_TICK_MIN_MS, FADE_TICK_MAX_MS)
 }
 
 /// 【2026-11-03 可访问性/省电】系统动画许可：
@@ -9556,6 +9617,48 @@ pub const FADE_WATCHDOG_MS: u32 = 100;
 // ============================================================================
 /// 动效高频 tick 消息（wndproc 消费 → fade_tick_shared）。
 pub const WM_APP_ANIM: u32 = 0x4941; // "A"
+/// 每窗最多一条尚未消费的动画消息。时间推进取当前时刻，积攒历史
+/// tick 不会补回丢帧，只会把键盘消息和收窗消息堵在旧 tick 后面。
+static ANIM_TICK_POSTED: std::sync::Mutex<Vec<isize>> = std::sync::Mutex::new(Vec::new());
+
+fn reserve_anim_tick(pending: &mut Vec<isize>, hwnd: isize) -> bool {
+    if pending.contains(&hwnd) {
+        return false;
+    }
+    pending.push(hwnd);
+    true
+}
+
+fn anim_tick_post_complete(hwnd: HWND) {
+    ANIM_TICK_POSTED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|h| *h != hwnd.0 as isize);
+}
+
+#[cfg(test)]
+mod anim_tick_queue_tests {
+    use super::reserve_anim_tick;
+
+    #[test]
+    fn slow_consumer_keeps_one_pending_tick_per_window() {
+        let mut pending = Vec::new();
+        assert!(reserve_anim_tick(&mut pending, 1));
+        for _ in 0..10_000 {
+            assert!(!reserve_anim_tick(&mut pending, 1));
+        }
+        assert!(reserve_anim_tick(&mut pending, 2));
+        assert_eq!(pending, vec![1, 2]);
+        // 消费第一窗的一拍后可排下一拍，第二窗仍独立合并。
+        pending.retain(|h| *h != 1);
+        assert!(reserve_anim_tick(&mut pending, 1));
+        assert!(!reserve_anim_tick(&mut pending, 2));
+        assert_eq!(pending.len(), 2);
+        // PostMessage 失败/窗口销毁同样释放，不把下次起臂永久卡住。
+        pending.retain(|h| *h != 1);
+        assert!(reserve_anim_tick(&mut pending, 1));
+    }
+}
 ///（截止 GetTickCount64 ms, 注册 (hwnd, tick 周期 ms) 列表）
 static ANIM_BOOST: std::sync::Mutex<(u64, Vec<(isize, u32)>)> =
     std::sync::Mutex::new((0, Vec::new()));
@@ -9616,8 +9719,18 @@ unsafe extern "system" fn anim_boost_cb(_id: u32, _m: u32, _u: usize, _a: usize,
         return;
     }
     for &(h, _tick) in post.iter() {
+        let should_post = reserve_anim_tick(
+            &mut ANIM_TICK_POSTED.lock().unwrap_or_else(|e| e.into_inner()),
+            h,
+        );
+        if !should_post {
+            continue;
+        }
+        let hwnd = HWND(h as *mut core::ffi::c_void);
         unsafe {
-            let _ = PostMessageW(HWND(h as *mut core::ffi::c_void), WM_APP_ANIM, WPARAM(0), LPARAM(0));
+            if PostMessageW(hwnd, WM_APP_ANIM, WPARAM(0), LPARAM(0)).is_err() {
+                anim_tick_post_complete(hwnd);
+            }
         }
     }
 }
@@ -10145,10 +10258,62 @@ mod anim_fps_probe {
 // 「每 N 帧追上一拍」的周期跳帧；帧间隔恒≈帧距（60Hz=16.7ms）。
 // 返回当前应收帧号；调用方与自己的 last_frame 字段比较。
 fn grid_frame_now(hwnd: HWND, t0: std::time::Instant) -> u32 {
-    // 精确微秒网格：morph_frame_interval_ms 的 ms 取整（floor 16.67→16）
-    // 会给网格距引入 -0.67ms/帧系统偏差，长动画漂移可见——用 µs 换算。
-    let fi_us = (morph_frame_interval_ms(hwnd) * 1000).max(1);
-    (t0.elapsed().as_micros() / fi_us) as u32
+    grid_frame_at(t0.elapsed().as_micros(), morph_refresh_hz(hwnd))
+}
+
+fn grid_frame_at(elapsed_us: u128, hz: u32) -> u32 {
+    // 直接按刷新率算帧号。先把 16.67ms 取整成 16ms 再乘 1000，
+    // 精度无法恢复：60Hz 会变成 62.5fps，144Hz 会变成 166.7fps。
+    (elapsed_us.saturating_mul(hz.max(1) as u128) / 1_000_000)
+        .min(u32::MAX as u128) as u32
+}
+
+/// live_pos 表示真正发给窗口的坐标。被帧门挡掉的采样不能写入它，
+/// 否则下一网格里坐标相同会被误认作已经移动，吞掉本该呈现的一步。
+fn accept_position_frame(
+    applied: &std::cell::Cell<(i32, i32)>,
+    last_frame: &std::cell::Cell<u32>,
+    desired: (i32, i32),
+    frame: u32,
+) -> bool {
+    if desired == applied.get() || frame == last_frame.get() {
+        return false;
+    }
+    applied.set(desired);
+    last_frame.set(frame);
+    true
+}
+
+#[cfg(test)]
+mod frame_grid_tests {
+    use super::{accept_position_frame, grid_frame_at};
+
+    #[test]
+    fn skipped_position_sample_does_not_hide_the_next_visible_step() {
+        let applied = std::cell::Cell::new((0, 0));
+        let frame = std::cell::Cell::new(0);
+        assert!(!accept_position_frame(&applied, &frame, (1, 0), 0));
+        assert_eq!(applied.get(), (0, 0));
+        // 整数插值在两个采样时刻相同，但窗口尚未走过这一步。
+        assert!(accept_position_frame(&applied, &frame, (1, 0), 1));
+        assert_eq!(applied.get(), (1, 0));
+        assert!(!accept_position_frame(&applied, &frame, (1, 0), 2));
+        // 静止采样不消费新网格号；同一网格后续出现真实位移仍可显示。
+        assert!(accept_position_frame(&applied, &frame, (2, 0), 2));
+    }
+
+    #[test]
+    fn grid_preserves_display_frequency_without_millisecond_rounding() {
+        for hz in [30u32, 60, 75, 120, 144, 165, 240, 360] {
+            // 每个理论帧边界两侧均校验：一秒恰好 hz 帧，非 62/166 等。
+            for frame in 1..=hz * 2 {
+                let boundary_us = (frame as u128 * 1_000_000).div_ceil(hz as u128);
+                assert_eq!(grid_frame_at(boundary_us - 1, hz), frame - 1, "{hz}Hz");
+                assert_eq!(grid_frame_at(boundary_us, hz), frame, "{hz}Hz");
+            }
+            assert_eq!(grid_frame_at(1_000_000, hz), hz);
+        }
+    }
 }
 
 unsafe fn fade_tick_shared(hwnd: HWND) {
@@ -10186,6 +10351,7 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
             )
         };
         let mut anim_done = true;
+        let mut rendered_this_tick = false;
         if let (Some(c), Some((cands, raw, sel))) = (tl.as_mut(), last.as_deref()) {
             // 【流畅度二批 2026-11-07】组段镜像：show 前刷给窗口
             c.comp_alive.set(alive);
@@ -10217,6 +10383,7 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
                     c.internal_rerender = true;
                     let _ = c.show(cands, raw, &skin, None, *sel);
                     c.internal_rerender = false;
+                    rendered_this_tick = true;
                 }
             }
             // 【三十六修·TL 补 chase 步进】chase 臂发在 show() 无线程
@@ -10285,15 +10452,25 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
                 if cur == t {
                     c.pos_anim = None;
                     c.live_pos.set(t);
+                    // 与主窗分支一致：最后一拍必须真正落位，不能只改镜像。
+                    if c.is_visible() {
+                        let _ = SetWindowPos(
+                            hwnd,
+                            HWND_TOPMOST,
+                            t.0,
+                            t.1,
+                            0,
+                            0,
+                            SWP_NOSIZE | SWP_NOACTIVATE | swp_z_guard(),
+                        );
+                    }
                 } else {
                     anim_done = false;
-                    c.live_pos.set(cur);
                     // 【帧钟网格锁相 2026-11-07】SWP 步进按 n×帧距网格
                     // 放行（tick 只采样）——位置动画的 SWP 频率与 vsync
                     // 对齐，消除 16ms tick vs 16.67ms vsync 的追拍跳步。
                     let fi = grid_frame_now(hwnd, t0);
-                    if c.is_visible() && fi != c.pos_anim_frame.get() {
-                        c.pos_anim_frame.set(fi);
+                    if c.is_visible() && accept_position_frame(&c.live_pos, &c.pos_anim_frame, cur, fi) {
                         // 【三十二修·门控】二十五修口径：trace 关时不白付
                         // format! 分配（动画期每 5ms tick 一次）。
                         if crate::tsf::trace_on() {
@@ -10331,13 +10508,16 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
                         }
                     })
                     .unwrap_or(false);
-                if c.is_visible() && render_ok {
+                // 尺寸帧的 show 已经绘制本拍高亮；避免同拍第二次 Present(1)。
+                if c.is_visible() && render_ok && !rendered_this_tick {
                     c.internal_rerender = true;
                     let _ = c.show(cands, raw, &skin, None, *sel);
                     c.internal_rerender = false;
                 }
             }
         }
+        // 位置步进只移动主窗，不经过 show；词框线程的挂件也要随窗同步。
+        crate::overlaywin::sync_for(hwnd, &skin);
         if anim_done {
             let _ = KillTimer(hwnd, FADE_TIMER_ID);
             anim_boost_disarm(hwnd);
@@ -10556,16 +10736,13 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
                 }
                 } else {
                     anim_done = false;
-                    let prev = c.live_pos.get();
-                    c.live_pos.set(cur);
                     // 死帧去重：坐标与上一拍相同（亚像素增量取整为0）
                     // 则不动窗不落档——尾巴只留真实位移。
                     // 【帧钟网格锁相 2026-11-07】SWP 按 n×帧距网格放行
                     //（tick 只采样）——消除 16ms tick vs 16.67ms vsync
                     // 相位追拍跳步（实测 SWP 间隔 30-33ms 双帧档 11%）。
                     let fi = grid_frame_now(hwnd, t0);
-                    if c.is_visible() && cur != prev && fi != c.pos_anim_frame.get() {
-                        c.pos_anim_frame.set(fi);
+                    if c.is_visible() && accept_position_frame(&c.live_pos, &c.pos_anim_frame, cur, fi) {
                         // 【三十二修·门控】同上：tick 热路径 trace 关不分配。
                         if crate::tsf::trace_on() {
                             crate::tsf::trace(&format!("cw2: SWP动画2 cur=({},{})", cur.0, cur.1));
@@ -10603,7 +10780,8 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
                     }
                 })
                 .unwrap_or(false);
-            if c.is_visible() && render_ok {
+            // 尺寸帧的 show 已经绘制本拍高亮；避免同拍第二次 Present(1)。
+            if c.is_visible() && render_ok && !rendered_this_tick {
                 c.internal_rerender = true;
                 let _ = c.show(cands, raw, &skin, caret.as_ref(), *sel);
                 c.internal_rerender = false;
@@ -10621,6 +10799,7 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
             c.internal_rerender = true;
             let _ = c.show(cands, raw, &skin, caret.as_ref(), *sel);
             c.internal_rerender = false;
+            rendered_this_tick = true;
             anim_fps_probe::frame(); // 实测打点：fs 步进帧
             c.fs_last_render_us
                 .set(t_frame.elapsed().as_micros().min(u32::MAX as u128) as u32);
@@ -10702,7 +10881,8 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
                         false
                     }
                 };
-                if c.is_visible() && render_ok {
+                // show 同时绘制调频视图；尺寸/高亮帧已经覆盖本拍动效。
+                if c.is_visible() && render_ok && !rendered_this_tick {
                     c.internal_rerender = true;
                     let _ = c.show(cands, raw, &skin, caret.as_ref(), *sel);
                     c.internal_rerender = false;
@@ -10901,35 +11081,31 @@ pub(crate) fn shadow_inset_for(hwnd: HWND) -> i32 {
 ///（超过刷新率的渲染合成器根本不上屏=纯浪费）。取窗口最近显示
 /// 器的 ENUM_CURRENT_SETTINGS.dmDisplayFrequency，进程级缓存一
 /// 次；查询失败兜底 60Hz。
-fn morph_frame_interval_ms(hwnd: HWND) -> u128 {
+fn morph_refresh_hz(hwnd: HWND) -> u32 {
     use std::sync::Mutex;
-    // 2s TTL 缓存（非首查永存）：窗口跨屏迁移（60Hz 外接 ↔ 高刷
-    // 主屏）至多 2s 内跟上新屏节奏；查询本身是轻 syscall，2s 一次
-    // 可忽略。
-    static CACHE: Mutex<(u64, u128)> = Mutex::new((0, 17));
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
+    // 按窗口分别缓存，避免同进程多线程候选窗分处不同刷新率屏幕时，
+    // 后到的窗沿用第一个窗的节奏。跨屏/显示模式变更至多 2s 后重查。
+    // 使用单调时钟，系统校时不延长 TTL；最多保留 8 个窗口。
+    static CACHE: Mutex<Vec<(isize, u64, u32)>> = Mutex::new(Vec::new());
+    let now_ms = unsafe { GetTickCount64() };
+    let key = hwnd.0 as isize;
     let mut g = CACHE.lock().unwrap_or_else(|p| p.into_inner());
-    if now_ms.saturating_sub(g.0) > 2000 {
-        let new = query_refresh_interval_ms(hwnd);
-        if new != g.1 && crate::tsf::trace_on() {
-            crate::tsf::trace(&format!("cw2: 形变帧率封顶 → {new}ms/帧（跨屏/初查）"));
+    if let Some((_, at, hz)) = g.iter().find(|(h, _, _)| *h == key) {
+        if now_ms.saturating_sub(*at) <= 2000 {
+            return *hz;
         }
-        *g = (now_ms, new);
     }
-    g.1
+    let hz = query_refresh_rate_hz(hwnd);
+    g.retain(|(h, at, _)| *h != key && now_ms.saturating_sub(*at) <= 2000);
+    if g.len() >= 8 {
+        g.remove(0);
+    }
+    g.push((key, now_ms, hz));
+    hz
 }
 
-/// 窗口最近显示器当前刷新率的帧距（ms，**向下取整**）。AppContainer
-///（SearchHost/UWP）或任何查询失败 → 兜底 60Hz。5ms winmm tick 是
-/// 渲染节拍地板：144Hz 屏阈值 ~6ms → 实际每 2 tick 渲一帧（≈100fps，
-/// 不超发合成帧的前提下最平滑；240Hz 阈值 4ms → 每 tick 一帧）。
-/// 【流畅度二批 2026-11-07】ceil→floor：tick 周期略快于 vsync，多出
-/// 的空 tick 被「周期-2ms」帧门幂等吸收——ceil 在 165/240Hz 屏上量化
-/// 出 11/5ms 周期反而慢于帧距（43/21ms 复合周期微顿丢帧）。
-fn query_refresh_interval_ms(hwnd: HWND) -> u128 {
+/// 窗口最近显示器当前刷新率。保留 Hz，不提前取整帧距；查询失败兜底 60Hz。
+fn query_refresh_rate_hz(hwnd: HWND) -> u32 {
     unsafe {
         let mut hz: u32 = 60;
         let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
@@ -10957,9 +11133,7 @@ fn query_refresh_interval_ms(hwnd: HWND) -> u128 {
                 }
             }
         }
-        // 【流畅度二批 2026-11-07】ceil→floor：tick 略快于 vsync，多出
-        // 的空 tick 由「周期-2ms」帧门幂等吸收（165/240Hz 丢帧修复）
-        (1000.0 / hz as f32).floor() as u128
+        hz
     }
 }
 

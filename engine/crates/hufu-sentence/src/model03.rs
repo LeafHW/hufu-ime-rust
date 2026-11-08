@@ -103,7 +103,7 @@ impl FivegramModel {
             return Err(bad("version"));
         }
         if rd_u32(d, 12) as usize != HEADER_SIZE
-            || rd_u64(d, 16) as usize != d.len()
+            || rd_u64(d, 16) != d.len() as u64
             || rd_u32(d, 24) != 5
             || rd_u32(d, 32) != 256
         {
@@ -113,12 +113,14 @@ impl FivegramModel {
         let step_div = if version == 2 { 1e9 } else { 1e12 };
         let vocab_count = rd_u32(d, 28) as usize;
         let index_stride = rd_u32(d, 36) as usize;
-        let vocab_offset = rd_u64(d, 40) as usize;
-        let vocab_bytes = rd_u64(d, 48) as usize;
+        let vocab_offset = usize::try_from(rd_u64(d, 40)).map_err(|_| bad("词表区间"))?;
+        let vocab_bytes = usize::try_from(rd_u64(d, 48)).map_err(|_| bad("词表区间"))?;
         let unknown_id = rd_u16(d, 56);
         let bos_id = rd_u16(d, 58);
         let eos_id = rd_u16(d, 60);
-        if index_stride == 0 || vocab_offset + vocab_bytes > d.len() {
+        let vocab_end = vocab_offset.checked_add(vocab_bytes)
+            .filter(|&end| end <= d.len()).ok_or_else(|| bad("词表区间"))?;
+        if index_stride == 0 {
             return Err(bad("词表区间"));
         }
         // 【P0-3 2026-11-03】vocab_count 只从头部读、未与 vocab_bytes
@@ -127,15 +129,19 @@ impl FivegramModel {
         // 每条词表记录至少 2B 长度 + 2×qbytes 概率，按字节区间封顶。
         let min_entry = 2usize + 2 * qbytes;
         let max_vocab = (vocab_bytes / min_entry).min(1_000_000).max(1);
-        if vocab_count == 0 || vocab_count > max_vocab {
+        if vocab_count == 0 || vocab_count > max_vocab || vocab_count > u16::MAX as usize + 1 {
             return Err(bad("词表数量越界"));
+        }
+        if [unknown_id, bos_id, eos_id].iter().any(|&id| id as usize >= vocab_count) {
+            return Err(bad("特殊词表 id 越界"));
         }
         let mut dirs: [Vec<Bucket>; 4] = Default::default();
         let mut quant: [Quant; 5] = [Quant { pmin: 0.0, pstep: 0.0, bmin: 0.0, bstep: 0.0 }; 5];
         for o in 0..4 {
-            let dir_off = rd_u64(d, 64 + o * 24) as usize;
+            let dir_off = usize::try_from(rd_u64(d, 64 + o * 24))
+                .map_err(|_| bad("directory 区间"))?;
             let rec = rd_u64(d, 64 + o * 24 + 16) as usize;
-            if dir_off + 256 * BUCKET_META > d.len() {
+            if dir_off.checked_add(256 * BUCKET_META).filter(|&end| end <= d.len()).is_none() {
                 return Err(bad("directory 区间"));
             }
             let mut v = Vec::with_capacity(256);
@@ -148,7 +154,8 @@ impl FivegramModel {
                 let bc = rd_u32(d, p + 28) as usize;
                 // 【P0-3 补充】计数不得超过文件本身，防止后续按
                 // index_count/block_count 做无界分配。
-                if io as usize > d.len() || ic > d.len() || bc > d.len() {
+                let index_end = io.checked_add((ic as u64) * INDEX_ENTRY as u64);
+                if index_end.filter(|&end| end <= d.len() as u64).is_none() || bc > d.len() {
                     return Err(bad("bucket 计数越界"));
                 }
                 v.push(Bucket {
@@ -171,7 +178,7 @@ impl FivegramModel {
             };
         }
         // 词表：id 顺序 { len:u16, token:u8[len], p:q, b:q }；token 为 UTF-8。
-        let vb = &d[vocab_offset..vocab_offset + vocab_bytes];
+        let vb = &d[vocab_offset..vocab_end];
         let mut cp2id = HashMap::with_capacity(vocab_count);
         let mut id2cp: Vec<Option<u32>> = Vec::with_capacity(vocab_count);
         let mut unigram_p = Vec::with_capacity(vocab_count);
@@ -250,14 +257,15 @@ impl FivegramModel {
     pub fn step_prob(&self, h: &[u32], cp: u32) -> f64 {
         let target = self.id_of(cp);
         let n = h.len().min(4);
+        // 每个事件最多四字历史。各阶共用同一栈上 id 尾巴，避免每阶
+        // 重新分配 Vec、重复哈希查词（长句 beam 的高频评分路径）。
+        let mut history_ids = [0u16; 4];
+        for (id, &c) in history_ids[..n].iter_mut().zip(&h[h.len() - n..]) {
+            *id = self.id_of(c);
+        }
         let mut total = 0.0f64; // log10 域回退累计
         for ctx_len in (1..=n).rev() {
-            let start = h.len() - ctx_len;
-            let mut ids = Vec::with_capacity(ctx_len);
-            for &c in &h[start..] {
-                ids.push(self.id_of(c));
-            }
-            if let Some((p, bow, observed)) = self.lookup(ctx_len + 1, &ids, target) {
+            if let Some((p, bow, observed)) = self.lookup(ctx_len + 1, &history_ids[n - ctx_len..n], target) {
                 if observed {
                     return 10f64.powf(total + p);
                 }
@@ -270,6 +278,9 @@ impl FivegramModel {
 
     /// (order, 上下文 ids, 目标 id) → (log10 概率, log10 回退, 是否观察)。
     pub(crate) fn lookup(&self, order: usize, ids: &[u16], target: u16) -> Option<(f64, f64, bool)> {
+        if !(2..=5).contains(&order) || ids.len() != order - 1 {
+            return None;
+        }
         let o = order - 2; // dirs 下标
         let first = ids[0] as usize;
         let meta = &self.dirs[o][first % 256];
@@ -308,18 +319,25 @@ impl FivegramModel {
         }
         let entry = lo - 1;
         let ip = idx + entry * INDEX_ENTRY;
-        let offset = rd_u64(d, ip + 8) as usize;
+        let offset = usize::try_from(rd_u64(d, ip + 8)).ok()?;
         let finish = if entry + 1 < meta.index_count as usize {
-            rd_u64(d, ip + INDEX_ENTRY + 8) as usize
+            usize::try_from(rd_u64(d, ip + INDEX_ENTRY + 8)).ok()?
         } else {
             meta.index_offset as usize
         };
+        // 索引区已在装载时验证；页指针与后继计数仍来自模型字节。
+        // 坏页视为未观测，沿正常回退链继续，不能把按键线程打崩。
+        if offset > finish || finish > idx {
+            return None;
+        }
         let qbytes = self.qbytes;
         let succ_bytes = 2 + qbytes;
         // 页内线性扫描（≤ index_stride 条块）
         let mut pos = offset;
         let block_hdr = ctx_len * 2 + qbytes + 2;
-        while pos + block_hdr <= finish {
+        let mut blocks_left = self.index_stride.min(meta.block_count as usize);
+        while blocks_left > 0 && finish - pos >= block_hdr {
+            blocks_left -= 1;
             let mut cmp = std::cmp::Ordering::Equal;
             for i in 0..ctx_len {
                 let a = rd_u16(d, pos + i * 2);
@@ -335,6 +353,9 @@ impl FivegramModel {
             let bow_q = read_q(d, pos + ctx_len * 2, qbytes);
             let count = rd_u16(d, pos + ctx_len * 2 + qbytes) as usize;
             let succ = pos + block_hdr;
+            if count > (finish - succ) / succ_bytes {
+                return None;
+            }
             if cmp == std::cmp::Ordering::Equal {
                 // 后继按 id 升序二分
                 let (mut lo, mut hi) = (0usize, count);
@@ -391,5 +412,115 @@ fn decode_backoff(qv: u32, q: Quant) -> f64 {
         0.0
     } else {
         q.bmin + (qv - 1) as f64 * q.bstep
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn set_u32(d: &mut [u8], p: usize, v: u32) {
+        d[p..p + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    fn set_u64(d: &mut [u8], p: usize, v: u64) {
+        d[p..p + 8].copy_from_slice(&v.to_le_bytes());
+    }
+    fn tiny_bytes() -> Vec<u8> {
+        let mut d = vec![0u8; HEADER_SIZE + 4 * 256 * BUCKET_META];
+        d[..8].copy_from_slice(MAGIC);
+        set_u32(&mut d, 8, 2);
+        set_u32(&mut d, 12, HEADER_SIZE as u32);
+        set_u32(&mut d, 24, 5);
+        set_u32(&mut d, 28, 3);
+        set_u32(&mut d, 32, 256);
+        set_u32(&mut d, 36, 1);
+        for o in 0..4 {
+            set_u64(&mut d, 64 + o * 24, (HEADER_SIZE + o * 256 * BUCKET_META) as u64);
+        }
+        for i in 0..5 {
+            set_u32(&mut d, 160 + i * 16, (-20_000_000i32) as u32);
+            set_u32(&mut d, 164 + i * 16, 10_000_000);
+        }
+        let vocab = d.len();
+        for token in ["<unk>", "甲", "乙"] {
+            d.extend_from_slice(&(token.len() as u16).to_le_bytes());
+            d.extend_from_slice(token.as_bytes());
+            d.extend_from_slice(&[100, 0]);
+        }
+        let vocab_bytes = d.len() - vocab;
+        set_u64(&mut d, 40, vocab as u64);
+        set_u64(&mut d, 48, vocab_bytes as u64);
+        let block = d.len();
+        // bigram 甲(id=1) -> 乙(id=2), log10 p=-1.5.
+        d.extend_from_slice(&[1, 0, 0, 1, 0, 2, 0, 50]);
+        let index = d.len();
+        d.extend_from_slice(&[1, 0, 0, 0, 0, 0, 0, 0]);
+        d.extend_from_slice(&(block as u64).to_le_bytes());
+        let bucket = HEADER_SIZE + BUCKET_META;
+        set_u64(&mut d, bucket, block as u64);
+        set_u64(&mut d, bucket + 8, (index - block) as u64);
+        set_u64(&mut d, bucket + 16, index as u64);
+        set_u32(&mut d, bucket + 24, 1);
+        set_u32(&mut d, bucket + 28, 1);
+        set_u64(&mut d, bucket + 32, 1);
+        let len = d.len();
+        set_u64(&mut d, 16, len as u64);
+        d
+    }
+    fn from_bytes(d: &[u8]) -> std::io::Result<FivegramModel> {
+        let mut map = memmap2::MmapMut::map_anon(d.len())?;
+        map.copy_from_slice(d);
+        FivegramModel::build(map.make_read_only()?)
+    }
+
+    #[test]
+    fn tiny_fivegram_queries() {
+        let m = from_bytes(&tiny_bytes()).unwrap();
+        assert_eq!(m.id_of('甲' as u32), 1);
+        let observed = m.step_prob(&['甲' as u32], '乙' as u32);
+        assert!((observed - 10f64.powf(-1.5)).abs() < 1e-10);
+        for history in [vec!['乙', '甲'], vec!['乙', '乙', '乙', '甲'], vec!['甲', '乙', '乙', '乙', '甲']] {
+            let history: Vec<u32> = history.into_iter().map(|c| c as u32).collect();
+            assert!((m.step_prob(&history, '乙' as u32) - observed).abs() < 1e-10);
+        }
+        assert!((m.step_prob(&[], '乙' as u32) - 0.1).abs() < 1e-10);
+        let unseen = m.step_prob(&['乙' as u32], '甲' as u32);
+        assert!((unseen - 0.1).abs() < 1e-10);
+    }
+
+    #[test]
+    fn overflowing_layout_rejected() {
+        for (off, value) in [(40, u64::MAX), (48, u64::MAX), (64, u64::MAX)] {
+            let mut d = tiny_bytes();
+            set_u64(&mut d, off, value);
+            assert!(from_bytes(&d).is_err(), "bad offset at {off}");
+        }
+    }
+
+    #[test]
+    fn truncated_bucket_index_rejected() {
+        let mut d = tiny_bytes();
+        let len = d.len();
+        set_u64(&mut d, HEADER_SIZE + BUCKET_META + 16, (len - 1) as u64);
+        assert!(from_bytes(&d).is_err());
+    }
+
+    #[test]
+    fn corrupt_page_and_successors_do_not_panic() {
+        let original = tiny_bytes();
+        let bucket = HEADER_SIZE + BUCKET_META;
+        let index = rd_u64(&original, bucket + 16) as usize;
+        let block = rd_u64(&original, index + 8) as usize;
+        for pointer in [u64::MAX, original.len() as u64 + 1, index as u64 + 1] {
+            let mut d = original.clone();
+            set_u64(&mut d, index + 8, pointer);
+            let m = from_bytes(&d).unwrap();
+            assert!(m.lookup(2, &[1], 2).is_none());
+        }
+        let mut d = original;
+        d[block + 3..block + 5].copy_from_slice(&u16::MAX.to_le_bytes());
+        let m = from_bytes(&d).unwrap();
+        assert!(m.lookup(2, &[1], 2).is_none());
+        assert!((m.step_prob(&['甲' as u32], '乙' as u32) - 0.1).abs() < 1e-10);
     }
 }

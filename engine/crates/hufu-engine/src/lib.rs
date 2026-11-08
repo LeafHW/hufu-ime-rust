@@ -435,9 +435,11 @@ pub struct Engine {
     /// 用户数据目录
     pub data_dir: PathBuf,
     sentence: Option<Arc<dyn SentenceDecoder>>,
-    /// 神经重排结果缓存：key=committed_raw+raw → 有序候选文本
+    /// 神经重排结果缓存：key=模型代际/方案/编码/前文 → 有序候选文本。
     /// Arc 共享给 server 重排线程写入
     pub rerank_cache: Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<String>>>>,
+    /// 同路径方案重载、用户词和解码器变化也必须隔离旧工作线程的迟到结果。
+    rerank_generation: u64,
     /// 单次按键内的提示音标签提示（select/page 覆盖默认 key/commit）
     sound_hint: Option<&'static str>,
     /// 上屏历史（跨 session，进程级，最新在前）——{重复上屏}/
@@ -640,6 +642,7 @@ impl Engine {
             data_dir: data_dir.to_path_buf(),
             sentence: None,
             rerank_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            rerank_generation: 0,
             sound_hint: None,
             last_commit: String::new(),
             commit_history: std::collections::VecDeque::new(),
@@ -679,6 +682,7 @@ impl Engine {
             schema,
             sentence: None,
             rerank_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            rerank_generation: 0,
             sound_hint: None,
             last_commit: String::new(),
             commit_history: std::collections::VecDeque::new(),
@@ -705,6 +709,7 @@ impl Engine {
     /// 注入整句解码器。
     pub fn set_sentence_decoder(&mut self, dec: Option<Arc<dyn SentenceDecoder>>) {
         self.sentence = dec;
+        self.rerank_generation = self.rerank_generation.wrapping_add(1);
         // 【防回归修复(07-reg P3-3) 2026-11-07】句模型装载/卸载改变
         // display_raw 的可用性但不动 schema——代际失效，堵缓存理论陈
         // 旧命中窗口（同 raw+同代际但句可用性已翻转）。
@@ -845,6 +850,12 @@ impl Engine {
         self.disabled_symbol().unwrap_or_else(|| "·".to_string())
     }
 
+    /// A user-initiated background switch must win over automatic file reloads.
+    /// The result remains pending until a key/select operation applies it.
+    pub fn schema_switch_pending(&self) -> bool {
+        self.switch_pending.is_some()
+    }
+
     /// 切换方案。同时记录「最近方案对」供 Ctrl+M 往返切换。
     pub fn switch_schema(&mut self, name: &str) -> std::io::Result<()> {
         // 【T2-5b 2026-11-07】同步切方案（设置页路由保持同步语义）：作废
@@ -895,6 +906,7 @@ impl Engine {
     /// 在途后台切换。
     pub fn apply_schema(&mut self, name: &str, schema: Schema) -> std::io::Result<()> {
         let _ = self.switch_pending.take();
+        self.rerank_generation = self.rerank_generation.wrapping_add(1);
         let old = self.config.schema.current.clone();
         self.schema = schema;
         // 【三十六修】会话学习按 (code,text) 登记，码义随方案变——
@@ -981,6 +993,7 @@ impl Engine {
                 if self.config.schema.current != pending.from {
                     return; // 期间已有同步切方案/apply_config 接管——结果作废
                 }
+                self.rerank_generation = self.rerank_generation.wrapping_add(1);
                 let old = pending.from.clone();
                 let name = pending.target.clone();
                 self.schema = schema;
@@ -1005,6 +1018,7 @@ impl Engine {
     /// {置顶}/{添加}/{删除}/{加权} 标记格式；词行由 {添加} 分拣产生），
     /// 码表主体不重载。旧 用户词.txt 只读兼容（历史数据）。
     pub fn reload_user_data(&mut self) {
+        self.rerank_generation = self.rerank_generation.wrapping_add(1);
         let dir = self.schema.dir.clone();
         let mut dict_all: Vec<String> = Vec::new();
         let mut replay: Vec<String> = Vec::new();
@@ -5324,7 +5338,6 @@ impl Engine {
         if session.raw.is_empty() {
             return None;
         }
-        let key = format!("{}{}", session.committed_raw, session.raw);
         let top = self.config.sentence.rerank.top_k.max(2);
         let texts: Vec<String> = session
             .candidates
@@ -5342,12 +5355,24 @@ impl Engine {
         // 但 ctx="。" 时模型获得「新句开始」信号，判序大幅正确——
         // 实测 agkadklecbsy：阖口而不言 -28.26 vs 痔问而不言 -40.26
         // （ngram 字模型把高频字病句排成语前面，句首用户实测投诉位）。
+        let ctx = Self::rerank_context(session);
+        Some((self.rerank_key(session, &ctx), ctx, texts))
+    }
+
+    fn rerank_context(session: &Session) -> String {
         let mut ctx = session.tail_context.clone();
         ctx.push_str(&session.committed_text);
-        if ctx.trim().is_empty() {
-            ctx = "。".to_string();
-        }
-        Some((key, ctx, texts))
+        if ctx.trim().is_empty() { "。".into() } else { ctx }
+    }
+
+    /// 长度前缀使任意编码、路径和前文都无法拼接碰撞。key 对 server
+    /// 是不透明标识；解码仍使用真实 full raw。候选重建/提交门控保持
+    /// 同 key，前文、已提交边界或方案/模型变化才失效。
+    fn rerank_key(&self, session: &Session, ctx: &str) -> String {
+        let schema = self.schema.dir.to_string_lossy();
+        format!("{}|{}:{}{}:{}{}:{}{}:{}", self.rerank_generation,
+            schema.len(), schema, session.committed_raw.len(), session.committed_raw,
+            session.raw.len(), session.raw, ctx.len(), ctx)
     }
 
     /// 轮询读入口：先应用已到达的重排缓存（无按键副作用）再取 state——
@@ -5358,10 +5383,11 @@ impl Engine {
 
     /// 应用神经重排缓存：同 key 时按缓存顺序重排 Sentence 类候选（稳定，缺席者保持相对顺序靠后）。
     fn apply_rerank(&self, session: &mut Session) {
-        if session.candidates.is_empty() {
+        if !self.config.sentence.rerank.enabled || session.candidates.is_empty() {
             return;
         }
-        let key = format!("{}{}", session.committed_raw, session.raw);
+        let raw = format!("{}{}", session.committed_raw, session.raw);
+        let key = self.rerank_key(session, &Self::rerank_context(session));
         // 【同 key 幂等 2026-09-08】DLL poll 每 40ms 的 state op 都进
         // 这里——同 key 重复执行会反复做 decode_rich（depth_map 的
         // 全量 beam 解码，锁内）——停顿期 40ms 一次重算同一结果。
@@ -5417,7 +5443,7 @@ impl Engine {
             .sentence
             .as_ref()
             .map(|dec| {
-                dec.decode_rich(&key)
+                dec.decode_rich(&raw)
                     .hits
                     .iter()
                     .map(|h| {
@@ -9014,6 +9040,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let mut eng = Engine::with_schema_dir(&dir, Config::default()).unwrap();
         eng.set_sentence_decoder(Some(std::sync::Arc::new(DepthMock)));
+        eng.config.sentence.rerank.enabled = true;
         let mut s = Session::new(true);
         s.raw = "javz".into();
         s.candidates = vec![
@@ -9024,7 +9051,7 @@ mod tests {
         // Qwen 把「舒服」排第一（词频偏爱）
         {
             let mut cache = eng.rerank_cache.lock().unwrap();
-            cache.insert("javz".into(), vec!["舒服".into(), "们改变".into(), "们服".into()]);
+            cache.insert(eng.rerank_key(&s, &Engine::rerank_context(&s)), vec!["舒服".into(), "们改变".into(), "们服".into()]);
         }
         eng.refresh_rerank(&mut s);
         let texts: Vec<&str> = s.candidates.iter().map(|c| c.text.as_str()).collect();
@@ -9060,7 +9087,7 @@ mod tests {
         //    按 Qwen 顺序自由重排（老痒痒可居首）。
         {
             let mut cache = eng.rerank_cache.lock().unwrap();
-            cache.insert("qlagy".into(), vec!["老鬼".into(), "老痒痒".into()]);
+            cache.insert(eng.rerank_key(&s, &Engine::rerank_context(&s)), vec!["老鬼".into(), "老痒痒".into()]);
         }
         eng.refresh_rerank(&mut s);
         let pos_lg = s.candidates.iter().position(|c| c.text == "老鬼").unwrap();
@@ -9105,17 +9132,18 @@ mod tests {
         eng.set_sentence_decoder(Some(std::sync::Arc::new(GateMock)));
         eng.config.sentence.auto_enable = false; // 整句域立即可用（不挑方案名）
         eng.config.sentence.rerank.enabled = true;
+        let mut s = Session::new(true);
+        s.raw = "javzq".into(); // 5 键 > max_code_length ⇒ 整句接管
+        let key = eng.rerank_key(&s, &Engine::rerank_context(&s));
         // Qwen 缓存序：乙 > 甲 > 丙（乙与甲同选重深度，允许居首）
         {
             let mut cache = eng.rerank_cache.lock().unwrap();
-            cache.insert("javzq".into(), vec!["乙".into(), "甲".into(), "丙".into()]);
+            cache.insert(key.clone(), vec!["乙".into(), "甲".into(), "丙".into()]);
         }
-        let mut s = Session::new(true);
-        s.raw = "javzq".into(); // 5 键 > max_code_length ⇒ 整句接管
         eng.refresh_candidates(&mut s);
         let t1: Vec<&str> = s.candidates.iter().map(|c| c.text.as_str()).collect();
         assert_eq!(t1, vec!["乙", "甲", "丙"], "首次刷新即应用重排: {t1:?}");
-        assert_eq!(s.rerank_applied_key, "javzq");
+        assert_eq!(s.rerank_applied_key, key);
         // 提交门控路径 = 同 key 重建（decode_rich_full 全量重解后
         // refresh_candidates）：幂等闸不得挡缓存序重放
         eng.refresh_candidates(&mut s);
@@ -9125,6 +9153,54 @@ mod tests {
         let o = eng.select_first(&mut s);
         assert_eq!(o.commit.as_deref(), Some("乙"), "空格提交必须吃重排后首选: {:?}", o.commit);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rerank_cache_separates_context_and_schema() {
+        let (mut eng, _dir) = test_engine("rerank-context");
+        eng.config.sentence.rerank.enabled = true;
+        let mut first = Session::new(true);
+        first.raw = "ab".into();
+        first.tail_context = "第一段前文".into();
+        first.candidates = vec![
+            Candidate::new("甲", "ab", CandidateKind::Sentence),
+            Candidate::new("乙", "ab", CandidateKind::Sentence),
+        ];
+        let key = eng.rerank_request(&first).unwrap().0;
+        eng.rerank_cache.lock().unwrap().insert(key.clone(), vec!["乙".into(), "甲".into()]);
+        let mut other = first.clone();
+        other.tail_context = "另一段前文".into();
+        assert_ne!(eng.rerank_request(&other).unwrap().0, key);
+        eng.refresh_rerank(&mut other);
+        assert_eq!(other.candidates[0].text, "甲", "其他前文不能套用旧判序");
+        eng.refresh_rerank(&mut first);
+        assert_eq!(first.candidates[0].text, "乙", "同前文仍能命中重排");
+        eng.schema.dir = eng.schema.dir.join("other-schema");
+        assert_ne!(eng.rerank_request(&first).unwrap().0, key);
+        first.candidates.reverse();
+        eng.refresh_rerank(&mut first);
+        assert_eq!(first.candidates[0].text, "甲", "不同方案不能套用旧判序");
+        eng.schema.dir.pop();
+        assert_eq!(eng.rerank_request(&first).unwrap().0, key);
+        eng.set_sentence_decoder(None);
+        assert_ne!(eng.rerank_request(&first).unwrap().0, key, "解码器重载同样隔离迟到缓存");
+    }
+
+    #[test]
+    fn disabled_rerank_does_not_apply_cached_order() {
+        let (mut eng, _dir) = test_engine("rerank-disabled");
+        eng.config.sentence.rerank.enabled = true;
+        let mut s = Session::new(true);
+        s.raw = "ab".into();
+        s.candidates = vec![
+            Candidate::new("甲", "ab", CandidateKind::Sentence),
+            Candidate::new("乙", "ab", CandidateKind::Sentence),
+        ];
+        let key = eng.rerank_request(&s).unwrap().0;
+        eng.rerank_cache.lock().unwrap().insert(key, vec!["乙".into(), "甲".into()]);
+        eng.config.sentence.rerank.enabled = false;
+        eng.refresh_rerank(&mut s);
+        assert_eq!(s.candidates[0].text, "甲", "关闭重排后不得继续吃旧缓存");
     }
 
     // 【2026-09-06 用户规格→2026-09-08 双档】\ 命令模式取消；

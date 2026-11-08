@@ -35,3 +35,6 @@ platform/windows/deploy-88/_probe/
 
 # Local bridge builds, test captures and machine-specific registration records
 /evidence/
+
+# settings 复查工作目录（本地审查产物）
+settings-app/.review/

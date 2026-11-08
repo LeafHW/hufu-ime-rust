@@ -18,7 +18,11 @@ LANG_NEUTRAL = 0
 def MAKEINTRESOURCE(i):
     return ctypes.c_void_p(i)
 
-def embed(exe_path, ico_path):
+def embed(exe_path, ico_path, group_id=1, language=LANG_NEUTRAL):
+    # TSF DLLs already use group 0 / en-US. Replace that group in place;
+    # writing a second group leaves Windows free to select the stale first one.
+    if not 0 <= group_id <= 0xffff or not 0 <= language <= 0xffff:
+        raise ValueError('resource group and language must be WORD values')
     ico = open(ico_path, 'rb').read()
     reserved, ico_type, count = struct.unpack_from('<HHH', ico, 0)
     assert ico_type == 1 and count > 0, 'not a valid .ico'
@@ -44,15 +48,18 @@ def embed(exe_path, ico_path):
     for i, img in enumerate(images, 1):
         # 【关键】RT_ICON 必须用整数 ID（GRPICONDIR.nID 按 MAKEINTRESOURCE 查找）；
         # 传宽字符串名会写成字符串名资源，图标组引用落空 → PrivateExtractIcons 提取 0 个、任务管理器无图标。
-        ok = UpdateResourceW(h, MAKEINTRESOURCE(RT_ICON), MAKEINTRESOURCE(i), LANG_NEUTRAL,
+        ok = UpdateResourceW(h, MAKEINTRESOURCE(RT_ICON), MAKEINTRESOURCE(i), language,
                              ctypes.create_string_buffer(img, len(img)), len(img)) and ok
     buf = ctypes.create_string_buffer(grp, len(grp))
-    ok = UpdateResourceW(h, MAKEINTRESOURCE(RT_GROUP_ICON), MAKEINTRESOURCE(1), LANG_NEUTRAL, buf, len(grp)) and ok
+    ok = UpdateResourceW(h, MAKEINTRESOURCE(RT_GROUP_ICON), MAKEINTRESOURCE(group_id), language, buf, len(grp)) and ok
     if not ok:
-        raise OSError('UpdateResource failed err=%d' % ctypes.get_last_error())
+        error = ctypes.get_last_error()
+        EndUpdateResourceW(h, True)
+        raise OSError('UpdateResource failed err=%d' % error)
     if not EndUpdateResourceW(h, False):
         raise OSError('EndUpdateResource failed err=%d' % ctypes.get_last_error())
     print('embedded %d icon images -> %s' % (count, exe_path))
 
 if __name__ == '__main__':
-    embed(sys.argv[1], sys.argv[2])
+    embed(sys.argv[1], sys.argv[2], int(sys.argv[3], 0) if len(sys.argv) > 3 else 1,
+          int(sys.argv[4], 0) if len(sys.argv) > 4 else LANG_NEUTRAL)

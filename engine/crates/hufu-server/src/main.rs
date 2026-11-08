@@ -31,6 +31,83 @@ use http::{Request, Response};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+/// A directory fingerprint and its lock-free preload belong to this exact
+/// configuration revision. A user switch (including A -> B -> A) wins over it.
+struct SchemaWatchTarget {
+    data_dir: PathBuf,
+    schema_dir: String,
+    current: String,
+    dir: PathBuf,
+    config_rev: u64,
+}
+
+impl SchemaWatchTarget {
+    fn capture(host: &Host) -> Self {
+        Self {
+            data_dir: host.data_dir.clone(),
+            schema_dir: host.engine.config.schema.dir.clone(),
+            current: host.engine.config.schema.current.clone(),
+            dir: hufu_engine::Engine::resolve_data_sub(
+                &host.data_dir, &host.engine.config.schema.dir,
+            ).join(&host.engine.config.schema.current),
+            config_rev: config_rev(),
+        }
+    }
+
+    fn is_current(&self, host: &Host) -> bool {
+        !host.engine.schema_switch_pending()
+            && self.config_rev == config_rev()
+            && self.data_dir == host.data_dir
+            && self.schema_dir == host.engine.config.schema.dir
+            && self.current == host.engine.config.schema.current
+            && self.dir == host.engine.schema.dir
+    }
+}
+
+fn schema_watch_changed_files(
+    base: &[(String, u64, i64)],
+    current: &[(String, u64, i64)],
+) -> Vec<String> {
+    let mut changed: Vec<String> = current.iter()
+        .filter(|row| !base.contains(row))
+        .map(|(name, _, _)| name.clone())
+        .collect();
+    // A removed main/symbol table also requires a full reload. An empty list
+    // would otherwise satisfy all(user_only) and leave its old entries alive.
+    changed.extend(base.iter()
+        .filter(|(name, _, _)| !current.iter().any(|(n, _, _)| n == name))
+        .map(|(name, _, _)| name.clone()));
+    changed
+}
+
+/// Caller holds the existing Host guard; never reacquire it in this helper.
+fn apply_schema_watch_reload(
+    host: &mut Host,
+    target: &SchemaWatchTarget,
+    schema: hufu_dict::Schema,
+) -> std::io::Result<bool> {
+    apply_preloaded_schema(host, target, &target.current, schema)
+}
+
+/// Lock-free schema reads must only commit against the Host they started from.
+/// This also covers explicit HTTP/pipe selections and manual reloads.
+fn apply_preloaded_schema(
+    host: &mut Host,
+    target: &SchemaWatchTarget,
+    name: &str,
+    schema: hufu_dict::Schema,
+) -> std::io::Result<bool> {
+    let expected_dir = hufu_engine::Engine::resolve_data_sub(
+        &target.data_dir, &target.schema_dir,
+    ).join(name);
+    if !target.is_current(host) || schema.dir != expected_dir {
+        return Ok(false);
+    }
+    host.engine.apply_schema(name, schema)?;
+    host.session.clear();
+    Ok(true)
+}
+
 const INDEX_HTML: &str = include_str!("../../../../settings-ui/index.html");
 
 /// 【打赏码 2026-10-26】关于页打赏码图片（include_bytes 进 exe 自包含，
@@ -611,7 +688,6 @@ fn main() {
     // 之重置（切方案本身已装载，不双触发）。
     {
         let shared_w = shared.clone();
-        let data_dir_w = data_dir.clone();
         let _ = std::thread::Builder::new()
             .name("hufu-schema-watch".into())
             .spawn(move || {
@@ -671,24 +747,19 @@ fn main() {
                     // 千分之一核）。两轮稳定=改动到生效 ≈1~1.5s。
                     std::thread::sleep(std::time::Duration::from_millis(500));
                     // 当前方案目录（切方案后跟着走；短锁只取两个字符串）
-                    let (dir, current) = {
+                    let target = {
                         let h = shared_w.lock().unwrap_or_else(|p| p.into_inner());
-                        (
-                            hufu_engine::Engine::resolve_data_sub(
-                                &data_dir_w,
-                                &h.engine.config.schema.dir,
-                            )
-                            .join(&h.engine.config.schema.current),
-                            h.engine.config.schema.current.clone(),
-                        )
+                        SchemaWatchTarget::capture(&h)
                     };
+                    let dir = &target.dir;
+                    let current = &target.current;
                     let Some(cur) = fingerprint(&dir) else {
                         continue; // 方案目录不在/不可读：静默等下一轮
                     };
                     // 首轮 or 目录切换：换基线不触发（切方案路径已装载）
-                    if first_round || dir != base_dir {
+                    if first_round || *dir != base_dir {
                         first_round = false;
-                        base_dir = dir;
+                        base_dir = dir.clone();
                         base = cur.clone();
                         prev = cur;
                         armed_since = None;
@@ -706,20 +777,15 @@ fn main() {
                         continue;
                     }
                     // 稳定的变化：cur != base && cur == prev → 分档重载
-                    let changed: Vec<String> = cur
-                        .iter()
-                        .filter(|(n, sz, mt)| {
-                            !base
-                                .iter()
-                                .any(|(bn, bs, bm)| bn == n && bs == sz && bm == mt)
-                        })
-                        .map(|(n, _, _)| n.clone())
-                        .collect();
+                    let changed = schema_watch_changed_files(&base, &cur);
                     let user_only = changed
                         .iter()
                         .all(|n| n == "用户调整|txt" || n == "用户词|txt");
                     if user_only {
                         let mut h = shared_w.lock().unwrap_or_else(|p| p.into_inner());
+                        if !target.is_current(&h) {
+                            continue;
+                        }
                         h.engine.reload_user_data();
                         eprintln!("码表监视：用户调整/用户词变化，轻量重载完成");
                         // 【云同步 2026-10-28】变化通知同步线程（防抖后
@@ -731,6 +797,9 @@ fn main() {
                         // 读——改表达式直取。
                         let defer = {
                             let h = shared_w.lock().unwrap_or_else(|p| p.into_inner());
+                            if !target.is_current(&h) {
+                                continue;
+                            }
                             !h.session.is_idle()
                         };
                         if defer {
@@ -748,29 +817,26 @@ fn main() {
                         // 【流畅度二批 2026-11-07】重载装载段出锁
                         //（原锁内 switch_schema = load 0.05-1s + apply，
                         // 云同步落表后首键被顶）：取路径 → 放锁装载 →
-                        // 短锁应用。装载期间用户恰切方案 → apply_schema
-                        // 会写回 current=本线程快照名，属最后写入者赢
-                        //（与原同步版语义一致，窗口从"锁内串行"变为
-                        // "装载期并发"，错切面=码表监视恰在切方案瞬间
-                        // 触发重载，可接受）。
+                        // 短锁应用。配置/路径快照在前后两段核对；装载
+                        // 期间用户切方案或保存设置，旧结果作废并下一轮
+                        // 重新观察，不能回切旧方案或清空新方案的组字。
                         let ok = {
-                            let (data_dir, schema_dir) = {
-                                let h = shared_w.lock().unwrap_or_else(|p| p.into_inner());
-                                (h.data_dir.clone(), h.engine.config.schema.dir.clone())
-                            };
                             let loaded = hufu_engine::Engine::load_schema_for(
-                                &data_dir,
-                                &schema_dir,
-                                &current,
+                                &target.data_dir,
+                                &target.schema_dir,
+                                current,
                             );
                             let mut h = shared_w.lock().unwrap_or_else(|p| p.into_inner());
+                            if !target.is_current(&h) {
+                                continue;
+                            }
                             match loaded {
                                 Ok(schema) => {
-                                    let r = h.engine.apply_schema(&current, schema);
-                                    if r.is_ok() {
-                                        h.session.clear();
+                                    match apply_schema_watch_reload(&mut h, &target, schema) {
+                                        Ok(true) => true,
+                                        Ok(false) => continue,
+                                        Err(_) => false,
                                     }
-                                    r.is_ok()
                                 }
                                 Err(_) => false,
                             }
@@ -985,8 +1051,8 @@ fn main() {
 static HOST_HANDLE: std::sync::OnceLock<std::sync::Arc<std::sync::Mutex<Host>>> =
     std::sync::OnceLock::new();
 
-/// 【P1-15 2026-11-04】配置版本号（CAS）。每次 POST /api/config 写入成功自增。
-/// route() 持 Host 锁期间读/比对/自增天然串行；仍用原子量是为了未来锁外
+/// 配置版本号（CAS）：HTTP、管道、托盘和同步的配置变更都须推进。
+/// 持 Host 锁期间读/比对/自增天然串行；仍用原子量是为了未来锁外
 /// 读取不引入锁序问题。初始 1——首次 GET 拿到的 rev 就是 1，第一次写回
 /// 时客户端带 1 与服务端一致，不会误报冲突。
 static CONFIG_REV: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -1333,7 +1399,7 @@ fn image_content_type(p: &std::path::Path, body: &[u8]) -> &'static str {
     }
 }
 
-/// 【SSF 真渲染 2026-10-16】spawn PowerShell P/Invoke 生产 DLL 的
+/// 【SSF 真渲染】原生 helper 加载生产 DLL 的
 /// hufu_test_skin_dump（连本进程拉当前皮肤真渲染）→ BMP。锁外执行
 ///（route 顶部提前分发）。
 fn ssf_render_endpoint() -> Response {
@@ -1481,6 +1547,67 @@ fn log_render_helper_missing() {
     }
 }
 
+fn render_output_path() -> PathBuf {
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!("hufu-ssf-render-{}-{stamp}-{sequence}.bmp", std::process::id()))
+}
+
+/// Bound cleanup as well: an OS termination failure must not turn a render
+/// timeout back into an unbounded wait on the HTTP worker.
+fn terminate_render_helper(child: &mut std::process::Child) -> std::io::Result<()> {
+    let kill_error = child.kill().err();
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return Ok(()),
+            Err(error) => return Err(error),
+            Ok(None) => {}
+        }
+        if started.elapsed() >= std::time::Duration::from_millis(500) {
+            return Err(kill_error.unwrap_or_else(|| std::io::Error::new(
+                std::io::ErrorKind::TimedOut, "终止渲染助手后仍未确认退出",
+            )));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// Poll and terminate the native helper with bounded render/cleanup budgets.
+fn wait_render_helper(
+    child: &mut std::process::Child,
+    budget: std::time::Duration,
+) -> std::io::Result<std::process::ExitStatus> {
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => {}
+            Err(error) => {
+                if let Err(cleanup) = terminate_render_helper(child) {
+                    eprintln!("渲染助手回收失败: {cleanup}");
+                }
+                return Err(error);
+            }
+        }
+        let Some(remaining) = budget.checked_sub(started.elapsed()).filter(|d| !d.is_zero()) else {
+            let detail = match terminate_render_helper(child) {
+                Ok(()) => "皮肤渲染超过时间限制".to_string(),
+                Err(cleanup) => {
+                    eprintln!("渲染助手超时后回收失败: {cleanup}");
+                    format!("皮肤渲染超过时间限制；回收失败: {cleanup}")
+                }
+            };
+            return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, detail));
+        };
+        std::thread::sleep(remaining.min(std::time::Duration::from_millis(20)));
+    }
+}
+
 fn ssf_render_inner(query_id: Option<&str>) -> Response {
     // 【渲染缓存 2026-10-16】命中直返（皮肤/设置/上位未变时零渲染）。
     // None（当前上位）→ 读 config 定位皮肤目录 + config 内容进指纹；
@@ -1503,8 +1630,8 @@ fn ssf_render_inner(query_id: Option<&str>) -> Response {
             })
         })
     };
-    if let Some(dir) = skin_dir_for_fp.clone() {
-        let fp = render_fingerprint(&dir, query_id.is_none());
+    let source_fingerprint = skin_dir_for_fp.as_ref().map(|dir| render_fingerprint(dir, query_id.is_none()));
+    if let Some(fp) = source_fingerprint {
         if let Some((c_fp, bmp)) = RENDER_CACHE.lock().unwrap().get(&cache_key) {
             if *c_fp == fp {
                 return Response { status: 200, content_type: "image/bmp".into(), body: bmp.clone() };
@@ -1518,13 +1645,8 @@ fn ssf_render_inner(query_id: Option<&str>) -> Response {
     let Some(dll) = find_tsf_dll() else {
         return Response::err(404, "未找到 hufu_tsf.dll");
     };
-    // 【审计 P3 2026-11-05】文件名掺进程 id：纯毫秒时间戳可被同机进程
-    // 抢注竞态覆盖（本地攻击者本就有 TEMP 写权，此处仅消除可预测性）。
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    let out = std::env::temp_dir().join(format!("hufu-ssf-render-{stamp}-{}.bmp", std::process::id()));
+    // Concurrent HTTP requests must never read or remove each other's output.
+    let out = render_output_path();
     // 【2026-11-05 去 PowerShell】实时预览只走原生 hufu-render-helper.exe。
     // 旧实现 helper 缺失/失败会回退「写 .ps1 + powershell.exe」驱动：开机
     // 预热全部 ssf 皮肤时每个皮肤一个 PowerShell 进程（用户实锤），且与
@@ -1537,7 +1659,7 @@ fn ssf_render_inner(query_id: Option<&str>) -> Response {
             "实时预览不可用：安装目录缺少 hufu-render-helper.exe（重新运行安装程序即可）",
         );
     };
-    let ok = {
+    let rendered = {
         let mut cmd = std::process::Command::new(helper); // zi-ok: helper=同目录 hufu-render-helper.exe（非解释器）
         cmd.arg(&out).arg(&dll);
         if let Some(id) = query_id {
@@ -1552,8 +1674,13 @@ fn ssf_render_inner(query_id: Option<&str>) -> Response {
             use std::os::windows::process::CommandExt;
             cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
         }
-        cmd.status().map(|s| s.success()).unwrap_or(false)
+        cmd.spawn().and_then(|mut child| wait_render_helper(&mut child, std::time::Duration::from_secs(10)))
     };
+    if rendered.as_ref().is_err_and(|error| error.kind() == std::io::ErrorKind::TimedOut) {
+        let _ = std::fs::remove_file(&out);
+        return Response::err(504, "皮肤渲染超时，请重试或更换皮肤");
+    }
+    let ok = rendered.map(|status| status.success()).unwrap_or(false);
     if !ok || !out.is_file() {
         let _ = std::fs::remove_file(&out);
         return Response::err(500, "渲染失败（hufu-render-helper 未产出图像）");
@@ -1561,26 +1688,92 @@ fn ssf_render_inner(query_id: Option<&str>) -> Response {
     match std::fs::read(&out) {
         Ok(b) => {
             let _ = std::fs::remove_file(&out);
-            store_render_cache(&skin_dir_for_fp, query_id.is_none(), &cache_key, &b);
+            store_render_cache(&skin_dir_for_fp, query_id.is_none(), source_fingerprint, &cache_key, &b);
             Response { status: 200, content_type: "image/bmp".into(), body: b }
         }
         Err(_) => Response::err(500, "渲染输出读取失败"),
     }
 }
 
-/// 渲染成功后入缓存（指纹现算——渲染期间文件变了也能存对版本）。
+/// Cache only a stable source snapshot. A finished old render must not be
+/// labelled with the newer fingerprint after an edit during rendering.
 fn store_render_cache(
     skin_dir: &Option<std::path::PathBuf>,
     with_config: bool,
+    source_fingerprint: Option<u64>,
     key: &str,
     bmp: &[u8],
 ) {
-    if let Some(dir) = skin_dir {
+    if let (Some(dir), Some(source_fingerprint)) = (skin_dir, source_fingerprint) {
         let fp = render_fingerprint(dir, with_config);
+        if fp != source_fingerprint {
+            return;
+        }
         RENDER_CACHE
             .lock()
             .unwrap()
             .insert(key.to_string(), (fp, bmp.to_vec()));
+    }
+}
+
+#[cfg(test)]
+mod render_cache_tests {
+    use super::*;
+
+    #[test]
+    fn concurrent_render_outputs_have_distinct_paths() {
+        let workers: Vec<_> = (0..8).map(|_| std::thread::spawn(|| {
+            (0..128).map(|_| render_output_path()).collect::<Vec<_>>()
+        })).collect();
+        let paths: std::collections::HashSet<_> = workers.into_iter()
+            .flat_map(|worker| worker.join().unwrap()).collect();
+        assert_eq!(paths.len(), 1024);
+    }
+
+    #[test]
+    fn changed_source_is_not_cached_under_new_fingerprint() {
+        let root = render_output_path().with_extension("cache-test");
+        std::fs::create_dir_all(&root).unwrap();
+        let key = root.to_string_lossy().into_owned();
+        let dir = Some(root.clone());
+        std::fs::write(root.join("skin.json"), b"old").unwrap();
+        let before = render_fingerprint(&root, false);
+        std::fs::write(root.join("skin.json"), b"newer skin").unwrap();
+        store_render_cache(&dir, false, Some(before), &key, b"old bitmap");
+        assert!(!RENDER_CACHE.lock().unwrap().contains_key(&key));
+        let current = render_fingerprint(&root, false);
+        store_render_cache(&dir, false, Some(current), &key, b"current bitmap");
+        let cached = RENDER_CACHE.lock().unwrap().remove(&key).unwrap();
+        assert_eq!(cached, (current, b"current bitmap".to_vec()));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Only the explicitly selected child test sleeps; no product executable or
+    // interpreter is started and no production service is contacted.
+    #[test]
+    fn native_helper_fixture() {
+        if std::env::var_os("HUFU_RENDER_WAIT_TEST_SLEEP").is_some() {
+            std::thread::sleep(std::time::Duration::from_secs(3));
+        }
+    }
+
+    #[test]
+    fn native_helper_deadline_reaps_child_and_preserves_success() {
+        let spawn = |sleep: bool| {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command.args(["--exact", "render_cache_tests::native_helper_fixture"])
+                .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+            if sleep { command.env("HUFU_RENDER_WAIT_TEST_SLEEP", "1"); }
+            command.spawn().unwrap()
+        };
+        let mut normal = spawn(false);
+        assert!(wait_render_helper(&mut normal, std::time::Duration::from_secs(3)).unwrap().success());
+        let mut hanging = spawn(true);
+        let started = std::time::Instant::now();
+        let error = wait_render_helper(&mut hanging, std::time::Duration::from_millis(100)).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert!(hanging.try_wait().unwrap().is_some(), "timed out helper was left alive");
     }
 }
 
@@ -1669,7 +1862,12 @@ fn update_check(fresh: bool) -> Response {
         }
     }
     let r = update_check_inner();
-    let ok = r.status == 200;
+    // 网络/解析失败也以 HTTP 200 + {ok:false} 返回，不能误用成功的 60s TTL。
+    let ok = r.status == 200
+        && serde_json::from_slice::<serde_json::Value>(&r.body)
+            .ok()
+            .and_then(|v| v.get("ok").and_then(|x| x.as_bool()))
+            == Some(true);
     let mut guard = cell.lock().unwrap_or_else(|p| p.into_inner());
     *guard = Some((std::time::Instant::now(), ok, r.clone()));
     r
@@ -3025,19 +3223,13 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                         .with_status(409);
                     }
                 }
-                drop(host);
                 Some((orig_current, loaded))
             } else {
-                // 【P0 2026-11-07 恶性卡键】无方案切换（改音效/皮肤/字号
-                // 等）时锁从未释放，落入下方无条件 relock=同线程重入
-                // std::sync::Mutex（Windows SRWLock UB，实机死锁）——
-                // POST 线程持锁原地挂死，全部端点与打字键路全挂；设置页
-                // 保存失败自动重试又把连接线程堆到数千个，全系统卡顿。
-                // 修复：else 出口同样放锁，与 if 分支统一为「无锁到达」。
-                drop(host);
                 None
             };
-            host = host_cell.lock().unwrap_or_else(|p| p.into_inner());
+            // CAS 验证与提交共用当前 guard。只在装载方案时释放一次，
+            // 回锁后二次验证便直接提交；普通保存全程不重入锁，也不给
+            // 其他写入插到「CAS 通过」和 apply_config 之间的窗口。
             match host.apply_config(cfg, pre) {
                 Ok((need_sentence, teardown)) => {
                     // 【逐候选字号 2026-10】外观节变化（开关/比例）推进皮肤
@@ -3054,7 +3246,7 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                     sync::notify("配置变化");
                     // 【P1-15】写入成功推进版本：后续带旧 rev 的写请求
                     // 会得到 409，而不是覆盖本条刚生效的配置。
-                    let rev = bump_config_rev();
+                    let rev = config_rev();
                     Response::json(&serde_json::json!({"ok": true, "rev": rev}))
                 }
                 Err(e) => Response::err(500, &format!("应用失败: {e}")),
@@ -3212,7 +3404,7 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                 }
                 host.engine.config.appearance.skin = id.clone();
                 host.engine.config.appearance.skin_kind = "ssf".into();
-                let _ = host.engine.config.save(&host.config_path);
+                let _ = host.persist_config();
                 // 皮肤版本 +1：DLL poll 立即强制重拉（不靠 2.5s 过期）
                 host.skin_ver += 1;
                 Response::json(&serde_json::json!({"ok": true, "id": id, "kind": "ssf"}))
@@ -3223,7 +3415,7 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                 }
                 host.engine.config.appearance.skin = id.clone();
                 host.engine.config.appearance.skin_kind = "json".into();
-                let _ = host.engine.config.save(&host.config_path);
+                let _ = host.persist_config();
                 // json→json 与旧行为一致（不 bump，靠 DLL 2.5s 过期+指纹
                 // 变化重拉）；仅形态切换（ssf→json）时强制重拉。
                 if prev_kind != "json" {
@@ -3317,7 +3509,7 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             }
             match host.reset_official_skin(&id) {
                 Some(s) => {
-                    let _ = host.engine.config.save(&host.config_path);
+                    let _ = host.persist_config();
                     //【皮肤参数云同步 2026-10-31】恢复出厂重写文件 → 触发同步
                     crate::sync::notify("皮肤");
                     Response::json(&serde_json::to_value(&s).unwrap())
@@ -3355,7 +3547,7 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                         // 同步归位（此前若停在 ssf 形态，保存 JSON 会留下悬空
                         // kind=ssf 指向不存在的 .ssf）。
                         host.engine.config.appearance.skin_kind = "json".into();
-                        let _ = host.engine.config.save(&host.config_path);
+                        let _ = host.persist_config();
                     }
                     // 皮肤版本 +1：DLL poll 发现变化即强制重拉（绕过
                     // 2.5s 缓存）——设置页调参实机预览即时生效
@@ -3639,7 +3831,7 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                         let fallback = hufu_config::AppearanceSection::default().skin;
                         host.engine.config.appearance.skin = fallback;
                         host.engine.config.appearance.skin_kind = "json".into();
-                        let _ = host.engine.config.save(&host.config_path);
+                        let _ = host.persist_config();
                         host.skin_ver += 1; // 强制 DLL 立即重拉回默认皮
                     }
                     Response::json(&serde_json::json!({"ok": true}))
@@ -4011,19 +4203,20 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
             // 与旧实现完全一致。
             let data_dir = host.data_dir.clone();
             let schema_dir = host.engine.config.schema.dir.clone();
+            let target = SchemaWatchTarget::capture(&host);
             drop(host);
             match hufu_engine::Engine::load_schema_for(&data_dir, &schema_dir, &name) {
                 Ok(prepared) => {
                     let mut host = host_cell.lock().unwrap_or_else(|p| p.into_inner());
-                    match host.engine.apply_schema(&name, prepared) {
-                        Ok(()) => {
-                            host.session.clear();
+                    match apply_preloaded_schema(&mut host, &target, &name, prepared) {
+                        Ok(true) => {
                             // 【卡死修复】旧 setup_sentence 持锁同步载模型（秒级
                             // 卡全机）——改后台重建（先拆旧防跨方案词典串扰）
                             reload_sentence_bg(true, false);
-                            let _ = host.engine.config.save(&host.config_path);
+                            let _ = host.persist_config();
                             Response::json(&serde_json::json!({"ok": true, "current": name}))
                         }
+                        Ok(false) => Response::err(409, "方案或配置已变化，请重新选择"),
                         Err(e) => Response::err(500, &format!("切换失败: {e}")),
                     }
                 }
@@ -4498,8 +4691,7 @@ fn route(host: &Mutex<Host>, req: &Request) -> Response {
                     .schema
                     .export_formats
                     .insert(target_name.clone(), format.clone());
-                let cfg_path = host.data_dir.join("config.json");
-                let _ = host.engine.config.save(&cfg_path);
+                let _ = host.persist_config();
             }
             if lines_only {
                 return Response::json(&serde_json::json!({
@@ -5455,4 +5647,426 @@ mod next_ui_tests {
             }
         }
     }
+}
+
+
+#[cfg(test)]
+mod config_route_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::{Arc, Barrier};
+    use std::time::Duration;
+
+    static ROUTE_TEST_MUTEX: Mutex<()> = Mutex::new(());
+
+    fn call(addr: &str, method: &str, path: &str, value: &serde_json::Value) -> (u16, serde_json::Value) {
+        let body = if method == "GET" { Vec::new() } else { serde_json::to_vec(value).unwrap() };
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+        let head = format!(
+            "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(head.as_bytes()).unwrap();
+        stream.write_all(&body).unwrap();
+        let mut reply = String::new();
+        stream.read_to_string(&mut reply).unwrap();
+        let (head, body) = reply.split_once("\r\n\r\n").expect("HTTP response");
+        let status = head.split_whitespace().nth(1).unwrap().parse().unwrap();
+        (status, serde_json::from_str(body).unwrap())
+    }
+
+    fn get_config(addr: &str) -> serde_json::Value {
+        let (status, cfg) = call(addr, "GET", "/api/config", &serde_json::Value::Null);
+        assert_eq!(status, 200);
+        cfg
+    }
+
+    /// Real HTTP parsing, route locking, config persistence and pipe mutations;
+    /// no tray, global pipe listener, keyboard injection or installed user data.
+    #[test]
+    fn config_cas_is_atomic_and_covers_other_writers() {
+        let _serial = ROUTE_TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let root = std::env::temp_dir().join(format!(
+            "hufu-config-route-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let data = root.join("数据");
+        std::fs::create_dir_all(&data).unwrap();
+        for name in ["A", "B", "C"] {
+            let dir = root.join("码表").join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            // Large enough for the two schema-load requests to overlap.
+            let mut table = String::from("#hufu-dict v1 name=test\n");
+            for i in 0..8000 {
+                table.push_str(&format!("a\t{name}测试{i}\n"));
+            }
+            std::fs::write(dir.join("main.txt"), table).unwrap();
+        }
+        std::fs::write(data.join("config.json"), serde_json::to_vec(&serde_json::json!({
+            "schema": { "dir": "码表", "current": "A" },
+            "sentence": { "enabled": false, "rerank": { "enabled": false } }
+        })).unwrap()).unwrap();
+        let shared = Arc::new(Mutex::new(Host::new(&data).unwrap()));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let serving = shared.clone();
+        std::thread::spawn(move || {
+            let _ = http::serve(listener, Arc::new(move |req: &Request| route(&serving, req)));
+        });
+
+        // Ordinary saves must neither re-enter the mutex nor release it between
+        // the revision check and commit: only one writer may accept a revision.
+        for _ in 0..6 {
+            let cfg = get_config(&addr);
+            let gate = Arc::new(Barrier::new(16));
+            let mut jobs = Vec::new();
+            for i in 0..16 {
+                let addr = addr.clone();
+                let gate = gate.clone();
+                let mut cfg = cfg.clone();
+                cfg["sound"]["volume"] = serde_json::json!(i);
+                jobs.push(std::thread::spawn(move || {
+                    gate.wait();
+                    call(&addr, "POST", "/api/config", &cfg).0
+                }));
+            }
+            let statuses: Vec<_> = jobs.into_iter().map(|j| j.join().unwrap()).collect();
+            assert!(statuses.iter().all(|s| *s == 200 || *s == 409), "{statuses:?}");
+            assert_eq!(statuses.iter().filter(|s| **s == 200).count(), 1, "{statuses:?}");
+        }
+
+        // Both requests need lock-free schema preparation. Whichever commits
+        // first invalidates the other request before it can apply its snapshot.
+        let cfg = get_config(&addr);
+        let gate = Arc::new(Barrier::new(2));
+        let mut jobs = Vec::new();
+        for name in ["B", "C"] {
+            let mut cfg = cfg.clone();
+            cfg["schema"]["current"] = serde_json::json!(name);
+            let addr = addr.clone();
+            let gate = gate.clone();
+            jobs.push(std::thread::spawn(move || {
+                gate.wait();
+                call(&addr, "POST", "/api/config", &cfg).0
+            }));
+        }
+        let mut statuses: Vec<_> = jobs.into_iter().map(|j| j.join().unwrap()).collect();
+        statuses.sort();
+        assert_eq!(statuses, vec![200, 409]);
+
+        let stale = get_config(&addr);
+        pipe::dispatch(&shared, &serde_json::json!({ "op": "sound_toggle" }), None);
+        assert_eq!(call(&addr, "POST", "/api/config", &stale).0, 409, "pipe toggle invalidates HTTP snapshots");
+
+        let stale = get_config(&addr);
+        pipe::dispatch(&shared, &serde_json::json!({ "op": "set_schema", "name": "A" }), None);
+        assert_eq!(call(&addr, "POST", "/api/config", &stale).0, 409, "pipe schema selection invalidates HTTP snapshots");
+
+        let stale = get_config(&addr);
+        let mut pipe_cfg = stale.clone();
+        pipe_cfg["sound"]["volume"] = serde_json::json!(55);
+        let result = pipe::dispatch(&shared, &serde_json::json!({ "op": "config_set", "config": pipe_cfg }), None);
+        assert_eq!(result["ok"], true);
+        assert_eq!(call(&addr, "POST", "/api/config", &stale).0, 409, "apply_config writers invalidate HTTP snapshots");
+
+        let stale = get_config(&addr);
+        assert_eq!(call(&addr, "POST", "/api/skin/select", &serde_json::json!({
+            "id": "hufu-default", "kind": "json"
+        })).0, 200);
+        assert_eq!(call(&addr, "POST", "/api/config", &stale).0, 409, "skin selection invalidates HTTP snapshots");
+
+        let cfg = get_config(&addr);
+        assert_eq!(cfg["schema"]["current"], "A");
+        assert_eq!(cfg["sound"]["volume"], 55);
+        assert_eq!(cfg["appearance"]["skin"], "hufu-default");
+        assert!(std::fs::read(data.join("config.json")).is_ok());
+        // root is freshly generated directly under temp_dir, never a user path.
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn key(addr: &str, name: &str) -> serde_json::Value {
+        let (status, result) = call(addr, "POST", "/api/key", &serde_json::json!({"key": name}));
+        assert_eq!(status, 200, "key {name}: {result}");
+        result
+    }
+
+    fn assert_chinese_commit(result: &serde_json::Value, expected: &str) {
+        assert_eq!(result["outcome"]["consumed"], true, "{result}");
+        assert_eq!(result["outcome"]["commit"].as_str(), Some(expected), "{result}");
+        assert!(expected.chars().any(|ch| ('\u{4e00}'..='\u{9fff}').contains(&ch)));
+    }
+
+    /// Protocol integration, including explicit Chinese commits. This exercises
+    /// HTTP -> Host -> engine -> response, not TSF composition or GUI rendering.
+    #[test]
+    fn chinese_input_editing_mapping_and_bad_schema_http_roundtrip() {
+        let _serial = ROUTE_TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let root = std::env::temp_dir().join(format!(
+            "hufu-input-route-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let data = root.join("数据");
+        let schema = root.join("码表").join("Test");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&schema).unwrap();
+        std::fs::write(schema.join("main.txt"),
+            "#hufu-dict v1 name=Test\na\t中\na\t国\na\t文\na\t字\nab\t你好\nb\t测试\nc\t流畅\n"
+        ).unwrap();
+        std::fs::write(data.join("config.json"), serde_json::to_vec(&serde_json::json!({
+            "schema": { "dir": "码表", "current": "Test" },
+            "input": { "auto_push": false, "auto_select_unique": false },
+            "candidates": { "page_size": 2 },
+            "sentence": { "enabled": false, "rerank": { "enabled": false } }
+        })).unwrap()).unwrap();
+        let shared = Arc::new(Mutex::new(Host::new(&data).unwrap()));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let serving = shared.clone();
+        std::thread::spawn(move || {
+            let _ = http::serve(listener, Arc::new(move |req: &Request| route(&serving, req)));
+        });
+
+        let a = key(&addr, "a");
+        assert_eq!(a["state"]["raw"], "a");
+        assert_eq!(a["state"]["candidates"][0]["text"], "中");
+        assert_chinese_commit(&key(&addr, "space"), "中");
+
+        key(&addr, "a");
+        assert_chinese_commit(&key(&addr, "2"), "国");
+
+        key(&addr, "a");
+        let page = key(&addr, "pagedown");
+        assert_eq!(page["state"]["page"], 1);
+        assert_eq!(page["state"]["candidates"][0]["text"], "文");
+        assert_chinese_commit(&key(&addr, "2"), "字");
+
+        key(&addr, "a");
+        assert_eq!(key(&addr, "b")["state"]["raw"], "ab");
+        assert_eq!(key(&addr, "backspace")["state"]["raw"], "a");
+        assert_eq!(key(&addr, "backspace")["state"]["raw"], "");
+        key(&addr, "b");
+        assert_chinese_commit(&key(&addr, "space"), "测试");
+
+        assert_eq!(key(&addr, "shift")["state"]["chinese"], false);
+        let english = key(&addr, "a");
+        assert_eq!(english["outcome"]["consumed"], false);
+        assert!(english["outcome"]["commit"].is_null());
+        assert_eq!(english["state"]["raw"], "");
+        assert_eq!(key(&addr, "shift")["state"]["chinese"], true);
+        key(&addr, "a");
+        assert_chinese_commit(&key(&addr, "space"), "中");
+
+        let mut cfg = get_config(&addr);
+        cfg["keymap"]["map"]["f8"] = serde_json::json!("select2");
+        assert_eq!(call(&addr, "POST", "/api/config", &cfg).0, 200);
+        key(&addr, "a");
+        assert_chinese_commit(&key(&addr, "f8"), "国");
+        let mut cfg = get_config(&addr);
+        cfg["keymap"]["map"].as_object_mut().unwrap().remove("f8");
+        assert_eq!(call(&addr, "POST", "/api/config", &cfg).0, 200);
+        assert!(get_config(&addr)["keymap"]["map"].get("f8").is_none());
+        key(&addr, "a");
+        let unbound = key(&addr, "f8");
+        assert_eq!(unbound["outcome"]["consumed"], false);
+        assert!(unbound["outcome"]["commit"].is_null());
+        assert_eq!(unbound["state"]["raw"], "a");
+        assert_chinese_commit(&key(&addr, "space"), "中");
+
+        let before = get_config(&addr);
+        let bytes = std::fs::read(data.join("config.json")).unwrap();
+        let mut invalid = before.clone();
+        invalid["schema"]["current"] = serde_json::json!("missing-schema");
+        let (status, error) = call(&addr, "POST", "/api/config", &invalid);
+        assert_eq!(status, 500, "{error}");
+        assert_eq!(get_config(&addr), before, "failed load must not change config or revision");
+        assert_eq!(std::fs::read(data.join("config.json")).unwrap(), bytes, "failed load must not touch the persisted config");
+        key(&addr, "c");
+        assert_chinese_commit(&key(&addr, "space"), "流畅");
+        // Freshly generated fixture directly under temp_dir; no installed data.
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn schema_watcher_rejects_stale_preloads_without_clearing_new_input() {
+        let _serial = ROUTE_TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let root = std::env::temp_dir().join(format!(
+            "hufu-schema-watch-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let data = root.join("数据");
+        std::fs::create_dir_all(&data).unwrap();
+        for (dir, name, text) in [("码表", "A", "旧甲"), ("码表", "B", "乙"), ("新码表", "A", "新甲"), ("新码表", "B", "新乙")] {
+            let schema = root.join(dir).join(name);
+            std::fs::create_dir_all(&schema).unwrap();
+            std::fs::write(schema.join("main.txt"), format!("#hufu-dict v1 name={name}\na\t{text}\n")).unwrap();
+        }
+        std::fs::write(data.join("config.json"), serde_json::to_vec(&serde_json::json!({
+            "schema": { "dir": "码表", "current": "A" },
+            "input": { "auto_push": false, "auto_select_unique": false },
+            "sentence": { "enabled": false, "rerank": { "enabled": false } }
+        })).unwrap()).unwrap();
+        let mut host = Host::new(&data).unwrap();
+        let preload = |host: &Host| {
+            let target = SchemaWatchTarget::capture(host);
+            let schema = hufu_engine::Engine::load_schema_for(
+                &target.data_dir, &target.schema_dir, &target.current,
+            ).unwrap();
+            (target, schema)
+        };
+
+        // Deterministic scheduling of the former race: watch A -> preload A ->
+        // user commits B -> old watch applies. B and its in-progress input win.
+        let (target, loaded) = preload(&host);
+        let mut cfg = host.engine.config.clone();
+        cfg.schema.current = "B".into();
+        host.apply_config(cfg, None).unwrap();
+        host.session.raw = "a".into();
+        let persisted = std::fs::read(&host.config_path).unwrap();
+        assert!(!apply_schema_watch_reload(&mut host, &target, loaded).unwrap());
+        assert_eq!(host.engine.config.schema.current, "B");
+        assert_eq!(host.engine.schema.dir, root.join("码表/B"));
+        assert_eq!(host.session.raw, "a");
+        assert_eq!(std::fs::read(&host.config_path).unwrap(), persisted);
+
+        let mut cfg = host.engine.config.clone();
+        cfg.schema.current = "A".into();
+        host.apply_config(cfg, None).unwrap();
+        let (target, loaded) = preload(&host);
+        for name in ["B", "A"] {
+            let mut cfg = host.engine.config.clone();
+            cfg.schema.current = name.into();
+            host.apply_config(cfg, None).unwrap();
+        }
+        host.session.raw = "a".into();
+        assert!(!apply_schema_watch_reload(&mut host, &target, loaded).unwrap(), "A -> B -> A invalidates the old generation");
+        assert_eq!(host.session.raw, "a");
+
+        let (target, loaded) = preload(&host);
+        let mut cfg = host.engine.config.clone();
+        cfg.schema.dir = "新码表".into();
+        host.apply_config(cfg, None).unwrap();
+        host.session.raw = "a".into();
+        assert!(!apply_schema_watch_reload(&mut host, &target, loaded).unwrap(), "same name in another directory is a different schema");
+        assert_eq!(host.engine.schema.dir, root.join("新码表/A"));
+        assert_eq!(host.session.raw, "a");
+
+        let (target, loaded) = preload(&host);
+        let mut cfg = host.engine.config.clone();
+        cfg.sound.volume = 37;
+        host.apply_config(cfg, None).unwrap();
+        host.session.raw = "a".into();
+        assert!(!apply_schema_watch_reload(&mut host, &target, loaded).unwrap(), "a newer config save also invalidates preloading");
+        assert_eq!(host.engine.config.sound.volume, 37);
+        assert_eq!(host.session.raw, "a");
+
+        // Ctrl+M only starts a background load. Until the next key applies it,
+        // current/revision still match A; reload must not take that pending B.
+        let mut cfg = host.engine.config.clone();
+        cfg.schema.recent_pair = Some(("A".into(), "B".into()));
+        host.apply_config(cfg, None).unwrap();
+        let (target, loaded) = preload(&host);
+        host.process_key(parse_key(&serde_json::json!({"key": "m", "modifiers": {"ctrl": true}})).unwrap());
+        assert!(host.engine.schema_switch_pending());
+        assert_eq!(host.engine.config.schema.current, "A");
+        assert_eq!(config_rev(), target.config_rev);
+        assert!(!apply_schema_watch_reload(&mut host, &target, loaded).unwrap());
+        assert!(host.engine.schema_switch_pending(), "watcher must not cancel the user's in-flight switch");
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while host.engine.schema_switch_pending() && std::time::Instant::now() < deadline {
+            host.process_key(parse_key(&serde_json::json!({"key": "f12"})).unwrap());
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!host.engine.schema_switch_pending());
+        assert_eq!(host.engine.config.schema.current, "B");
+        assert_eq!(host.engine.schema.dir, root.join("新码表/B"));
+        let mut cfg = host.engine.config.clone();
+        cfg.schema.current = "A".into();
+        host.apply_config(cfg, None).unwrap();
+
+        // The current unchanged target still reloads and replaces the actual
+        // dictionary, rather than disabling automatic reload to avoid races.
+        let target = SchemaWatchTarget::capture(&host);
+        std::fs::write(target.dir.join("main.txt"), "#hufu-dict v1 name=A\na\t重载成功\n").unwrap();
+        let loaded = hufu_engine::Engine::load_schema_for(&target.data_dir, &target.schema_dir, &target.current).unwrap();
+        assert!(apply_schema_watch_reload(&mut host, &target, loaded).unwrap());
+        assert_eq!(host.session.raw, "");
+        host.process_key(parse_key(&serde_json::json!({"key": "a"})).unwrap());
+        assert_chinese_commit(&host.process_key(parse_key(&serde_json::json!({"key": "space"})).unwrap()), "重载成功");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn explicit_schema_preloads_reject_newer_state_and_wrong_dictionary() {
+        let _serial = ROUTE_TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let root = std::env::temp_dir().join(format!(
+            "hufu-schema-select-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let data = root.join("数据");
+        std::fs::create_dir_all(&data).unwrap();
+        for name in ["A", "B", "C"] {
+            let dir = root.join("码表").join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("main.txt"), format!("#hufu-dict v1 name={name}\na\t{name}词\n")).unwrap();
+        }
+        std::fs::write(data.join("config.json"), serde_json::to_vec(&serde_json::json!({
+            "schema": { "dir": "码表", "current": "A" },
+            "input": { "auto_push": false, "auto_select_unique": false },
+            "sentence": { "enabled": false, "rerank": { "enabled": false } }
+        })).unwrap()).unwrap();
+        let mut host = Host::new(&data).unwrap();
+        let prepare = |host: &Host, name: &str| {
+            let target = SchemaWatchTarget::capture(host);
+            let loaded = hufu_engine::Engine::load_schema_for(&target.data_dir, &target.schema_dir, name).unwrap();
+            (target, loaded)
+        };
+        // HTTP and pipe now share this commit boundary. Reproduce the old race
+        // deterministically: prepare B, another operation commits C, then B ends.
+        let (target, loaded) = prepare(&host, "B");
+        let mut cfg = host.engine.config.clone();
+        cfg.schema.current = "C".into();
+        host.apply_config(cfg, None).unwrap();
+        host.session.raw = "a".into();
+        let persisted = std::fs::read(&host.config_path).unwrap();
+        let rev = config_rev();
+        assert!(!apply_preloaded_schema(&mut host, &target, "B", loaded).unwrap());
+        assert_eq!(host.engine.config.schema.current, "C");
+        assert_eq!(host.session.raw, "a");
+        assert_eq!(config_rev(), rev);
+        assert_eq!(std::fs::read(&host.config_path).unwrap(), persisted);
+
+        let (target, wrong) = prepare(&host, "A");
+        assert!(!apply_preloaded_schema(&mut host, &target, "B", wrong).unwrap());
+        assert_eq!(host.session.raw, "a", "wrong prepared dictionary cannot clear input");
+        let (target, fresh) = prepare(&host, "B");
+        assert!(apply_preloaded_schema(&mut host, &target, "B", fresh).unwrap());
+        assert_eq!(host.engine.config.schema.current, "B");
+        assert!(host.session.raw.is_empty());
+        host.process_key(parse_key(&serde_json::json!({"key": "a"})).unwrap());
+        assert_chinese_commit(&host.process_key(parse_key(&serde_json::json!({"key": "space"})).unwrap()), "B词");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn schema_watcher_detects_removed_tables_and_keeps_user_log_lightweight() {
+        let base = vec![
+            ("main|txt".into(), 200, 1),
+            ("常用符号|txt".into(), 80, 1),
+            ("用户调整|txt".into(), 20, 1),
+        ];
+        let without_symbols = vec![base[0].clone(), base[2].clone()];
+        let changed = schema_watch_changed_files(&base, &without_symbols);
+        assert_eq!(changed, vec!["常用符号|txt"]);
+        assert!(!changed.iter().all(|n| n == "用户调整|txt" || n == "用户词|txt"));
+        let without_main = vec![base[1].clone(), base[2].clone()];
+        assert_eq!(schema_watch_changed_files(&base, &without_main), vec!["main|txt"]);
+        let without_user = vec![base[0].clone(), base[1].clone()];
+        let changed = schema_watch_changed_files(&base, &without_user);
+        assert_eq!(changed, vec!["用户调整|txt"]);
+        assert!(changed.iter().all(|n| n == "用户调整|txt" || n == "用户词|txt"));
+    }
+
 }

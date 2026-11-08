@@ -1,9 +1,11 @@
 //! 极简 HTTP/1.1 服务（仅 localhost 设置界面 + 本地 API，线程每连接）。
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 pub struct Request {
     pub method: String,
@@ -61,21 +63,49 @@ fn status_text(code: u16) -> &'static str {
         405 => "Method Not Allowed",
         403 => "Forbidden",
         500 => "Internal Server Error",
+        503 => "Service Unavailable",
+        504 => "Gateway Timeout",
         _ => "OK",
     }
 }
 
 /// 【审计 P2-E 2026-11-05】带总量上限的按行读：超限即断连（None）。
 /// 防超长请求行/header 单行灌爆内存（read_line 本身无上限）。
-fn read_line_bounded(reader: &mut BufReader<TcpStream>, limit: usize) -> Option<String> {
-    let mut buf: Vec<u8> = Vec::new();
-    reader
-        .by_ref()
-        .take(limit as u64 + 1)
-        .read_until(b'\n', &mut buf)
-        .ok()?;
-    if buf.len() > limit {
+fn set_remaining_timeout(reader: &BufReader<TcpStream>, deadline: Instant) -> Option<()> {
+    let remaining = deadline.checked_duration_since(Instant::now())?;
+    if remaining.is_zero() {
         return None;
+    }
+    reader
+        .get_ref()
+        .set_read_timeout(Some(remaining.min(Duration::from_secs(15))))
+        .ok()
+}
+
+fn read_line_bounded(
+    reader: &mut BufReader<TcpStream>,
+    limit: usize,
+    deadline: Instant,
+) -> Option<String> {
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        // read_until/read_exact may perform many underlying reads. Updating the
+        // timeout only outside those calls lets a trickling peer reset it forever.
+        set_remaining_timeout(reader, deadline)?;
+        let available = reader.fill_buf().ok()?;
+        if available.is_empty() {
+            break;
+        }
+        let n = available.iter().position(|b| *b == b'\n').map_or(available.len(), |i| i + 1);
+        if n > limit.saturating_sub(buf.len()) {
+            return None;
+        }
+        let complete = available[n - 1] == b'\n';
+        buf.extend_from_slice(&available[..n]);
+        reader.consume(n);
+        if complete {
+            break;
+        }
     }
     Some(String::from_utf8_lossy(&buf).into_owned())
 }
@@ -91,26 +121,34 @@ fn read_request(stream: &mut TcpStream) -> Option<Request> {
     // 挤 1 字节可无限占线程）。加总 deadline：整个请求（行+头+体）自首读起
     // 30s 内必须完成，任一阶段越线即断连。每轮把单次读超时收紧为
     // min(15s, 剩余预算)，两头都封死。
-    const TOTAL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
-    let started = std::time::Instant::now();
-    let budget = || TOTAL_DEADLINE.checked_sub(started.elapsed());
-    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(15)));
+    read_request_with_budget(stream, Duration::from_secs(30))
+}
+
+fn read_request_with_budget(stream: &mut TcpStream, budget: Duration) -> Option<Request> {
+    let deadline = Instant::now().checked_add(budget)?;
     let mut reader = BufReader::new(stream.try_clone().ok()?);
-    let line = read_line_bounded(&mut reader, 8 * 1024)?;
+    let line = read_line_bounded(&mut reader, 8 * 1024, deadline)?;
     let mut parts = line.split_whitespace();
     let method = parts.next()?.to_string();
     let target = parts.next()?.to_string();
     let mut headers = HashMap::new();
+    let mut headers_complete = false;
     for _ in 0..128 {
-        let _ = stream.set_read_timeout(Some(budget()?));
-        let h = read_line_bounded(&mut reader, 16 * 1024)?;
+        let h = read_line_bounded(&mut reader, 16 * 1024, deadline)?;
+        if h.is_empty() {
+            return None;
+        }
         let h = h.trim_end();
         if h.is_empty() {
+            headers_complete = true;
             break;
         }
         if let Some((k, v)) = h.split_once(':') {
             headers.insert(k.trim().to_lowercase(), v.trim().to_string());
         }
+    }
+    if !headers_complete {
+        return None;
     }
     let len: usize = headers
         .get("content-length")
@@ -120,10 +158,18 @@ fn read_request(stream: &mut TcpStream) -> Option<Request> {
     if len > MAX_BODY {
         return None;
     }
-    let mut body = vec![0u8; len];
-    if len > 0 {
-        let _ = stream.set_read_timeout(Some(budget()?));
-        reader.read_exact(&mut body).ok()?;
+    // Allocate as bytes arrive rather than reserving a claimed 16 MiB for an
+    // idle connection. The same absolute deadline also covers every body read.
+    let mut body = Vec::with_capacity(len.min(64 * 1024));
+    while body.len() < len {
+        set_remaining_timeout(&reader, deadline)?;
+        let available = reader.fill_buf().ok()?;
+        if available.is_empty() {
+            return None;
+        }
+        let n = available.len().min(len - body.len());
+        body.extend_from_slice(&available[..n]);
+        reader.consume(n);
     }
     let (path, query_str) = match target.split_once('?') {
         Some((p, q)) => (p.to_string(), q.to_string()),
@@ -208,6 +254,23 @@ fn accept_backoff_ms(errors: u32) -> u64 {
     (50u64 << shift).min(1000)
 }
 
+struct ConnectionPermit(Arc<AtomicUsize>);
+
+impl ConnectionPermit {
+    fn acquire(active: &Arc<AtomicUsize>, limit: usize) -> Option<Self> {
+        active.fetch_update(Ordering::AcqRel, Ordering::Relaxed, |n| {
+            (n < limit).then_some(n + 1)
+        }).ok()?;
+        Some(Self(active.clone()))
+    }
+}
+
+impl Drop for ConnectionPermit {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// 阻塞运行；handler 返回 Response。
 /// 【2026-11-02 P2】改为接**已 bind 的 listener**：调用方在端口探测时
 /// 一次 bind 成功就把监听器交进来，消除“探测 bind→drop→serve 再 bind”
@@ -225,10 +288,18 @@ pub fn serve<F>(listener: TcpListener, handler: Arc<F>) -> std::io::Result<()>
 where
     F: Fn(&Request) -> Response + Send + Sync + 'static,
 {
+    serve_with_limit(listener, handler, 64)
+}
+
+fn serve_with_limit<F>(listener: TcpListener, handler: Arc<F>, limit: usize) -> std::io::Result<()>
+where
+    F: Fn(&Request) -> Response + Send + Sync + 'static,
+{
     if let Ok(addr) = listener.local_addr() {
         eprintln!("HuFu server listening on http://{addr}");
     }
     let mut accept_errors: u32 = 0;
+    let active = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
         let mut stream = match stream {
             Ok(s) => {
@@ -249,8 +320,17 @@ where
                 continue;
             }
         };
+        let Some(permit) = ConnectionPermit::acquire(&active, limit) else {
+            // Never wait on a client in the accept loop. Bound both idle sockets
+            // and slow handlers so a retry storm cannot spawn thousands of threads.
+            if stream.set_nonblocking(true).is_ok() {
+                let _ = stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\nRetry-After: 1\r\n\r\n");
+            }
+            continue;
+        };
         let handler = handler.clone();
-        std::thread::spawn(move || {
+        let worker = std::thread::Builder::new().name("hufu-http".into()).spawn(move || {
+            let _permit = permit;
             let request = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 read_request(&mut stream)
             }))
@@ -278,6 +358,9 @@ where
             }
             let _ = stream.shutdown(std::net::Shutdown::Both);
         });
+        if let Err(error) = worker {
+            eprintln!("HTTP worker 创建失败: {error}");
+        }
     }
     Ok(())
 }
@@ -340,5 +423,92 @@ mod tests {
         let seq: Vec<u64> = (1..=8).map(accept_backoff_ms).collect();
         assert_eq!(seq, vec![50, 100, 200, 400, 800, 1000, 1000, 1000]);
         assert_eq!(accept_backoff_ms(0), 50, "计数为 0 也按首档处理");
+    }
+
+    #[test]
+    fn connection_limit_rejects_overload_and_recovers() {
+        use std::sync::{mpsc, Condvar, Mutex};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let worker_gate = gate.clone();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let handler = Arc::new(move |req: &Request| {
+            if req.path == "/hold" {
+                entered_tx.send(()).unwrap();
+                let (lock, ready) = &*worker_gate;
+                let mut released = lock.lock().unwrap();
+                while !*released {
+                    released = ready.wait(released).unwrap();
+                }
+            }
+            Response::json(&serde_json::json!({"ok":true}))
+        });
+        std::thread::spawn(move || { let _ = serve_with_limit(listener, handler, 2); });
+        let clients: Vec<_> = (0..2).map(|_| {
+            let addr = addr.clone();
+            std::thread::spawn(move || one_request(&addr, "/hold"))
+        }).collect();
+        for _ in 0..2 {
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        let rejected = one_request(&addr, "/overload");
+        let (lock, ready) = &*gate;
+        *lock.lock().unwrap() = true;
+        ready.notify_all();
+        for client in clients {
+            assert!(client.join().unwrap().starts_with("HTTP/1.1 200"));
+        }
+        assert!(rejected.starts_with("HTTP/1.1 503"), "{rejected:?}");
+        let started = Instant::now();
+        loop {
+            if one_request(&addr, "/recovered").starts_with("HTTP/1.1 200") { break; }
+            assert!(started.elapsed() < Duration::from_secs(5), "connection permit leaked");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn absolute_deadline_covers_trickling_line_headers_and_body() {
+        for prefix in [
+            "GET /",
+            "GET / HTTP/1.1\r\nX-Test: ",
+            "POST / HTTP/1.1\r\nContent-Length: 1000\r\n\r\n",
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let writer = std::thread::spawn(move || {
+                let mut peer = TcpStream::connect(addr).unwrap();
+                peer.write_all(prefix.as_bytes()).unwrap();
+                for _ in 0..250 {
+                    if peer.write_all(b"x").is_err() { break; }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            });
+            let (mut stream, _) = listener.accept().unwrap();
+            let started = Instant::now();
+            assert!(read_request_with_budget(&mut stream, Duration::from_millis(120)).is_none());
+            let elapsed = started.elapsed();
+            drop(stream);
+            writer.join().unwrap();
+            assert!(elapsed < Duration::from_secs(1), "trickle extended deadline: {elapsed:?}");
+        }
+    }
+
+    #[test]
+    fn request_body_and_header_bounds_preserve_normal_requests() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let sender = std::thread::spawn(move || {
+            let mut peer = TcpStream::connect(addr).unwrap();
+            peer.write_all(b"POST /test?q=%E4%B8%AD HTTP/1.1\r\nContent-Length: 6\r\n\r\n").unwrap();
+            peer.write_all("中文".as_bytes()).unwrap();
+        });
+        let (mut stream, _) = listener.accept().unwrap();
+        let req = read_request(&mut stream).unwrap();
+        sender.join().unwrap();
+        assert_eq!(req.path, "/test");
+        assert_eq!(req.query.get("q").unwrap(), "中");
+        assert_eq!(req.body, "中文".as_bytes());
     }
 }

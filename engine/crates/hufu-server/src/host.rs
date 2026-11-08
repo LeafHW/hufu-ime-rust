@@ -585,6 +585,9 @@ impl Host {
     pub fn setup_rerank(&mut self) {
         // 关旧：Drop Sender 使 recv 返回 Err → 线程自然退出
         self.rerank_tx = None;
+        // 旧线程可能仍在推理，不能让它把旧模型结果写回新配置的缓存。
+        self.engine.rerank_cache =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
         let Some(model) = self.resolve_rerank_model() else {
             eprintln!("神经重排：未启用或模型缺失");
             return;
@@ -1093,7 +1096,7 @@ impl Host {
         // 落盘（重启保留；与设置页开关同一 config 文件）。
         if self.engine.pending_config_save {
             self.engine.pending_config_save = false;
-            let _ = self.engine.config.save(&self.config_path);
+            let _ = self.persist_config();
         }
         // 【选重闪帧 2026-10-09】顶层 state 优先透传 outcome.state——选重
         // 上屏的闪帧（旧候选+高亮=选中项）在 outcome.state 里；此处按
@@ -1139,6 +1142,13 @@ impl Host {
             .take()
             .unwrap_or_else(|| self.engine.state(&self.session));
         serde_json::json!({ "outcome": outcome, "state": state })
+    }
+
+    /// 配置已在内存中修改后的统一落盘入口。即使磁盘写失败，HTTP 旧快照
+    /// 也已失效，不能再次把刚生效的键控开关/方案/皮肤静默覆盖回去。
+    pub fn persist_config(&self) -> std::io::Result<()> {
+        crate::bump_config_rev();
+        self.engine.config.save(&self.config_path)
     }
 
     /// 应用新配置：落盘 + 热更新 + 必要时重装重排。
@@ -1239,6 +1249,9 @@ impl Host {
         if rerank_changed {
             self.setup_rerank();
         }
+        // 所有 apply_config 调用方（HTTP/pipe/import/sync）共用 CAS 版本，
+        // 否则 HTTP 的旧快照能静默覆盖刚从管道或同步应用的配置。
+        crate::bump_config_rev();
         Ok((sentence_changed || schema_changed, schema_changed))
     }
 
@@ -1285,7 +1298,7 @@ impl Host {
         eprintln!("ssf 皮肤 {id} 的源文件已删除，回退默认 JSON 皮肤 {fallback}");
         self.engine.config.appearance.skin = fallback;
         self.engine.config.appearance.skin_kind = "json".into();
-        let _ = self.engine.config.save(&self.config_path);
+        let _ = self.persist_config();
     }
 
     /// JSON 皮肤列表 + 两个代表色（列表缩略图/概览当前皮肤共用一套配色）：

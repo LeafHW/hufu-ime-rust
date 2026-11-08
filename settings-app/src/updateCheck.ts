@@ -99,16 +99,23 @@ export async function startUpdateDownload(): Promise<{
   return { started: r.ok, state: v };
 }
 
-export async function fetchDownloadState(): Promise<DownloadState> {
-  return await getJson<DownloadState>('/api/update/download/status');
+let downloadStateRequest: Promise<DownloadState> | null = null;
+export function fetchDownloadState(): Promise<DownloadState> {
+  // Overview/About stay mounted together; their ticks share the same read.
+  if (!downloadStateRequest) {
+    downloadStateRequest = getJson<DownloadState>('/api/update/download/status')
+      .finally(() => { downloadStateRequest = null; });
+  }
+  return downloadStateRequest;
 }
 
 export async function cancelUpdateDownload(): Promise<void> {
-  await fetchWithTimeout('/api/update/download/cancel', {
+  const r = await fetchWithTimeout('/api/update/download/cancel', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: '{}',
   });
+  if (!r.ok) throw new Error(`取消下载失败（${r.status}）`);
 }
 
 /** 打开刚下载的安装包（installer）或在资源管理器定位（folder）。

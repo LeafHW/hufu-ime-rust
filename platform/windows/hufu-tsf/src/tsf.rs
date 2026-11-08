@@ -37,24 +37,98 @@ pub fn tl_shared() -> Option<SharedRef> {
     TL_SHARED.with(|s| s.borrow().clone())
 }
 /// 【全键盘按键映射 2026-11】VK 路由白名单查询：键名是否被用户映射
-/// （G_SHARED 主线程 Shared 的 keymap 快照）。vk_to_name 的条件路由
+/// （当前 TSF 实例的 keymap 快照）。vk_to_name 的条件路由
 /// 用（home/end/delete/F 区）——映射过才递引擎，未映射 None=直通。
 /// 【左右 Shift 分开 2026-11】shift 查精确名（shiftleft/shiftright）
 /// 外加通用名 "shift" 兜底（老配置两侧同效）。
-fn keymap_has(name: &str) -> bool {
-    let g = G_SHARED.get().map(|g| g.0.lock().unwrap_or_else(|e| e.into_inner()));
-    match g {
-        Some(g) => {
-            g.keymap.contains_key(name)
-                || g.keymap_idle.contains_key(name)
-                || (name == "shift"
-                    && (g.keymap.contains_key("shiftleft")
-                        || g.keymap.contains_key("shiftright")
-                        || g.keymap_idle.contains_key("shiftleft")
-                        || g.keymap_idle.contains_key("shiftright")))
-        }
-        None => false,
+fn keymap_has(shared: &SharedRef, name: &str) -> bool {
+    // G_SHARED 永久保留首激活实例，后续标签/词框实例的映射已在自己的
+    // Shared 更新，不能再用首实例的旧映射决定是否放行功能键。
+    let g = shared.lock().unwrap_or_else(|e| e.into_inner());
+    g.keymap.contains_key(name)
+        || g.keymap_idle.contains_key(name)
+        || (name == "shift"
+            && (g.keymap.contains_key("shiftleft")
+                || g.keymap.contains_key("shiftright")
+                || g.keymap_idle.contains_key("shiftleft")
+                || g.keymap_idle.contains_key("shiftright")))
+}
+
+/// 两态映射是一份配置快照：只接收完整的字符串对象，缺字段/错误响应
+/// 保留上次有效配置。激活、按键和现有状态刷新共用，避免首个功能键
+/// 必须先靠普通按键“喂”出映射；原始 JSON 未变时不重建 HashMap。
+fn sync_keymaps(g: &mut Shared, state: &serde_json::Value) -> bool {
+    if state.get("error").is_some() {
+        return false;
     }
+    let (Some(km_raw), Some(kmi_raw)) = (state.get("keymap"), state.get("keymap_idle"))
+    else {
+        return false;
+    };
+    let (km_changed, kmi_changed) = {
+        let last = g.keymap_last_raw.lock().unwrap_or_else(|p| p.into_inner());
+        (km_raw != &last.0, kmi_raw != &last.1)
+    };
+    let (Some(km), Some(kmi)) = (km_raw.as_object(), kmi_raw.as_object()) else {
+        return false;
+    };
+    if !km_changed && !kmi_changed {
+        g.keymap_polled_at = Some(std::time::Instant::now());
+        return false;
+    }
+    if !km.values().chain(kmi.values()).all(serde_json::Value::is_string) {
+        return false;
+    }
+    let parse = |o: &serde_json::Map<String, serde_json::Value>| {
+        o.iter()
+            .map(|(k, v)| (k.clone(), v.as_str().unwrap().to_string()))
+            .collect::<std::collections::HashMap<String, String>>()
+    };
+    if km_changed {
+        g.keymap = parse(km);
+        trace(&format!("keymap 同步: {} 项", g.keymap.len()));
+    }
+    if kmi_changed {
+        g.keymap_idle = parse(kmi);
+        trace(&format!("keymap_idle 同步: {} 项", g.keymap_idle.len()));
+    }
+    let mut last = g.keymap_last_raw.lock().unwrap_or_else(|p| p.into_inner());
+    if km_changed {
+        last.0 = km_raw.clone();
+    }
+    if kmi_changed {
+        last.1 = kmi_raw.clone();
+    }
+    drop(last);
+    g.keymap_polled_at = Some(std::time::Instant::now());
+    true
+}
+
+/// 复用已有 poll timer 的空闲配置刷新。先记尝试时刻，再发请求，失败
+/// 也等满 5s；只更新所属 Shared 的映射，不发布候选投影、不重绘 UI。
+fn refresh_idle_keymaps(shared: &SharedRef) {
+    {
+        let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        if !keymap_poll_due(&mut g, std::time::Instant::now()) {
+            return;
+        }
+    }
+    if let Some(resp) = ipc::call(&serde_json::json!({"op": "state"})) {
+        if let Some(state) = resp.get("state") {
+            let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+            sync_keymaps(&mut g, state);
+        }
+    }
+}
+
+fn keymap_poll_due(g: &mut Shared, now: std::time::Instant) -> bool {
+    if g.keymap_polled_at.is_some_and(|last| {
+        now.saturating_duration_since(last) < std::time::Duration::from_secs(5)
+    }) {
+        return false;
+    }
+    g.keymap_polled_at = Some(now);
+    true
 }
 // 【当前 update_ui 的 Shared·二十六修】update_ui 入口登记（线程局部），
 // tl_cand_show 经此取「本渲染写 last_show 的那把锁」登记进 TL_SHARED。
@@ -209,11 +283,13 @@ pub struct Shared {
     pub cand2_busy: bool,
     pub pending_cand_hide: bool,
     /// 【T3-f 2026-11-07·防回归修复(10-reg P1)】上一拍 state.keymap/
-    /// keymap_idle 原始 JSON（**每实例**字段，缺省归一 Null）。原实现
+    /// keymap_idle 原始 JSON（**每实例**字段，未收到有效快照时为 Null）。原实现
     /// 是进程级 static × g.keymap 每实例 Shared——同进程 TSF 重激活/
     /// 第二输入线程的新实例首帧与进程缓存全等→跳过重建→该实例
     /// keymap 恒空表（自定义 keymap 的 F 区键/空态预判静默失效）。
     pub keymap_last_raw: std::sync::Mutex<(serde_json::Value, serde_json::Value)>,
+    /// 空闲配置刷新最近一次尝试/有效快照；失败也在现有 poll 内节流。
+    keymap_polled_at: Option<std::time::Instant>,
     /// v3（普通分层窗，打包宿主 SearchHost/UWP 专用——DComp 直通窗
     /// 被 DWM cloak，普通分层窗考古验证在 UWP 可见可跟光标）
     /// 沉浸式宿主（自绘窗被 DWM cloaked）→ 双通道候选：
@@ -614,6 +690,7 @@ impl Shared {
                 serde_json::Value::Null,
                 serde_json::Value::Null,
             )),
+            keymap_polled_at: None,
             cand_ui: None,
             cand_ui_id: 0,
             cand_ui_active: false,
@@ -1121,7 +1198,14 @@ impl ITfTextInputProcessor_Impl for HuFuTs_Impl {
         // 诊断：宿主画像 + 管道探活（排查开始菜单搜索等特殊宿主：
         // AppContainer 的 DLL 加载与管道连通分层定位）——ProgramData\HuFu\diag
         {
-            let pipe_ok = crate::ipc::call(&serde_json::json!({"op": "status"})).is_some();
+            // 同一次探活直接初始化所属实例的两态映射。首个自定义功能键
+            // 在 TestDown 就需要它，不能等普通键的响应才建表。
+            g.keymap_polled_at = Some(std::time::Instant::now());
+            let resp = crate::ipc::call(&serde_json::json!({"op": "state"}));
+            if let Some(state) = resp.as_ref().and_then(|r| r.get("state")) {
+                sync_keymaps(&mut g, state);
+            }
+            let pipe_ok = resp.is_some();
             let perr = crate::ipc::LAST_PIPE_ERR.load(std::sync::atomic::Ordering::SeqCst);
             let line = format!(
                 "pid={} pipe={} perr={} t={:?}\n",
@@ -3686,13 +3770,13 @@ impl HuFuTs_Impl {
         // space 仍按住。修「Ctrl 先抬、Space 后抬切不了中英」：该序下
         // space up 到达时 GetKeyState(VK_CONTROL) 已松，旧判定按「此刻
         // 无 Ctrl」直通不切——但组合确实发生过，应切。
-        let (name0, sh0, ct0, al0) = match if num_enter && keymap_has("numenter") {
+        let (name0, sh0, ct0, al0) = match if num_enter && keymap_has(&self.shared, "numenter") {
             // 【小键盘 Enter 2026-11】扩展位 Enter 且映射过 numenter：
             // 发精确名（vk_to_name 0x0D 的 "enter" 是主排身份）。
             // 未映射走下方 vk_to_name → "enter"（与旧版同口径零差异）。
             Some(("numenter".to_string(), false, false, false))
         } else {
-            vk_to_name(wparam, false)
+            vk_to_name(wparam, false, Some(&self.shared))
         } {
             Some((n, sh, ct, al)) => (Some(n), sh, ct, al),
             None => (None, false, false, false),
@@ -3866,10 +3950,10 @@ impl HuFuTs_Impl {
                 let g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
                 (g.chinese, g.composing, g.shift_down)
             };
-            let (name, shift, ctrl, alt) = if num_enter && keymap_has("numenter") {
+            let (name, shift, ctrl, alt) = if num_enter && keymap_has(&self.shared, "numenter") {
                 ("numenter".to_string(), false, false, false)
             } else {
-                match vk_to_name(wparam, hint) {
+                match vk_to_name(wparam, hint, Some(&self.shared)) {
                     Some(v) => v,
                     None => return BOOL(0),
                 }
@@ -4106,10 +4190,10 @@ impl HuFuTs_Impl {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .shift_down;
-        let (name, shift, ctrl, alt) = if num_enter && keymap_has("numenter") {
+        let (name, shift, ctrl, alt) = if num_enter && keymap_has(&self.shared, "numenter") {
             ("numenter".to_string(), false, false, false)
         } else {
-            match vk_to_name(wparam, hint) {
+            match vk_to_name(wparam, hint, Some(&self.shared)) {
                 Some(v) => v,
                 None => return BOOL(0),
             }
@@ -4310,78 +4394,8 @@ impl HuFuTs_Impl {
                 trace(&format!("esc_undo_ready 同步: {eur}"));
             }
             g.esc_undo_ready = eur;
-            // 【全键盘按键映射 2026-11】同帧同步 keymap 快照：F 区键
-            // 路由白名单 + TestDown 空态预判放行表。
-            // 【T3-f 2026-11-07】与上一拍原始 JSON 全等（缺省↔Null 归一）
-            // 则跳过重建——server 稳态每键回同样两表，逐键重建纯白付；
-            // 变化拍才重建+trace+缓存原始值，口径与旧版一致。
-            // 【防回归修复(10-reg P1)】缓存落 Shared（每实例）——进程级
-            // static 会毒化同进程新实例（见字段注释）。缓存锁内只做
-            // 「比对+换出已变值」（避免嵌套借用 g：guard 借 g.keymap_
-            // last_raw 期间不可再写 g.keymap），字段赋值移出锁后。
-            let km_changed: Option<serde_json::Value> = {
-                let mut km_last = g.keymap_last_raw.lock().unwrap_or_else(|p| p.into_inner());
-                let km_now = state.get("keymap");
-                let km_same = match km_now {
-                    Some(v) => v == &km_last.0,
-                    None => km_last.0.is_null(),
-                };
-                if km_same {
-                    None
-                } else {
-                    let taken = km_now.cloned().unwrap_or(serde_json::Value::Null);
-                    km_last.0 = taken.clone();
-                    Some(taken)
-                }
-            };
-            if let Some(raw) = km_changed {
-                let km: std::collections::HashMap<String, String> = raw
-                    .as_object()
-                    .map(|o| {
-                        o.iter()
-                            .filter_map(|(k, v)| {
-                                v.as_str().map(|s| (k.clone(), s.to_string()))
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                if g.keymap != km {
-                    trace(&format!("keymap 同步: {} 项", km.len()));
-                }
-                g.keymap = km;
-            }
-            // 【两态映射 2026-11】空态专用表同帧同步（同上：未变跳过重建）。
-            let kmi_changed: Option<serde_json::Value> = {
-                let mut km_last = g.keymap_last_raw.lock().unwrap_or_else(|p| p.into_inner());
-                let kmi_now = state.get("keymap_idle");
-                let kmi_same = match kmi_now {
-                    Some(v) => v == &km_last.1,
-                    None => km_last.1.is_null(),
-                };
-                if kmi_same {
-                    None
-                } else {
-                    let taken = kmi_now.cloned().unwrap_or(serde_json::Value::Null);
-                    km_last.1 = taken.clone();
-                    Some(taken)
-                }
-            };
-            if let Some(raw) = kmi_changed {
-                let kmi: std::collections::HashMap<String, String> = raw
-                    .as_object()
-                    .map(|o| {
-                        o.iter()
-                            .filter_map(|(k, v)| {
-                                v.as_str().map(|s| (k.clone(), s.to_string()))
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                if g.keymap_idle != kmi {
-                    trace(&format!("keymap_idle 同步: {} 项", kmi.len()));
-                }
-                g.keymap_idle = kmi;
-            }
+            // 完整双表同帧同步；与激活/现有状态刷新共用逐实例缓存。
+            sync_keymaps(&mut g, &state);
             // 【Alt+修改 下线 2026-10-17】alt_symbols/alt_always 同步块与
             // LL 钩子快照刷新已随功能整体删除。
             // 【十七修·零锁快照 v2】从**本拍 state** 直读——旧版读 g.raw_last
@@ -4798,7 +4812,8 @@ impl HuFuTs_Impl {
 
 /// 冒烟测试直驱：vk_to_name + 管道引擎往返（不经 msctf/组段/候选窗）。
 pub fn test_key(vk: u32) -> i32 {
-    let Some((name, shift, ctrl, alt)) = vk_to_name(vk as usize, false) else {
+    let shared = tl_shared().or_else(|| G_SHARED.get().map(|g| g.0.clone()));
+    let Some((name, shift, ctrl, alt)) = vk_to_name(vk as usize, false, shared.as_ref()) else {
         eprintln!("hufu-tsf: test_key vk={vk} 无映射");
         return 0;
     };
@@ -4820,7 +4835,8 @@ pub fn test_key(vk: u32) -> i32 {
 /// vk → (基础键名, shift, ctrl, alt)。shift = GetKeyState 按下 ||
 /// hint（本 DLL 跟踪的 TestDown/KeyDown 状态——32 位宿主 KeyDown 时刻
 /// GetKeyState 偶发失准，双保险）。
-fn vk_to_name(vk: usize, hint: bool) -> Option<(String, bool, bool, bool)> {
+fn vk_to_name(vk: usize, hint: bool, shared: Option<&SharedRef>) -> Option<(String, bool, bool, bool)> {
+    let mapped = |name: &str| shared.is_some_and(|s| keymap_has(s, name));
     unsafe {
         let shift = GetKeyState(VK_SHIFT.0 as i32) < 0 || hint;
         let ctrl = GetKeyState(VK_CONTROL.0 as i32) < 0;
@@ -4846,21 +4862,21 @@ fn vk_to_name(vk: usize, hint: bool) -> Option<(String, bool, bool, bool)> {
             // 未映射 → None 直通，升级零差异。F1-F12 同理（VK 0x70-
             // 0x7B）。
             0x24 => {
-                let km = keymap_has("home");
+                let km = mapped("home");
                 if km { "home".to_string() } else { return None }
             }
             0x23 => {
-                let km = keymap_has("end");
+                let km = mapped("end");
                 if km { "end".to_string() } else { return None }
             }
             0x2E => {
-                let km = keymap_has("delete");
+                let km = mapped("delete");
                 if km { "delete".to_string() } else { return None }
             }
             0x70..=0x7B => {
                 let n = vk - 0x6F;
                 let name = format!("f{n}");
-                if keymap_has(&name) { name } else { return None }
+                if mapped(&name) { name } else { return None }
             }
             // 【小键盘映射 2026-11】VK 0x60-0x69（NumLock 开启的小键盘
             // 数字）与 0x6A-0x6F（*/-+/.//Enter——NumLock 无关）：仅当
@@ -4870,13 +4886,13 @@ fn vk_to_name(vk: usize, hint: bool) -> Option<(String, bool, bool, bool)> {
             // 0x69 是方向/Home/End 群（VK 0x23/0x24/…），不走本分支。
             0x60..=0x69 => {
                 let name = format!("num{}", vk as u8 - 0x60);
-                if keymap_has(&name) { name } else { return None }
+                if mapped(&name) { name } else { return None }
             }
-            0x6A => { if keymap_has("nummul") { "nummul".to_string() } else { return None } }
-            0x6B => { if keymap_has("numadd") { "numadd".to_string() } else { return None } }
-            0x6D => { if keymap_has("numsub") { "numsub".to_string() } else { return None } }
-            0x6E => { if keymap_has("numdot") { "numdot".to_string() } else { return None } }
-            0x6F => { if keymap_has("numdiv") { "numdiv".to_string() } else { return None } }
+            0x6A => { if mapped("nummul") { "nummul".to_string() } else { return None } }
+            0x6B => { if mapped("numadd") { "numadd".to_string() } else { return None } }
+            0x6D => { if mapped("numsub") { "numsub".to_string() } else { return None } }
+            0x6E => { if mapped("numdot") { "numdot".to_string() } else { return None } }
+            0x6F => { if mapped("numdiv") { "numdiv".to_string() } else { return None } }
             // 【八十四修·Shift+字母传大写】字母键按 shift 实态保大小写：
             // 旧口径一律 |32 转小写（引擎只知道 shift=true），而引擎的
             // 大写通道（混输缓冲、大写直上屏）都认大写字符——小写+shift
@@ -4905,6 +4921,114 @@ fn vk_to_name(vk: usize, hint: bool) -> Option<(String, bool, bool, bool)> {
             _ => return None,
         };
         Some((name, shift, ctrl, alt))
+    }
+}
+
+#[cfg(test)]
+mod keymap_instance_tests {
+    use super::*;
+
+    #[test]
+    fn initial_state_routes_the_first_mapped_key_without_an_ordinary_key() {
+        let shared = Arc::new(Mutex::new(Shared::new()));
+        let state = serde_json::json!({
+            "keymap": {"f1": "select1"},
+            "keymap_idle": {"delete": "toggle"}
+        });
+        assert_eq!(vk_to_name(0x70, false, Some(&shared)), None);
+        assert!(sync_keymaps(&mut shared.lock().unwrap(), &state));
+        assert_eq!(vk_to_name(0x70, false, Some(&shared)).unwrap().0, "f1");
+        assert_eq!(vk_to_name(0x2e, false, Some(&shared)).unwrap().0, "delete");
+    }
+
+    #[test]
+    fn keymap_snapshots_replace_both_states_and_accept_explicit_empty_maps() {
+        let mut g = Shared::new();
+        let first = serde_json::json!({
+            "keymap": {"f1": "select1"}, "keymap_idle": {"delete": "toggle"}
+        });
+        assert!(sync_keymaps(&mut g, &first));
+        let old_value = g.keymap["f1"].as_ptr();
+        assert!(!sync_keymaps(&mut g, &first));
+        assert_eq!(g.keymap["f1"].as_ptr(), old_value);
+        let changed = serde_json::json!({
+            "keymap": {"f2": "select2"}, "keymap_idle": {"numenter": "commit"}
+        });
+        assert!(sync_keymaps(&mut g, &changed));
+        assert!(!g.keymap.contains_key("f1"));
+        assert!(!g.keymap_idle.contains_key("delete"));
+        assert_eq!(g.keymap["f2"], "select2");
+        assert_eq!(g.keymap_idle["numenter"], "commit");
+        assert!(sync_keymaps(&mut g, &serde_json::json!({"keymap": {}, "keymap_idle": {}})));
+        assert!(g.keymap.is_empty() && g.keymap_idle.is_empty());
+    }
+
+    #[test]
+    fn incomplete_or_malformed_keymap_response_preserves_the_entire_snapshot() {
+        let mut g = Shared::new();
+        let valid = serde_json::json!({
+            "keymap": {"f1": "select1"}, "keymap_idle": {"delete": "toggle"}
+        });
+        assert!(sync_keymaps(&mut g, &valid));
+        let raw = g.keymap_last_raw.lock().unwrap().clone();
+        let polled_at = g.keymap_polled_at;
+        for invalid in [
+            serde_json::json!({"error": "offline"}),
+            serde_json::json!({"keymap": {"f2": "select2"}}),
+            serde_json::json!({"keymap": null, "keymap_idle": {}}),
+            serde_json::json!({"keymap": {}, "keymap_idle": []}),
+            serde_json::json!({"keymap": {"f2": "select2"}, "keymap_idle": {"delete": 42}}),
+            serde_json::json!({"error": "bad", "keymap": {}, "keymap_idle": {}}),
+        ] {
+            assert!(!sync_keymaps(&mut g, &invalid));
+            assert_eq!(g.keymap.len(), 1);
+            assert_eq!(g.keymap["f1"], "select1");
+            assert_eq!(g.keymap_idle.len(), 1);
+            assert_eq!(g.keymap_idle["delete"], "toggle");
+            assert_eq!(*g.keymap_last_raw.lock().unwrap(), raw);
+            assert_eq!(g.keymap_polled_at, polled_at);
+        }
+    }
+
+    #[test]
+    fn idle_keymap_refresh_attempt_is_throttled_even_without_a_response() {
+        let mut first = Shared::new();
+        let mut second = Shared::new();
+        let now = std::time::Instant::now();
+        assert!(keymap_poll_due(&mut first, now));
+        assert!(!keymap_poll_due(&mut first, now + std::time::Duration::from_millis(4999)));
+        assert!(keymap_poll_due(&mut first, now + std::time::Duration::from_secs(5)));
+        assert!(!keymap_poll_due(&mut first, now + std::time::Duration::from_secs(5)));
+        assert!(keymap_poll_due(&mut second, now));
+    }
+
+    #[test]
+    fn conditional_key_routes_use_the_owning_shared_snapshot() {
+        let first = Arc::new(Mutex::new(Shared::new()));
+        let second = Arc::new(Mutex::new(Shared::new()));
+        first.lock().unwrap().keymap.insert("f1".into(), "select1".into());
+        {
+            let mut g = second.lock().unwrap();
+            g.keymap.insert("f2".into(), "select2".into());
+            g.keymap.insert("num5".into(), "select5".into());
+            g.keymap_idle.insert("delete".into(), "toggle".into());
+            g.keymap_idle.insert("numenter".into(), "commit".into());
+            g.keymap_idle.insert("shiftright".into(), "select2".into());
+        }
+        let route = |vk, shared| vk_to_name(vk, false, Some(shared)).map(|v| v.0);
+        assert_eq!(route(0x70, &first).as_deref(), Some("f1"));
+        assert_eq!(route(0x70, &second), None);
+        assert_eq!(route(0x71, &first), None);
+        assert_eq!(route(0x71, &second).as_deref(), Some("f2"));
+        assert_eq!(route(0x65, &first), None);
+        assert_eq!(route(0x65, &second).as_deref(), Some("num5"));
+        assert_eq!(route(0x2e, &first), None);
+        assert_eq!(route(0x2e, &second).as_deref(), Some("delete"));
+        assert!(!keymap_has(&first, "numenter"));
+        assert!(keymap_has(&second, "numenter"));
+        assert!(!keymap_has(&first, "shift"));
+        assert!(keymap_has(&second, "shift"));
+        assert_eq!(vk_to_name(0x70, false, None), None);
     }
 }
 
@@ -9688,7 +9812,7 @@ unsafe fn game_call_orig(
 /// （转交）。
 fn game_engine_key(vk: usize) -> Option<bool> {
     let shared = G_SHARED.get().map(|g| g.0.clone())?;
-    let (name, shift, ctrl, alt) = vk_to_name(vk, false)?;
+    let (name, shift, ctrl, alt) = vk_to_name(vk, false, Some(&shared))?;
     let line_end = shared
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -10898,6 +11022,10 @@ extern "system" fn poll_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                     // 无条件跑——上屏跟随与 Chromium 跨帧竞态自愈共用）。
                 }
                 if let Some(state) = crate::ipc::state_request() {
+                    {
+                        let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+                        sync_keymaps(&mut g, &state);
+                    }
                     let raw_empty = state
                         .get("raw")
                         .and_then(|v| v.as_str())
@@ -11369,6 +11497,7 @@ fn poll_tick() {
                 // 没打字过的进程右键指示符永远空菜单/旧 ✓。5s 节流在
                 // refresh 内部，空闲进程也只是一轮一个管道 schemas 调用。
                 crate::langbar::refresh_schemas_cache();
+                refresh_idle_keymaps(&s);
                 poll_collapse_stale(&s);
                 return;
             }
@@ -11424,6 +11553,7 @@ fn poll_tick() {
     //（poll_collapse_stale 双源判定用）。
     {
         let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        sync_keymaps(&mut g, &state);
         let srv_raw_empty = state
             .get("raw")
             .and_then(|v| v.as_str())

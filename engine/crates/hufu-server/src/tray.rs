@@ -533,7 +533,7 @@ fn switch_schema(name: &str) {
             // 载 546MB 模型秒级卡全机打字）。本线程持锁中——reload 内部
             // 再 spawn 井线程等锁，无死锁。
             crate::reload_sentence_bg(true, false);
-            let _ = host.engine.config.save(&host.config_path);
+            let _ = host.persist_config();
         }
     }
 }

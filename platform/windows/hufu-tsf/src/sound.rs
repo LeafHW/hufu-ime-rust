@@ -18,9 +18,12 @@ struct Clip {
     channels: u16,
     bits: u16,
     volume: u8,
+    generation: u64,
 }
 
 static CACHE: Mutex<Option<HashMap<String, Clip>>> = Mutex::new(None);
+/// 清缓存与异步取料以代际隔离：旧包的迟到响应不能重新污染新缓存。
+static CACHE_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// 键音池标签缓存（原为 key_pool_tags 函数内 static；提到模块级以便
 /// invalidate() 在换音效包/音量变更时一并失效——池成员来自音效目录
 /// 实测，旧池在换包后可能整包取不到 → 键音静默）。
@@ -31,7 +34,22 @@ static KEY_POOL_TAGS: Mutex<Option<Vec<String>>> = Mutex::new(None);
 struct Pool {
     key: (u32, u16, u16),
     handles: Vec<HWAVEOUT>,
-    next: usize,
+    busy: Vec<bool>,
+}
+impl Pool {
+    fn take_free(&mut self) -> Option<HWAVEOUT> {
+        let index = self.busy.iter().position(|busy| !busy)?;
+        self.busy[index] = true;
+        Some(self.handles[index])
+    }
+
+    fn release(&mut self, h: HWAVEOUT) -> bool {
+        let Some(index) = self.handles.iter().position(|handle| *handle == h) else {
+            return false;
+        };
+        self.busy[index] = false;
+        true
+    }
 }
 // HWAVEOUT 是裸句柄（内部 *mut c_void），跨线程移动安全（waveOut API 线程无关）
 unsafe impl Send for Pool {}
@@ -63,14 +81,14 @@ fn take_handle(rate: u32, channels: u16, bits: u16) -> Option<HWAVEOUT> {
     let pool = match pools.iter_mut().find(|p| p.key == key) {
         Some(p) => p,
         None => {
-            let block_align = channels * bits / 8;
+            let (block_align, byte_rate) = pcm_format(rate, channels, bits)?;
             let wfx = WAVEFORMATEX {
                 wFormatTag: 1,
                 nChannels: channels,
                 nSamplesPerSec: rate,
                 wBitsPerSample: bits,
                 nBlockAlign: block_align,
-                nAvgBytesPerSec: rate * block_align as u32,
+                nAvgBytesPerSec: byte_rate,
                 cbSize: 0,
             };
             let mut handles = Vec::new();
@@ -90,15 +108,15 @@ fn take_handle(rate: u32, channels: u16, bits: u16) -> Option<HWAVEOUT> {
             }
             pools.push(Pool {
                 key,
+                busy: vec![false; handles.len()],
                 handles,
-                next: 0,
             });
             pools.last_mut().unwrap()
         }
     };
-    let h = pool.handles[pool.next % pool.handles.len()];
-    pool.next = pool.next.wrapping_add(1);
-    Some(h)
+    // 工人数量有限不代表轮转句柄已经空闲：一个长音未结束时，其他工人
+    // 可连续播完多段短音绕回它。只租借空闲句柄，全忙则丢本次音效。
+    pool.take_free()
 }
 
 /// 播放 tag 音效（失败静默）。**调度线程 + 4 固定播放工人**：
@@ -283,8 +301,10 @@ fn dispatch_tx() -> Option<std::sync::mpsc::SyncSender<Job>> {
 /// 同步播放（工人线程内调用）：预开句柄 + 单缓冲写 + 忙等到 DONE 归还。
 /// 句柄在写入前登记 ACTIVE（key_up 据此截断键音），归还前注销。
 fn play_sync(c: Clip, is_key: bool) {
-    let block_align = c.channels * c.bits / 8;
-    if block_align == 0 {
+    if c.generation != CACHE_GENERATION.load(std::sync::atomic::Ordering::Relaxed) {
+        return; // 换包前排队的播放任务也随缓存一起失效
+    }
+    if pcm_format(c.samples_per_sec, c.channels, c.bits).is_none() {
         return;
     }
     let Some(h) = take_handle(c.samples_per_sec, c.channels, c.bits) else {
@@ -342,6 +362,17 @@ fn play_sync(c: Clip, is_key: bool) {
         // 句柄保留复用，不 Close
     }
     unregister_active(h);
+    release_handle(h);
+}
+
+/// 成功/超时播放结束后归还租借；失败路径直接 retire，不再进入池。
+fn release_handle(h: HWAVEOUT) {
+    let mut pools = POOLS.lock().unwrap_or_else(|p| p.into_inner());
+    for pool in pools.iter_mut() {
+        if pool.release(h) {
+            return;
+        }
+    }
 }
 
 /// 从 ACTIVE 注销句柄（播放完成/Prepare 失败时）。
@@ -361,7 +392,10 @@ fn retire_handle(h: HWAVEOUT, rate: u32, channels: u16, bits: u16) {
     let mut pools = POOLS.lock().unwrap_or_else(|p| p.into_inner());
     let key = (rate, channels, bits);
     if let Some(pool) = pools.iter_mut().find(|p| p.key == key) {
-        pool.handles.retain(|x| *x != h);
+        if let Some(index) = pool.handles.iter().position(|handle| *handle == h) {
+            pool.handles.swap_remove(index);
+            pool.busy.swap_remove(index);
+        }
         if pool.handles.is_empty() {
             pools.retain(|p| p.key != key);
         }
@@ -374,14 +408,7 @@ fn retire_handle(h: HWAVEOUT, rate: u32, channels: u16, bits: u16) {
 /// 拆成「锁内查 / 锁外取」两半，锁永不跨管道调用。
 fn cached_clip(tag: &str) -> Option<Clip> {
     let guard = CACHE.lock().unwrap_or_else(|p| p.into_inner());
-    let c = guard.as_ref()?.get(tag)?;
-    Some(Clip {
-        samples: c.samples.clone(),
-        samples_per_sec: c.samples_per_sec,
-        channels: c.channels,
-        bits: c.bits,
-        volume: c.volume,
-    })
+    guard.as_ref()?.get(tag).cloned()
 }
 
 /// 取料（工人线程内调用）：管道取+base64 解码+wav 解析在锁外，插入
@@ -391,6 +418,7 @@ fn fetch_clip(tag: &str) -> Option<Clip> {
     if let Some(c) = cached_clip(tag) {
         return Some(c); // 排队期间他人已取好：直接复用
     }
+    let generation = CACHE_GENERATION.load(std::sync::atomic::Ordering::Relaxed);
     let resp = crate::ipc::call(&serde_json::json!({"op": "sound", "tag": tag}))?;
     let data_b64 = resp.get("data").and_then(|v| v.as_str())?;
     let volume = resp.get("volume").and_then(|v| v.as_u64()).unwrap_or(50) as u8;
@@ -402,20 +430,15 @@ fn fetch_clip(tag: &str) -> Option<Clip> {
         channels,
         bits,
         volume,
+        generation,
     };
     {
         let mut guard = CACHE.lock().unwrap_or_else(|p| p.into_inner());
+        if generation != CACHE_GENERATION.load(std::sync::atomic::Ordering::Relaxed) {
+            return None; // 取料期间换包，丢弃旧响应
+        }
         let map = guard.get_or_insert_with(HashMap::new);
-        map.insert(
-            tag.to_string(),
-            Clip {
-                samples: clip.samples.clone(),
-                samples_per_sec: clip.samples_per_sec,
-                channels: clip.channels,
-                bits: clip.bits,
-                volume: clip.volume,
-            },
-        );
+        map.insert(tag.to_string(), clip.clone());
     }
     Some(clip)
 }
@@ -440,6 +463,7 @@ fn warm_pool_async() {
 /// 事件 tag 逐个取料入缓存，取得到的进池；全空回退 "key"。
 /// 【T1-2c 2026-11-07】原在按键线程同步做，现整体搬到后台。
 fn warm_pool() {
+    let generation = CACHE_GENERATION.load(std::sync::atomic::Ordering::Relaxed);
     let mut v: Vec<String> = ["key", "select", "commit", "page"]
         .iter()
         .filter(|t| fetch_clip(t).is_some())
@@ -448,14 +472,19 @@ fn warm_pool() {
     if v.is_empty() {
         v.push("key".to_string());
     }
-    let mut g = KEY_POOL_TAGS.lock().unwrap_or_else(|p| p.into_inner());
-    *g = Some(v);
+    // 与 invalidate 相同锁序，检查到发布之间不允许跨代际。
+    let _cache = CACHE.lock().unwrap_or_else(|p| p.into_inner());
+    if generation == CACHE_GENERATION.load(std::sync::atomic::Ordering::Relaxed) {
+        let mut g = KEY_POOL_TAGS.lock().unwrap_or_else(|p| p.into_inner());
+        *g = Some(v);
+    }
 }
 
 /// 清空缓存（音量/文件变更后重取）。
 pub fn invalidate() {
     {
         let mut guard = CACHE.lock().unwrap_or_else(|p| p.into_inner());
+        CACHE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         *guard = None;
         // 【P2-8 2026-11-07】键音池标签一并失效：换音效包后旧池标签可能
         // 在新包里全部取不到 → 键音整包静默。
@@ -471,13 +500,19 @@ pub fn invalidate() {
 }
 
 /// 极简 wav 解析：RIFF→fmt→data（PCM，任意声道/位深，waveOut 按实际格式开）。
+fn pcm_format(rate: u32, channels: u16, bits: u16) -> Option<(u16, u32)> {
+    if rate == 0 || channels == 0 || (bits != 8 && bits != 16) {
+        return None;
+    }
+    let block_align = channels.checked_mul(bits / 8)?;
+    Some((block_align, rate.checked_mul(block_align as u32)?))
+}
+
 fn parse_wav(raw: &[u8]) -> Option<(Vec<u8>, u32, u16, u16)> {
     if raw.len() < 44 || &raw[0..4] != b"RIFF" || &raw[8..12] != b"WAVE" {
         return None;
     }
-    let mut rate = 44_100u32;
-    let mut channels = 1u16;
-    let mut bits = 16u16;
+    let mut format = None;
     let mut data: Option<Vec<u8>> = None;
     let mut pos = 12usize;
     while pos + 8 <= raw.len() {
@@ -485,18 +520,24 @@ fn parse_wav(raw: &[u8]) -> Option<(Vec<u8>, u32, u16, u16)> {
         let size =
             u32::from_le_bytes([raw[pos + 4], raw[pos + 5], raw[pos + 6], raw[pos + 7]]) as usize;
         let body = pos + 8;
-        if id == b"fmt " && size >= 16 {
+        // 先校验整个 chunk；尤其 32 位上 body + u32::MAX 不能先做裸加。
+        let end = body.checked_add(size)?;
+        if end > raw.len() {
+            return None;
+        }
+        if id == b"fmt " {
             // 【越界修复 2026-09-09】截断/损坏 wav（fmt 头声称 16 字节但
             // 文件不够）原样读 raw[body+14] 越界 panic——本函数在宿主
             // UI 线程同步调用，panic=宿主进程崩溃。读前验界。
-            if body + 16 > raw.len() {
+            if size < 16 || u16::from_le_bytes([raw[body], raw[body + 1]]) != 1 {
                 return None;
             }
-            channels = u16::from_le_bytes([raw[body + 2], raw[body + 3]]);
-            rate = u32::from_le_bytes([raw[body + 4], raw[body + 5], raw[body + 6], raw[body + 7]]);
-            bits = u16::from_le_bytes([raw[body + 14], raw[body + 15]]);
+            let channels = u16::from_le_bytes([raw[body + 2], raw[body + 3]]);
+            let rate = u32::from_le_bytes([raw[body + 4], raw[body + 5], raw[body + 6], raw[body + 7]]);
+            let bits = u16::from_le_bytes([raw[body + 14], raw[body + 15]]);
+            pcm_format(rate, channels, bits)?;
+            format = Some((rate, channels, bits));
         } else if id == b"data" {
-            let end = (body + size).min(raw.len());
             data = Some(raw[body..end].to_vec());
         }
         // pos 递增防溢出回绕（size 伪造巨大值→usize 回绕→死循环/越界）
@@ -505,10 +546,8 @@ fn parse_wav(raw: &[u8]) -> Option<(Vec<u8>, u32, u16, u16)> {
             _ => break,
         }
     }
-    if bits != 8 && bits != 16 {
-        return None; // 仅 PCM 8/16bit
-    }
-    Some((data?, rate, channels.max(1), bits))
+    let (rate, channels, bits) = format?;
+    Some((data?, rate, channels, bits))
 }
 
 /// 标准 base64 解码（无填充容错）。overlaywin 贴图挂件同款复用。
@@ -546,7 +585,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_stereo_wav() {
+    fn long_playback_keeps_its_handle_until_released() {
+        // 只测句柄分配状态，不打开音频设备。一个长音占住 h1 时，其余
+        // 工人重复播短音，不论轮转多少次都只能复用已归还的 h2。
+        let h1 = HWAVEOUT(1usize as *mut core::ffi::c_void);
+        let h2 = HWAVEOUT(2usize as *mut core::ffi::c_void);
+        let mut pool = Pool {
+            key: (44100, 1, 16),
+            handles: vec![h1, h2],
+            busy: vec![false, false],
+        };
+        assert_eq!(pool.take_free(), Some(h1));
+        for _ in 0..16 {
+            assert_eq!(pool.take_free(), Some(h2));
+            assert!(pool.take_free().is_none(), "忙句柄不能重复借出");
+            assert!(pool.release(h2));
+        }
+        assert!(pool.release(h1));
+        assert_eq!(pool.take_free(), Some(h1));
+    }
+
+    fn stereo_wav() -> Vec<u8> {
         // 最小 RIFF：fmt(16, stereo 44100 16bit) + data(4 字节)
         let mut w = Vec::new();
         w.extend_from_slice(b"RIFF");
@@ -563,9 +622,42 @@ mod tests {
         w.extend_from_slice(b"data");
         w.extend_from_slice(&4u32.to_le_bytes());
         w.extend_from_slice(&[1, 2, 3, 4]);
+        w
+    }
+
+    #[test]
+    fn parse_stereo_wav() {
+        let w = stereo_wav();
         let (d, rate, ch, bits) = parse_wav(&w).unwrap();
         assert_eq!(d, vec![1, 2, 3, 4]);
         assert_eq!((rate, ch, bits), (44100, 2, 16));
+    }
+
+    #[test]
+    fn parse_rejects_corrupt_pcm_headers_and_chunk_bounds() {
+        let mut non_pcm = stereo_wav();
+        non_pcm[20..22].copy_from_slice(&2u16.to_le_bytes());
+        assert!(parse_wav(&non_pcm).is_none(), "非 PCM 数据不能当 PCM 播放");
+
+        let mut huge_chunk = stereo_wav();
+        huge_chunk[40..44].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(parse_wav(&huge_chunk).is_none(), "32 位也不能溢出或接受截断 data");
+
+        let mut no_fmt = stereo_wav();
+        no_fmt[12..16].copy_from_slice(b"JUNK");
+        assert!(parse_wav(&no_fmt).is_none(), "缺少 fmt 不能猜测格式");
+
+        let mut zero_channels = stereo_wav();
+        zero_channels[22..24].copy_from_slice(&0u16.to_le_bytes());
+        assert!(parse_wav(&zero_channels).is_none());
+
+        let mut huge_rate = stereo_wav();
+        huge_rate[24..28].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(parse_wav(&huge_rate).is_none(), "byte rate 溢出应拒绝");
+
+        let mut huge_channels = stereo_wav();
+        huge_channels[22..24].copy_from_slice(&u16::MAX.to_le_bytes());
+        assert!(parse_wav(&huge_channels).is_none(), "block align 溢出应拒绝");
     }
 
     #[test]

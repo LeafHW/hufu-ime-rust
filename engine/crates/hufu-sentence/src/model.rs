@@ -282,12 +282,12 @@ impl NgramModel {
             return None;
         }
         let page = lo - 1;
-        let block = rd_i64(&self.data, index_off + page * 16 + 8) as usize;
+        let block = usize::try_from(rd_i64(&self.data, index_off + page * 16 + 8)).ok()?;
         // 页内顺序扫描（≤ index_stride 条，键升序可提前退出）
         let rec = self.succ_rec_size();
         let mut off = block;
         for _ in 0..self.index_stride {
-            if off + 16 > self.data.len() {
+            if off.checked_add(16)? > self.data.len() {
                 return None;
             }
             let k = rd_i64(&self.data, off);
@@ -577,5 +577,20 @@ mod tests {
         );
         let p = m.bigram_prob('我' as u32, '们' as u32);
         assert!(p > 0.0 && p.is_finite(), "回退 unigram 概率: {p}");
+    }
+
+    #[test]
+    fn corrupt_page_offsets_fall_back_without_panicking() {
+        for offset in [-1i64, i64::MIN, i64::MAX, u32::MAX as i64] {
+            let mut d = tiny_model_bytes();
+            let bi_index = rd_i64(&d, 64) as usize;
+            let tri_index = rd_i64(&d, 96) as usize;
+            d[bi_index + 8..bi_index + 16].copy_from_slice(&offset.to_le_bytes());
+            d[tri_index + 8..tri_index + 16].copy_from_slice(&offset.to_le_bytes());
+            let m = NgramModel::from_bytes(d).unwrap();
+            assert!(!m.has_bigram('我' as u32, '们' as u32));
+            assert_eq!(m.bigram_prob('我' as u32, '们' as u32), m.unigram_prob('们' as u32));
+            assert_eq!(m.trigram_prob('我' as u32, '们' as u32, '是' as u32), m.unigram_prob('是' as u32));
+        }
     }
 }

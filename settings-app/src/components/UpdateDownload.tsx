@@ -4,6 +4,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Icon } from './Icon';
 import { Badge } from './ui';
+import { createSnapshotRequest } from '../snapshotRequest';
 import {
   cancelUpdateDownload,
   fetchDownloadState,
@@ -41,41 +42,37 @@ export function useUpdateDownload(): UpdateDownloadApi {
   const [openError, setOpenError] = useState('');
   const [cancelling, setCancelling] = useState(false);
   const [speed, setSpeed] = useState(0);
-
-  /* 首次挂载：接上 server 已有的任务（关窗重开 / 换页回来都不丢进度） */
-  useEffect(() => {
-    let alive = true;
-    fetchDownloadState()
-      .then((s) => {
-        if (alive) setState(s);
-      })
-      .catch(() => {
-        /* server 未就绪：保持空态，用户点检查更新时会报明确错误 */
-      });
-    return () => {
-      alive = false;
-    };
+  const requests = useRef<ReturnType<typeof createSnapshotRequest<DownloadState>> | null>(null);
+  const mounted = useRef(false);
+  const refreshState = useCallback((reportError = false) => {
+    void requests.current?.refresh(reportError);
   }, []);
 
-  /* 换页/回到窗口时补拉一次：页面是常驻挂载的，别的页启动的下载要让
-     本页立刻看到（否则会停在旧状态）。 */
+  /* 所有快照入口共用一个请求；慢请求不会按 400ms 周期堆积。
+     启动/取消前后的代际失效防止旧状态覆盖操作结果。 */
   useEffect(() => {
+    mounted.current = true;
+    const reader = createSnapshotRequest(fetchDownloadState, (s) => {
+      setState(s);
+      setError('');
+    }, (e) => setError((e as Error).message));
+    requests.current = reader;
+    refreshState();
     const refresh = () => {
-      fetchDownloadState()
-        .then(setState)
-        .catch(() => {
-          /* 静默：轮询/启动路径会给出具体错误 */
-        });
+      if (!document.hidden) refreshState();
     };
     window.addEventListener('hashchange', refresh);
     window.addEventListener('focus', refresh);
     document.addEventListener('visibilitychange', refresh);
     return () => {
+      mounted.current = false;
+      reader.dispose();
+      if (requests.current === reader) requests.current = null;
       window.removeEventListener('hashchange', refresh);
       window.removeEventListener('focus', refresh);
       document.removeEventListener('visibilitychange', refresh);
     };
-  }, []);
+  }, [refreshState]);
 
   const busy = isDownloadActive(state?.phase);
   const done = state?.phase === 'done';
@@ -83,24 +80,13 @@ export function useUpdateDownload(): UpdateDownloadApi {
   /* 任务进行中每 400ms 拉一次快照；结束自动停 */
   useEffect(() => {
     if (!busy) return;
-    let alive = true;
     const id = window.setInterval(() => {
-      fetchDownloadState()
-        .then((s) => {
-          if (alive) {
-            setState(s);
-            setError('');
-          }
-        })
-        .catch((e: unknown) => {
-          if (alive) setError((e as Error).message);
-        });
+      if (!document.hidden) refreshState(true);
     }, 400);
     return () => {
-      alive = false;
       clearInterval(id);
     };
-  }, [busy]);
+  }, [busy, refreshState]);
 
   /* 完成时自动在资源管理器定位安装包（仅本次点击发起的下载） */
   const prevPhase = useRef<DownloadPhase | undefined>(undefined);
@@ -110,7 +96,9 @@ export function useUpdateDownload(): UpdateDownloadApi {
     prevPhase.current = p;
     if (p === 'done' && pendingReveal && isDownloadActive(before)) {
       pendingReveal = false;
-      openDownloaded('folder').catch((e: unknown) => setOpenError((e as Error).message));
+      openDownloaded('folder').catch((e: unknown) => {
+        if (mounted.current) setOpenError((e as Error).message);
+      });
     }
     if (!isDownloadActive(p)) setCancelling(false);
   }, [state?.phase]);
@@ -134,41 +122,47 @@ export function useUpdateDownload(): UpdateDownloadApi {
   }, [state?.phase, state?.downloaded]);
 
   const start = useCallback(async () => {
+    requests.current?.invalidate();
     setError('');
     setOpenError('');
     try {
       const r = await startUpdateDownload();
+      if (!mounted.current) return;
+      requests.current?.invalidate();
       if (r.started) pendingReveal = true;
       setState(r.state);
     } catch (e) {
-      setError((e as Error).message);
+      if (mounted.current) setError((e as Error).message);
     }
   }, []);
 
   const cancel = useCallback(async () => {
+    requests.current?.invalidate();
     setCancelling(true);
     try {
       await cancelUpdateDownload();
+      if (!mounted.current) return;
+      requests.current?.invalidate();
+      refreshState(true);
     } catch (e) {
+      if (!mounted.current) return;
       setError((e as Error).message);
       setCancelling(false);
     }
-  }, []);
+  }, [refreshState]);
 
   const open = useCallback(async (target: 'installer' | 'folder') => {
     setOpenError('');
     try {
       await openDownloaded(target);
     } catch (e) {
+      if (!mounted.current) return;
       setOpenError((e as Error).message);
       /* 文件被删/移走后按钮才会报错：立刻重拉状态，让卡片翻成「已不在」 */
-      fetchDownloadState()
-        .then(setState)
-        .catch(() => {
-          /* 忽略：提示已经给出 */
-        });
+      requests.current?.invalidate();
+      refreshState();
     }
-  }, []);
+  }, [refreshState]);
 
   const total = state?.total ?? 0;
   const downloaded = state?.downloaded ?? 0;

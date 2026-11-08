@@ -367,32 +367,26 @@ export function SchemesPage({ data, notify }: { data: Bootstrap; notify: (msg: s
     busyRef.current = true;
     setBusy('save');
     try {
-      /* 落盘前重取最新整份配置：本页可能停留很久，期间别的页/别的窗口
-         可能改过皮肤、按键等——用旧快照写回会把它们洗掉；只补本页两节。 */
-      const base = await getJson<RawConfig>('/api/config');
-      /* 语义校验用刚取到的最新 config（页面快照可能停留很久，别的页刚改过
-         字母表）。必须在 POST 之前拒掉：一旦写进 config.json，引擎下一键就
-         整类编码失效，用户只看到「打不出来」却不知道是前缀惹的。 */
-      const badPrefix = prefixRejectReason(form.prefix, base);
-      if (badPrefix) {
-        fail(badPrefix);
-        return;
-      }
-      const next: RawConfig = {
-        ...base,
-        reverse: {
-          ...(base.reverse ?? {}),
-          scheme: form.reverseScheme,
-          prefix: form.prefix,
-          disabled_output: form.disabledOutput,
-        },
-        candidates: {
-          ...(base.candidates ?? {}),
-          split_scheme: form.splitScheme,
-        },
-      };
-      // 【P1-15】配置写入走统一 updateConfig（带 rev 的 CAS）。
-      await updateConfig(next);
+      // 排到本次保存时，用同份 fresh 校验前缀并构造配置；排队前的
+      // 字母表快照可能已被输入页修改，不可再拿来批准新前缀。
+      await updateConfig((fresh) => {
+        const base = fresh as RawConfig;
+        const badPrefix = prefixRejectReason(form.prefix, base);
+        if (badPrefix) throw new Error(badPrefix);
+        return {
+          ...base,
+          reverse: {
+            ...(base.reverse ?? {}),
+            scheme: form.reverseScheme,
+            prefix: form.prefix,
+            disabled_output: form.disabledOutput,
+          },
+          candidates: {
+            ...(base.candidates ?? {}),
+            split_scheme: form.splitScheme,
+          },
+        };
+      });
       markDirty(false);
       const fresh = await getJson<RawConfig>('/api/config');
       applyConfig(fresh);

@@ -28,7 +28,7 @@
 //! | 项                       | 上限                          |
 //! |--------------------------|-------------------------------|
 //! | 单图边长                 | ≤8192×8192                    |
-//! | 每帧像素                 | ≤16,000,000                   |
+//! | 每帧像素                 | ≤9,000,000                    |
 //! | 帧数                     | ≤256                          |
 //! | 全图解码内存（帧流总量） | ≤64MB                         |
 //! | 单文件输入               | ≤16MiB（虎娘 4MiB，虎符放宽） |
@@ -135,7 +135,19 @@ fn frame_pair(f: image::Frame) -> (image::RgbaImage, u32) {
 /// 余格式（WebP/JPEG）走 load_from_memory 单帧。plays 取自 LoopCount
 /// （APNG=acTL num_plays / GIF=Netscape loop，Infinite→0）。
 fn decode_bitmap(data: &[u8]) -> Result<SsfBitmap, String> {
-    use image::AnimationDecoder;
+    use image::{AnimationDecoder, ImageDecoder};
+
+    // 必须在像素解码/动图全画布分配之前检查头信息。仅在迭代首帧后
+    // 检查已经太迟：小体积 GIF/PNG 也能声明数百 MB 的画布，32 位
+    // 宿主可能在返回错误前就因分配失败 abort。
+    let mut reader = image::ImageReader::new(Cursor::new(data))
+        .with_guessed_format()
+        .map_err(|e| format!("图片格式读取失败: {e}"))?;
+    reader.limits(bitmap_decoder_limits());
+    let (width, height) = reader
+        .into_dimensions()
+        .map_err(|e| format!("图片头信息读取失败: {e}"))?;
+    validate_bitmap_dimensions(width, height)?;
 
     const PNG_MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
     let is_gif = data.len() > 3 && &data[0..3] == b"GIF";
@@ -149,18 +161,19 @@ fn decode_bitmap(data: &[u8]) -> Result<SsfBitmap, String> {
 
     let animated;
     let plays;
-    let iter: Box<dyn Iterator<Item = (image::RgbaImage, u32)>> = if is_gif {
-        let dec = image::codecs::gif::GifDecoder::new(Cursor::new(data))
+    let iter: Box<dyn Iterator<Item = image::ImageResult<(image::RgbaImage, u32)>>> = if is_gif {
+        let mut dec = image::codecs::gif::GifDecoder::new(Cursor::new(data))
             .map_err(|e| format!("GIF 解码失败: {e}"))?;
+        dec.set_limits(bitmap_decoder_limits())
+            .map_err(|e| format!("GIF 解码预算超限: {e}"))?;
         plays = plays_of(dec.loop_count());
         animated = true;
         Box::new(
             dec.into_frames()
-                .filter_map(|f| f.ok())
-                .map(frame_pair),
+                .map(|f| f.map(frame_pair)),
         )
     } else if is_png {
-        let dec = image::codecs::png::PngDecoder::new(Cursor::new(data))
+        let dec = image::codecs::png::PngDecoder::with_limits(Cursor::new(data), bitmap_decoder_limits())
             .map_err(|e| format!("PNG 解码失败: {e}"))?;
         if dec.is_apng().unwrap_or(false) {
             let apng = dec
@@ -170,8 +183,7 @@ fn decode_bitmap(data: &[u8]) -> Result<SsfBitmap, String> {
             animated = true;
             Box::new(
                 apng.into_frames()
-                    .filter_map(|f| f.ok())
-                    .map(frame_pair),
+                    .map(|f| f.map(frame_pair)),
             )
         } else {
             plays = 0;
@@ -179,7 +191,7 @@ fn decode_bitmap(data: &[u8]) -> Result<SsfBitmap, String> {
             let img = image::load_from_memory(data)
                 .map_err(|e| format!("静态图解码失败: {e}"))?
                 .to_rgba8();
-            Box::new(std::iter::once((img, 0u32)))
+            Box::new(std::iter::once(Ok((img, 0u32))))
         }
     } else {
         // WebP/JPEG（及其余 image crate 可吃格式）：静态单帧
@@ -188,24 +200,19 @@ fn decode_bitmap(data: &[u8]) -> Result<SsfBitmap, String> {
         let img = image::load_from_memory(data)
             .map_err(|e| format!("静态图解码失败: {e}"))?
             .to_rgba8();
-        Box::new(std::iter::once((img, 0u32)))
+        Box::new(std::iter::once(Ok((img, 0u32))))
     };
 
     let mut frames: Vec<Vec<u8>> = Vec::new();
     let mut delays_ms: Vec<u32> = Vec::new();
     let mut dims @ (w0, h0) = (0u32, 0u32);
-    for (img, ms) in iter {
+    for frame in iter {
+        // 不可 filter_map(f.ok())：损坏/超预算帧必须立即退出，部分解码器
+        // 错误会在后续 next 重复返回，忽略错误会让 UI 线程原地空转。
+        let (img, ms) = frame.map_err(|e| format!("动图帧解码失败: {e}"))?;
         if frames.is_empty() {
             let (w, h) = (img.width(), img.height());
-            if w == 0 || h == 0 {
-                return Err("图片尺寸为 0".to_string());
-            }
-            if w > MAX_DIM || h > MAX_DIM {
-                return Err(format!("图片超限 {w}×{h}（>8192×8192）"));
-            }
-            if w as u64 * h as u64 > MAX_PIXELS {
-                return Err(format!("单帧像素超限 {w}×{h}（>{} px）", MAX_PIXELS));
-            }
+            validate_bitmap_dimensions(w, h)?;
             dims = (w, h);
         } else if (img.width(), img.height()) != dims {
             // image 的 APNG/GIF 合成保证全画布帧；不一致=解码器异常，拒收
@@ -242,6 +249,29 @@ fn decode_bitmap(data: &[u8]) -> Result<SsfBitmap, String> {
         frames,
         delays_ms,
     })
+}
+
+fn validate_bitmap_dimensions(w: u32, h: u32) -> Result<(), String> {
+    if w == 0 || h == 0 {
+        return Err("图片尺寸为 0".to_string());
+    }
+    if w > MAX_DIM || h > MAX_DIM {
+        return Err(format!("图片超限 {w}×{h}（>8192×8192）"));
+    }
+    if w as u64 * h as u64 > MAX_PIXELS {
+        return Err(format!("单帧像素超限 {w}×{h}（>{} px）", MAX_PIXELS));
+    }
+    Ok(())
+}
+
+pub(crate) fn bitmap_decoder_limits() -> image::Limits {
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_DIM);
+    limits.max_image_height = Some(MAX_DIM);
+    // 临时合成缓冲与驻留帧流预算分开：覆盖 4K/16 位 APNG 的多缓冲，
+    // 同时阻止 GIF 小逻辑画布里伪造巨大子帧绕过头信息尺寸检查。
+    limits.max_alloc = Some(256 * 1024 * 1024);
+    limits
 }
 
 // ============================================================================
@@ -281,6 +311,25 @@ fn with_cache<R>(f: impl FnOnce(&mut HashMap<(PathBuf, String), CacheEntry>) -> 
 
 fn cache_tick() -> u64 {
     CACHE_TICK.fetch_add(1, Ordering::Relaxed)
+}
+
+fn lookup_cached_bitmap(
+    cache: &mut HashMap<(PathBuf, String), CacheEntry>,
+    key: &(PathBuf, String),
+    fp: &str,
+) -> Option<Arc<SsfBitmap>> {
+    if let Some(e) = cache.get_mut(key) {
+        if e.fp == fp {
+            e.last_used = cache_tick();
+            return Some(e.bitmap.clone());
+        }
+        // 指纹变更失效也必须出账，否则重存皮肤会不断虚增预算，
+        // 最终把新图逐帧驱逐，后续每一帧都重新读盘/解码。
+        if let Some(old) = cache.remove(key) {
+            CACHE_BYTES.fetch_sub(entry_bytes(&old), Ordering::Relaxed);
+        }
+    }
+    None
 }
 
 // ============================================================================
@@ -437,17 +486,7 @@ fn load_bitmap_uncached(cache_dir: &Path, fp: &str, name: &str) -> Result<Arc<Ss
     let key = (cache_dir.to_path_buf(), name.to_string());
     // ① 快路径：命中且 fp 未变
     {
-        let hit = with_cache(|cache| {
-            if let Some(e) = cache.get_mut(&key) {
-                if e.fp == fp {
-                    e.last_used = cache_tick();
-                    return Some(e.bitmap.clone());
-                }
-                // fp 变化 → 失效（虎娘皮肤刷新戳同款语义）
-                cache.remove(&key);
-            }
-            None
-        });
+        let hit = with_cache(|cache| lookup_cached_bitmap(cache, &key, fp));
         if let Some(bmp) = hit {
             return Ok(bmp);
         }
@@ -710,8 +749,9 @@ pub fn frame_at(bmp: &SsfBitmap, elapsed_ms: u64) -> (usize, u32) {
     if delays.len() < 2 || bmp.frames.len() < 2 {
         return (0, 0);
     }
-    let eff: Vec<u64> = delays.iter().map(|&d| d.max(MIN_FRAME_DELAY_MS) as u64).collect();
-    let duration: u64 = eff.iter().sum();
+    // Called from every animation repaint: walk the bounded delay slice directly
+    // instead of allocating a temporary vector on the host's UI thread.
+    let duration: u64 = delays.iter().map(|&d| d.max(MIN_FRAME_DELAY_MS) as u64).sum();
     if duration == 0 {
         return (0, 0);
     }
@@ -719,7 +759,8 @@ pub fn frame_at(bmp: &SsfBitmap, elapsed_ms: u64) -> (usize, u32) {
         return (delays.len() - 1, 0);
     }
     let mut within = elapsed_ms % duration;
-    for (i, &d) in eff.iter().enumerate() {
+    for (i, &delay) in delays.iter().enumerate() {
+        let d = delay.max(MIN_FRAME_DELAY_MS) as u64;
         if within < d {
             return (i, (d - within) as u32);
         }
@@ -1657,6 +1698,89 @@ mod tests {
         let spec3 = SsfSkinSpec::parse(&v3).expect("parse3");
         assert_eq!(spec3.choose(true, true, true).map(|l| l.image.as_str()),
                    Some("vc.png"));
+    }
+
+    #[test]
+    fn bitmap_fingerprint_invalidation_releases_budget() {
+        let key = (PathBuf::from(r"C:\__hufu_cache_budget_test__"), "a.png".into());
+        with_cache(|cache| {
+            let before = CACHE_BYTES.load(Ordering::Relaxed);
+            // 多轮模拟同一张皮肤反复重存，不允许账本残留已移除条目。
+            for generation in 0..4 {
+                let fp = format!("fp-{generation}");
+                let entry = CacheEntry {
+                    fp: fp.clone(),
+                    bitmap: Arc::new(SsfBitmap {
+                        width: 2,
+                        height: 2,
+                        plays: 0,
+                        frames: vec![vec![0; 16]],
+                        delays_ms: vec![0],
+                    }),
+                    last_used: cache_tick(),
+                };
+                CACHE_BYTES.fetch_add(entry_bytes(&entry), Ordering::Relaxed);
+                assert!(cache.insert(key.clone(), entry).is_none());
+                assert!(lookup_cached_bitmap(cache, &key, &fp).is_some());
+                assert!(lookup_cached_bitmap(cache, &key, "next-fp").is_none());
+                assert!(!cache.contains_key(&key));
+                assert_eq!(CACHE_BYTES.load(Ordering::Relaxed), before);
+            }
+        });
+    }
+
+    #[test]
+    fn decode_gif_animation_preserves_frames_and_delays() {
+        let mut data = Vec::new();
+        {
+            let mut encoder = image::codecs::gif::GifEncoder::new(&mut data);
+            encoder.set_repeat(image::codecs::gif::Repeat::Finite(2)).unwrap();
+            for (rgba, ms) in [([255, 0, 0, 255], 40), ([0, 0, 255, 255], 60)] {
+                encoder.encode_frame(image::Frame::from_parts(
+                    image::RgbaImage::from_pixel(2, 1, image::Rgba(rgba)),
+                    0,
+                    0,
+                    image::Delay::from_numer_denom_ms(ms, 1),
+                )).unwrap();
+            }
+        }
+        let bmp = decode_bitmap(&data).expect("valid GIF remains supported");
+        assert_eq!((bmp.width, bmp.height, bmp.plays), (2, 1, 2));
+        assert_eq!(bmp.delays_ms, [40, 60]);
+        assert_eq!(bmp.frames.len(), 2);
+        assert_eq!(&bmp.frames[0][..4], &[0, 0, 255, 255]);
+        assert_eq!(&bmp.frames[1][..4], &[255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn decode_rejects_gif_subframe_that_exceeds_decoder_budget() {
+        let mut data = Vec::new();
+        image::codecs::gif::GifEncoder::new(&mut data)
+            .encode_frame(image::Frame::new(image::RgbaImage::new(1, 1)))
+            .unwrap();
+        let descriptor = data.iter().position(|&b| b == 0x2c).expect("GIF image descriptor");
+        data[descriptor + 5..descriptor + 7].copy_from_slice(&8192u16.to_le_bytes());
+        data[descriptor + 7..descriptor + 9].copy_from_slice(&8192u16.to_le_bytes());
+        // 逻辑画布仍是 1px；子帧预算失败必须立即返回 Err，不能被过滤后重试。
+        assert!(decode_bitmap(&data).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_oversized_gif_before_canvas_allocation() {
+        // 有效的 1px GIF 仅改逻辑画布头；帧体仍为 1px。若等首帧才检查，
+        // GIF 合成器已经为 8192² 的画布分配约 256MiB。
+        let mut data = Vec::new();
+        image::codecs::gif::GifEncoder::new(&mut data)
+            .encode_frame(image::Frame::new(image::RgbaImage::new(1, 1)))
+            .unwrap();
+        data[6..8].copy_from_slice(&8192u16.to_le_bytes());
+        data[8..10].copy_from_slice(&8192u16.to_le_bytes());
+        let err = decode_bitmap(&data).err().expect("oversized canvas rejected");
+        assert!(err.contains("单帧像素超限"), "{err}");
+        // 4K 仍在合法范围，单轴/总像素/零尺寸三道边界均保持。
+        assert!(validate_bitmap_dimensions(3840, 2160).is_ok());
+        assert!(validate_bitmap_dimensions(8193, 1).is_err());
+        assert!(validate_bitmap_dimensions(0, 1).is_err());
     }
 
     #[test]

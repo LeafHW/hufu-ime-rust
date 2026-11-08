@@ -65,13 +65,13 @@ static OVERLAY_SKIN_HASH: AtomicU64 = AtomicU64::new(0);
 
 /// 沙盒取证（diag 目录授过全应用包写权限；AppContainer 宿主 trace
 /// 写不进去）：关键分支一次性落 notes-<pid>.txt，只作诊断不进热路径。
-fn note_once(key: &'static str, msg: &str) {
+fn note_once(key: &'static str, msg: impl FnOnce() -> String) {
     static SEEN: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
     let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
     if !g.contains(&key) {
         g.push(key);
         drop(g);
-        crate::tsf::diag_note(msg);
+        crate::tsf::diag_note(&msg());
     }
 }
 
@@ -382,7 +382,8 @@ fn decode_worker(cfg: &OverlayCfg, target_h: f32, st: &DecodeState) -> Option<()
     let mut animated = false;
     let mut iter: Box<dyn Iterator<Item = (image::RgbaImage, u32)>> = if is_gif {
         animated = true;
-        let dec = image::codecs::gif::GifDecoder::new(std::io::Cursor::new(bytes)).ok()?;
+        let mut dec = image::codecs::gif::GifDecoder::new(std::io::Cursor::new(bytes)).ok()?;
+        dec.set_limits(crate::ssfwin::bitmap_decoder_limits()).ok()?;
         let (w, h) = dec.dimensions();
         if !dims_ok(w, h) {
             crate::tsf::trace(&format!("ov: 动图尺寸超限 {w}×{h}，拒绝解码"));
@@ -395,7 +396,10 @@ fn decode_worker(cfg: &OverlayCfg, target_h: f32, st: &DecodeState) -> Option<()
                 .map(frame_pair),
         )
     } else if is_png {
-        let dec = image::codecs::png::PngDecoder::new(std::io::Cursor::new(bytes)).ok()?;
+        let dec = image::codecs::png::PngDecoder::with_limits(
+            std::io::Cursor::new(bytes),
+            crate::ssfwin::bitmap_decoder_limits(),
+        ).ok()?;
         let (w, h) = dec.dimensions();
         if !dims_ok(w, h) {
             crate::tsf::trace(&format!("ov: PNG 尺寸超限 {w}×{h}，拒绝解码"));
@@ -633,6 +637,30 @@ struct FadeAnim {
     hide_when_done: bool,
     /// 参与淡变的帧号（淡出期间 frame_idx 已被重置为 0，必须钉住当时那帧）
     frame_idx: usize,
+}
+
+impl FadeAnim {
+    fn frame_to_draw(&self, live_frame: usize) -> usize {
+        if self.hide_when_done { self.frame_idx } else { live_frame }
+    }
+
+    /// Repeated hide signals share the original deadline and captured frame.
+    fn begin_hide(fade: &mut Option<Self>, from: u8, frame_idx: usize, now: std::time::Instant) -> bool {
+        if from == 0 {
+            *fade = None;
+            return false;
+        }
+        if !fade.as_ref().is_some_and(|f| f.hide_when_done) {
+            *fade = Some(Self {
+                start: now,
+                from,
+                to: 0,
+                hide_when_done: true,
+                frame_idx,
+            });
+        }
+        true
+    }
 }
 
 struct OverlayEntry {
@@ -1085,11 +1113,18 @@ unsafe fn advance_frame(ov_hwnd: HWND) {
     let (Some(dec), Some(cfg)) = (entry.decoded.clone(), entry.cfg.clone()) else {
         return;
     };
-    if !dec.animated.load(Ordering::Acquire) || !dec.ready.load(Ordering::Acquire) {
+    if !dec.animated.load(Ordering::Acquire) {
+        let _ = KillTimer(ov_hwnd, OVERLAY_TIMER_ID);
+        entry.timer_armed = false;
+        return;
+    }
+    if !dec.ready.load(Ordering::Acquire) {
         return;
     }
     let n = dec.frames.lock().unwrap_or_else(|e| e.into_inner()).len();
     if n <= 1 {
+        let _ = KillTimer(ov_hwnd, OVERLAY_TIMER_ID);
+        entry.timer_armed = false;
         return;
     }
     let Some(ov) = entry.ov.as_mut() else { return };
@@ -1140,7 +1175,7 @@ pub unsafe fn sync_for(cand: HWND, skin: &Value) {
         return;
     }
     let gen = OVERLAY_GEN.load(Ordering::Acquire);
-    note_once("sync-enter", &format!("ov: sync_for 进入 gen={gen}"));
+    note_once("sync-enter", || format!("ov: sync_for 进入 gen={gen}"));
     let mut list = OVERLAYS.lock().unwrap_or_else(|e| e.into_inner());
     let pos = match list.iter().position(|e| e.cand == cand_key) {
         Some(p) => p,
@@ -1176,7 +1211,7 @@ pub unsafe fn sync_for(cand: HWND, skin: &Value) {
             entry.retry_until = None;
             note_once(
                 "cfg-parse",
-                &format!(
+                || format!(
                     "ov: 代次解析 cfg={}（None=皮肤未载/无 overlay 节）skin_null={}",
                     entry.cfg.is_some(),
                     skin.is_null()
@@ -1273,7 +1308,7 @@ unsafe fn sync_tail_locked(cand: HWND, list: &mut Vec<OverlayEntry>, pos: usize)
             None => {
                 entry.disabled = true;
                 crate::tsf::trace("ov: 兄弟窗创建失败,本代次禁用");
-                note_once("create-fail", "ov: 兄弟窗创建失败（沙盒建窗被拒?）→本代次禁用");
+                note_once("create-fail", || "ov: 兄弟窗创建失败（沙盒建窗被拒?）→本代次禁用".to_string());
                 return;
             }
         }
@@ -1294,9 +1329,10 @@ unsafe fn sync_tail_locked(cand: HWND, list: &mut Vec<OverlayEntry>, pos: usize)
         // 旧参数的成品帧。
         let prewarmed = {
             let pw = PREWARM.lock().unwrap_or_else(|e| e.into_inner());
+            // Share the in-flight decode too. Starting another worker before
+            // ready_first duplicates the expensive first-frame work and budget.
             pw.as_ref().and_then(|(k, b, pk, d)| {
-                (d.ready_first.load(Ordering::Acquire)
-                    && *k == cfg.img_key
+                (*k == cfg.img_key
                     && *b == target_h.round() as u32
                     && *pk == cfg.proc_key)
                     .then(|| d.clone())
@@ -1326,7 +1362,7 @@ unsafe fn sync_tail_locked(cand: HWND, list: &mut Vec<OverlayEntry>, pos: usize)
                 .retry_until
                 .get_or_insert(now + std::time::Duration::from_secs(3));
             if now < until {
-                note_once("not-ready", "ov: 首帧未就绪→补拍钟自查");
+                note_once("not-ready", || "ov: 首帧未就绪→补拍钟自查".to_string());
                 let _ = SetTimer(oh, OVERLAY_RESYNC_TIMER_ID, 30, None);
             } else {
                 let _ = KillTimer(oh, OVERLAY_RESYNC_TIMER_ID);
@@ -1435,7 +1471,7 @@ unsafe fn sync_tail_locked(cand: HWND, list: &mut Vec<OverlayEntry>, pos: usize)
     entry.retry_until = None;
     note_once(
         "shown",
-        &format!("ov: 上屏 {cw}x{ch} at ({x},{y}) cand_visible={}", {
+        || format!("ov: 上屏 {cw}x{ch} at ({x},{y}) cand_visible={}", {
             let v = IsWindowVisible(cand).as_bool();
             v
         }),
@@ -1510,6 +1546,8 @@ unsafe fn tick_playback(
     }
     let n = dec.frames.lock().unwrap_or_else(|e| e.into_inner()).len();
     if n <= 1 {
+        let _ = KillTimer(ov_h, OVERLAY_TIMER_ID);
+        *timer_armed = false;
         return;
     }
     let delays = dec.delays.lock().unwrap_or_else(|e| e.into_inner());
@@ -1589,17 +1627,14 @@ fn fade_alpha_at(from: u8, to: u8, p: f32) -> u8 {
 /// （调用方直接 SW_HIDE 兜底，不挂空钟）。
 unsafe fn start_fade_out(entry: &mut OverlayEntry, h: HWND) -> bool {
     let from = entry.ov.as_ref().map(|o| o.alpha_cur).unwrap_or(0);
-    if from == 0 {
+    let already_hiding = entry.fade.as_ref().is_some_and(|f| f.hide_when_done);
+    if !FadeAnim::begin_hide(&mut entry.fade, from, entry.frame_idx, std::time::Instant::now()) {
+        let _ = KillTimer(h, OVERLAY_FADE_TIMER_ID);
         return false;
     }
-    entry.fade = Some(FadeAnim {
-        start: std::time::Instant::now(),
-        from,
-        to: 0,
-        hide_when_done: true,
-        frame_idx: entry.frame_idx,
-    });
-    let _ = SetTimer(h, OVERLAY_FADE_TIMER_ID, OVERLAY_FADE_STEP_MS, None);
+    if !already_hiding {
+        let _ = SetTimer(h, OVERLAY_FADE_TIMER_ID, OVERLAY_FADE_STEP_MS, None);
+    }
     true
 }
 
@@ -1634,7 +1669,7 @@ unsafe fn fade_tick(hwnd: HWND) {
     let a = fade_alpha_at(f.from, f.to, p);
     let done = p >= 1.0;
     let hide_when_done = f.hide_when_done;
-    let frame = f.frame_idx;
+    let frame = f.frame_to_draw(entry.frame_idx);
     let dec = entry.decoded.clone();
     let cfg = entry.cfg.clone();
     if let Some(ov) = entry.ov.as_mut() {
@@ -1713,4 +1748,52 @@ unsafe fn dpi_scale(cand: HWND) -> f32 {
     let dpi = GetDpiForWindow(cand).max(96) as f32 / 96.0;
     // 【T3-d 2026-11-07】env 查询进程内缓存（show 热路径），口径不变。
     crate::tsf::fake_dpi_scale().unwrap_or(dpi)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn fade_in_tracks_playback_but_fade_out_keeps_last_visible_frame() {
+        let mut fade = FadeAnim {
+            start: Instant::now(), from: 0, to: 255,
+            hide_when_done: false, frame_idx: 0,
+        };
+        // Playback and opacity timers interleave. Opacity changes must not
+        // rewind each newly displayed GIF frame back to the first one.
+        let frames: Vec<_> = [0, 0, 1, 2, 2, 3].map(|live| fade.frame_to_draw(live)).into();
+        assert_eq!(frames, [0, 0, 1, 2, 2, 3]);
+        fade.hide_when_done = true;
+        fade.frame_idx = 3;
+        assert_eq!(fade.frame_to_draw(0), 3);
+    }
+
+    #[test]
+    fn repeated_hide_preserves_deadline_and_captured_frame() {
+        let start = Instant::now();
+        let mut fade = None;
+        assert!(FadeAnim::begin_hide(&mut fade, 200, 7, start));
+        for ms in [20, 60, 100, 140] {
+            assert!(FadeAnim::begin_hide(&mut fade, 150, 0, start + Duration::from_millis(ms)));
+        }
+        let fade = fade.unwrap();
+        assert_eq!(fade.start, start);
+        assert_eq!(fade.from, 200);
+        assert_eq!(fade.frame_to_draw(0), 7);
+        let p = Duration::from_millis(140).as_millis() as f32 / OVERLAY_FADE_MS as f32;
+        assert_eq!(fade_alpha_at(fade.from, fade.to, p), 0);
+    }
+
+    #[test]
+    fn hiding_before_first_fade_tick_cancels_stale_fade_in() {
+        let now = Instant::now();
+        let mut fade = Some(FadeAnim {
+            start: now, from: 0, to: 255,
+            hide_when_done: false, frame_idx: 0,
+        });
+        assert!(!FadeAnim::begin_hide(&mut fade, 0, 0, now));
+        assert!(fade.is_none());
+    }
 }

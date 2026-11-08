@@ -16,25 +16,36 @@ import {
    页面）。15s 足够本机磁盘写盘，超时给明确文案而不是静默挂住。 */
 const REQ_TIMEOUT_MS = 15000;
 
-/** fetch 的可超时包装：AbortController + setTimeout，调用方签名不变。
- *  只有「我们自己 abort 过」才报超时——其它网络错误（server 未启动等）
- *  仍原样抛出，避免把连接失败误报成超时。 */
+/** 本机 API 都读取有限响应：超时覆盖响应头和完整响应体，避免 fetch
+ *  收到头就清计时、之后 json()/arrayBuffer() 永久等剩余字节。
+ *  调用方主动取消保留原始取消错误，只有本计时器触发才报超时。 */
 export async function fetchWithTimeout(
   url: string,
   init?: RequestInit,
   timeoutMs: number = REQ_TIMEOUT_MS,
 ): Promise<Response> {
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  let timedOut = false;
+  const abort = () => ctrl.abort(init?.signal?.reason);
+  if (init?.signal?.aborted) abort();
+  else init?.signal?.addEventListener('abort', abort, { once: true });
+  const timer = setTimeout(() => { timedOut = true; ctrl.abort(); }, timeoutMs);
   try {
-    return await fetch(url, { ...init, signal: ctrl.signal });
+    const response = await fetch(url, { ...init, signal: ctrl.signal });
+    const body = response.body === null ? null : await response.arrayBuffer();
+    return new Response(body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+    });
   } catch (e) {
-    if (ctrl.signal.aborted) {
+    if (timedOut) {
       throw new Error(`请求超时：${url}（${Math.round(timeoutMs / 1000)}s 无响应）`);
     }
     throw e;
   } finally {
     clearTimeout(timer);
+    init?.signal?.removeEventListener('abort', abort);
   }
 }
 
@@ -247,22 +258,28 @@ function deepMerge(base: JsonDict, patch: JsonDict): JsonDict {
 
 let configWriteChain: Promise<unknown> = Promise.resolve();
 
+/** 对象只补给出的字段；函数在轮到本次写入、取到最新配置后构造整份配置。
+ *  函数形式适用于删除映射键或依赖 fresh 计算的编辑；409 重试会重新计算。 */
+type ConfigUpdate = JsonDict | ((fresh: Config) => JsonDict);
+
 /** 统一配置写入：成功后返回合并后的配置快照；失败抛错（409 用户取消也抛错）。 */
-export function updateConfig(patch: JsonDict): Promise<Config> {
-  const run = () => writeConfigOnce(patch);
+export function updateConfig(update: ConfigUpdate): Promise<Config> {
+  const run = () => writeConfigOnce(update);
   const p = configWriteChain.then(run, run);
   // 链本身吞错，避免一次失败卡死后续写入（错误仍抛给各自调用方）
   configWriteChain = p.catch(() => undefined);
   return p;
 }
 
-async function writeConfigOnce(patch: JsonDict): Promise<Config> {
+async function writeConfigOnce(update: ConfigUpdate): Promise<Config> {
   for (let attempt = 0; attempt < 2; attempt += 1) {
     const fresh = (await getJson<Config & { rev?: number }>('/api/config')) as Config & {
       rev?: number;
     };
     const rev = typeof fresh.rev === 'number' ? fresh.rev : undefined;
-    const merged = deepMerge(fresh as unknown as JsonDict, patch);
+    const merged = typeof update === 'function'
+      ? update(fresh)
+      : deepMerge(fresh as unknown as JsonDict, update);
     const body: JsonDict = { ...merged };
     if (rev !== undefined) body.rev = rev;
     const r = await fetchWithTimeout('/api/config', {
@@ -270,7 +287,7 @@ async function writeConfigOnce(patch: JsonDict): Promise<Config> {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     });
-    const respBody = (await r.json().catch(() => ({}))) as { error?: string };
+    const respBody = (await r.json().catch(() => ({}))) as { error?: string; rev?: number };
     if (r.status === 409) {
       const retry = window.confirm(
         '其他页面/窗口已修改并保存了配置。\n\n' +
@@ -281,6 +298,7 @@ async function writeConfigOnce(patch: JsonDict): Promise<Config> {
       continue; // 重新 GET 最新 rev，再把本次 patch 合并上去
     }
     if (!r.ok) throw new Error(respBody.error || `保存失败（${r.status}）`);
+    if (typeof respBody.rev === 'number') merged.rev = respBody.rev;
     return merged as unknown as Config;
   }
   throw new Error('配置已被其他页面持续修改，保存失败（请稍后重试）');

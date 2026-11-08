@@ -8,24 +8,34 @@
 //! DLL 内部读 HUFU_SKIN_DUMP 环境变量定位输出——本助手把 argv[1] 写
 //! 进去，两处单一事实源不冲突。
 
+#![cfg_attr(not(test), windows_subsystem = "windows")]
+
+use std::os::windows::ffi::OsStrExt;
+
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
     if args.len() < 3 {
         eprintln!("usage: hufu-render-helper <out.bmp> <hufu_tsf.dll>");
         std::process::exit(1);
     }
     std::env::set_var("HUFU_SKIN_DUMP", &args[1]);
-    let dll = args[2].clone();
-    let dll_bytes = dll.clone().into_bytes();
-    let dll_ptr = dll_bytes.as_ptr();
+    // Win32 requires a terminated UTF-16 path. Passing UTF-8 bytes to
+    // LoadLibraryA both misreads Chinese install paths and reads past the Vec.
+    let dll_path: Vec<u16> = args[2].encode_wide().chain(Some(0)).collect();
     unsafe {
-        let h = windows_sys::LoadLibraryA(dll_ptr);        if h.is_null() {
-            eprintln!("LoadLibrary failed: {}", dll);
+        let h = windows_sys::LoadLibraryW(dll_path.as_ptr());
+        if h.is_null() {
+            eprintln!(
+                "LoadLibrary failed: {}: {}",
+                std::path::Path::new(&args[2]).display(),
+                std::io::Error::last_os_error()
+            );
             std::process::exit(1);
         }
         let proc = windows_sys::GetProcAddress(h, b"hufu_test_skin_dump\0".as_ptr());
         if proc.is_null() {
             eprintln!("GetProcAddress(hufu_test_skin_dump) failed");
+            windows_sys::FreeLibrary(h);
             std::process::exit(1);
         }
         // dump 生成+落盘在 DLL 内同步完成（含 0ms hold）——返回即
@@ -48,7 +58,7 @@ mod windows_sys {
 
     #[link(name = "kernel32")]
     extern "system" {
-        pub fn LoadLibraryA(name: *const u8) -> HMODULE;
+        pub fn LoadLibraryW(name: *const u16) -> HMODULE;
         pub fn GetProcAddress(module: HMODULE, name: *const u8) -> FARPROC;
         pub fn FreeLibrary(module: HMODULE) -> i32;
     }

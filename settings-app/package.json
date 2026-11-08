@@ -7,6 +7,8 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1 --port 5173",
     "build": "tsc -b && vite build",
+    "test:config-write": "node scripts/test-config-write.mjs",
+    "test:request-lifecycle": "node scripts/test-request-lifecycle.mjs",
     "preview": "vite preview --host 127.0.0.1 --port 4173"
   },
   "dependencies": {

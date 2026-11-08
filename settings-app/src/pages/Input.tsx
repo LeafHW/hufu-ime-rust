@@ -567,51 +567,43 @@ export function InputPage({ data, notify }: { data: Bootstrap; notify: (msg: str
     }
     setSaving(true);
     try {
-      const fresh = await getConfig();
-      /* 【保存前对齐 2026-11】忽略窗里积压的外部改动可能还没机会补进 draft
-         （窗口结束后如果没有任何新的 props 变化，上面的补同步不会触发）。
-         这里用刚取回的 fresh 做同一套合并：用户改过的字段以 draft 为准，没动
-         过的字段取服务端最新值 —— 既不改写外部改动，也不覆盖本页编辑。
-         合并成功后再清 pendingPropKey，失败时保留账继续等下一轮补同步。 */
-      const merged = mergeUntouched(draft, saved, normalize(fresh));
-      const base: Dict = { ...(fresh as unknown as Dict) };
-      base.general = Object.assign({}, asDict(fresh.general), merged.general);
-      base.input = Object.assign({}, asDict(fresh.input), merged.input, {
-        max_code_length: clampInt(merged.input.max_code_length, 1, 10),
-      });
-      base.candidates = Object.assign({}, asDict(fresh.candidates), merged.candidates, {
-        page_size: clampInt(merged.candidates.page_size, 1, 10),
-        delay_show_ms: clampInt(merged.candidates.delay_show_ms, 0, 2000),
-        delay_comment_ms: clampInt(merged.candidates.delay_comment_ms, 0, 2000),
-        freq_key: merged.readOnly.freq_key,
-        delete_key: merged.readOnly.delete_key,
-      });
-      base.general = Object.assign({}, asDict(fresh.general), merged.general, {
-        export_key: merged.readOnly.export_key,
-      });
-      base.punct = Object.assign({}, asDict(fresh.punct), merged.punct);
-      base.sound = Object.assign({}, asDict(fresh.sound), merged.sound, {
-        volume: clampInt(merged.sound.volume, 0, 100),
-      });
-      base.opencc = Object.assign({}, asDict(fresh.opencc), merged.opencc);
-      base.clipboard = Object.assign({}, asDict(fresh.clipboard), {
-        enabled: merged.clipboard.enabled,
-        whitelist: parseList(merged.clipboard.whitelist),
-      });
-      // 【P1-15】配置写入走统一 updateConfig（带 rev 的 CAS）。
-      await updateConfig(base);
-
-      const applied: InputDraft = {
-        ...merged,
-        input: { ...merged.input, max_code_length: clampInt(merged.input.max_code_length, 1, 10) },
-        candidates: {
-          ...merged.candidates,
+      // 在全局写队列实际执行时合并 fresh；排队前的整份快照会覆盖别页改动。
+      const appliedConfig = await updateConfig((fresh) => {
+        /* 【保存前对齐 2026-11】忽略窗里积压的外部改动可能还没机会补进 draft
+           （窗口结束后如果没有任何新的 props 变化，上面的补同步不会触发）。
+           这里用刚取回的 fresh 做同一套合并：用户改过的字段以 draft 为准，没动
+           过的字段取服务端最新值 —— 既不改写外部改动，也不覆盖本页编辑。
+           合并成功后再清 pendingPropKey，失败时保留账继续等下一轮补同步。 */
+        const merged = mergeUntouched(draft, saved, normalize(fresh));
+        const invalid = validate(merged, str(asDict(fresh.reverse).prefix, '`'));
+        if (invalid) throw new Error(invalid);
+        const base: Dict = { ...(fresh as unknown as Dict) };
+        base.general = Object.assign({}, asDict(fresh.general), merged.general);
+        base.input = Object.assign({}, asDict(fresh.input), merged.input, {
+          max_code_length: clampInt(merged.input.max_code_length, 1, 10),
+        });
+        base.candidates = Object.assign({}, asDict(fresh.candidates), merged.candidates, {
           page_size: clampInt(merged.candidates.page_size, 1, 10),
           delay_show_ms: clampInt(merged.candidates.delay_show_ms, 0, 2000),
           delay_comment_ms: clampInt(merged.candidates.delay_comment_ms, 0, 2000),
-        },
-        sound: { ...merged.sound, volume: clampInt(merged.sound.volume, 0, 100) },
-      };
+          freq_key: merged.readOnly.freq_key,
+          delete_key: merged.readOnly.delete_key,
+        });
+        base.general = Object.assign({}, asDict(fresh.general), merged.general, {
+          export_key: merged.readOnly.export_key,
+        });
+        base.punct = Object.assign({}, asDict(fresh.punct), merged.punct);
+        base.sound = Object.assign({}, asDict(fresh.sound), merged.sound, {
+          volume: clampInt(merged.sound.volume, 0, 100),
+        });
+        base.opencc = Object.assign({}, asDict(fresh.opencc), merged.opencc);
+        base.clipboard = Object.assign({}, asDict(fresh.clipboard), {
+          enabled: merged.clipboard.enabled,
+          whitelist: parseList(merged.clipboard.whitelist),
+        });
+        return base;
+      });
+      const applied = normalize(appliedConfig);
       setDraft(applied);
       setSaved(applied);
       pendingPropKey.current = null;

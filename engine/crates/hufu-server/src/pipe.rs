@@ -111,7 +111,7 @@ pub fn dispatch(
                 // Ctrl+M 切方案：落盘 + 后台重装整句（与 HTTP /api/schema
                 // 行为一致；旧 setup_sentence 持锁载模型秒级卡全机打字）
                 if host.engine.config.schema.current != schema_before {
-                    let _ = host.engine.config.save(&host.config_path);
+                    let _ = host.persist_config();
                     crate::reload_sentence_bg(true, false);
                     // 【换方案通知 2026-09-11】键路径响应携带标记：DLL
                     // 收到即置皮肤失效（entrance_anim 等方案相关字段跟
@@ -931,15 +931,15 @@ pub fn dispatch(
             if !name.is_empty() {
                 let data_dir = host.data_dir.clone();
                 let schema_dir = host.engine.config.schema.dir.clone();
+                let target = crate::SchemaWatchTarget::capture(&host);
                 drop(host);
                 let loaded = hufu_engine::Engine::load_schema_for(&data_dir, &schema_dir, name);
                 host = host_cell.lock().unwrap_or_else(|p| p.into_inner());
                 if let Ok(schema) = loaded {
-                    if host.engine.apply_schema(name, schema).is_ok() {
-                        host.session.clear();
+                    if crate::apply_preloaded_schema(&mut host, &target, name, schema).unwrap_or(false) {
                         // 【卡死修复】后台重建整句（不持锁载 546MB 模型）
                         crate::reload_sentence_bg(true, false);
-                        let _ = host.engine.config.save(&host.config_path);
+                        let _ = host.persist_config();
                     }
                 }
             }
@@ -969,14 +969,14 @@ pub fn dispatch(
             let name = host.engine.config.schema.current.clone();
             let data_dir = host.data_dir.clone();
             let schema_dir = host.engine.config.schema.dir.clone();
+            let target = crate::SchemaWatchTarget::capture(&host);
             drop(host);
             let loaded = hufu_engine::Engine::load_schema_for(&data_dir, &schema_dir, &name);
             host = host_cell.lock().unwrap_or_else(|p| p.into_inner());
             let ok = match loaded {
                 Ok(schema) => {
-                    let r = host.engine.apply_schema(&name, schema).is_ok();
+                    let r = crate::apply_preloaded_schema(&mut host, &target, &name, schema).unwrap_or(false);
                     if r {
-                        host.session.clear();
                         // 【卡死修复】后台重建整句（重读补充语料语义）
                         crate::reload_sentence_bg(true, true);
                     }
@@ -984,7 +984,7 @@ pub fn dispatch(
                 }
                 Err(_) => false,
             };
-            serde_json::json!({"ok": ok, "current": name})
+            serde_json::json!({"ok": ok, "current": host.engine.config.schema.current})
         }
         // 语言栏右键「打开方案文件夹」：explorer 打开当前方案码表目录
         "open_schema_dir" => {
@@ -1045,7 +1045,7 @@ pub fn dispatch(
         "sound_toggle" => {
             host.engine.config.sound.enabled = !host.engine.config.sound.enabled;
             let enabled = host.engine.config.sound.enabled;
-            let _ = host.engine.config.save(&host.config_path);
+            let _ = host.persist_config();
             serde_json::json!({"enabled": enabled})
         }
         // 越进程候选窗（沉浸式宿主如开始菜单搜索：DLL 自绘窗被 DWM
