@@ -239,9 +239,21 @@ pub fn capture_physical_key(msg: &windows::Win32::UI::WindowsAndMessaging::MSG) 
     if !relay {
         return false;
     }
-    // 键时间记账（统计 + 20ms 选重/标顶配对；须在 TSF 改写 VK_PROCESSKEY 之前）
-    note_key(vk, query_tick_ms());
-    if ctrl {
+    // Heat-map bookkeeping: skip keyboard auto-repeat (bit 30), the F row
+    // (product shortcuts, not typed keys) and the shortcut payload keys of
+    // Ctrl+←/→, Ctrl+V and Alt+E so the measured keyboard only shows real
+    // typing keys. The 20 ms selection pairing shares this path.
+    let repeat = (msg.lParam.0 as usize) & (1 << 30) != 0;
+    let product_shortcut = (ctrl && !composing && matches!(vk, 0x25 | 0x27 | 0x56))
+        || (alt && !composing && vk == 0x45);
+    let function_row = (0x70..=0x7b).contains(&vk);
+    if !repeat && !product_shortcut && !function_row {
+        note_key(
+            physical_heatmap_vk(vk, msg.lParam.0 as usize),
+            query_tick_ms(),
+        );
+    }
+    if ctrl && !composing {
         match vk {
             0x25 => push_cmd(CommandKey::CtrlLeft),
             0x27 => push_cmd(CommandKey::CtrlRight),
@@ -250,7 +262,7 @@ pub fn capture_physical_key(msg: &windows::Win32::UI::WindowsAndMessaging::MSG) 
         }
         return true;
     }
-    if alt {
+    if alt && !composing {
         if vk == 0x45 {
             push_cmd(CommandKey::AltE);
         }
@@ -263,6 +275,37 @@ pub fn capture_physical_key(msg: &windows::Win32::UI::WindowsAndMessaging::MSG) 
         }
     }
     false
+}
+
+/// Resolve the physical side of modifiers and distinguish the numpad Enter.
+fn physical_heatmap_vk(vk: u32, lparam: usize) -> u32 {
+    let scan = (lparam >> 16) & 0xff;
+    let extended = lparam & (1 << 24) != 0;
+    match vk {
+        0x10 => {
+            if scan == 0x36 {
+                0xa1
+            } else {
+                0xa0
+            }
+        }
+        0x11 => {
+            if extended {
+                0xa3
+            } else {
+                0xa2
+            }
+        }
+        0x12 => {
+            if extended {
+                0xa5
+            } else {
+                0xa4
+            }
+        }
+        0x0d if extended => 0x0e,
+        _ => vk,
+    }
 }
 
 fn push_cmd(k: CommandKey) {
@@ -715,6 +758,10 @@ unsafe extern "system" fn relay_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
                         push_cmd(CommandKey::LoadClipboard);
                         return LRESULT(0);
                     }
+                    // Ctrl+Z / Ctrl+Y are legitimate corrections. RichEdit
+                    // handles WM_UNDO/WM_REDO; the document diff below turns
+                    // the shrink into Backspace events for the comparer.
+                    0x5A | 0x59 => return call_orig!(),
                     _ => return LRESULT(0), // 其余 Ctrl 组合吞（防粘贴/复制/全选）
                 }
             }
@@ -801,7 +848,8 @@ unsafe extern "system" fn relay_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
             }
         }
         0x007B => return LRESULT(0), // WM_CONTEXTMENU：训练模式全拦（右键/VK_APPS/Shift+F10 的公共出口）
-        0x0300 | 0x0301 | 0x0302 | 0x0303 | 0x0304 => return LRESULT(0), // cut/copy/paste/clear/undo are not training commits
+        0x0300 | 0x0301 | 0x0302 | 0x0303 => return LRESULT(0), // cut/copy/paste/clear are not training commits
+        0x0304 => return call_orig!(),                          // WM_UNDO is a user correction
         WM_SYSCHAR => return LRESULT(0), // Alt+字母字符直通是疾风1代漏字根源，吞
         _ => {}
     }
@@ -840,8 +888,11 @@ pub fn note_key(vk: u32, t_ms: u64) {
 pub enum CommitCause {
     /// 顶屏：配对窗内最后按键是编码键延续（字母）——继续打码把首选顶上屏
     Ding,
-    /// 选重：配对窗内最后按键是数字/选重键（主行 0-9 或小键盘 0-9）
+    /// 选重：配对窗内最后按键是数字或当前方案的选重键。
     Select,
+    /// A configured non-statistical key actually selected a candidate. Only this
+    /// proven use may add Shift/Caps/etc. to the completed output key batch.
+    SelectExtra { vk: u32, lag_ms: u64 },
     /// 无法判定（窗内无键、或最后按键不在两类内）——不计入选重/顶屏统计
     Unknown,
 }
@@ -852,9 +903,53 @@ const COMMIT_PAIR_WINDOW_MS: u64 = 20;
 /// 上屏归因待取队列（drain_commit_causes 消费）
 static COMMIT_CAUSES: Mutex<Vec<CommitCause>> = Mutex::new(Vec::new());
 
+/// Additional physical selection keys supplied by the active IME scheme. This
+/// does not change StatsEngine's ordinary key filter or create HostEvent::Key.
+#[derive(Clone, Copy)]
+struct SelectionKeys([bool; 256]);
+impl SelectionKeys {
+    const fn empty() -> Self {
+        Self([false; 256])
+    }
+    fn from_vks(vks: &[u32]) -> Self {
+        let mut keys = Self::empty();
+        for &vk in vks {
+            if vk == 0 || vk > 255 {
+                continue;
+            }
+            keys.0[vk as usize] = true;
+            // capture_physical_key resolves generic modifier messages to sides.
+            // A generic configured key intentionally enables both physical sides.
+            let pair = match vk {
+                0x10 => Some((0xA0, 0xA1)),
+                0x11 => Some((0xA2, 0xA3)),
+                0x12 => Some((0xA4, 0xA5)),
+                _ => None,
+            };
+            if let Some((left, right)) = pair {
+                keys.0[left] = true;
+                keys.0[right] = true;
+            }
+        }
+        keys
+    }
+    fn contains(&self, vk: u32) -> bool {
+        vk < 256 && self.0[vk as usize]
+    }
+}
+static SELECTION_KEYS: Mutex<SelectionKeys> = Mutex::new(SelectionKeys::empty());
+
+/// Replaces the active scheme's extra selection keys; digits remain available.
+/// Pass [] when a scheme has no extra keys. Generic Shift/Ctrl/Alt includes both
+/// physical sides; side-specific VKs stay side-specific. Invalid VKs are ignored.
+pub fn set_selection_keys(keys: &[u32]) {
+    let mut configured = SELECTION_KEYS.lock().unwrap_or_else(|e| e.into_inner());
+    *configured = SelectionKeys::from_vks(keys);
+}
+
 /// 记录一次上屏并做 20ms 配对判定（poll 差分出 Commit 时调用）。
 /// 取配对窗内**最后**一次按键的 vk 分类（晴 Score.cs 语义：编码延续=顶屏、
-/// 数字=选重）。纯 ASCII 直通提交（输入法关/英文模式）不归因——无 IME
+/// 数字/方案选重键=选重）。纯 ASCII 直通提交（输入法关/英文模式）不归因——无 IME
 /// 参与就没有选重/顶屏可言。
 pub fn note_commit(t_ms: u64, committed_text: &str) {
     if committed_text.is_ascii() {
@@ -865,11 +960,25 @@ pub fn note_commit(t_ms: u64, committed_text: &str) {
             .iter()
             .rev()
             .find(|(_, key_ms)| t_ms.abs_diff(*key_ms) <= COMMIT_PAIR_WINDOW_MS)
-            .map(|(vk, _)| classify_commit_cause(*vk))
+            .map(|(vk, key_ms)| {
+                let cause = classify_commit_cause(*vk);
+                // Physical 0x0E is the heatmap identity for extended Enter;
+                // HostEvent::Key still carries ordinary VK_RETURN and counted it.
+                if cause == CommitCause::Select && *vk != 0x0E && !StatsEngine::is_stat_key(*vk) {
+                    CommitCause::SelectExtra {
+                        vk: *vk,
+                        lag_ms: t_ms.abs_diff(*key_ms),
+                    }
+                } else {
+                    cause
+                }
+            })
             .unwrap_or(CommitCause::Unknown),
         Err(_) => CommitCause::Unknown,
     };
-    input_log(&format!("commit 配对 text={committed_text:?} cause={cause:?}"));
+    input_log(&format!(
+        "commit 配对 text={committed_text:?} cause={cause:?}"
+    ));
     if let Ok(mut q) = COMMIT_CAUSES.lock() {
         q.push(cause);
         if q.len() > 512 {
@@ -880,6 +989,13 @@ pub fn note_commit(t_ms: u64, committed_text: &str) {
 
 /// 配对窗内最后按键的 vk 分类
 fn classify_commit_cause(vk: u32) -> CommitCause {
+    let keys = SELECTION_KEYS.lock().unwrap_or_else(|e| e.into_inner());
+    classify_commit_cause_with_keys(vk, &keys)
+}
+fn classify_commit_cause_with_keys(vk: u32, keys: &SelectionKeys) -> CommitCause {
+    if keys.contains(vk) {
+        return CommitCause::Select;
+    }
     match vk {
         0x41..=0x5A => CommitCause::Ding, // 字母 = 编码键延续 → 顶屏
         0x30..=0x39 | 0x60..=0x69 => CommitCause::Select, // 数字 = 选重
@@ -1026,7 +1142,10 @@ impl InputHost {
                 WPARAM(0),
                 LPARAM(ENM_UPDATE as isize),
             );
-            SendMessageW(hwnd, 0x435, WPARAM(0), LPARAM(100_000));
+            // EM_SETUNDOLIMIT：limit 装在 wParam（lParam 恒 0）。此前把 10 万
+            // 误放在 lParam、wParam 传 0——而 wParam=0 是"禁用撤回"，导致
+            // Ctrl+Z 物理键完全失效（2026-11-09 修复）。
+            SendMessageW(hwnd, 0x435, WPARAM(100_000), LPARAM(0));
             // 显式开启 TSF 支持（RichEdit50W 默认开；显式设确保 CUAS→TSF 桥激活，
             // 纯 TSF 输入法（虎符）依赖此链路——architecture.md Mandate #1）。
             // 返回值校验（2026-11-08）：成功返回旧样式位（小非负值），失败为负
@@ -1461,6 +1580,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn physical_keyboard_sides_and_numpad_enter_remain_distinct() {
+        assert_eq!(physical_heatmap_vk(0x10, 0x2a << 16), 0xa0);
+        assert_eq!(physical_heatmap_vk(0x10, 0x36 << 16), 0xa1);
+        assert_eq!(physical_heatmap_vk(0x11, 1 << 24), 0xa3);
+        assert_eq!(physical_heatmap_vk(0x12, 0), 0xa4);
+        assert_eq!(physical_heatmap_vk(0x0d, 1 << 24), 0x0e);
+        assert_eq!(physical_heatmap_vk(0x14, 0), 0x14);
+    }
+
+    #[test]
     fn diff_commit_and_backspace() {
         let mut h = InputHost {
             hwnd: 0,
@@ -1769,6 +1898,8 @@ mod tests {
     // ── 20ms 选重/标顶配对（注入时间序列验证）──
     #[test]
     fn commit_cause_pairing_within_20ms() {
+        let _guard = COMMIT_PAIR_TEST_LOCK.lock().unwrap();
+        set_selection_keys(&[]);
         // 隔离：先清两个静态队列（与其它测试共享进程）
         let _ = drain_key_times(1024);
         let _ = drain_commit_causes();
@@ -1811,5 +1942,65 @@ mod tests {
         );
         assert!(drain_commit_causes().is_empty(), "drain 后应清空");
         let _ = drain_key_times(1024); // 还原隔离
+    }
+
+    static COMMIT_PAIR_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn scheme_selection_keys_support_oem_modifiers_and_replace_old_scheme() {
+        let _guard = COMMIT_PAIR_TEST_LOCK.lock().unwrap();
+        let _ = drain_key_times(1024);
+        let _ = drain_commit_causes();
+        set_selection_keys(&[0xBA, 0xDE, 0x10, 0x14, 0x51, 999]);
+        for (i, vk) in [0xBA, 0xDE, 0xA0, 0xA1, 0x14, 0x51].into_iter().enumerate() {
+            let now = 1000 + i as u64 * 100;
+            note_key(vk, now);
+            note_commit(now + 10, "候选");
+        }
+        assert_eq!(
+            drain_commit_causes(),
+            vec![
+                CommitCause::Select,
+                CommitCause::Select,
+                CommitCause::SelectExtra {
+                    vk: 0xA0,
+                    lag_ms: 10
+                },
+                CommitCause::SelectExtra {
+                    vk: 0xA1,
+                    lag_ms: 10
+                },
+                CommitCause::SelectExtra {
+                    vk: 0x14,
+                    lag_ms: 10
+                },
+                CommitCause::Select,
+            ]
+        );
+        // A custom letter selection overrides the generic letter=ding heuristic.
+        assert_eq!(classify_commit_cause(0x51), CommitCause::Select);
+        assert_eq!(classify_commit_cause(0x41), CommitCause::Ding);
+        // Replacing a scheme must remove its old OEM and modifier bindings.
+        set_selection_keys(&[0xA1]);
+        assert_eq!(classify_commit_cause(0xA0), CommitCause::Unknown);
+        assert_eq!(classify_commit_cause(0xA1), CommitCause::Select);
+        assert_eq!(classify_commit_cause(0xBA), CommitCause::Unknown);
+        assert_eq!(classify_commit_cause(0x14), CommitCause::Unknown);
+        assert_eq!(classify_commit_cause(0x32), CommitCause::Select);
+        assert_eq!(classify_commit_cause(0x62), CommitCause::Select);
+        set_selection_keys(&[0x0E]);
+        note_key(0x0E, 3_000);
+        note_commit(3_005, "候选");
+        assert_eq!(
+            drain_commit_causes(),
+            vec![CommitCause::Select],
+            "numpad Enter already generated a statistical VK_RETURN event"
+        );
+        // This classification API cannot add modifiers to ordinary speed stats.
+        for vk in [0x10, 0xA0, 0xA1, 0x14] {
+            assert!(!StatsEngine::is_stat_key(vk));
+        }
+        set_selection_keys(&[]);
+        let _ = drain_key_times(1024);
     }
 }

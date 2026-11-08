@@ -61,6 +61,14 @@ pub struct Session {
     pub frozen_rules: Option<SessionRules>,
     pub raw_segments: Vec<Segment>,
     pub results: Vec<Option<ScoreRecord>>,
+    /// Per-text starts survive retries, article reloads, and recovery snapshots.
+    #[serde(default)]
+    text_attempts: std::collections::BTreeMap<String, u32>,
+    #[serde(default)]
+    current_retype_count: u32,
+    /// Old snapshots cannot reconstruct commit boundaries, hence None means unknown.
+    #[serde(default)]
+    word_attribution: Option<gale_core::scorecard::WordRateTracker>,
     pub cleaned: bool,
     pub pasted: bool,
     /// 载文难度（群文《难度》头 / 文来难度；结算时随成绩入 ScoreRecord.difficulty，
@@ -121,6 +129,9 @@ impl Session {
             frozen_rules: None,
             raw_segments: vec![seg],
             results: vec![None],
+            text_attempts: std::collections::BTreeMap::new(),
+            current_retype_count: 0,
+            word_attribution: Some(gale_core::scorecard::WordRateTracker::default()),
             cleaned: false,
             pasted: false,
             difficulty: None,
@@ -205,6 +216,8 @@ impl Session {
         self.composing = false;
         self.recorded = false;
         self.last_stats = None;
+        self.current_retype_count = 0;
+        self.word_attribution = Some(gale_core::scorecard::WordRateTracker::default());
         self.frozen_rules = None;
         self.frozen_text_hash.clear();
         self.frozen_raw_text_hash.clear();
@@ -227,6 +240,37 @@ impl Session {
     }
     pub fn aggregate(&self) -> gale_core::report::RaceSummary {
         gale_core::report::RaceSummary::from_records(self.results.iter().flatten())
+    }
+    /// Seed start counts from the durable journal after restoring the session.
+    /// Old records have retype_count=0, so also count completions for compatibility.
+    /// The max keeps aborted attempts already present in a recovery snapshot.
+    pub fn seed_retype_history<'a>(&mut self, records: impl IntoIterator<Item = &'a ScoreRecord>) {
+        let untracked_active =
+            self.phase == Phase::Typing && !self.text_attempts.contains_key(&self.frozen_text_hash);
+        let mut completed = std::collections::BTreeMap::<String, u32>::new();
+        let mut attempts = std::collections::BTreeMap::<String, u32>::new();
+        for record in records {
+            let Some(meta) = record.round.as_ref().filter(|m| !m.text_hash.is_empty()) else {
+                continue;
+            };
+            let count = completed.entry(meta.text_hash.clone()).or_default();
+            *count = count.saturating_add(1);
+            let observed = attempts.entry(meta.text_hash.clone()).or_default();
+            *observed = (*observed).max(record.retype_count.saturating_add(1));
+        }
+        for (hash, count) in completed {
+            let count = count.max(attempts.get(&hash).copied().unwrap_or(0));
+            let saved = self.text_attempts.entry(hash).or_default();
+            *saved = (*saved).max(count);
+        }
+        if untracked_active {
+            let count = self
+                .text_attempts
+                .entry(self.frozen_text_hash.clone())
+                .or_default();
+            self.current_retype_count = *count;
+            *count = count.saturating_add(1);
+        }
     }
     pub fn current_segment(&self) -> &Segment {
         self.segments.get(self.index).unwrap_or(&self.segments[0])
@@ -318,6 +362,12 @@ impl Session {
         self.frozen_rules = Some(self.rules.clone());
         self.frozen_text_hash = fingerprint(self.comparer.text.as_bytes());
         self.frozen_raw_text_hash = fingerprint(self.raw_segments[self.index].text.as_bytes());
+        let attempts = self
+            .text_attempts
+            .entry(self.frozen_text_hash.clone())
+            .or_default();
+        self.current_retype_count = *attempts;
+        *attempts = attempts.saturating_add(1);
         self.phase = Phase::Typing;
         self.started_ms = Some(now);
         self.comparer.started_at = Some(now);
@@ -336,7 +386,15 @@ impl Session {
         // Event intervals use the same active-time axis as the headline duration.
         // This also preserves active time before blur, including the first commit.
         let active_now = now.saturating_sub(self.paused_ms);
+        let previous_pos = self.comparer.pos;
         let out = self.comparer.feed(&ev, active_now);
+        if let Some(attribution) = &mut self.word_attribution {
+            if matches!(ev, InputEvent::Backspace) && self.comparer.pos < previous_pos {
+                attribution.backspace();
+            } else if !out.is_empty() {
+                attribution.commit(&out);
+            }
+        }
         if matches!(ev, InputEvent::Commit { .. }) && !out.is_empty() {
             self.stats.on_commit(out.len(), active_now);
             self.stats.end_composition();
@@ -373,12 +431,24 @@ impl Session {
     }
     /// 20ms 配对账（P1-3 选重/标顶）：Ding→标顶、Select→选重、Unknown 忽略。
     /// main.rs 在每帧 poll 之后 drain_commit_causes 并逐条转发到这里；
-    /// 仅 Typing 记账，换段/重打随 reset_current 清零。
+    /// The final Commit reaches Done before this queue drains. Accept it until
+    /// finalize sets recorded, otherwise every final selection/top-code is lost.
     pub fn on_commit_cause(&mut self, cause: CommitCause) {
-        if self.phase == Phase::Typing {
+        if !self.recorded && matches!(self.phase, Phase::Typing | Phase::Done) {
             match cause {
                 CommitCause::Ding => self.stats.note_ding(),
                 CommitCause::Select => self.stats.note_select(),
+                CommitCause::SelectExtra { vk, lag_ms } => {
+                    if let Some(commit_ms) = self.stats.commit_attributions.last().map(|a| a.at_ms)
+                    {
+                        if self
+                            .stats
+                            .note_selection_key_timed(vk, commit_ms.saturating_sub(lag_ms))
+                        {
+                            self.stats.note_select();
+                        }
+                    }
+                }
                 CommitCause::Unknown => {}
             }
         }
@@ -488,6 +558,12 @@ impl Session {
             self.difficulty.clone(),
         );
         let rules = self.frozen_rules.as_ref().unwrap_or(&self.rules);
+        rec.retype_count = self.current_retype_count;
+        rec.word_rate = self
+            .word_attribution
+            .as_ref()
+            .filter(|a| a.is_valid_for(self.comparer.pos))
+            .map(|a| a.percent());
         rec.round = Some(RoundMetadata {
             mode: rules.mode,
             text_hash: self.frozen_text_hash.clone(),
@@ -614,6 +690,12 @@ impl Session {
             || self.comparer.typed.len() != self.comparer.pos
             || self.comparer.text != self.segments[self.index].text
             || self.segments.iter().any(|s| s.text.contains('\r'))
+            || self
+                .word_attribution
+                .as_ref()
+                .is_some_and(|a| !a.is_valid_for(self.comparer.pos))
+            || self.text_attempts.len() > 100000
+            || self.text_attempts.keys().any(|hash| hash.len() > 128)
         {
             return false;
         }
@@ -694,10 +776,11 @@ impl Session {
                     ]
                     .iter()
                     .any(|v| !v.is_finite())
-                    || r
-                        .difficulty
-                        .as_ref()
-                        .is_some_and(|d| d.label.chars().count() > 32 || d.score.is_some_and(|v| !v.is_finite()))
+                    || r.word_rate
+                        .is_some_and(|v| !v.is_finite() || !(0. ..=100.).contains(&v))
+                    || r.difficulty.as_ref().is_some_and(|d| {
+                        d.label.chars().count() > 32 || d.score.is_some_and(|v| !v.is_finite())
+                    })
                 {
                     return false;
                 }
@@ -962,6 +1045,86 @@ mod tests {
         assert!((s.aggregate().speed - 150.0).abs() < 1e-9);
     }
 
+    #[test]
+    fn word_rate_tracks_accepted_commits_and_text_corrections() {
+        let mut s = Session::new(100);
+        s.load_book("t", "你好我呀末");
+        s.on_key(0x41, 100);
+        s.feed_input(
+            InputEvent::Commit {
+                chars: "你好，".into(),
+            },
+            200,
+        );
+        s.on_key(0x08, 300);
+        s.feed_input(InputEvent::Backspace, 300); // remove the wrong punctuation
+        s.on_key(0x42, 400);
+        s.feed_input(
+            InputEvent::Commit {
+                chars: "我".into()
+            },
+            400,
+        );
+        s.on_key(0x43, 500);
+        s.feed_input(
+            InputEvent::Commit {
+                chars: "呀".into()
+            },
+            500,
+        );
+        s.on_key(0x44, 600);
+        s.feed_input(
+            InputEvent::Commit {
+                chars: "末多余".into(),
+            },
+            600,
+        );
+        let r = s.finalize_current_at(600, 1).unwrap();
+        assert_eq!(r.chars, 5);
+        assert_eq!(r.wrong, 0);
+        assert_eq!(r.word_rate, Some(40.)); // extra text beyond the target is not counted
+    }
+
+    #[test]
+    fn retype_counts_follow_text_across_segments_reload_and_recovery() {
+        let mut s = session();
+        round(&mut s, 100, 1100, "甲乙丙丁戊");
+        let a = s.finalize_current_at(1100, 1).unwrap();
+        assert_eq!(a.retype_count, 0);
+        s.next_segment();
+        round(&mut s, 2000, 3000, "己庚辛壬癸");
+        let b = s.finalize_current_at(3000, 2).unwrap();
+        assert_eq!(b.retype_count, 0);
+        s.jump(0);
+        s.on_key(0x41, 4000); // an abandoned attempt still counts as a start
+        s.jump(0);
+        round(&mut s, 5000, 6000, "甲乙丙丁戊");
+        let c = s.finalize_current_at(6000, 3).unwrap();
+        assert_eq!(c.retype_count, 2);
+        s.load_book("new title, same text", "甲乙丙丁戊");
+        round(&mut s, 7000, 8000, "甲乙丙丁戊");
+        let d = s.finalize_current_at(8000, 4).unwrap();
+        assert_eq!(d.retype_count, 3);
+        let mut recovered: Session =
+            serde_json::from_slice(&s.snapshot_bytes_bounded().unwrap()).unwrap();
+        recovered.jump(0);
+        recovered.seed_retype_history([&a, &b, &c, &d]);
+        round(&mut recovered, 9000, 10000, "甲乙丙丁戊");
+        assert_eq!(
+            recovered
+                .finalize_current_at(10000, 5)
+                .unwrap()
+                .retype_count,
+            4
+        );
+        // A fresh launch without a recovery file also learns the latest start count.
+        let mut fresh = Session::new(100);
+        fresh.load_book("t", "甲乙丙丁戊");
+        fresh.seed_retype_history([&a, &b, &c, &d]);
+        round(&mut fresh, 100, 1100, "甲乙丙丁戊");
+        assert_eq!(fresh.finalize_current_at(1100, 6).unwrap().retype_count, 4);
+    }
+
     /// P1-4 有效性门槛边界（is_valid 双门槛 + <5 聚合硬门并存，语义分开）：
     /// 2字/4字 → 硬门挡出聚合且 is_valid=false；9字9s/9字10s/10字9s → 进聚合但
     /// is_valid=false（进练习字数、不进有效均速）；10字10s → is_valid=true。
@@ -969,11 +1132,11 @@ mod tests {
     fn validity_gate_boundaries_mark_records_and_gate_aggregate() {
         let cases: &[(&str, u64, bool, u64)] = &[
             ("甲乙", 1_000, false, 0),                  // 2字：硬门 + 无效
-            ("甲乙丙丁", 1_000, false, 0),               // 4字：硬门 + 无效
-            ("甲乙丙丁戊己庚辛壬", 9_000, false, 9),      // 9字9s：进聚合、无效
-            ("甲乙丙丁戊己庚辛壬", 10_000, false, 9),     // 9字10s：仅字数门不过
-            ("甲乙丙丁戊己庚辛壬癸", 9_999, false, 10),    // 10字9.999s：仅用时门不过
-            ("甲乙丙丁戊己庚辛壬癸", 10_000, true, 10),    // 10字10s：双过
+            ("甲乙丙丁", 1_000, false, 0),              // 4字：硬门 + 无效
+            ("甲乙丙丁戊己庚辛壬", 9_000, false, 9),    // 9字9s：进聚合、无效
+            ("甲乙丙丁戊己庚辛壬", 10_000, false, 9),   // 9字10s：仅字数门不过
+            ("甲乙丙丁戊己庚辛壬癸", 9_999, false, 10), // 10字9.999s：仅用时门不过
+            ("甲乙丙丁戊己庚辛壬癸", 10_000, true, 10), // 10字10s：双过
         ];
         for &(text, ms, valid, agg_chars) in cases {
             let mut s = Session::new(100);
@@ -1046,10 +1209,7 @@ mod tests {
         let r = s.finalize_current_at(1100, 1).unwrap();
         assert_eq!(r.difficulty.as_ref().unwrap().label, "普");
         assert!((r.difficulty.as_ref().unwrap().score.unwrap() - 1.84).abs() < 1e-9);
-        assert!(
-            gale_core::score::format_score_report(&r)
-                .contains("字数5  难度普(1.84)  用时")
-        );
+        assert!(gale_core::score::format_score_report(&r).contains("字数5  难度普(1.84)  用时"));
         // 换载文（无难度头）清空
         s.load_book("plain", "甲乙丙丁戊甲乙丙丁戊");
         assert!(s.difficulty.is_none());
@@ -1336,7 +1496,12 @@ mod tests {
     fn backspace_protect_window_routes_ime_delete_then_correction() {
         let mut s = session();
         s.on_key(0x41, 100);
-        s.feed_input(InputEvent::Commit { chars: "甲".into() }, 150);
+        s.feed_input(
+            InputEvent::Commit {
+                chars: "甲".into()
+            },
+            150,
+        );
         assert_eq!(s.comparer.pos, 1);
         // 第二字组字中
         s.set_composing(true);
@@ -1369,7 +1534,12 @@ mod tests {
         s.on_key(0x41, 100);
         s.set_composing(true);
         s.on_key(0x42, 150);
-        s.feed_input(InputEvent::Commit { chars: "甲".into() }, 200);
+        s.feed_input(
+            InputEvent::Commit {
+                chars: "甲".into()
+            },
+            200,
+        );
         // feed_input 的 Commit 分支已通知 router(false, true)；主循环的
         // Composing(false) 同批补一次 (false, true) 幂等无害
         s.set_composing_from_host(false, true);
@@ -1403,6 +1573,55 @@ mod tests {
             "{}",
             gale_core::score::format_score_report(&r)
         );
+    }
+
+    #[test]
+    fn final_selection_and_proven_modifier_key_are_recorded_once() {
+        let mut s = session();
+        s.on_key(0x41, 100);
+        s.on_key(0xA0, 150); // ordinary Shift is excluded until a commit proves selection
+        assert_eq!(s.stats.keys, 1);
+        s.feed_input(
+            InputEvent::Commit {
+                chars: "甲乙丙丁戊".into(),
+            },
+            200,
+        );
+        assert_eq!(s.phase, Phase::Done);
+        s.on_commit_cause(CommitCause::SelectExtra {
+            vk: 0xA0,
+            lag_ms: 5,
+        });
+        s.on_commit_cause(CommitCause::Ding);
+        assert_eq!(s.stats.commit_attributions[0].keys, 2);
+        let r = s.finalize_current_at(200, 123).unwrap();
+        assert_eq!(r.keys, 2);
+        assert_eq!(r.code_len, 0.4);
+        assert_eq!(r.select_count, 1);
+        assert_eq!(r.ding_count, 1);
+        s.on_commit_cause(CommitCause::SelectExtra {
+            vk: 0x14,
+            lag_ms: 0,
+        });
+        assert_eq!(s.stats.keys, 2, "finalized records reject late attribution");
+        assert_eq!(s.stats.select_count, 1);
+
+        s.jump(0);
+        s.on_key(0x41, 300);
+        s.on_key(0xBA, 400);
+        s.feed_input(
+            InputEvent::Commit {
+                chars: "甲乙丙丁戊".into(),
+            },
+            400,
+        );
+        s.on_commit_cause(CommitCause::Select);
+        let ordinary = s.finalize_current_at(400, 124).unwrap();
+        assert_eq!(
+            ordinary.keys, 2,
+            "an ordinary selection key was already counted"
+        );
+        assert_eq!(ordinary.select_count, 1);
     }
 
     /// 整改12：直方图随段清零、结算冻结进 last_vk_histogram、换段保留快照。

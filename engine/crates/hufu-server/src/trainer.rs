@@ -145,6 +145,124 @@ fn version(s: &Schema, cfg: &Config, sentence: bool) -> String {
     format!("{:016x}", h.finish())
 }
 
+fn select_action(action: &str) -> bool {
+    action
+        .strip_prefix("select")
+        .and_then(|n| n.parse::<usize>().ok())
+        .is_some_and(|n| (1..=10).contains(&n))
+}
+
+/// Windows physical VKs which may select a candidate in the active scheme.
+/// This is an attribution hint, not a promise that a key is currently selectable:
+/// code continuations and candidate availability remain owned by the live engine.
+/// map_idle is deliberately excluded; the input has candidates when selecting.
+fn selection_keys(cfg: &Config) -> Vec<u32> {
+    let mut keys = std::collections::BTreeSet::new();
+    for n in 0..10 {
+        keys.insert(0x30 + n);
+        keys.insert(0x60 + n);
+    }
+    let map = &cfg.keymap.map;
+    for ch in [cfg.candidates.second_select, cfg.candidates.third_select]
+        .into_iter()
+        .chain(cfg.candidates.custom_select_keys.iter().copied())
+    {
+        let name = if ch == ' ' {
+            "space".into()
+        } else {
+            ch.to_string()
+        };
+        if map.get(&name).is_some_and(|a| !select_action(a)) {
+            continue;
+        }
+        if let Some(vk) = selection_char_vk(ch) {
+            keys.insert(vk);
+        }
+    }
+    for (name, action) in map {
+        if !select_action(action) || matches!(name.as_str(), "shift" | "shiftleft" | "shiftright") {
+            continue;
+        }
+        if let Some(vk) = selection_key_vk(name) {
+            keys.insert(vk);
+        }
+    }
+    // Engine lookup: side-specific Shift overrides the legacy generic binding.
+    for (name, vk) in [("shiftleft", 0xA0), ("shiftright", 0xA1)] {
+        if map
+            .get(name)
+            .or_else(|| map.get("shift"))
+            .is_some_and(|a| select_action(a))
+        {
+            keys.insert(vk);
+        }
+    }
+    keys.into_iter().collect()
+}
+fn selection_char_vk(ch: char) -> Option<u32> {
+    Some(match ch {
+        'a'..='z' => ch.to_ascii_uppercase() as u32,
+        '0'..='9' => ch as u32,
+        ' ' => 0x20,
+        ';' => 0xBA,
+        '=' => 0xBB,
+        ',' => 0xBC,
+        '-' => 0xBD,
+        '.' => 0xBE,
+        '/' => 0xBF,
+        '`' => 0xC0,
+        '[' => 0xDB,
+        '\\' => 0xDC,
+        ']' => 0xDD,
+        '\'' => 0xDE,
+        _ => return None,
+    })
+}
+fn selection_key_vk(name: &str) -> Option<u32> {
+    if name.chars().count() == 1 {
+        return selection_char_vk(name.chars().next()?);
+    }
+    Some(match name {
+        "space" => 0x20,
+        "enter" => 0x0D,
+        "tab" => 0x09,
+        "backspace" => 0x08,
+        "delete" => 0x2E,
+        "home" => 0x24,
+        "end" => 0x23,
+        "pageup" => 0x21,
+        "pagedown" => 0x22,
+        "left" => 0x25,
+        "up" => 0x26,
+        "right" => 0x27,
+        "down" => 0x28,
+        "capslock" => 0x14,
+        "numadd" => 0x6B,
+        "numsub" => 0x6D,
+        "nummul" => 0x6A,
+        "numdiv" => 0x6F,
+        "numdot" => 0x6E,
+        "numenter" => 0x0E, // trainer's physical extended-Enter identity
+        _ => {
+            if let Some(n) = name
+                .strip_prefix("num")
+                .filter(|n| n.len() == 1)
+                .and_then(|n| n.parse::<u32>().ok())
+            {
+                if n <= 9 {
+                    return Some(0x60 + n);
+                }
+            }
+            if let Some(n) = name.strip_prefix('f').and_then(|n| n.parse::<u32>().ok()) {
+                if (1..=12).contains(&n) && name == format!("f{n}") {
+                    return Some(0x6F + n);
+                }
+            }
+            return None;
+        }
+    })
+}
+
 pub fn executable() -> Option<std::path::PathBuf> {
     std::env::current_exe()
         .ok()?
@@ -240,7 +358,7 @@ pub fn route(host: &Mutex<Host>, req: &Request) -> Response {
             // 【整改4 2026-11-08】整句模式词提已放开（码表编码口径），
             // 不再因 sentence_active 下发 hint_unavailable_reason；
             // 快照超限（用户词过大）仍是真实的词提不可用，保留。
-            let (schema, schema_ver, enabled, max_code_length, sentence, unavailable) =
+            let (schema, schema_ver, enabled, max_code_length, sentence, unavailable, selections) =
                 match snapshot(host) {
                     Ok((s, cfg, sentence)) => (
                         s.name.clone(),
@@ -249,6 +367,7 @@ pub fn route(host: &Mutex<Host>, req: &Request) -> Response {
                         cfg.input.max_code_length,
                         sentence,
                         None,
+                        selection_keys(&cfg),
                     ),
                     Err(reason) => {
                         // A dictionary snapshot limit disables hints, not the feature switch.
@@ -264,6 +383,7 @@ pub fn route(host: &Mutex<Host>, req: &Request) -> Response {
                             h.engine.config.input.max_code_length,
                             h.engine.sentence_active(),
                             Some(reason),
+                            selection_keys(&h.engine.config),
                         )
                     }
                 };
@@ -272,7 +392,7 @@ pub fn route(host: &Mutex<Host>, req: &Request) -> Response {
                 "schema":schema,"schema_ver":schema_ver,
                 "max_article_chars":MAX_CHARS,"max_code_length":max_code_length,
                 "version":"0.1.0","hint_scope":"dictionary","sentence_active":sentence,
-                "hint_unavailable_reason":unavailable}),
+                "hint_unavailable_reason":unavailable,"selection_keys":selections}),
             )
         }
         ("POST", "/api/trainer/analyze") => {
@@ -299,6 +419,15 @@ pub fn route(host: &Mutex<Host>, req: &Request) -> Response {
                 },
                 None => false,
             };
+            // Theory requests describe dictionary recipes independently of the live
+            // sentence decoder.  None preserves the ordinary word-hint contract.
+            let theory_auto4 = match v.get("theory_auto4") {
+                Some(value) => match value.as_bool() {
+                    Some(auto4) => Some(auto4),
+                    None => return Response::err(400, "theory_auto4 必须为布尔值"),
+                },
+                None => None,
+            };
             let char_count = text.chars().count();
             if char_count > MAX_CHARS {
                 return Response::err(413, "文章最多 10000 字");
@@ -316,16 +445,22 @@ pub fn route(host: &Mutex<Host>, req: &Request) -> Response {
                 Err(e) => return Response::err(503, e),
             };
             let ver = version(&s, &cfg, sentence);
-            if let Some(cache) = CACHE.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
-                if cache.text == text
-                    && cache.version == ver
-                    && cache.single == single
-                    && cache.include_full == include_full
-                {
-                    return cache.response.clone();
+            // Theory options change both recipe costs and DP segmentation.  Do not
+            // consume or replace the ordinary hint cache with a theory response.
+            if theory_auto4.is_none() {
+                if let Some(cache) = CACHE.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
+                    if cache.text == text
+                        && cache.version == ver
+                        && cache.single == single
+                        && cache.include_full == include_full
+                    {
+                        return cache.response.clone();
+                    }
                 }
             }
-            match Analyzer::new(&s, &cfg, sentence).analyze_mode(text, started, single) {
+            let mut analyzer = Analyzer::new(&s, &cfg, sentence && theory_auto4.is_none());
+            analyzer.theory_auto4 = theory_auto4;
+            match analyzer.analyze_mode(text, started, single) {
                 Ok(words) => {
                     // 全文分析按词提分词口径逐词聚合；words 已在锁外算完，
                     // 这里只做算术聚合（同样在锁外）。rank>1 每词至多计 1 次选重。
@@ -358,20 +493,26 @@ pub fn route(host: &Mutex<Host>, req: &Request) -> Response {
                     let mut body = serde_json::json!({"schema":s.name,"schema_ver":ver,
                     "max_code_length":cfg.input.max_code_length,"hint_scope":"dictionary",
                     "sentence_active":sentence,"hint_unavailable_reason":null,
-                    "single":single,"words":words,"elapsed_ms":started.elapsed().as_secs_f64()*1000.0});
+                    "single":single,"words":words,"selection_keys":selection_keys(&cfg),
+                    "elapsed_ms":started.elapsed().as_secs_f64()*1000.0});
                     if let Some(fa) = full_analysis {
                         body["full_analysis"] = fa;
                     }
+                    if let Some(auto4) = theory_auto4 {
+                        body["theory_auto4"] = auto4.into();
+                    }
                     let response = Response::json(&body);
-                    *CACHE.lock().unwrap_or_else(|p| p.into_inner()) = Some(CachedAnalysis {
-                        text: text.into(),
-                        version: ver,
-                        single,
-                        include_full,
-                        response: response.clone(),
-                        _dict: s.dict.clone(),
-                        _personal: s.personal.clone(),
-                    });
+                    if theory_auto4.is_none() {
+                        *CACHE.lock().unwrap_or_else(|p| p.into_inner()) = Some(CachedAnalysis {
+                            text: text.into(),
+                            version: ver,
+                            single,
+                            include_full,
+                            response: response.clone(),
+                            _dict: s.dict.clone(),
+                            _personal: s.personal.clone(),
+                        });
+                    }
                     response
                 }
                 Err(e) => Response::err(503, e),
@@ -417,6 +558,8 @@ struct Analyzer<'a> {
     s: &'a Schema,
     cfg: &'a Config,
     sentence: bool,
+    /// Explicit theoretical four-code auto commit; None follows runtime settings.
+    theory_auto4: Option<bool>,
     extra: HashMap<String, Vec<String>>,
     extra_prefixes: HashSet<String>,
     started: Instant,
@@ -450,6 +593,7 @@ impl<'a> Analyzer<'a> {
             s,
             cfg,
             sentence,
+            theory_auto4: None,
             extra,
             extra_prefixes,
             started: Instant::now(),
@@ -494,7 +638,11 @@ impl<'a> Analyzer<'a> {
             return None;
         }
         if rank == 1 {
-            let auto = !self.sentence
+            if self.theory_auto4 == Some(true) && code.len() == 4 {
+                return Some(String::new());
+            }
+            let auto = self.theory_auto4.is_none()
+                && !self.sentence
                 && count == 1
                 && ((self.cfg.input.auto_select_unique
                     && code.len() >= 2
@@ -995,6 +1143,11 @@ mod tests {
             let mut h = host.lock().unwrap();
             let mut enabled = h.engine.config.clone();
             enabled.trainer.enabled = true;
+            enabled
+                .keymap
+                .map
+                .insert("capslock".into(), "select2".into());
+            enabled.keymap.map.insert("shift".into(), "select3".into());
             h.apply_config(enabled, None).unwrap();
         }
         assert!(
@@ -1027,6 +1180,13 @@ mod tests {
         };
         let words = analyze(false);
         assert_eq!(words["words"][0]["text"], "你好");
+        let selections = words["selection_keys"].as_array().unwrap();
+        for vk in [0xBA, 0xDE, 0x14, 0xA0, 0xA1] {
+            assert!(
+                selections.contains(&serde_json::json!(vk)),
+                "missing selection VK {vk}"
+            );
+        }
         let single = analyze(true);
         assert_eq!(single["words"].as_array().unwrap().len(), 3);
         assert_eq!(single["words"][0]["text"], "你");
@@ -1070,6 +1230,13 @@ mod tests {
             assert_eq!(status["enabled"], !oversized_bytes);
             assert!(status["installed"].is_boolean());
             assert!(status["hint_unavailable_reason"].is_string());
+            assert!(
+                status["selection_keys"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&serde_json::json!(0x14)),
+                "selection configuration remains available when dictionary hints exceed limits"
+            );
             let response = route(
                 &host,
                 &request(
@@ -1087,6 +1254,37 @@ mod tests {
             )
             .status,
             403
+        );
+    }
+
+    #[test]
+    fn selection_keys_follow_candidates_and_active_mapping_with_shift_overrides() {
+        let mut cfg = Config::default();
+        let defaults = selection_keys(&cfg);
+        assert!(defaults.contains(&0xBA) && defaults.contains(&0xDE));
+        assert!(!defaults.contains(&0x14) && !defaults.contains(&0xA0));
+        cfg.candidates.custom_select_keys = vec![',', 'q'];
+        cfg.keymap.map.insert(";".into(), "text:甲".into());
+        cfg.keymap.map.insert("capslock".into(), "select4".into());
+        cfg.keymap.map.insert("shift".into(), "select2".into());
+        cfg.keymap.map.insert("shiftleft".into(), "switch".into());
+        cfg.keymap.map.insert("numdot".into(), "select10".into());
+        cfg.keymap.map.insert("f12".into(), "select3".into());
+        cfg.keymap.map.insert("f01".into(), "select2".into());
+        cfg.keymap.map.insert("escape".into(), "select2".into()); // fixed engine behavior
+        cfg.keymap.map.insert("ctrl".into(), "select2".into()); // no engine keymap identity
+        cfg.keymap.map.insert("/".into(), "select11".into()); // invalid action
+        cfg.keymap.map_idle.insert("tab".into(), "select2".into());
+        let active = selection_keys(&cfg);
+        for vk in [0xBC, 0x51, 0x14, 0xA1, 0x6E, 0x7B] {
+            assert!(active.contains(&vk), "missing {vk}");
+        }
+        for vk in [0xBA, 0xA0, 0x70, 0x1B, 0x11, 0xBF, 0x09] {
+            assert!(!active.contains(&vk), "inactive key {vk}");
+        }
+        assert!(
+            active.windows(2).all(|pair| pair[0] < pair[1]),
+            "stable deduplicated API order"
         );
     }
 
@@ -1162,6 +1360,145 @@ mod tests {
         assert!(Analyzer::new(&s, &c, false).hint("丙").code.is_none());
         c.keymap.map.insert("a".into(), "clear".into());
         assert!(Analyzer::new(&s, &c, false).hint("甲").code.is_none());
+    }
+    #[test]
+    fn theory_auto4_overrides_runtime_auto_but_preserves_space_legality() {
+        let s = schema(vec![("ab", "甲"), ("abcd", "乙")]);
+        let mut cfg = Config::default();
+        cfg.input.auto_select_unique = true;
+        cfg.input.max_code_length = 2;
+        assert_eq!(Analyzer::new(&s, &cfg, false).hint("甲").tail, "");
+        for auto4 in [false, true] {
+            let mut theory = Analyzer::new(&s, &cfg, false);
+            theory.theory_auto4 = Some(auto4);
+            assert_eq!(
+                theory.hint("甲").tail,
+                "_",
+                "two-code recipes must not inherit runtime unique auto-commit"
+            );
+        }
+        cfg.input.max_code_length = 4;
+        cfg.keymap.map.insert("space".into(), "clear".into());
+        let mut manual = Analyzer::new(&s, &cfg, false);
+        manual.theory_auto4 = Some(false);
+        assert!(
+            manual.hint("乙").code.is_none(),
+            "mapped space cannot select"
+        );
+        let mut auto4 = Analyzer::new(&s, &cfg, false);
+        auto4.theory_auto4 = Some(true);
+        assert_eq!(auto4.hint("乙").tail, "");
+        assert!(
+            auto4.hint("甲").code.is_none(),
+            "short codes still need legal space"
+        );
+    }
+
+    #[test]
+    fn theory_requests_resegment_without_sentence_tails_or_cache_contamination() {
+        let _analyze_gate = ANALYZE_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        struct EmptyDecoder;
+        impl hufu_engine::SentenceDecoder for EmptyDecoder {
+            fn decode_rich(&self, _: &str) -> Arc<hufu_engine::SentenceDecode> {
+                Arc::new(hufu_engine::SentenceDecode {
+                    hits: Vec::new(),
+                    truncated: false,
+                    early_hits: Vec::new(),
+                    early_truncated: false,
+                })
+            }
+        }
+        let dir =
+            std::env::temp_dir().join(format!("hufu-trainer-theory-mode-{}", std::process::id()));
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(dir.clone());
+        let schema_dir = dir.join("码表/test");
+        std::fs::create_dir_all(&schema_dir).unwrap();
+        std::fs::write(
+            schema_dir.join("test.dict.yaml"),
+            "---\nname: test\nsort: by_weight\n...\n甲\ta\t900\n乙\tb\t900\n甲乙\tabcd\t900\n丙\tab\t800\n丁\tab\t700\n",
+        )
+        .unwrap();
+        let mut cfg = Config::default();
+        cfg.schema.current = "test".into();
+        cfg.sentence.enabled = true;
+        cfg.sentence.auto_enable = false;
+        cfg.input.auto_select_unique = true;
+        cfg.save(&dir.join("config.json")).unwrap();
+        let mut host = Host::new(&dir).unwrap();
+        host.engine
+            .set_sentence_decoder(Some(Arc::new(EmptyDecoder)));
+        assert!(host.engine.sentence_active());
+        let host = Mutex::new(host);
+        let request = |body| Request {
+            method: "POST".into(),
+            path: "/api/trainer/analyze".into(),
+            query: Default::default(),
+            headers: Default::default(),
+            body: serde_json::to_vec(&body).unwrap(),
+        };
+        let post = |body| {
+            let response = route(&host, &request(body));
+            assert_eq!(
+                response.status,
+                200,
+                "{}",
+                String::from_utf8_lossy(&response.body)
+            );
+            serde_json::from_slice::<serde_json::Value>(&response.body).unwrap()
+        };
+        let ordinary = post(serde_json::json!({"text":"丁"}));
+        assert_eq!(ordinary["sentence_active"], true);
+        assert_eq!(ordinary["words"][0]["rank"], 2);
+        assert_eq!(ordinary["words"][0]["tail"], "");
+        assert!(ordinary.get("theory_auto4").is_none());
+        for auto4 in [false, true] {
+            let theory = post(serde_json::json!({"text":"丁", "theory_auto4":auto4}));
+            assert_eq!(theory["theory_auto4"], auto4);
+            assert_eq!(theory["words"][0]["rank"], 2);
+            assert_eq!(
+                theory["words"][0]["tail"], ";",
+                "theory keeps real rank-2 selector even when sentence mode is active"
+            );
+        }
+        for auto4 in [false, true, false] {
+            let theory = post(serde_json::json!({"text":"甲乙", "theory_auto4":auto4}));
+            let words = theory["words"].as_array().unwrap();
+            let texts: Vec<_> = words.iter().map(|w| w["text"].as_str().unwrap()).collect();
+            if auto4 {
+                assert_eq!(
+                    texts,
+                    vec!["甲乙"],
+                    "four-code auto commit makes the phrase cheapest (tie prefers phrase)"
+                );
+                assert_eq!(words[0]["tail"], "");
+            } else {
+                assert_eq!(
+                    texts,
+                    vec!["甲", "乙"],
+                    "manual four-code commit costs five keys, so DP must split into four-key route"
+                );
+                assert!(words.iter().all(|w| w["tail"] == "_"));
+            }
+        }
+        assert_eq!(
+            post(serde_json::json!({"text":"丁"})),
+            ordinary,
+            "theory requests must neither consume nor overwrite the ordinary hint cache"
+        );
+        assert_eq!(
+            route(
+                &host,
+                &request(serde_json::json!({"text":"甲", "theory_auto4":"true"}))
+            )
+            .status,
+            400
+        );
     }
     #[test]
     fn inaccessible_page_is_not_a_hint() {
@@ -1396,7 +1733,9 @@ mod tests {
             "sentence hints carry dictionary codes"
         );
         // 整句下不给选重键（rank>1 词提的 tail 为空），这是维持的保守语义。
-        assert!(words.iter().all(|w| w.hint.tail.is_empty() || w.hint.rank <= 1));
+        assert!(words
+            .iter()
+            .all(|w| w.hint.tail.is_empty() || w.hint.rank <= 1));
     }
 
     #[test]
@@ -1473,15 +1812,9 @@ mod tests {
             parse_hotkey("Shift+Win+F5"),
             Some((MOD_SHIFT | MOD_WIN | MOD_NOREPEAT, 0x74))
         );
-        assert_eq!(
-            parse_hotkey("meta+z"),
-            Some((MOD_WIN | MOD_NOREPEAT, 0x5A))
-        );
+        assert_eq!(parse_hotkey("meta+z"), Some((MOD_WIN | MOD_NOREPEAT, 0x5A)));
         // 数字与 f12
-        assert_eq!(
-            parse_hotkey("alt+7"),
-            Some((MOD_ALT | MOD_NOREPEAT, 0x37))
-        );
+        assert_eq!(parse_hotkey("alt+7"), Some((MOD_ALT | MOD_NOREPEAT, 0x37)));
         assert_eq!(
             parse_hotkey("shift+f12"),
             Some((MOD_SHIFT | MOD_NOREPEAT, 0x7B))
@@ -1509,10 +1842,8 @@ mod tests {
         let _analyze_gate = ANALYZE_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
         use std::io::{Read, Write};
         use std::net::{TcpListener, TcpStream};
-        let dir = std::env::temp_dir().join(format!(
-            "hufu-trainer-full-analysis-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("hufu-trainer-full-analysis-{}", std::process::id()));
         struct Cleanup(std::path::PathBuf);
         impl Drop for Cleanup {
             fn drop(&mut self) {

@@ -580,6 +580,11 @@ pub fn open_settings() {
                     crate::platform::http_port()
                 );
                 let mut c = std::process::Command::new(shell); // zi-ok: shell=ShellExecuteW 回退链首选项路径（非解释器）
+                // 【2026-11-09 根治】同 main.rs：不继承 stdio，防父进程句柄
+                // 失效拖死子进程（codex 拉起的 server 实例实证）。
+                c.stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null());
                 c.arg("--url").arg(url);
                 match c.spawn() {
                     Ok(_) => return,

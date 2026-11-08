@@ -11,7 +11,7 @@
 //!   立即回写快照，不留空窗。
 
 use std::sync::Mutex;
-use windows::Win32::Foundation::{GlobalFree, HGLOBAL, HANDLE};
+use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL, HWND};
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, GetClipboardSequenceNumber,
     IsClipboardFormatAvailable, OpenClipboard, SetClipboardData,
@@ -19,7 +19,7 @@ use windows::Win32::System::DataExchange::{
 use windows::Win32::System::Memory::{
     GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE,
 };
-use windows::Win32::System::Ole::CF_UNICODETEXT;
+use windows::Win32::System::Ole::{CF_DIB, CF_UNICODETEXT};
 
 /// 延迟恢复状态：写入前的用户文本 + 写入完成时的剪贴板序列号 + 恢复期限。
 /// 连续写入只保留**第一次**的快照（那时才是用户内容），期限顺延、序列号刷新。
@@ -108,7 +108,9 @@ fn register_restore(snap: Option<Vec<u16>>, seq_after: u32) {
             .lock()
             .ok()
             .and_then(|g| g.as_ref().map(|st| st.deadline));
-        let Some(my_deadline) = my_deadline else { return };
+        let Some(my_deadline) = my_deadline else {
+            return;
+        };
         std::thread::sleep(RESTORE_PROBE);
         // 600ms 探针：期间有人动过剪贴板（含用户自己复制）→ 立即放弃还原
         let data = {
@@ -127,7 +129,9 @@ fn register_restore(snap: Option<Vec<u16>>, seq_after: u32) {
         if my_deadline > now {
             std::thread::sleep(my_deadline - now);
         }
-        let Ok(mut guard) = RESTORE.lock() else { return };
+        let Ok(mut guard) = RESTORE.lock() else {
+            return;
+        };
         match guard.as_ref() {
             Some(st) if st.deadline == my_deadline => {
                 if unsafe { GetClipboardSequenceNumber() } != st.seq_after {
@@ -135,8 +139,12 @@ fn register_restore(snap: Option<Vec<u16>>, seq_after: u32) {
                     return;
                 }
                 *guard = None; // 本次还原成为最新内容，取消后续还原
-                drop(guard);
-                unsafe { let _ = set_text_raw(&data); };
+                               // Keep the restoration mutex through the actual write. An
+                               // explicit image copy uses the same mutex, so an already-due
+                               // restore cannot overwrite that newer copy after it returns.
+                unsafe {
+                    let _ = set_text_raw(&data);
+                };
             }
             _ => {}
         }
@@ -183,6 +191,53 @@ pub unsafe fn read_text() -> Option<String> {
 /// 写剪贴板（String → UTF-16）；失败忽略（调用方只用于发成绩/载文提示）
 pub unsafe fn write_text(s: &str) {
     let _ = try_write_text(s);
+}
+
+/// Explicit image copy: keep the DIB until another clipboard write, without the
+/// temporary text bridge's delayed restoration. The caller supplies an owned
+/// BITMAPINFOHEADER + pixels buffer; Windows takes the HGLOBAL only on success.
+pub(crate) fn try_write_dib(owner: isize, dib: &[u8]) -> Result<(), String> {
+    if owner == 0 || dib.len() < 40 || dib.len() > u32::MAX as usize {
+        return Err("复制图像的数据或窗口无效".into());
+    }
+    let mut restore = RESTORE.lock().unwrap_or_else(|p| p.into_inner());
+    unsafe {
+        let h = GlobalAlloc(GMEM_MOVEABLE, dib.len())
+            .map_err(|_| "无法分配剪贴板图像内存".to_string())?;
+        let ptr = GlobalLock(h);
+        if ptr.is_null() {
+            let _ = GlobalFree(h);
+            return Err("无法锁定剪贴板图像内存".into());
+        }
+        std::ptr::copy_nonoverlapping(dib.as_ptr(), ptr as *mut u8, dib.len());
+        let _ = GlobalUnlock(h);
+        for _ in 0..3 {
+            // A real owner is required: EmptyClipboard after OpenClipboard(NULL)
+            // can leave the clipboard owner NULL and make SetClipboardData fail.
+            if OpenClipboard(HWND(owner as *mut _)).is_err() {
+                std::thread::sleep(std::time::Duration::from_millis(15));
+                continue;
+            }
+            let snap = snapshot_locked();
+            let emptied = EmptyClipboard().is_ok();
+            let copied = emptied && SetClipboardData(CF_DIB.0 as u32, HANDLE(h.0)).is_ok();
+            let _ = CloseClipboard();
+            if copied {
+                // System owns h. Cancel any earlier temporary text restoration.
+                *restore = None;
+                return Ok(());
+            }
+            let _ = GlobalFree(h);
+            if emptied {
+                if let Some(data) = snap {
+                    let _ = set_text_raw(&data);
+                }
+            }
+            return Err("无法写入剪贴板图像，请稍后重试".into());
+        }
+        let _ = GlobalFree(h);
+        Err("剪贴板正被其他程序占用，请稍后重试".into())
+    }
 }
 
 /// 写剪贴板并确认系统接受了内容；先分配再清空，分配失败不会丢掉原内容。

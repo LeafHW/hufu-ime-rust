@@ -1,5 +1,8 @@
 //! 虎符跟打：真实 RichEdit/TSF 输入，原生 D2D 界面，后台联网。
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+mod analysis;
+mod history;
+mod keyboard;
 mod modals;
 mod online;
 mod qq_bridge;
@@ -12,7 +15,7 @@ use gale_core::{
     config::Config,
     library::Library,
     rules::{CleaningPreset, CleaningRule, TrainingMode},
-    score::{format_score_report, ScoreStore},
+    score::ScoreStore,
     segment::parse_group_text,
     single::SingleDrillConfig,
     wenlai::{Difficulty, FetchParams, WenlaiArticle},
@@ -27,7 +30,7 @@ use modals::{Action, Modal, Model};
 use online::{OnlineCommand, OnlinePayload, OnlinePrefs, OnlineWorker};
 use session::{Phase, Session, SessionSource};
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, VecDeque},
     io::{Read, Write},
     path::{Path, PathBuf},
     sync::mpsc,
@@ -35,47 +38,18 @@ use std::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, ReleaseCapture, VK_CONTROL};
 use windows::Win32::{
-    Foundation::{ERROR_ALREADY_EXISTS, GetLastError, BOOL, HWND, LPARAM, WPARAM},
+    Foundation::{GetLastError, BOOL, ERROR_ALREADY_EXISTS, HWND, LPARAM, WPARAM},
     UI::WindowsAndMessaging::*,
 };
 
-/// 整改13：server `/api/trainer/analyze?include_full=true` 返回的全篇理论
-/// 码长分析（`full_analysis` 字段）。字段名与 server 端严格一致——视觉代理
-/// 的分析页模态按此消费；任务14（词提全文显示）同源复用 entries。
-#[derive(Debug, Clone, Default, serde::Deserialize)]
-pub struct FullAnalysis {
-    #[serde(default)]
-    pub entries: Vec<FullAnalysisEntry>,
-    #[serde(default)]
-    pub total_code_len: u64,
-    #[serde(default)]
-    pub avg_code_len_per_char: f64,
-    #[serde(default)]
-    pub select_count: u64,
-}
+pub use analysis::{FullAnalysis, FullAnalysisEntry};
 
-/// 分析词条：word=词面、code=编码（生词无码时 None）、code_len=码长、rank=词频名次
-#[derive(Debug, Clone, Default, serde::Deserialize)]
-pub struct FullAnalysisEntry {
-    #[serde(default)]
-    pub word: String,
-    #[serde(default)]
-    pub code: Option<String>,
-    #[serde(default)]
-    pub code_len: u64,
-    #[serde(default)]
-    pub rank: u64,
-}
+/// Full physical keyboard capture is independent of speed statistics.
 
-/// 整改12：热力图 VK 口径（任务指定区段）。wParam 低 16 位里的修饰/扫描码
-/// 高位标志已由 `& 0xFF` 剥离；小键盘（0x60-0x6F）、Tab、OEM ` 与重映射
-/// 0xE5 不计（比 stats 的 is_stat_key 窄一档，与热力图需求对齐）。
 fn heatmap_vk(vk: u32) -> Option<u8> {
-    match vk & 0xFF {
-        0x08 | 0x0D | 0x20 => Some(vk as u8),
-        0x30..=0x39 | 0x41..=0x5A => Some(vk as u8),
-        0xBA..=0xBF | 0xDB..=0xDE => Some(vk as u8),
-        _ => None,
+    match vk & 0xff {
+        0 | 0xe5 | 0xff => None,
+        v => Some(v as u8),
     }
 }
 
@@ -92,6 +66,8 @@ const AUX_AUTO_NEXT: &str = "online_auto_next";
 const AUX_SINGLE_SHUFFLE: &str = "single_shuffle";
 const AUX_SINGLE_SEG_PLUS: &str = "single_seg+5";
 const AUX_SINGLE_SEG_MINUS: &str = "single_seg-5";
+const AUX_SINGLE_SEG_CYCLE: &str = "single_seg_cycle";
+const AUX_SINGLE_TARGET_CYCLE: &str = "single_target_cycle";
 const AUX_SHOW_FULL: &str = "show_full_analysis";
 const AUX_SHOW_HEATMAP: &str = "show_heatmap";
 
@@ -105,8 +81,20 @@ enum AuxAction {
     OnlineAutoNext,
     SingleShuffle,
     SingleSeg(i32),
+    SingleSegCycle,
+    SingleTargetCycle,
     ShowFullAnalysis,
     ShowHeatmap,
+    AnalysisAuto4,
+    AnalysisFont(u8),
+    AnalysisView,
+    AnalysisCopy,
+    AnalysisRetry,
+    Preference(String),
+    HistoryToggle,
+    HistoryOpen(usize),
+    HistoryStep(i32),
+    SingleTarget(i32),
 }
 
 fn aux_action(a: &Action) -> Option<AuxAction> {
@@ -122,8 +110,31 @@ fn aux_action(a: &Action) -> Option<AuxAction> {
         AUX_SINGLE_SHUFFLE => AuxAction::SingleShuffle,
         AUX_SINGLE_SEG_PLUS => AuxAction::SingleSeg(5),
         AUX_SINGLE_SEG_MINUS => AuxAction::SingleSeg(-5),
+        AUX_SINGLE_SEG_CYCLE => AuxAction::SingleSegCycle,
+        AUX_SINGLE_TARGET_CYCLE => AuxAction::SingleTargetCycle,
         AUX_SHOW_FULL => AuxAction::ShowFullAnalysis,
         AUX_SHOW_HEATMAP => AuxAction::ShowHeatmap,
+        "analysis_auto4" => AuxAction::AnalysisAuto4,
+        "analysis_view" => AuxAction::AnalysisView,
+        "analysis_copy" => AuxAction::AnalysisCopy,
+        "analysis_retry" => AuxAction::AnalysisRetry,
+        _ if cmd.starts_with("analysis_font:") => AuxAction::AnalysisFont(
+            cmd.strip_prefix("analysis_font:")?
+                .parse::<u8>()
+                .ok()?
+                .clamp(12, 36),
+        ),
+        "history_toggle" => AuxAction::HistoryToggle,
+        _ if cmd.starts_with("history_open:") => {
+            AuxAction::HistoryOpen(cmd.strip_prefix("history_open:")?.parse().ok()?)
+        }
+        _ if cmd.starts_with("history_step:") => {
+            AuxAction::HistoryStep(cmd.strip_prefix("history_step:")?.parse().ok()?)
+        }
+        _ if cmd.starts_with("single_target_step:") => {
+            AuxAction::SingleTarget(cmd.strip_prefix("single_target_step:")?.parse().ok()?)
+        }
+        _ if cmd.starts_with("pref_") => AuxAction::Preference(cmd.to_string()),
         _ => return None,
     })
 }
@@ -131,6 +142,111 @@ fn aux_action(a: &Action) -> Option<AuxAction> {
 pub(crate) fn aux_marker(cmd: &str) -> Action {
     Action::Theme(format!("{AUX_PREFIX}{cmd}"))
 }
+const PREFERENCE_COLORS: &[&str] = &[
+    "词提简码色",
+    "词提二字全码色",
+    "词提三字全码色",
+    "词提四字全码色",
+    "跟打区背景色",
+    "打对字色",
+    "对打打对底色",
+    "打错字色",
+    "对打打错底色",
+    "词提编码色",
+    "词提角标色",
+    "词提下划线色",
+    "词提底色",
+];
+const SCORE_FIELD_LABELS: &[(&str, &str)] = &[
+    ("segment", ""),
+    ("speed", "速度"),
+    ("accuracy", "键准"),
+    ("code_len", "码长"),
+    ("word_rate", "词率"),
+    ("select", "选重"),
+    ("retype", "重打"),
+    ("chars", "字数"),
+    ("time", "用时"),
+    ("keys", "总键数"),
+    ("backspace", "退格"),
+    ("wrong", "错字"),
+    ("signature", ""),
+];
+fn canonical_score_fields(fields: &str) -> String {
+    let mut unique = Vec::new();
+    for key in fields.split(',') {
+        let key = match key.trim() {
+            "accuracy" => "key_accuracy",
+            "select" => "select_count",
+            "retype" => "retype_count",
+            "backspace" => "backspaces",
+            other => other,
+        };
+        if !key.is_empty() && !unique.contains(&key) {
+            unique.push(key);
+        }
+    }
+    unique.join(",")
+}
+fn configured_template(cfg: &Config) -> String {
+    if !cfg.score_template.trim().is_empty() {
+        return cfg.score_template.clone();
+    }
+    let parts: Vec<_> = cfg
+        .score_fields
+        .split(',')
+        .filter_map(|key| {
+            let label = SCORE_FIELD_LABELS
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| *v)
+                .or_else(|| {
+                    gale_core::scorecard::SCORE_FIELDS
+                        .iter()
+                        .find(|(k, _)| *k == key)
+                        .map(|(_, v)| v.split('（').next().unwrap_or(v))
+                })?;
+            Some(format!(
+                "{label}{{{key}}}{}",
+                if matches!(key, "accuracy" | "character_accuracy" | "key_accuracy") {
+                    "%"
+                } else {
+                    ""
+                }
+            ))
+        })
+        .collect();
+    if parts.is_empty() {
+        "{segment} 速度{speed}".into()
+    } else {
+        parts.join("  ")
+    }
+}
+
+/// Which score-report preset the saved configuration corresponds to. The old
+/// build kept this only in `Model.fields`, so reopening F1 highlighted nothing
+/// and the settings looked unsaved.
+fn current_score_preset(cfg: &Config) -> &'static str {
+    let template = cfg.score_template.trim();
+    if template.is_empty() {
+        return if cfg.score_fields == Config::default().score_fields {
+            "standard"
+        } else {
+            ""
+        };
+    }
+    for id in ["compact", "classic", "detailed"] {
+        if gale_core::scorecard::preset(id).template.trim() == template {
+            return match id {
+                "compact" => "compact",
+                "classic" => "classic",
+                _ => "detailed",
+            };
+        }
+    }
+    "custom"
+}
+
 pub fn data_dir() -> PathBuf {
     if let Some(v) =
         cli_value("--data").or_else(|| std::env::var_os("HUFU_TRAINER_DATA").map(PathBuf::from))
@@ -156,6 +272,33 @@ fn unix_secs() -> u64 {
         .unwrap_or_default()
         .as_secs()
 }
+fn fetch_theory(text: &str, single: bool, auto4: bool) -> Result<FullAnalysis, String> {
+    if text.chars().count() > 10000 {
+        return Err("全文分析最多支持10000字，请载入较短文章".into());
+    }
+    let value = local_json(
+        local_port(),
+        "/api/trainer/analyze",
+        Some(serde_json::json!({
+            "text": text, "single": single, "theory_auto4": auto4,
+        })),
+    )?;
+    if value["theory_auto4"].as_bool() != Some(auto4) {
+        return Err("当前虎符服务不支持理论分析，请更新服务后重试".into());
+    }
+    let mut fa = FullAnalysis {
+        entries: analysis::response_entries(text, &value)?,
+        schema: value["schema"].as_str().unwrap_or("当前词库").into(),
+        schema_ver: value["schema_ver"].as_str().unwrap_or("").into(),
+        max_code_length: value["max_code_length"].as_u64().unwrap_or(4) as usize,
+        ..Default::default()
+    };
+    let summary = analysis::summarize(&fa, auto4);
+    fa.total_code_len = summary.known_keys;
+    fa.avg_code_len_per_char = summary.avg_code_len;
+    fa.select_count = summary.select_count;
+    Ok(fa)
+}
 /// P2 今日汇总（任务 6b）：从磁盘成绩库（统计/records.jsonl；load_valid 过
 /// <5 硬门，与聚合口径一致）算今天的字数。ui.rs 的今日卡片读 cfg.today_chars
 ///（该文件禁改），数据由 main 侧在启动时 + 每次成绩保存成功后注入。
@@ -166,10 +309,7 @@ fn today_chars_from_dir(dir: &Path) -> u64 {
         .unwrap_or(0)
 }
 fn completed_segment_action(command: CommandKey, done: bool, modal: Modal) -> Option<Action> {
-    if done
-        && matches!(modal, Modal::None | Modal::Result)
-        && matches!(command, CommandKey::Enter | CommandKey::Space)
-    {
+    if done && modal == Modal::None && matches!(command, CommandKey::Enter | CommandKey::Space) {
         Some(Action::Next)
     } else {
         None
@@ -185,20 +325,15 @@ fn single_instance_guard() -> bool {
     use windows::Win32::Foundation::WAIT_EVENT;
     use windows::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
     unsafe {
-        let handle = match CreateMutexW(
-            None,
-            true,
-            windows::core::w!("HuFu-Trainer-SingleInstance"),
-        ) {
-            Ok(h) => h,
-            Err(_) => return false, // 创建失败不拦启动（宁可双开也不打不开）
-        };
+        let handle =
+            match CreateMutexW(None, true, windows::core::w!("HuFu-Trainer-SingleInstance")) {
+                Ok(h) => h,
+                Err(_) => return false, // 创建失败不拦启动（宁可双开也不打不开）
+            };
         // 判据：CreateMutexW 后 GetLastError==ERROR_ALREADY_EXISTS 且探测未接管
         //（WAIT_ABANDONED = 旧实例持锁僵死，本实例接管放行——与 window.rs 同解）。
         let wait: WAIT_EVENT = WaitForSingleObject(handle, 0);
-        let already = GetLastError() == ERROR_ALREADY_EXISTS
-            && wait.0 != 0
-            && wait.0 != 128; /* WAIT_ABANDONED */
+        let already = GetLastError() == ERROR_ALREADY_EXISTS && wait.0 != 0 && wait.0 != 128; /* WAIT_ABANDONED */
         if already {
             if let Some(hwnd) = find_existing_hufu_window() {
                 let _ = ShowWindow(hwnd, SW_RESTORE);
@@ -216,8 +351,7 @@ fn single_instance_guard() -> bool {
 /// 禁改故此处硬拷贝字面量），找不到再 EnumWindows 按标题模糊匹配（旧版兜底）。
 fn find_existing_hufu_window() -> Option<HWND> {
     unsafe {
-        if let Ok(hwnd) = FindWindowExW(None, None, windows::core::w!("HuFuTrainerWindow"), None)
-        {
+        if let Ok(hwnd) = FindWindowExW(None, None, windows::core::w!("HuFuTrainerWindow"), None) {
             return Some(hwnd);
         }
         let mut found: Vec<HWND> = Vec::new();
@@ -254,8 +388,8 @@ enum Bg {
     Skin(u64, Result<gale_core::theme::Theme, String>),
     RuleTest(u64, Result<gale_core::rules::CleaningResult, String>),
     RuleApply(u64, u64, Result<Session, String>),
-    /// 整改13：全篇理论分析（None=旧版服务无 full_analysis 字段，静默降级）
-    FullAnalysis(u64, Option<FullAnalysis>),
+    /// Full-article theory response with an explicit, retryable error.
+    FullAnalysis(String, Result<FullAnalysis, String>),
 }
 enum Persist {
     Snapshot(Vec<u8>),
@@ -368,6 +502,10 @@ struct App {
     pending_draft: Option<(String, String)>,
     edit_epoch: u64,
     hits: Vec<modals::Hit>,
+    /// 最近一次鼠标位置（逻辑坐标），用于悬停高亮。
+    hover: Option<(f32, f32)>,
+    /// Last time a snapshot-save error toast was shown (rate limit).
+    save_toast_at: u64,
     anim: ui::Animation,
     clock: Instant,
     online: Option<OnlineWorker>,
@@ -410,8 +548,11 @@ struct App {
     qq_scan_at: u64,
     /// 整改8：单字练习配置（single.json：乱序 + 段长）
     single_cfg: SingleDrillConfig,
-    /// 整改13：已请求过全篇分析的文章指纹（同文重打不重复请求）
+    /// Last successful analysis key: text, source mode, schema and auto4 option.
     full_fetch_hash: Option<String>,
+    full_analyzing: bool,
+    full_retry_at: u64,
+    analysis_font_drag: bool,
 }
 fn main() {
     if let Err(e) = run() {
@@ -442,6 +583,7 @@ fn run() -> Result<(), String> {
     let mut cfg = Config::load_or_create(&dir.join("config.toml")).map_err(|e| e.to_string())?;
     // Native child editors require the opaque redirection surface in this build.
     cfg.material = gale_core::config::Material::Solid;
+    cfg.score_fields = canonical_score_fields(&cfg.score_fields);
     let sc = gale_win::window::dpi_scale();
     let work = unsafe {
         let mut r = windows::Win32::Foundation::RECT::default();
@@ -484,7 +626,12 @@ fn run() -> Result<(), String> {
         let (name, text) = read_article_file(&path)?;
         sess.load_book(&name, &text);
     }
+    let history = ScoreStore::open(&dir.join("统计"))
+        .map(|store| store.load_all())
+        .unwrap_or_default();
+    sess.seed_retype_history(history.iter());
     let mut model = Model::default();
+    model.history = history;
     model.rule_save_preset = true;
     model.hints = sess.rules.word_hints;
     model.race = sess.rules.mode == TrainingMode::Race;
@@ -539,6 +686,8 @@ fn run() -> Result<(), String> {
         pending_draft: None,
         edit_epoch: u64::MAX,
         hits: Vec::new(),
+        hover: None,
+        save_toast_at: 0,
         anim: ui::Animation::default(),
         clock: Instant::now(),
         online,
@@ -570,11 +719,15 @@ fn run() -> Result<(), String> {
         qq_scan_at: 0,
         single_cfg: SingleDrillConfig::load(&dir.join("single.json")),
         full_fetch_hash: None,
+        full_analyzing: false,
+        full_retry_at: 0,
+        analysis_font_drag: false,
     };
     app.model
         .fields
         .insert("online_auto_next".into(), app.online_auto_next.to_string());
     app.sync_single_fields();
+    app.sync_preferences(true);
     app.sync_rule_model();
     if app.cfg.theme == "跟随虎符" {
         app.fetch_skin();
@@ -626,14 +779,21 @@ fn run() -> Result<(), String> {
             gale_win::window::request_frame();
         }
         app.collect_background();
+        if app.model.modal == Modal::FullAnalysis && app.sess.full_analysis.is_none() {
+            app.fetch_full_analysis();
+        }
         app.collect_online();
         app.pump_persistence();
         let focused = unsafe { GetForegroundWindow() == app.win.hwnd() };
-        if focused && !was_focused && app.sess.phase == Phase::Idle {
+        if focused
+            && !was_focused
+            && (app.sess.phase == Phase::Idle || app.model.modal == Modal::FullAnalysis)
+        {
             app.analyzed = 0;
             app.analyze();
         }
-        let accept_host = app.model.modal == Modal::None && (focused || was_focused);
+        let accept_host =
+            app.model.modal == Modal::None && !app.compact_history() && (focused || was_focused);
         was_focused = focused;
         app.online_pending = app.online.as_ref().map(|o| o.pending_count()).unwrap_or(0);
         app.model.online_busy = app.online_pending > 0;
@@ -646,9 +806,7 @@ fn run() -> Result<(), String> {
         if accept_host {
             // P1-6：Composing(false) 与 Commit 同批 = 提交清空（不置 protect）；
             // 只有 Composing(false) = 退格删空/Esc 取消（置 protect）。
-            let batch_has_commit = events
-                .iter()
-                .any(|e| matches!(e, HostEvent::Commit(_)));
+            let batch_has_commit = events.iter().any(|e| matches!(e, HostEvent::Commit(_)));
             for ev in events {
                 match ev {
                     HostEvent::Key { vk } => app.sess.on_key(vk, now),
@@ -691,7 +849,8 @@ fn run() -> Result<(), String> {
             app.sess.on_backspace_up();
         }
         bs_down_prev = bs_down;
-        let paused = (!focused || app.model.modal != Modal::None) && !app.model.race;
+        let paused = (!focused || app.model.modal != Modal::None || app.compact_history())
+            && !app.model.race;
         app.sess.set_paused(paused, now);
         if paused != app.model.paused {
             app.model.paused = paused;
@@ -716,16 +875,19 @@ fn run() -> Result<(), String> {
                         None
                     }
                 }
-                CommandKey::F1 | CommandKey::F7 | CommandKey::F10 => {
-                    Some(Action::Open(Modal::Appearance))
-                }
-                CommandKey::F2 => Some(Action::Open(Modal::Load)),
+                CommandKey::F1 => Some(Action::Open(Modal::Preferences)),
+                CommandKey::F7 => Some(Action::Open(Modal::Appearance)),
+                CommandKey::F10 => Some(aux_marker(AUX_SHOW_FULL)),
+                // 【2026-11-09 减法定稿】F2 载文窗整体退役（剪贴板走 Ctrl+V、
+                // 群文走 F4、在线走 F8、本地文库/单字走主界面「文库」按钮）；
+                // F5 = 选群（原 F6），F6 不再绑定。
                 CommandKey::F3 => Some(Action::Restart),
                 CommandKey::F4 => Some(Action::ReadGroup),
-                CommandKey::F5 => Some(Action::Open(Modal::Report)),
-                CommandKey::F6 => Some(Action::Open(Modal::Groups)),
+                CommandKey::F5 => Some(Action::Open(Modal::Groups)),
                 CommandKey::F8 => Some(Action::Open(Modal::Online)),
                 CommandKey::F9 => Some(Action::Open(Modal::Rules)),
+                // 【减法定稿】F2/F6 不再绑定；F2=载文窗、F6=旧选群位均已退役。
+                CommandKey::F2 | CommandKey::F6 | CommandKey::RetryResult => None,
                 CommandKey::LoadClipboard | CommandKey::AltE => Some(Action::LoadClipboard),
                 CommandKey::CopyResult => Some(if app.model.modal == Modal::Report {
                     Action::CopyRace
@@ -738,22 +900,13 @@ fn run() -> Result<(), String> {
                     Action::SendScore
                 }),
                 CommandKey::ExportResult => Some(Action::ExportImage),
-                CommandKey::RetryResult => {
-                    (app.model.modal == Modal::Result).then_some(Action::Restart)
-                }
                 CommandKey::CtrlLeft => Some(Action::Previous),
                 CommandKey::CtrlRight => Some(Action::Next),
-                CommandKey::Enter => {
-                    if app.model.modal == Modal::Load {
-                        Some(Action::LoadText)
-                    } else {
-                        completed_segment_action(
-                            cmd,
-                            app.sess.phase == Phase::Done,
-                            app.model.modal,
-                        )
-                    }
-                }
+                CommandKey::Enter => completed_segment_action(
+                    cmd,
+                    app.sess.phase == Phase::Done,
+                    app.model.modal,
+                ),
                 CommandKey::Space => {
                     completed_segment_action(cmd, app.sess.phase == Phase::Done, app.model.modal)
                 }
@@ -767,8 +920,31 @@ fn run() -> Result<(), String> {
                 app.model.latest = Some(record.clone());
                 let id = app.score_next;
                 app.score_next += 1;
-                app.pending_scores.push_back((id, record));
-                app.open(Modal::Result);
+                app.model.history.push(record.clone());
+                app.model.history_scroll = 0;
+                app.pending_scores.push_back((id, record.clone()));
+                if app.cfg.score_auto_copy {
+                    let text = app.format_record(&record);
+                    match unsafe { gale_win::clipboard_bridge::try_write_text(&text) } {
+                        Ok(()) => app.toast("本段已记录 · 成绩已自动复制"),
+                        Err(e) => app.toast(format!("本段已记录，自动复制失败：{e}")),
+                    }
+                } else {
+                    app.toast("本段已记录 · Enter 下一段 / F3 重打");
+                }
+                if app.sess.source == SessionSource::Single {
+                    let passed =
+                        record.strokes_per_sec >= app.single_cfg.target_keystroke_x10 as f64 / 10.;
+                    app.model.fields.insert(
+                        "single_target_status".into(),
+                        if passed { "已达标" } else { "未达标" }.into(),
+                    );
+                }
+                // 【群三件套 2026-11-09】单段结算弹窗退役；绑定群且开自动发
+                // 成绩时，打完一段把晴兼容成绩单直接发到群。
+                if app.cfg.auto_send_score && app.model.bound.is_some() {
+                    app.act(Action::SendScoreToGroup, false);
+                }
                 app.snapshot();
                 // 整改2b：在线练习（正文来自文来）结算后 1.5s 自动取下一段；
                 // 赛制（竞赛段）结算不自动跳，等发文确认。
@@ -791,7 +967,7 @@ fn run() -> Result<(), String> {
                     && app.online_logged_in
                     && app.online_article_current
                     && app.article.is_some()
-                    && app.model.modal == Modal::Result
+                    && matches!(app.model.modal, Modal::None)
                     && app.sess.phase == Phase::Done
                     && app.sess.rules.mode != TrainingMode::Race
                 {
@@ -800,8 +976,7 @@ fn run() -> Result<(), String> {
             }
         }
         // 整改7：QQ 读取屏（F6 群屏 / F2 第三 tab）打开期间每 10s 刷新会话列表。
-        let qq_screen = app.model.modal == Modal::Groups
-            || (app.model.modal == Modal::Load && app.model.load_tab == 2);
+        let qq_screen = app.model.modal == Modal::Groups;
         if qq_screen && !app.qq_busy && now.saturating_sub(app.qq_scan_at) >= 10_000 {
             app.qq_scan_at = now;
             app.act(Action::ScanGroups, false);
@@ -815,9 +990,7 @@ fn run() -> Result<(), String> {
         }
         gale_win::input_host::set_round_done(app.sess.phase == Phase::Done);
         gale_win::input_host::set_result_key_target(
-            (app.model.modal == Modal::Report
-                || (app.model.modal == Modal::Result && app.sess.phase == Phase::Done))
-                .then_some(app.win.hwnd),
+            (app.model.modal == Modal::Report).then_some(app.win.hwnd),
         );
         for e in gale_win::window::drain_mouse() {
             match e {
@@ -828,6 +1001,8 @@ fn run() -> Result<(), String> {
                         if a == Action::None {
                             continue;
                         }
+                        app.analysis_font_drag =
+                            matches!(aux_action(&a), Some(AuxAction::AnalysisFont(_)));
                         app.capture_fields();
                         app.act(a, false);
                     } else if yy < 55. {
@@ -840,18 +1015,56 @@ fn run() -> Result<(), String> {
                                 LPARAM(0),
                             );
                         }
-                    } else if app.model.modal == Modal::None {
+                    } else if app.model.modal == Modal::None && !app.compact_history() {
                         app.host.focus();
                     }
                 }
+                MouseEv::Move { x, y }
+                    if app.analysis_font_drag && app.model.modal == Modal::FullAnalysis =>
+                {
+                    app.set_analysis_font_at(x as f32);
+                    app.hover = Some((x as f32, y as f32));
+                }
+                MouseEv::Move { x, y } => {
+                    let pos = Some((x as f32, y as f32));
+                    if app.hover != pos {
+                        app.hover = pos;
+                        gale_win::window::request_frame();
+                    }
+                }
+                MouseEv::LUp { .. } => {
+                    app.analysis_font_drag = false;
+                }
                 MouseEv::Wheel { delta, .. } => {
+                    if app.model.modal == Modal::FullAnalysis {
+                        if unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0 {
+                            let font = app
+                                .model
+                                .field("analysis_font")
+                                .parse::<i32>()
+                                .unwrap_or(20);
+                            let font = (font + delta / 120).clamp(12, 36);
+                            app.model
+                                .fields
+                                .insert("analysis_font".into(), font.to_string());
+                        } else {
+                            let sc = gale_win::window::dpi_scale();
+                            let (w, h) = app.win.client_size();
+                            let (_, _, pw, ph) =
+                                modals::panel(Modal::FullAnalysis, w as f32 / sc, h as f32 / sc);
+                            let max = modals::analysis_scroll_max(&app.sess, &app.model, pw, ph);
+                            app.model.scroll =
+                                (app.model.scroll - delta as f32 / 120. * 64.).clamp(0., max);
+                        }
+                        gale_win::window::request_frame();
+                        continue;
+                    }
                     // 整改6：Ctrl+滚轮 = 实时字号（10..=60，滚轮向上放大），
                     // 不滚面板；800ms 防抖后统一落盘（见主循环 font_save_due）。
                     if unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0 {
                         let step = (delta / 120).clamp(-1, 1);
                         if step != 0 {
-                            app.cfg.font_size =
-                                (app.cfg.font_size + step as f32).clamp(10., 60.);
+                            app.cfg.font_size = (app.cfg.font_size + step as f32).clamp(10., 60.);
                             app.apply_style();
                             app.font_save_due = Some(app.ms() + 800);
                             gale_win::window::request_frame();
@@ -863,16 +1076,14 @@ fn run() -> Result<(), String> {
                         0.,
                         app.win.client_size().1 as f32 / gale_win::window::dpi_scale(),
                     );
-                    let max = if matches!(app.model.modal, Modal::Result | Modal::Report) {
-                        (650. - ph).max(0.)
+                    let max = if app.model.modal == Modal::Report {
+                        (secondary_panels::content_height(app.model.modal) - ph).max(0.)
                     } else {
                         (ph - app.win.client_size().1 as f32 / gale_win::window::dpi_scale() + 48.)
                             .max(0.)
                     };
-                    let has_list = matches!(
-                        app.model.modal,
-                        Modal::Rules | Modal::Groups | Modal::Report
-                    ) || (app.model.modal == Modal::Load && app.model.load_tab == 1);
+                    let has_list =
+                        matches!(app.model.modal, Modal::Rules | Modal::Groups | Modal::Report);
                     if app.model.modal != Modal::None
                         && max > 0.
                         && !(has_list
@@ -884,7 +1095,6 @@ fn run() -> Result<(), String> {
                     } else {
                         let cap = match app.model.modal {
                             Modal::Groups => app.model.groups.len().saturating_sub(5),
-                            Modal::Load => app.model.books.len().saturating_sub(5),
                             Modal::Rules => app.model.rules.len().saturating_sub(6),
                             Modal::Report => app.sess.total_segments().saturating_sub(6),
                             _ => 0,
@@ -894,7 +1104,6 @@ fn run() -> Result<(), String> {
                     }
                     gale_win::window::request_frame();
                 }
-                _ => {}
             }
         }
         let size = app.win.client_size();
@@ -902,12 +1111,17 @@ fn run() -> Result<(), String> {
             last_size = size;
             gale_win::window::request_frame();
         }
-        if app.sess.phase == Phase::Idle && now - status_at >= 5000 {
+        if (app.sess.phase == Phase::Idle || app.model.modal == Modal::FullAnalysis)
+            && now - status_at >= 5000
+        {
             status_at = now;
             app.analyzed = 0;
             app.analyze();
         }
-        if app.sess.phase == Phase::Typing && now - status_at >= 250 {
+        if app.sess.phase == Phase::Typing
+            && app.model.modal != Modal::FullAnalysis
+            && now - status_at >= 250
+        {
             status_at = now;
             gale_win::window::request_frame();
         }
@@ -1047,10 +1261,27 @@ impl App {
         self.host.reset_text();
         self.anim.caret = None;
         self.model.words.clear();
+        // Switching segments used to clear the prefetched whole-book hints and
+        // wait for another service round-trip. Re-slice the cached words first;
+        // analyze() still runs to refresh schema/status in the background.
+        self.refill_from_full_words();
         self.generation = self.generation.wrapping_add(1);
+        self.full_retry_at = 0;
         self.analyze();
-        self.fetch_full_analysis();
         gale_win::window::request_frame();
+    }
+    /// Re-slice `full_words` for the current segment when the cache still covers
+    /// the whole article under the active schema. Returns true when it applied.
+    fn refill_from_full_words(&mut self) -> bool {
+        if !self.last_analyze_whole
+            || self.full_words.is_empty()
+            || self.full_words_of != self.analysis_text()
+            || self.full_words_ver != self.model.schema_ver
+        {
+            return false;
+        }
+        self.refill_segment_words();
+        true
     }
     /// 整改2a：在线文章直达跟打区（预览流程退役的唯一载入口）。
     /// 打字中（规则已冻结）或成绩积压时降级为待读草稿，不抢正文。
@@ -1063,7 +1294,13 @@ impl App {
             self.toast("在线正文超过100000字，请重新取较短文段");
             return;
         }
-        if self.sess.frozen_rules.is_some() || self.pending_scores.len() >= 32 {
+        // A finished round keeps frozen_rules until the next text is loaded.
+        // Treating that as "still typing" made auto-next fetch the next
+        // article and then park it as a draft forever. Only an unfinished
+        // session (or a full score queue) may defer the incoming text.
+        if self.sess.phase != Phase::Done
+            && (self.sess.frozen_rules.is_some() || self.pending_scores.len() >= 32)
+        {
             self.defer_draft("在线文章".into(), a.text);
             return;
         }
@@ -1092,61 +1329,285 @@ impl App {
         self.model
             .fields
             .insert("single_shuffle".into(), self.single_cfg.shuffle.to_string());
+        self.model.fields.insert(
+            "single_seg".into(),
+            self.single_cfg.segment_chars.to_string(),
+        );
+        self.model.fields.insert(
+            "single_target_keystroke".into(),
+            format!("{:.1}", self.single_cfg.target_keystroke_x10 as f64 / 10.),
+        );
+    }
+    fn compact_history(&self) -> bool {
+        self.model.history_expanded
+            && self.win.client_size().1 as f32 / gale_win::window::dpi_scale() < 680.
+    }
+    fn sync_preferences(&mut self, editors: bool) {
+        for (key, value) in [
+            ("hint_show_code", self.cfg.hint_show_code),
+            ("hint_show_rank", self.cfg.hint_show_rank),
+            ("hint_color_words", self.cfg.hint_color_words),
+            ("hint_underline", self.cfg.hint_underline),
+            ("hint_word_bg", self.cfg.hint_word_bg),
+            ("score_auto_copy", self.cfg.score_auto_copy),
+            ("auto_send_score", self.cfg.auto_send_score),
+        ] {
+            self.model.fields.insert(key.into(), value.to_string());
+        }
+        self.model.fields.insert(
+            "hint_font_size".into(),
+            format!("{:.0}", self.cfg.hint_font_size),
+        );
         self.model
             .fields
-            .insert("single_seg".into(), self.single_cfg.segment_chars.to_string());
+            .insert("score_fields".into(), self.cfg.score_fields.clone());
+        self.model.fields.insert(
+            "score_preset".into(),
+            current_score_preset(&self.cfg).into(),
+        );
+        for key in PREFERENCE_COLORS {
+            let c = ui::setting_color(&self.theme, key);
+            self.model.fields.insert(
+                format!("color_{key}"),
+                format!(
+                    "{:02x}{:02x}{:02x}",
+                    (c[0] * 255.).round() as u8,
+                    (c[1] * 255.).round() as u8,
+                    (c[2] * 255.).round() as u8
+                ),
+            );
+        }
+        if editors {
+            self.model
+                .fields
+                .insert("score_template".into(), configured_template(&self.cfg));
+            let key = self
+                .model
+                .fields
+                .entry("pref_color_key".into())
+                .or_insert_with(|| "词提简码色".into())
+                .clone();
+            self.model.fields.insert(
+                "pref_color_hex".into(),
+                self.model.field(&format!("color_{key}")),
+            );
+        }
     }
-    /// 整改13：文章载入后（在线/本地全文均可）后台请求全篇理论分析。
-    /// 同一文章（指纹一致）不重复请求；server 旧版无 full_analysis 字段=
-    /// 无此功能，静默降级（Bg::FullAnalysis(None) 丢弃）。
+    fn preference_action(&mut self, command: &str) {
+        self.cfg.score_fields = canonical_score_fields(&self.cfg.score_fields);
+        let parts: Vec<_> = command.split(':').collect();
+        match parts.as_slice() {
+            ["pref_toggle", key] => {
+                let field = match *key {
+                    "hint_show_code" => &mut self.cfg.hint_show_code,
+                    "hint_show_rank" => &mut self.cfg.hint_show_rank,
+                    "hint_color_words" => &mut self.cfg.hint_color_words,
+                    "hint_underline" => &mut self.cfg.hint_underline,
+                    "hint_word_bg" => &mut self.cfg.hint_word_bg,
+                    "score_auto_copy" => &mut self.cfg.score_auto_copy,
+                    "auto_send_score" => &mut self.cfg.auto_send_score,
+                    _ => return,
+                };
+                *field = !*field;
+            }
+            ["pref_step", "hint_font_size", delta] => {
+                if let Ok(delta) = delta.parse::<f32>() {
+                    self.cfg.hint_font_size = (self.cfg.hint_font_size + delta).clamp(14., 28.);
+                }
+            }
+            ["pref_tab", tab] => {
+                if let Ok(tab) = tab.parse::<u8>() {
+                    self.model
+                        .fields
+                        .insert("pref_tab".into(), tab.min(2).to_string());
+                    self.model.modal_epoch += 1;
+                }
+                return;
+            }
+            ["pref_color_select", key] if PREFERENCE_COLORS.contains(key) => {
+                self.model
+                    .fields
+                    .insert("pref_color_key".into(), (*key).into());
+                let c = ui::setting_color(&self.theme, key);
+                self.model.fields.insert(
+                    "pref_color_hex".into(),
+                    format!(
+                        "{:02x}{:02x}{:02x}",
+                        (c[0] * 255.).round() as u8,
+                        (c[1] * 255.).round() as u8,
+                        (c[2] * 255.).round() as u8
+                    ),
+                );
+                self.model.modal_epoch += 1;
+                return;
+            }
+            ["pref_apply_colors"] => {
+                let key = self.model.field("pref_color_key");
+                if !PREFERENCE_COLORS.contains(&key.as_str()) {
+                    return;
+                }
+                let value = self.model.field("pref_color_hex");
+                let value = value.trim().trim_start_matches('#').to_ascii_lowercase();
+                if value.len() != 6 || !value.is_ascii() {
+                    self.toast("颜色需为六位十六进制，例如 63C08D");
+                    return;
+                }
+                if let Some(color) = gale_core::theme::Color::from_hex_no_hash(&value) {
+                    self.theme.set(&key, color);
+                    self.cfg.color_overrides.insert(key, value);
+                    self.apply_style();
+                } else {
+                    self.toast("颜色格式无效");
+                    return;
+                }
+            }
+            ["pref_score_preset", id] => {
+                match *id {
+                    "standard" => {
+                        self.cfg.score_template.clear();
+                        self.cfg.score_fields = Config::default().score_fields;
+                        self.toast("已恢复标准字段（原勾选已重置）");
+                    }
+                    "compact" | "classic" | "detailed" => {
+                        self.cfg.score_template = gale_core::scorecard::preset(id).template.into();
+                        self.toast("已切换成绩单预设");
+                    }
+                    "custom" => {}
+                    _ => return,
+                }
+                self.model
+                    .fields
+                    .insert("score_preset".into(), (*id).into());
+                self.model
+                    .fields
+                    .insert("score_template".into(), configured_template(&self.cfg));
+                self.model.modal_epoch += 1;
+                if *id == "custom" {
+                    // Free editing is a view state, not a saved config value;
+                    // returning early keeps the highlight until the user saves
+                    // or picks a preset, instead of being re-inferred away.
+                    return;
+                }
+            }
+            ["pref_save_template"] => {
+                self.cfg.score_template = self.model.field("score_template");
+                self.toast("成绩单模板已保存");
+            }
+            ["pref_field", key] => {
+                if !SCORE_FIELD_LABELS
+                    .iter()
+                    .chain(gale_core::scorecard::SCORE_FIELDS.iter())
+                    .any(|(k, _)| k == key)
+                {
+                    return;
+                }
+                let mut fields: Vec<_> = self
+                    .cfg
+                    .score_fields
+                    .split(',')
+                    .filter(|v| !v.is_empty())
+                    .map(str::to_string)
+                    .collect();
+                if fields.iter().any(|v| v == key) {
+                    fields.retain(|v| v != key);
+                } else {
+                    fields.push((*key).into());
+                }
+                self.cfg.score_fields = fields.join(",");
+                let cleared_template = !self.cfg.score_template.trim().is_empty();
+                self.cfg.score_template.clear();
+                if cleared_template {
+                    self.toast("已切回字段模式 · 自定义模板已清除");
+                }
+                self.model
+                    .fields
+                    .insert("score_template".into(), configured_template(&self.cfg));
+                self.model
+                    .fields
+                    .insert("score_preset".into(), "standard".into());
+                self.model.modal_epoch += 1;
+            }
+            _ => return,
+        }
+        self.sync_preferences(false);
+        self.save_config();
+    }
+    fn format_record(&self, record: &gale_core::score::ScoreRecord) -> String {
+        gale_core::scorecard::format_score_template(
+            record,
+            &configured_template(&self.cfg),
+            &self.cfg.score_signature,
+        )
+    }
+    fn analysis_text(&self) -> String {
+        self.sess.segments.iter().map(|s| s.text.as_str()).collect()
+    }
+    fn analysis_auto4(&self) -> bool {
+        self.model.field("analysis_auto4") != "false"
+    }
+    fn analysis_key(&self) -> String {
+        format!(
+            "{}:{}:{}:{}",
+            gale_core::rules::fingerprint(self.analysis_text().as_bytes()),
+            self.sess.source == SessionSource::Single,
+            self.model.schema_ver,
+            self.analysis_auto4()
+        )
+    }
+    /// Serialize with ordinary hints. Failed requests remain retryable and only
+    /// a successful result is cached; generation changes alone never poison it.
     fn fetch_full_analysis(&mut self) {
-        let full: String = self
-            .sess
-            .segments
-            .iter()
-            .map(|s| s.text.as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
+        if self.analyzing || self.full_analyzing {
+            return;
+        }
+        let full = self.analysis_text();
         if full.trim().is_empty() {
             return;
         }
-        let hash = gale_core::rules::fingerprint(full.as_bytes());
-        if self.full_fetch_hash.as_deref() == Some(&hash) {
+        let key = self.analysis_key();
+        if self.model.field("analysis_failed_key") != key {
+            self.full_retry_at = 0;
+        }
+        if self.ms() < self.full_retry_at {
             return;
         }
-        self.full_fetch_hash = Some(hash);
-        let g = self.generation;
+        if self.full_fetch_hash.as_deref() == Some(&key) && self.sess.full_analysis.is_some() {
+            return;
+        }
+        self.full_analyzing = true;
+        self.sess.full_analysis = None;
+        self.model
+            .fields
+            .insert("analysis_loading".into(), "true".into());
+        self.model.fields.remove("analysis_error");
         let single = self.sess.source == SessionSource::Single;
+        let auto4 = self.analysis_auto4();
         let tx = self.tx.clone();
         let hwnd = self.win.hwnd;
         std::thread::spawn(move || {
-            let body = serde_json::json!({ "text": full, "single": single });
-            // 失败静默：local_json 报错或旧版服务无 full_analysis 字段都归 None
-            let v = local_json(local_port(), "/api/trainer/analyze?include_full=true", Some(body))
-                .ok()
-                .and_then(|v| v.get("full_analysis").cloned());
-            let parsed = v
-                .filter(|v| !v.is_null())
-                .and_then(|v| serde_json::from_value::<FullAnalysis>(v).ok())
-                .filter(|f| !f.entries.is_empty());
-            let _ = tx.send(Bg::FullAnalysis(g, parsed));
-            let _ = wake(hwnd);
+            let result = fetch_theory(&full, single, auto4);
+            let _ = tx.send(Bg::FullAnalysis(key, result));
+            wake(hwnd);
         });
     }
-    /// 整改13：把 full_analysis 移交给展示模态的触发点。modals.rs 尚无
-    /// Modal::FullAnalysis 变体（禁改域，待视觉代理/Y2 添加），当前以提示
-    /// 收尾；变体就位后此函数改为 self.open(Modal::FullAnalysis) 即接通。
     fn show_full_analysis(&mut self) {
-        match &self.sess.full_analysis {
-            Some(f) if !f.entries.is_empty() => {
-                // 整改13收口：分析页模态（Y2 域已就绪）直接打开，不再只提示。
-                self.model.modal = Modal::FullAnalysis;
-                self.model.modal_epoch += 1;
-                let _ = f;
-            }
-            Some(_) => self.toast("理论分析无词条"),
-            None => self.toast("当前服务未提供全文理论分析（需新版虎符服务）"),
-        }
+        self.open(Modal::FullAnalysis);
+        self.full_retry_at = 0;
+        self.analyzed = 0;
+        self.analyze();
+        self.fetch_full_analysis();
+    }
+
+    fn set_analysis_font_at(&mut self, cursor_x: f32) {
+        let sc = gale_win::window::dpi_scale();
+        let (w, h) = self.win.client_size();
+        let (x, _, pw, _) = modals::panel(Modal::FullAnalysis, w as f32 / sc, h as f32 / sc);
+        let width = (pw - 430.).clamp(80., 250.);
+        let size = (12. + ((cursor_x - x - 70.) / width).clamp(0., 1.) * 24.).round() as u8;
+        self.model
+            .fields
+            .insert("analysis_font".into(), size.to_string());
+        gale_win::window::request_frame();
     }
 
     /// 整改12收口：打开当前段落键盘热力图模态（数据=最近结算段
@@ -1169,7 +1630,13 @@ impl App {
         ];
         if !matches!(
             key,
-            "词提编码色" | "词提角标色" | "词提下划线色" | "词提底色"
+            "词提编码色"
+                | "词提角标色"
+                | "词提下划线色"
+                | "词提底色"
+                | "多字词一色"
+                | "多字词二色"
+                | "多字词三色"
         ) {
             return false;
         }
@@ -1214,6 +1681,38 @@ impl App {
     /// 私有标记动作执行（aux_action 解码后）
     fn run_aux(&mut self, aux: AuxAction) {
         match aux {
+            AuxAction::Preference(command) => self.preference_action(&command),
+            AuxAction::HistoryToggle => {
+                self.model.history_expanded = !self.model.history_expanded;
+                gale_win::window::set_focus_relay(!self.compact_history());
+                if self.compact_history() {
+                    self.host.hide();
+                    unsafe {
+                        let _ =
+                            windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(self.win.hwnd());
+                    }
+                } else {
+                    self.host.show();
+                    self.host.focus();
+                }
+            }
+            AuxAction::HistoryStep(delta) => {
+                self.model.history_scroll = (self.model.history_scroll as i64 + delta as i64)
+                    .clamp(0, self.model.history.len().saturating_sub(4) as i64)
+                    as usize;
+            }
+            AuxAction::HistoryOpen(index) => {
+                if let Some(record) = self.model.history.get(index).cloned() {
+                    self.model.latest = Some(record);
+                    self.auto_next_at = None;
+                    self.open(Modal::Report);
+                }
+            }
+            AuxAction::SingleTarget(delta) => {
+                self.single_cfg.target_keystroke_x10 =
+                    (self.single_cfg.target_keystroke_x10 as i32 + delta).clamp(10, 120) as u16;
+                self.save_single_cfg();
+            }
             AuxAction::OnlineRegister => {
                 // 登录卡 ↔ 注册卡切换（原整改2c开站点入口退役：晴站注册
                 // API 已实装 /api/auth/register*，见 wenlai.rs 与 online.rs）。
@@ -1293,15 +1792,79 @@ impl App {
             }
             AuxAction::SingleSeg(d) => {
                 let c = self.single_cfg.clamped();
-                self.single_cfg.segment_chars =
-                    (c.segment_chars as i32 + d).clamp(
-                        gale_core::single::SINGLE_SEGMENT_MIN as i32,
-                        gale_core::single::SINGLE_SEGMENT_MAX as i32,
-                    ) as u16;
+                self.single_cfg.segment_chars = (c.segment_chars as i32 + d).clamp(
+                    gale_core::single::SINGLE_SEGMENT_MIN as i32,
+                    gale_core::single::SINGLE_SEGMENT_MAX as i32,
+                ) as u16;
+                self.save_single_cfg();
+            }
+            // 练习屏一键循环：+5 超过上限回绕到下限（一键可减，无需 − 按钮）
+            AuxAction::SingleSegCycle => {
+                let c = self.single_cfg.clamped();
+                let next = c.segment_chars as i32 + 5;
+                self.single_cfg.segment_chars = if next > gale_core::single::SINGLE_SEGMENT_MAX as i32
+                {
+                    gale_core::single::SINGLE_SEGMENT_MIN
+                } else {
+                    next as u16
+                };
+                self.save_single_cfg();
+            }
+            AuxAction::SingleTargetCycle => {
+                let c = self.single_cfg.clamped();
+                let next = c.target_keystroke_x10 as i32 + 5; // +0.5 击/秒
+                self.single_cfg.target_keystroke_x10 = if next > 120 { 10 } else { next as u16 };
                 self.save_single_cfg();
             }
             AuxAction::ShowFullAnalysis => self.show_full_analysis(),
             AuxAction::ShowHeatmap => self.show_heatmap(),
+            AuxAction::AnalysisAuto4 => {
+                let next = !self.analysis_auto4();
+                self.model
+                    .fields
+                    .insert("analysis_auto4".into(), next.to_string());
+                self.full_retry_at = 0;
+                self.full_fetch_hash = None;
+                self.fetch_full_analysis();
+            }
+            AuxAction::AnalysisFont(size) => {
+                self.model
+                    .fields
+                    .insert("analysis_font".into(), size.to_string());
+            }
+            AuxAction::AnalysisView => {
+                let next = if self.model.field("analysis_view") == "heatmap" {
+                    "article"
+                } else {
+                    "heatmap"
+                };
+                self.model
+                    .fields
+                    .insert("analysis_view".into(), next.into());
+                self.model.scroll = 0.;
+            }
+            AuxAction::AnalysisRetry => {
+                self.full_retry_at = 0;
+                self.full_fetch_hash = None;
+                self.fetch_full_analysis();
+            }
+            AuxAction::AnalysisCopy => {
+                self.draw();
+                let sc = gale_win::window::dpi_scale();
+                let (w, h) = self.win.client_size();
+                let (x, y, pw, ph) =
+                    modals::panel(Modal::FullAnalysis, w as f32 / sc, h as f32 / sc);
+                let crop = Some((
+                    (x * sc) as u32,
+                    (y * sc) as u32,
+                    (pw * sc) as u32,
+                    (ph * sc) as u32,
+                ));
+                match self.renderer.copy_bmp_to_clipboard(crop) {
+                    Ok(()) => self.toast("当前分析图片已复制"),
+                    Err(error) => self.toast(error),
+                }
+            }
         }
     }
     fn save_single_cfg(&mut self) {
@@ -1352,9 +1915,12 @@ impl App {
     }
     fn open(&mut self, m: Modal) {
         self.capture_fields();
+        if m == Modal::Preferences {
+            self.sync_preferences(true);
+        }
         self.model.open(m);
         gale_win::input_host::set_result_key_target(
-            matches!(m, Modal::Result | Modal::Report).then_some(self.win.hwnd),
+            matches!(m, Modal::Report).then_some(self.win.hwnd),
         );
         gale_win::window::set_focus_relay(m == Modal::None);
         if m != Modal::None {
@@ -1434,13 +2000,16 @@ impl App {
         let (_, _, _, ph) = modals::panel(self.model.modal, lw, lh);
         self.model.panel_scroll = self.model.panel_scroll.clamp(
             0.,
-            if matches!(self.model.modal, Modal::Result | Modal::Report) {
-                (650. - ph).max(0.)
+            if matches!(self.model.modal, Modal::Report) {
+                (secondary_panels::content_height(self.model.modal) - ph).max(0.)
             } else {
                 (ph - (lh - 48.).min(ph)).max(0.)
             },
         );
-        let (bw, fs, lheight) = ui::body_metrics(&self.sess, &self.cfg, lw);
+        let (bw, fs, base_lh) = ui::body_metrics(&self.sess, &self.cfg, lw);
+        let hints_visible = gale_core::rules::hints_effective(self.model.hints, self.model.race)
+            && self.cfg.hint_style != 2;
+        let lheight = ui::line_height_for_anchor(&self.cfg, fs, base_lh, hints_visible);
         let key = (self.generation, fs.to_bits(), bw.to_bits());
         if self.layout_key != key {
             self.layout = self
@@ -1472,10 +2041,44 @@ impl App {
             lh,
             now,
         );
+        if let Some((mx, my)) = self.hover {
+            if let Some(a) = modals::hit(&self.hits, mx, my) {
+                if a != Action::None {
+                    if let Some(h) = self.hits.iter().rev().find(|h| {
+                        h.action == a && mx >= h.x && mx < h.x + h.w && my >= h.y && my < h.y + h.h
+                    }) {
+                        if h.w <= 920. && h.h <= 56. && h.w > 12. {
+                            let palette = ui::tokens(&self.theme);
+                            let dark = palette.bg[0] * 0.2126
+                                + palette.bg[1] * 0.7152
+                                + palette.bg[2] * 0.0722
+                                < 0.5;
+                            let tint = if dark {
+                                [1., 1., 1., 0.065]
+                            } else {
+                                [0., 0., 0., 0.055]
+                            };
+                            let radius = (h.h * 0.25).clamp(3., 8.);
+                            ui::round(
+                                &mut f,
+                                h.x + 1.,
+                                h.y + 1.,
+                                (h.w - 2.).max(0.),
+                                (h.h - 2.).max(0.),
+                                radius,
+                                tint,
+                                None,
+                            );
+                        }
+                    }
+                }
+            }
+        }
         if let Err(e) = self.renderer.draw_frame(&f) {
             self.toast(format!("绘制失败：{e}"));
         }
-        if self.model.modal == Modal::None {
+        if self.model.modal == Modal::None && !self.compact_history() {
+            gale_win::window::set_focus_relay(true);
             // Keep a visible, focused native TSF host at the painted caret.
             // It has a real client surface; text itself is drawn by DirectWrite.
             let (cx, cy) = self.anim.caret.unwrap_or((32., 270.));
@@ -1497,6 +2100,10 @@ impl App {
                 dpi,
             );
             self.host.show();
+        }
+        if self.model.modal == Modal::None && self.compact_history() {
+            gale_win::window::set_focus_relay(false);
+            self.host.hide();
         }
         let specs = modals::fields(&self.model, lw, lh);
         if self.edit_epoch != self.model.modal_epoch {
@@ -1522,7 +2129,7 @@ impl App {
                 e.style(
                     ui::rgba(self.theme.get("次级背景色")),
                     ui::rgba(self.theme.get("窗体字体色")),
-                    12.,
+                    16.,
                 );
                 let top = z.y.max(8.);
                 let bottom = (z.y + z.h).min(lh - 8.);
@@ -1535,7 +2142,7 @@ impl App {
         }
     }
     fn analyze(&mut self) {
-        if self.analyzing || self.analyzed == self.generation {
+        if self.analyzing || self.full_analyzing || self.analyzed == self.generation {
             return;
         }
         self.analyzing = true;
@@ -1564,7 +2171,10 @@ impl App {
             self.full_words_of.clear();
         }
         self.last_analyze_whole = whole_book;
-        let hints = gale_core::rules::hints_effective(self.sess.rules.word_hints, self.model.race);
+        // 【减法 2026-11-09】词提（文章模式的词级提示）整体下线：只有单字
+        // 练习保留字提。文章模式一律不请求词提数据、不显示提示。
+        let hints = self.sess.source == session::SessionSource::Single
+            && gale_core::rules::hints_effective(self.sess.rules.word_hints, self.model.race);
         let single = self.sess.source == session::SessionSource::Single || self.cfg.hint_style == 1;
         // 缓存仅当：有词提数据 且 schema 版本未变 且 正文未变（换书/清洗自动失效）。
         let known_version = if self.full_words.is_empty()
@@ -1607,7 +2217,18 @@ impl App {
                     if g == self.generation {
                         match r {
                             Ok(v) => {
+                                if let Some(keys) = v["selection_keys"].as_array() {
+                                    let keys: Vec<_> = keys
+                                        .iter()
+                                        .filter_map(|v| {
+                                            v.as_u64().filter(|v| *v <= 255).map(|v| v as u32)
+                                        })
+                                        .collect();
+                                    gale_win::input_host::set_selection_keys(&keys);
+                                }
                                 self.model.schema = v["schema"].as_str().unwrap_or("").into();
+                                self.model.max_code_length =
+                                    v["max_code_length"].as_u64().unwrap_or(4) as usize;
                                 self.model.schema_ver =
                                     v["schema_ver"].as_str().unwrap_or("").into();
                                 // 整改14：words 是全文坐标；缓存命中（words_unchanged）
@@ -1630,10 +2251,7 @@ impl App {
                                                     .iter()
                                                     .copied()
                                                     .eq(word.text.chars())
-                                                && word
-                                                    .code
-                                                    .as_ref()
-                                                    .is_none_or(|c| c.len() <= 32)
+                                                && word.code.as_ref().is_none_or(|c| c.len() <= 32)
                                                 && word.tail.len() <= 16
                                         })
                                         .collect();
@@ -1682,18 +2300,24 @@ impl App {
                                 }
                             }
                             Err(e) => {
-                                self.model.words.clear();
-                                self.model.status = format!("词提暂不可用 · {e}");
+                                // Keep showing the prefetched whole-book hints
+                                // when the service is temporarily unavailable.
+                                if self.refill_from_full_words() {
+                                    self.model.status =
+                                        format!("词提请求失败 · 已用本地全文缓存 · {e}");
+                                } else {
+                                    self.model.words.clear();
+                                    self.model.status = format!("词提暂不可用 · {e}");
+                                }
                             }
                         }
                         // CTF 自检失败的持续警示：任何状态文案都带上前缀（任务 7）
                         if self.tsf_broken {
-                            self.model.status = format!(
-                                "TSF 输入法可能不可用 · {}",
-                                self.model.status
-                            );
+                            self.model.status =
+                                format!("TSF 输入法可能不可用 · {}", self.model.status);
                         }
                     }
+                    self.fetch_full_analysis();
                     self.analyze();
                 }
                 Bg::Chats(v) => {
@@ -1711,15 +2335,43 @@ impl App {
                         .as_ref()
                         .and_then(|t| self.chats.iter().position(|c| &c.title == t));
                     if self.chats.is_empty() {
-                        self.toast("未检测到 QQ：请打开并登录 QQ 后重试");
+                        let panel = qq_bridge::main_panel().is_some();
+                        let msg = if panel {
+                            "已找到 QQ 主面板，但 UIA 未返回会话列表；请重启 QQ 或打开群聊窗口后重试"
+                        } else {
+                            "未检测到 QQ：请打开并登录 QQ 后重试"
+                        };
+                        self.model.status = msg.into();
+                        self.toast(msg);
                     }
                 }
-                Bg::FullAnalysis(g, v) => {
-                    // 整改13：旧版服务无 full_analysis 字段（None）=无此功能，静默
-                    if g == self.generation {
-                        self.sess.full_analysis = v;
-                        self.snapshot_dirty = true;
+                Bg::FullAnalysis(key, result) => {
+                    self.full_analyzing = false;
+                    self.model
+                        .fields
+                        .insert("analysis_loading".into(), "false".into());
+                    if key == self.analysis_key() {
+                        match result {
+                            Ok(fa) => {
+                                self.model.schema = fa.schema.clone();
+                                self.model.schema_ver = fa.schema_ver.clone();
+                                self.sess.full_analysis = Some(fa);
+                                self.full_fetch_hash = Some(self.analysis_key());
+                                self.full_retry_at = 0;
+                                self.model.fields.remove("analysis_error");
+                            }
+                            Err(error) => {
+                                self.model.fields.insert("analysis_failed_key".into(), key);
+                                self.full_retry_at = u64::MAX;
+                                self.model.fields.insert("analysis_error".into(), error);
+                            }
+                        }
+                    } else {
+                        self.full_retry_at = 0;
+                        self.fetch_full_analysis();
                     }
+                    self.analyze();
+                    gale_win::window::request_frame();
                 }
                 Bg::Article(g, bound, revision, r) => {
                     self.capture_fields();
@@ -1786,7 +2438,12 @@ impl App {
                 Bg::Saved(r) => {
                     if let Err(e) = r {
                         self.snapshot_dirty = true;
-                        self.toast(format!("保存失败：{e}"));
+                        // A locked/denied data dir otherwise re-toasts every
+                        // few seconds forever; keep the error visible but calm.
+                        if self.ms().saturating_sub(self.save_toast_at) > 30_000 {
+                            self.save_toast_at = self.ms();
+                            self.toast(format!("保存失败：{e}"));
+                        }
                     }
                 }
                 Bg::RuleTest(g, r) => {
@@ -2078,6 +2735,13 @@ impl App {
         self.snapshot();
     }
     fn score_text(&self) -> Option<String> {
+        if self.model.modal == Modal::Report {
+            return self
+                .model
+                .latest
+                .as_ref()
+                .map(|record| self.format_record(record));
+        }
         if self.sess.phase != Phase::Done || !self.sess.recorded {
             return None;
         }
@@ -2085,7 +2749,7 @@ impl App {
             .results
             .get(self.sess.current_index())
             .and_then(Option::as_ref)
-            .map(format_score_report)
+            .map(|record| self.format_record(record))
     }
     fn race_text(&self) -> String {
         let a = self.sess.aggregate();
@@ -2100,7 +2764,7 @@ impl App {
             a.speed
         );
         for r in self.sess.results.iter().flatten() {
-            s.push_str(&format_score_report(r));
+            s.push_str(&self.format_record(r));
             s.push('\n');
         }
         s
@@ -2117,8 +2781,9 @@ impl App {
         // 先行解码执行，不再走后面的公共分支（真实 Theme 动作不受影响）。
         // 整改9收口：词提四色循环选色（aux 前缀带参数，不进 AuxAction 枚举）。
         if let Action::Theme(s) = &a {
-            if let Some(key) =
-                s.strip_prefix(AUX_PREFIX).and_then(|c| c.strip_prefix("hint_color:"))
+            if let Some(key) = s
+                .strip_prefix(AUX_PREFIX)
+                .and_then(|c| c.strip_prefix("hint_color:"))
             {
                 if self.cycle_hint_color(key) {
                     gale_win::window::request_frame();
@@ -2162,7 +2827,6 @@ impl App {
                     | Action::Restart
                     | Action::Next
                     | Action::ToggleRace
-                    | Action::LoadText
                     | Action::LoadClipboard
                     | Action::LoadFile
                     | Action::LoadBook(_)
@@ -2178,9 +2842,7 @@ impl App {
         // 整改5：F1-F4 跳段/取文不再弹"是否中断打文"确认——直接执行。
         // 打字中触发载文件/读群文时，先把未完成段按中断处理（jump 复位本段），
         // 与原确认后路径的语义一致；Esc 停表语义不变（主循环 Escape 分支）。
-        if self.sess.phase == Phase::Typing
-            && matches!(a, Action::LoadFile | Action::ReadGroup)
-        {
+        if self.sess.phase == Phase::Typing && matches!(a, Action::LoadFile | Action::ReadGroup) {
             self.sess.jump(self.sess.index);
             self.reset_host();
         }
@@ -2317,6 +2979,8 @@ impl App {
             }
             Action::HintStyle(style) => {
                 self.cfg.hint_style = style.min(2);
+                self.full_words.clear();
+                self.full_words_ver.clear();
                 self.generation = self.generation.wrapping_add(1);
                 self.model.words.clear();
                 self.analyze();
@@ -2407,47 +3071,39 @@ impl App {
                 }
             }
             Action::ToggleHints => {
-                let mut r = self.sess.rules.clone();
-                r.word_hints = !r.word_hints;
-                match self.sess.set_rules(r) {
-                    Ok(()) => {
-                        self.model.hints = self.sess.rules.word_hints;
-                        self.generation = self.generation.wrapping_add(1);
-                        self.model.words.clear();
-                        self.analyze();
-                        self.save_config();
+                // 【减法 2026-11-09】词提已下线；本开关只服务单字练习的字提。
+                if self.sess.source != session::SessionSource::Single {
+                    self.toast("词提已移除（单字练习的字提不受影响）");
+                } else {
+                    let mut r = self.sess.rules.clone();
+                    r.word_hints = !r.word_hints;
+                    match self.sess.set_rules(r) {
+                        Ok(()) => {
+                            self.model.hints = self.sess.rules.word_hints;
+                            self.generation = self.generation.wrapping_add(1);
+                            self.model.words.clear();
+                            self.analyze();
+                            self.save_config();
+                        }
+                        Err(e) => self.toast(e),
                     }
-                    Err(e) => self.toast(e),
                 }
             }
             Action::LoadClipboard => match unsafe { gale_win::clipboard_bridge::read_text() } {
                 Some(t) => {
+                    // 【减法 2026-11-09】载文窗退役：剪贴板内容直接开打。
                     self.model.fields.insert("load_text".into(), t);
-                    if self.model.modal == Modal::Load {
-                        self.model.modal_epoch += 1;
-                    } else {
-                        self.load_text();
-                    }
+                    self.load_text();
                 }
                 None => self.toast("剪贴板为空或不可用"),
             },
-            Action::LoadText => self.load_text(),
             Action::AcceptDraft => {
                 if let Some((_, text)) = self.pending_draft.take() {
-                    self.open(Modal::Load);
-                    self.model.load_tab = 0;
                     self.model.fields.insert("load_text".into(), text);
                     self.model.pending_source.clear();
                     self.model.modal_epoch += 1;
+                    self.load_text();
                 }
-            }
-            Action::LoadTab(tab) => {
-                self.model.load_tab = tab;
-                self.model.modal_epoch += 1;
-            }
-            Action::LoadEdit => {
-                self.model.load_editing = !self.model.load_editing;
-                self.model.modal_epoch += 1;
             }
             Action::LoadBook(i) => {
                 if let Some(b) = self.library.books().get(i) {
@@ -2546,6 +3202,61 @@ impl App {
                     self.copy(&s);
                 }
             }
+            Action::ToggleAutoSend => {
+                self.cfg.auto_send_score = !self.cfg.auto_send_score;
+                self.save_config();
+                self.toast(if self.cfg.auto_send_score {
+                    "打完自动发成绩：开"
+                } else {
+                    "打完自动发成绩：关（仅复制）"
+                });
+            }
+            Action::SendScoreToGroup => match self
+                .model
+                .bound
+                .and_then(|i| self.chats.get(i).cloned())
+            {
+                Some(chat) => match self.score_text() {
+                    Some(s) => match qq_bridge::send_message_enhanced(&chat, &s) {
+                        Ok(()) => self.toast(format!("成绩已发送到「{}」", chat.title)),
+                        Err(e) => self.toast(e),
+                    },
+                    None => self.toast("当前没有可发送的成绩"),
+                },
+                None => {
+                    self.toast("未绑定群，请先选择");
+                    self.open(Modal::Groups);
+                }
+            },
+            Action::PostArticle => match self
+                .model
+                .bound
+                .and_then(|i| self.chats.get(i).cloned())
+            {
+                Some(chat) => {
+                    let seg = self.sess.current_segment();
+                    let chars = seg.text.chars().count();
+                    let mark = if seg.mark.is_empty() {
+                        (self.sess.index + 1).to_string()
+                    } else {
+                        seg.mark.clone()
+                    };
+                    // 发文格式（跟打码生态通用）：[难度]标题 [字数]\n正文\n-----第N段-晴发文
+                    let title = crate::ui::elide(&self.sess.title, 24);
+                    let text = format!(
+                        "[跟打]{} [{}字]\n{}\n-----第{}段-晴发文",
+                        title, chars, seg.text, mark
+                    );
+                    match qq_bridge::send_message_enhanced(&chat, &text) {
+                        Ok(()) => self.toast(format!("第{mark}段已发文到「{}」", chat.title)),
+                        Err(e) => self.toast(e),
+                    }
+                }
+                None => {
+                    self.toast("未绑定群，请先选择");
+                    self.open(Modal::Groups);
+                }
+            },
             Action::ExportImage => {
                 if let Some(p) = file_dialog(self.win.hwnd, true, "bmp") {
                     match self.renderer.save_bmp(&p) {
@@ -2559,26 +3270,27 @@ impl App {
                     self.qq_busy = true;
                     // 整改7：QQ 读取屏扫描节流锚点（开屏 10s 后自动刷新用）
                     self.qq_scan_at = self.ms();
-                    let tx = self.tx.clone();
-                    let hwnd = self.win.hwnd;
-                    std::thread::spawn(move || {
-                        unsafe {
-                            let _ = windows::Win32::System::Com::CoInitializeEx(
-                                None,
-                                windows::Win32::System::Com::COINIT_MULTITHREADED,
-                            );
-                        }
-                        // 整改7：主面板会话列表 ∪ 独立聊天窗，按标题去重（主面板优先）
-                        let chats = qq_bridge::list_sessions_merged();
-                        let _ = tx.send(Bg::Chats(chats));
-                        wake(hwnd);
-                    });
+                    // Run on the UI thread: QQ's Chromium accessibility tree is
+                    // only fully materialised for an STA client with a message
+                    // pump. A bare worker thread sees just the D3D child.
+                    let chats = qq_bridge::list_sessions_merged();
+                    let _ = self.tx.send(Bg::Chats(chats));
+                    gale_win::window::request_frame();
                 }
             }
             Action::SelectGroup(i) => {
                 if i < self.chats.len() {
                     self.model.bound = Some(i);
-                    self.toast("已选择会话。请在 QQ 手动打开该群后读取");
+                    // 【群三件套】选群即切换：能自动切就切，切不动再让用户点。
+                    let chat = self.chats[i].clone();
+                    if qq_bridge::focus_chat(&chat) {
+                        self.toast(format!("已切到「{}」· F4 读文 / 打完自动发成绩", chat.title));
+                    } else {
+                        self.toast(format!(
+                            "已绑定「{}」· 请在 QQ 点开该群后 F4 读文",
+                            chat.title
+                        ));
+                    }
                 }
             }
             Action::ReadGroup => {
@@ -2586,24 +3298,19 @@ impl App {
                     self.toast("QQ 正在读取，请稍候");
                 } else if let Some(c) = self.model.bound.and_then(|i| self.chats.get(i)).cloned() {
                     self.qq_busy = true;
-                    let tx = self.tx.clone();
-                    let hwnd = self.win.hwnd;
+                    // Same apartment rule as ScanGroups: Chromium's UIA tree is
+                    // only complete for the UI STA thread, not for an MTA worker.
+                    let r = uia_bridge::read_current_article(c.hwnd, &c.title);
                     let g = self.generation;
                     let bound = self.model.bound;
                     let revision = self.draft_revision;
-                    std::thread::spawn(move || {
-                        unsafe {
-                            let _ = windows::Win32::System::Com::CoInitializeEx(
-                                None,
-                                windows::Win32::System::Com::COINIT_MULTITHREADED,
-                            );
-                        }
-                        let r = uia_bridge::read_current_article(c.hwnd, &c.title);
-                        let _ = tx.send(Bg::Article(g, bound, revision, r));
-                        wake(hwnd);
-                    });
+                    let _ = self.tx.send(Bg::Article(g, bound, revision, r));
+                    gale_win::window::request_frame();
                 } else {
-                    self.toast("先按 F6 扫描并选择 QQ 会话，或手动复制群文");
+                    // 【减法 2026-11-09】没绑群就直接弹选群面板（用户拍板：
+                    // F4 群载文、没选群就弹出选群）。
+                    self.toast("未绑定群，请选择要跟打的群");
+                    self.open(Modal::Groups);
                 }
             }
             Action::OnlineLogin => {
@@ -2999,27 +3706,22 @@ fn local_json(
 mod persistence_tests {
     use super::*;
     #[test]
-    fn completed_round_continues_only_from_result_or_typing_view() {
+    fn completed_round_continues_only_from_typing_view() {
         let panels = [
             Modal::None,
-            Modal::Result,
-            Modal::Load,
             Modal::Groups,
             Modal::Appearance,
             Modal::Report,
             Modal::Online,
             Modal::Rules,
             Modal::Confirm,
+            Modal::Library,
         ];
         for panel in panels {
             for key in [CommandKey::Enter, CommandKey::Space] {
                 assert_eq!(
                     completed_segment_action(key, true, panel),
-                    if matches!(panel, Modal::None | Modal::Result) {
-                        Some(Action::Next)
-                    } else {
-                        None
-                    },
+                    (panel == Modal::None).then_some(Action::Next),
                     "panel={panel:?} key={key:?}"
                 );
                 assert_eq!(completed_segment_action(key, false, panel), None);

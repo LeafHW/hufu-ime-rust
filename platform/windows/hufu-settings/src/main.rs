@@ -721,6 +721,18 @@ unsafe extern "system" fn handler_invoke(
         KIND_CONTROLLER => {
             let hr = p1 as i32;
             if hr < 0 || p2.is_null() {
+                // 【2026-11-09】ERROR_BUSY(0x800700AA)：UDF 被残留 WebView2
+                // 浏览器进程短暂占用（会话注销/重启后的孤儿进程，实测数分钟
+                // 内自行消亡）。不弹失败框，延 1.8s 复用 env 重试（最多 2 次）。
+                if hr as u32 == 0x8007_00AA && (*app).busy_retry < 2 {
+                    (*app).busy_retry += 1;
+                    (*app).log(&format!(
+                        "controller creation busy (ERROR_BUSY); retry {} in 1.8s",
+                        (*app).busy_retry
+                    ));
+                    SetTimer((*app).hwnd, 9, 1800, null());
+                    return S_OK;
+                }
                 fail_close(
                     app,
                     &format!("controller creation failed hr=0x{:08X}", hr as u32),
@@ -958,6 +970,10 @@ struct App {
     ///（约 600ms），否则窗口抢不到前台时会每 120ms 无限重试并反复
     /// 合成 Alt 按键，干扰用户其他窗口。
     focus_retry: u32,
+    /// 【2026-11-09】controller ERROR_BUSY(0x800700AA) 已重试次数：UDF 被残留
+    /// WebView2 浏览器进程短暂占用（注销/重启后的孤儿进程）时延 1.8s 重试，
+    /// 最多 2 次，不再直接弹失败框。
+    busy_retry: u32,
     /// 【2026-11-03 浅色黑边】7px 非客户区边框的填充色（COLORREF 0x00BBGGRR）：
     /// 页面底色 / 侧栏底色，由页面 win:theme 消息同步；默认按深色主题。
     frame_bg: u32,
@@ -1004,6 +1020,19 @@ fn log_line(path: &Path, msg: &str) {
     );
     if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
         let _ = f.write_all(line.as_bytes());
+    } else {
+        // 【2026-11-09】目标日志写不进（目录锁/权限异常）时落到 exe 旁，
+        // 消灭"弹了错却零日志"的取证黑洞（0x800700AA 排查时失败运行
+        // 未在主日志留下任何一行）。
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                let _ = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(dir.join("hufu-settings-fallback.log"))
+                    .and_then(|mut f| f.write_all(line.as_bytes()));
+            }
+        }
     }
 }
 
@@ -1422,6 +1451,33 @@ unsafe extern "system" fn wndproc(
             return 0;
         }
         WM_TIMER => {
+            if wparam == 9 {
+                // 【2026-11-09】controller ERROR_BUSY 重试：复用已建 env 重新发起
+                KillTimer(hwnd, 9);
+                let app = app_ptr(hwnd);
+                if !app.is_null() && (*app).controller.is_null() && !(*app).env.is_null() {
+                    let controller_handler =
+                        handler_new(KIND_CONTROLLER, IID_CONTROLLER_HANDLER, app);
+                    let hr2 = env_create_controller((*app).env, hwnd, controller_handler);
+                    (*app).log(&format!(
+                        "busy retry: CreateCoreWebView2Controller -> hr=0x{:08X}",
+                        hr2 as u32
+                    ));
+                    if hr2 < 0 && hr2 as u32 != 0x8007_00AA {
+                        fail_close(app, "CreateCoreWebView2Controller call failed");
+                    } else if hr2 < 0 {
+                        // 同步调用仍返回 BUSY（不走回调臂）：自己计数并再排队，
+                        // 超限才认输。
+                        if (*app).busy_retry >= 2 {
+                            fail_close(app, "CreateCoreWebView2Controller call failed");
+                        } else {
+                            (*app).busy_retry += 1;
+                            SetTimer(hwnd, 9, 1800, null());
+                        }
+                    }
+                }
+                return 0;
+            }
             if wparam == 8 {
                 // 【2026-11-05】错误页自动恢复：每 2s 重新探测端口，命中即导航
                 let app = app_ptr(hwnd);
@@ -2177,6 +2233,26 @@ fn main() -> std::process::ExitCode {
 }
 
 unsafe fn real_main() -> i32 {
+    // 【2026-11-09 排障】boot 探针：exe 旁固定路径、无任何依赖的最早心跳。
+    // 若 server 拉起的实例连这行都不写 → 进程死于 Rust main 之前（加载器/
+    // AV/策略），排查方向完全不同。正常启动也写（一行开销换确定性）。
+    {
+        let boot = exe_dir().join("hufu-settings-boot.log");
+        let mut st = SYSTEMTIME::default();
+        GetLocalTime(&mut st);
+        let cwd = std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|e| format!("<{e}>"));
+        let line = format!(
+            "[{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}] boot pid={} ppid=unknown cwd={}\r\n",
+            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+            std::process::id(),
+            cwd
+        );
+        if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&boot) {
+            let _ = f.write_all(line.as_bytes());
+        }
+    }
     let exe_dir = exe_dir();
     let mut args = parse_args(&exe_dir);
 
@@ -2185,6 +2261,15 @@ unsafe fn real_main() -> i32 {
     }
     let user_data = absolutize(&args.user_data);
     if let Err(err) = fs::create_dir_all(&user_data) {
+        // 【2026-11-09 排障】return 2 前也写一份到 exe 旁 boot 日志——
+        // 此前该错误只写 args.log，若该路径本身异常则取证全灭。
+        {
+            let boot = exe_dir.join("hufu-settings-boot.log");
+            let line = format!("create user data dir FAILED: {err} (target={})\r\n", user_data.display());
+            if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&boot) {
+                let _ = f.write_all(line.as_bytes());
+            }
+        }
         log_line(
             &args.log,
             &format!("failed to create user data dir {}: {err}", user_data.display()),
@@ -2378,6 +2463,7 @@ unsafe fn real_main() -> i32 {
         error_mode: false,
         error_nav_pending: false,
         focus_retry: 0,
+        busy_retry: 0,
         frame_bg: 0x0017_1413,   // #131417 (dark --bg)
         frame_side: 0x001c_1817, // #17181c (dark --bg2)
         close_state: 0,

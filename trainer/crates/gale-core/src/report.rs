@@ -389,6 +389,8 @@ mod tests {
             commit_groups: 0,
             ding_count: 0,
             select_count: 0,
+            word_rate: None,
+            retype_count: 0,
             input_method: String::new(),
             time_breakdown: crate::stats::TimeBreakdown::default(),
             jj: 5.0,

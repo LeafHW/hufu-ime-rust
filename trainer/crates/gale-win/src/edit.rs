@@ -19,9 +19,14 @@ impl NativeEdit {
     pub fn new(parent: isize, multiline: bool, password: bool) -> windows::core::Result<Self> {
         unsafe {
             crate::input_host::load_library();
-            let mut style = WS_CHILD | WS_TABSTOP | WINDOW_STYLE(0x80); // ES_AUTOHSCROLL
+            let mut style = WS_CHILD | WS_TABSTOP;
             if multiline {
+                // ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN. Horizontal
+                // auto-scroll disables wrapping in RichEdit; only single-line
+                // fields should carry ES_AUTOHSCROLL.
                 style |= WS_VSCROLL | WINDOW_STYLE(0x4 | 0x40 | 0x1000);
+            } else {
+                style |= WINDOW_STYLE(0x80); // ES_AUTOHSCROLL
             }
             if password {
                 style |= WINDOW_STYLE(0x20);
@@ -42,6 +47,11 @@ impl NativeEdit {
             )?;
             SendMessageW(h, 1228, WPARAM(0x10000), LPARAM(0x10000));
             SendMessageW(h, 0x435, WPARAM(0), LPARAM(100_000));
+            if multiline {
+                // EM_SETTARGETDEVICE: null device and zero width wrap to the
+                // edit control's current client area, including after resize.
+                SendMessageW(h, 0x448, WPARAM(0), LPARAM(0));
+            }
             if password {
                 SendMessageW(h, 0xCC, WPARAM(0x25CF), LPARAM(0));
             }

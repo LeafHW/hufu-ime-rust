@@ -1425,7 +1425,7 @@ mod tests {
         assert!(err.contains("用户名已被注册"), "{err}");
         assert!(c.account().is_none()); // 失败不留半截会话
         assert_eq!(c.transport.requests().len(), 1); // 不触发自动登录
-        // 客户端先拦空字段
+                                                     // 客户端先拦空字段
         let t2 = ScriptableMockTransport::new();
         let mut c2 = WenlaiHttpClient::new("https://x.com", t2);
         assert!(c2.register(" ", "pw", "a@b.com", "1").is_err());

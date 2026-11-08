@@ -53,6 +53,25 @@ pub struct Config {
     pub hint_style: u8,
     #[serde(default = "default_motion_level")]
     pub motion_level: u8,
+    #[serde(default = "yes")]
+    pub hint_show_code: bool,
+    #[serde(default = "yes")]
+    pub hint_show_rank: bool,
+    #[serde(default = "yes")]
+    pub hint_color_words: bool,
+    #[serde(default)]
+    pub hint_underline: bool,
+    #[serde(default)]
+    pub hint_word_bg: bool,
+    #[serde(default = "hint_font_default")]
+    pub hint_font_size: f32,
+    #[serde(default = "yes")]
+    pub score_auto_copy: bool,
+    #[serde(default)]
+    pub score_template: String,
+    #[serde(default = "score_fields_default")]
+    pub score_fields: String,
+
     /// 窗口材质
     pub material: Material,
     /// 背景不透明度 10-100
@@ -100,6 +119,16 @@ pub struct Config {
     pub wenlai_domain: String,
 }
 
+fn yes() -> bool {
+    true
+}
+fn hint_font_default() -> f32 {
+    14.
+}
+fn score_fields_default() -> String {
+    "segment,speed,character_accuracy,key_accuracy,code_len,word_rate,select_count,retype_count,chars,time,keys,backspaces,wrong,signature".into()
+}
+
 fn default_motion_level() -> u8 {
     2
 }
@@ -116,13 +145,22 @@ impl Default for Config {
             font_size: 36.0,
             hint_style: 0,
             motion_level: 2,
+            hint_show_code: true,
+            hint_show_rank: true,
+            hint_color_words: true,
+            hint_underline: false,
+            hint_word_bg: false,
+            hint_font_size: 14.,
+            score_auto_copy: true,
+            score_template: String::new(),
+            score_fields: score_fields_default(),
             material: Material::Solid,
             opacity: 100,
             seg_chars: 100,
             auto_next: 0,
             group_watch: false,
             group_id: String::new(),
-            auto_send_score: false,
+            auto_send_score: true,
             score_signature: "虎符跟打".into(),
             theme: "default".into(),
             color_overrides: BTreeMap::new(),
@@ -205,6 +243,20 @@ impl Config {
             },
             hint_style: get("hint_style", "0").parse::<u8>().unwrap_or(0).min(2),
             motion_level: get("motion_level", "2").parse::<u8>().unwrap_or(2).min(3),
+            hint_show_code: get("hint_show_code", "true") == "true",
+            hint_show_rank: get("hint_show_rank", "true") == "true",
+            hint_color_words: get("hint_color_words", "true") == "true",
+            hint_underline: get("hint_underline", "false") == "true",
+            hint_word_bg: get("hint_word_bg", "false") == "true",
+            hint_font_size: get("hint_font_size", "14")
+                .parse::<f32>()
+                .ok()
+                .filter(|v| v.is_finite())
+                .unwrap_or(14.)
+                .clamp(14., 28.),
+            score_auto_copy: get("score_auto_copy", "true") == "true",
+            score_template: get("score_template", ""),
+            score_fields: get("score_fields", &d.score_fields),
             opacity: get("opacity", &d.opacity.to_string())
                 .parse()
                 .unwrap_or(d.opacity),
@@ -216,7 +268,7 @@ impl Config {
                 .unwrap_or(d.auto_next),
             group_watch: get("group_watch", "false") == "true",
             group_id: get("group_id", &d.group_id),
-            auto_send_score: get("auto_send_score", "false") == "true",
+            auto_send_score: get("auto_send_score", "true") == "true",
             score_signature: get("score_signature", &d.score_signature),
             theme: get("theme", &d.theme),
             color_overrides: map
@@ -307,6 +359,19 @@ impl Config {
         m.insert("font_size".into(), self.font_size.to_string());
         m.insert("hint_style".into(), self.hint_style.to_string());
         m.insert("motion_level".into(), self.motion_level.to_string());
+        for (key, value) in [
+            ("hint_show_code", self.hint_show_code),
+            ("hint_show_rank", self.hint_show_rank),
+            ("hint_color_words", self.hint_color_words),
+            ("hint_underline", self.hint_underline),
+            ("hint_word_bg", self.hint_word_bg),
+            ("score_auto_copy", self.score_auto_copy),
+        ] {
+            m.insert(key.into(), value.to_string());
+        }
+        m.insert("hint_font_size".into(), self.hint_font_size.to_string());
+        m.insert("score_template".into(), self.score_template.clone());
+        m.insert("score_fields".into(), self.score_fields.clone());
         m.insert("material".into(), format!("{:?}", self.material));
         m.insert("opacity".into(), self.opacity.to_string());
         m.insert("seg_chars".into(), self.seg_chars.to_string());
@@ -521,5 +586,31 @@ mod tests {
             Some("33534a")
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+    #[test]
+    fn trainer_preferences_preserve_multiline_templates_and_independent_switches() {
+        let mut cfg = Config::default();
+        cfg.hint_show_code = false;
+        cfg.hint_show_rank = true;
+        cfg.hint_word_bg = true;
+        cfg.hint_font_size = 22.;
+        cfg.score_auto_copy = false;
+        cfg.score_template = "第{segment}段\n速度 {speed} \"quote\"".into();
+        cfg.score_fields = "segment,word_rate,retype".into();
+        cfg.color_overrides
+            .insert("词提三字全码色".into(), "123aef".into());
+        let loaded = Config::from_toml_text(&cfg.to_toml_text()).unwrap();
+        assert!(!loaded.hint_show_code && loaded.hint_show_rank && loaded.hint_word_bg);
+        assert_eq!(loaded.hint_font_size, 22.);
+        assert!(!loaded.score_auto_copy);
+        assert_eq!(loaded.score_template, cfg.score_template);
+        assert_eq!(loaded.score_fields, cfg.score_fields);
+        assert_eq!(loaded.color_overrides, cfg.color_overrides);
+        assert_eq!(
+            Config::from_toml_text("hint_font_size = 99")
+                .unwrap()
+                .hint_font_size,
+            28.
+        );
     }
 }

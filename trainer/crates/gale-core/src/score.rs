@@ -69,6 +69,13 @@ pub struct ScoreRecord {
     /// 选重次数（候选选重键完成提交，20ms 键-提交配对；成绩单 `选重N`）。旧记录缺省 0。
     #[serde(default)]
     pub select_count: u32,
+    /// 打词率 %（0–100）：按上屏组的非标点字符归类，回改会撤销被删字符。
+    /// None 表示旧记录或恢复快照缺少上屏归类数据，不能用 0 冒充。
+    #[serde(default)]
+    pub word_rate: Option<f64>,
+    /// 同一正文第几次重打，首打为 0；以开打而非完成计次。
+    #[serde(default)]
+    pub retype_count: u32,
     /// 输入法名（晴发文 leaderboard 字段 input_method；由输入层在结算时注入）
     #[serde(default)]
     pub input_method: String,
@@ -110,7 +117,10 @@ impl DifficultyTag {
         if label.is_empty() {
             return None;
         }
-        let score = it.next().and_then(|s| s.parse::<f64>().ok()).filter(|v| v.is_finite());
+        let score = it
+            .next()
+            .and_then(|s| s.parse::<f64>().ok())
+            .filter(|v| v.is_finite());
         Some(Self { label, score })
     }
 }
@@ -159,6 +169,8 @@ impl ScoreRecord {
             commit_groups: stats.commit_groups,
             ding_count: stats.ding_count,
             select_count: stats.select_count,
+            word_rate: None,
+            retype_count: 0,
             input_method: String::new(),
             time_breakdown: stats.time_breakdown,
             jj: stats.jj,
@@ -339,7 +351,7 @@ pub fn format_score_report(r: &ScoreRecord) -> String {
 /// 用时（晴 trim_timespan 口径，typesunny-stats.md:211）：
 /// TimeSpan 文本裁到厘秒（去小数第3位起，**截断不四舍五入**）→ 去前导 "00:"。
 /// 83.45s → "1:23.45"；723.45s → "12:03.45"；1h+ → "1:02:03.45"。
-fn fmt_duration(ms: u64) -> String {
+pub(crate) fn fmt_duration(ms: u64) -> String {
     let h = ms / 3_600_000;
     let m = (ms % 3_600_000) / 60_000;
     let sec = (ms % 60_000) / 1000;
@@ -486,20 +498,55 @@ pub fn durable_replace(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     file.write_all(bytes)?;
     file.sync_all()?;
     drop(file);
-    let backup = backup_path(path);
-    if path.exists() {
-        if backup.exists() {
-            std::fs::remove_file(&backup)?;
+    // A fixed .bak can be held by an editor/AV/another agent; when that
+    // happens the old code failed the whole save with "Access denied".
+    // Use a per-process backup name if the canonical one cannot be replaced,
+    // and fall back to an in-place write if the new file cannot be renamed in.
+    let canonical = backup_path(path);
+    let backup = if !canonical.exists() {
+        canonical
+    } else if std::fs::remove_file(&canonical).is_ok() {
+        canonical
+    } else {
+        let mut name = path.as_os_str().to_os_string();
+        name.push(format!(".bak-{}", std::process::id()));
+        PathBuf::from(name)
+    };
+    let had_original = path.exists();
+    let moved = if had_original {
+        std::fs::rename(path, &backup).is_ok()
+    } else {
+        true
+    };
+    if moved {
+        match std::fs::rename(&staged, path) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                if !path.exists() && backup.exists() {
+                    let _ = std::fs::rename(&backup, path);
+                }
+                // Some filter drivers deny rename-over but allow truncate.
+                if let Ok(mut direct) = std::fs::File::create(path) {
+                    if direct.write_all(bytes).is_ok() && direct.sync_all().is_ok() {
+                        let _ = std::fs::remove_file(&staged);
+                        return Ok(());
+                    }
+                }
+                return Err(error);
+            }
         }
-        std::fs::rename(path, &backup)?;
     }
-    if let Err(error) = std::fs::rename(&staged, path) {
-        if !path.exists() && backup.exists() {
-            let _ = std::fs::rename(&backup, path);
+    // Rename to backup failed (locked backup or target). Try a direct write.
+    if let Ok(mut direct) = std::fs::File::create(path) {
+        if direct.write_all(bytes).is_ok() && direct.sync_all().is_ok() {
+            let _ = std::fs::remove_file(&staged);
+            return Ok(());
         }
-        return Err(error);
     }
-    Ok(())
+    Err(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        format!("无法写入 {}（目标与备份均被占用）", path.display()),
+    ))
 }
 
 /// 统计有效性门槛（E4）：字数 <5 的段不入汇总（测试段/误触段），原始记录保留。
@@ -601,7 +648,11 @@ mod tests {
     /// 赛制标记三态（P1-3）：【赛制】/【非赛制】/【非赛制】[词提开]；后缀 ·未完成·清洗·粘贴 保持原样。
     #[test]
     fn report_full_string_race_badges() {
-        fn meta(mode: crate::rules::TrainingMode, word_hints: bool, complete: bool) -> crate::rules::RoundMetadata {
+        fn meta(
+            mode: crate::rules::TrainingMode,
+            word_hints: bool,
+            complete: bool,
+        ) -> crate::rules::RoundMetadata {
             crate::rules::RoundMetadata {
                 mode,
                 text_hash: String::new(),
@@ -624,20 +675,19 @@ mod tests {
         assert!(format_score_report(&r).ends_with("总键数208  【非赛制】  虎符跟打"));
         // 练习 + 词提开
         r.round = Some(meta(TrainingMode::Practice, true, true));
-        assert!(
-            format_score_report(&r)
-                .ends_with("总键数208  【非赛制】[词提开]  虎符跟打")
-        );
+        assert!(format_score_report(&r).ends_with("总键数208  【非赛制】[词提开]  虎符跟打"));
         // 练习 + 词提开 + 未完成 + 清洗 + 粘贴（后缀直接接在 badge 后）
         r.round = Some(meta(TrainingMode::Practice, true, false));
         r.round.as_mut().unwrap().cleaned = true;
         r.round.as_mut().unwrap().pasted = true;
-        assert!(format_score_report(&r).ends_with(
-            "总键数208  【非赛制】[词提开]·未完成·清洗·粘贴  虎符跟打"
-        ));
+        assert!(format_score_report(&r)
+            .ends_with("总键数208  【非赛制】[词提开]·未完成·清洗·粘贴  虎符跟打"));
         // race_badge 单点取用（secondary_panels 同款标记走这里，防两边漂移）
         assert_eq!(race_badge(TrainingMode::Race, false), "【赛制】");
-        assert_eq!(race_badge(TrainingMode::Practice, true), "【非赛制】[词提开]");
+        assert_eq!(
+            race_badge(TrainingMode::Practice, true),
+            "【非赛制】[词提开]"
+        );
         assert_eq!(race_badge(TrainingMode::Practice, false), "【非赛制】");
     }
 
@@ -649,8 +699,7 @@ mod tests {
         r.select_count = 1;
         r.ding_count = 2;
         assert!(
-            format_score_report(&r)
-                .contains("废码0  选重1  标顶2  回改3  总键数208"),
+            format_score_report(&r).contains("废码0  选重1  标顶2  回改3  总键数208"),
             "{}",
             format_score_report(&r)
         );

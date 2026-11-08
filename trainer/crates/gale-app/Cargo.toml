@@ -16,6 +16,7 @@ gale-win = { path = "../gale-win" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 windows = { version = "0.58", features = [
+    "implement",
     "Win32_Foundation",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
@@ -30,3 +31,4 @@ windows = { version = "0.58", features = [
     "Win32_UI_Controls_Dialogs",
     "Win32_Graphics_Gdi",
 ] }
+windows-core = "0.58"

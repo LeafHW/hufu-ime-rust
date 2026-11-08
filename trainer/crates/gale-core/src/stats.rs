@@ -244,6 +244,33 @@ impl StatsEngine {
         self.on_key(&KeyEvent { vk, composing });
     }
 
+    /// Add a normally excluded key only after the input host proves that it
+    /// selected the last committed candidate. The poller emits at most one
+    /// commit per document diff, and attribution is drained directly after it.
+    /// This repairs that completed batch, so the key cannot leak into the next
+    /// composition's wasted-key accounting or be counted twice by on_key.
+    pub fn note_selection_key_timed(&mut self, vk: u32, ts_ms: u64) -> bool {
+        if vk == 0x0E || Self::is_stat_key(vk) || self.commit_attributions.is_empty() {
+            return false;
+        }
+        self.keys = self.keys.saturating_add(1);
+        self.composing_keys = self.composing_keys.saturating_add(1);
+        self.attributed_keys = self.attributed_keys.saturating_add(1);
+        if let Some(start) = &mut self.composition_start_keys {
+            *start = start.saturating_add(1);
+        }
+        let batch = self.commit_attributions.last_mut().unwrap();
+        batch.keys = batch.keys.saturating_add(1);
+        if let Some(last) = self.last_key_ms {
+            self.per_key
+                .push((vk, ts_ms.saturating_sub(last).min(u32::MAX as u64) as u32));
+            self.last_key_ms = Some(ts_ms.max(last));
+        } else {
+            self.last_key_ms = Some(ts_ms);
+        }
+        true
+    }
+
     /// 结算一段。`elapsed_ms` 为真实用时（首键→完成），由应用层计时器给出。
     pub fn finalize(&self, cmp: &Comparer, elapsed_ms: u64) -> SegmentStats {
         let chars = cmp.pos.min(cmp.states.len()) as f64;
@@ -793,12 +820,12 @@ mod tests {
     #[test]
     fn is_valid_double_threshold_boundaries() {
         let cases: &[(&str, u64, bool)] = &[
-            ("甲乙", 1_000, false),                    // 2字：双不过
-            ("甲乙丙丁", 1_000, false),                 // 4字：<字数门（也<5 硬门）
-            ("甲乙丙丁戊己庚辛壬", 9_000, false),        // 9字9s：双不过
-            ("甲乙丙丁戊己庚辛壬", 10_000, false),       // 9字10s：仅字数不过
-            ("甲乙丙丁戊己庚辛壬癸", 9_999, false),      // 10字9.999s：仅用时不过
-            ("甲乙丙丁戊己庚辛壬癸", 10_000, true),      // 10字10s：双过
+            ("甲乙", 1_000, false),                 // 2字：双不过
+            ("甲乙丙丁", 1_000, false),             // 4字：<字数门（也<5 硬门）
+            ("甲乙丙丁戊己庚辛壬", 9_000, false),   // 9字9s：双不过
+            ("甲乙丙丁戊己庚辛壬", 10_000, false),  // 9字10s：仅字数不过
+            ("甲乙丙丁戊己庚辛壬癸", 9_999, false), // 10字9.999s：仅用时不过
+            ("甲乙丙丁戊己庚辛壬癸", 10_000, true), // 10字10s：双过
         ];
         for (text, ms, valid) in cases {
             let st = StatsEngine::new();
@@ -941,6 +968,37 @@ mod tests {
             0,
             "committed deletions are corrections, not composing Backspaces"
         );
+    }
+
+    #[test]
+    fn proven_selection_modifier_repairs_only_completed_key_batch() {
+        let mut st = StatsEngine::new();
+        assert!(
+            !st.note_selection_key_timed(0xA0, 90),
+            "no commit to attribute"
+        );
+        st.on_key_timed(0x41, true, 100);
+        st.on_key_timed(0xA0, true, 190); // an ordinary modifier stays excluded
+        st.on_commit(2, 200);
+        st.end_composition();
+        st.begin_composition(); // host may already report the next composition
+        assert!(st.note_selection_key_timed(0xA0, 195));
+        assert_eq!(st.keys, 2);
+        assert_eq!(st.composing_keys, 2);
+        assert_eq!(st.commit_attributions[0].keys, 2);
+        assert_eq!(st.attributed_keys, 2);
+        assert_eq!(st.per_key.last(), Some(&(0xA0, 95)));
+        assert!(
+            !st.note_selection_key_timed(0xBA, 200),
+            "normal OEM key was counted already"
+        );
+        st.on_key_timed(0x42, true, 250);
+        st.cancel_composition();
+        assert_eq!(
+            st.waste_keys, 1,
+            "the completed selection never becomes next-round waste"
+        );
+        assert_eq!(st.commit_attributions[0].keys, 2);
     }
 
     /// 并击口径：3 次 commit → commit_groups = 3，与串行键数并存

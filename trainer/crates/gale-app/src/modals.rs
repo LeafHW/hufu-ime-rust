@@ -8,22 +8,40 @@ use gale_core::{
 use gale_win::d2d::{DrawCmd, Frame};
 use serde::Deserialize;
 use std::collections::BTreeMap;
+#[path = "preferences.rs"]
+mod preferences;
+// Modal text always remains legible at the actual window size. Decorative
+// geometry and the training article's configured size are independent.
+fn text(f: &mut Frame, x: f32, y: f32, size: f32, s: impl Into<String>, c: [f32; 4]) {
+    crate::ui::text(f, x, y, size.max(15.), s, c)
+}
+fn mono(f: &mut Frame, x: f32, y: f32, size: f32, s: impl Into<String>, c: [f32; 4]) {
+    crate::ui::mono(f, x, y, size.max(15.), s, c)
+}
+fn right(f: &mut Frame, x: f32, y: f32, size: f32, s: impl Into<String>, c: [f32; 4]) {
+    crate::ui::right(f, x, y, size.max(15.), s, c)
+}
+fn body_text(f: &mut Frame, x: f32, y: f32, size: f32, s: impl Into<String>, c: [f32; 4]) {
+    crate::ui::body_text(f, x, y, size.max(15.), s, c)
+}
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Modal {
     #[default]
     None,
-    Load,
     Groups,
     Appearance,
-    Result,
+    Preferences,
     Report,
     Online,
     Rules,
     Confirm,
-    /// 整改 12：本段按键热力图（结算后，数据 Session::last_vk_histogram）。
+    /// 本段按键热力图（结算后，数据 Session::last_vk_histogram）。
     Heatmap,
-    /// 整改 13：文章理论分析（数据 Session::full_analysis，None=旧版服务）。
+    /// 文章理论分析（数据 Session::full_analysis，None=旧版服务）。
     FullAnalysis,
+    /// 【减法 2026-11-09】原 F2 载文窗退役；本地文库 + 单字表 + TXT 收拢为
+    /// 轻量文库面板，从主界面「文库」按钮进入。
+    Library,
 }
 #[derive(Clone, Debug, PartialEq)]
 pub enum Action {
@@ -42,14 +60,17 @@ pub enum Action {
     CopyRace,
     ExportImage,
     SendScore,
+    /// 【群三件套】把成绩单直接发到绑定群（增强链：剪贴板→激活→校验→粘贴→回车）。
+    SendScoreToGroup,
+    /// 【群三件套】按晴发文格式把当前段/整篇发到绑定群。
+    PostArticle,
+    /// 【群三件套】切换「打完自动发成绩到群」（cfg.auto_send_score）。
+    ToggleAutoSend,
     LoadClipboard,
     LoadFile,
-    LoadText,
     AcceptDraft,
     LoadBook(usize),
     Practice(usize),
-    LoadTab(u8),
-    LoadEdit,
     Theme(String),
     Material(Material),
     Font(i32),
@@ -135,6 +156,7 @@ pub struct Model {
     pub paused: bool,
     pub status: String,
     pub words: Vec<HintWord>,
+    pub max_code_length: usize,
     pub schema: String,
     pub schema_ver: String,
     pub load_tab: u8,
@@ -173,6 +195,9 @@ pub struct Model {
     pub quote_relaxed: bool,
     pub fields: BTreeMap<String, String>,
     pub latest: Option<ScoreRecord>,
+    pub history: Vec<ScoreRecord>,
+    pub history_expanded: bool,
+    pub history_scroll: usize,
     pub confirm: String,
     pub pending: Option<Action>,
     pub toast: Option<(String, f64)>,
@@ -205,23 +230,24 @@ pub const PANEL_HEAD: f32 = 62.;
 pub const PANEL_FOOT: f32 = 62.;
 
 pub fn panel(m: Modal, w: f32, h: f32) -> (f32, f32, f32, f32) {
-    if matches!(m, Modal::Result | Modal::Report) {
+    if m == Modal::Report {
         return (0., 55., w, (h - 92.).max(160.));
     }
     let (ideal_w, ph): (f32, f32) = match m {
-        Modal::Load | Modal::Online => (880., 596.),
+        Modal::Online => (960., 760.),
+        Modal::Preferences => (960., 1040.),
         Modal::Groups => (940., 620.),
         Modal::Appearance => (1064., 668.),
-        Modal::Rules => (1040., 660.),
+        Modal::Rules => (1040., 900.),
         Modal::Confirm => (560., 300.),
-        Modal::Heatmap => (780., 474.),
-        // 整改 13：明细表行数驱动面板高度（draw_full_analysis 每帧更新；
-        // 首帧前用上一次缓存值，上限 600 行防极端长文）。
-        Modal::FullAnalysis => (
-            900.,
-            620f32.max(202. + full_analysis_rows() as f32 * 26.),
-        ),
+        Modal::Heatmap => (1040., 620.),
+        Modal::FullAnalysis => (1000., 690.),
         _ => (880., 596.),
+    };
+    let ph = if matches!(m, Modal::FullAnalysis | Modal::Heatmap) {
+        panel_view(ph, h)
+    } else {
+        ph
     };
     let pw = ideal_w.min((w - 32.).max(200.));
     let view = panel_view(ph, h);
@@ -230,28 +256,20 @@ pub fn panel(m: Modal, w: f32, h: f32) -> (f32, f32, f32, f32) {
 fn panel_view(ph: f32, h: f32) -> f32 {
     ph.min((h - 48.).max(PANEL_HEAD + PANEL_FOOT + 48.))
 }
-fn load_side(pw: f32) -> f32 {
-    232f32.min(pw * 0.29).max(154.)
-}
 pub fn fields(m: &Model, w: f32, h: f32) -> Vec<FieldSpec> {
     let (x, y, pw, ph) = panel(m.modal, w, h);
     let mut v = match m.modal {
-        Modal::Load if m.load_tab == 0 && m.load_editing => {
-            let side = load_side(pw);
-            vec![FieldSpec {
-                id: "load_text",
-                x: x + side + 38.,
-                y: y + 204.,
-                w: (pw - side - 76.).max(80.),
-                h: ph - 344.,
-                multi: true,
-                password: false,
-            }]
-        }
         Modal::Online | Modal::Rules => crate::secondary_panels::fields(m, x, y, pw, ph),
+        Modal::Preferences => preferences::fields(m, x, y, pw, ph),
         _ => Vec::new(),
     };
-    let top = y + PANEL_HEAD;
+    let top = y
+        + PANEL_HEAD
+        + if m.modal == Modal::Preferences {
+            50.
+        } else {
+            0.
+        };
     let bottom = y + panel_view(ph, h) - PANEL_FOOT;
     let scroll = m.panel_scroll.clamp(0., (ph - panel_view(ph, h)).max(0.));
     for z in &mut v {
@@ -303,11 +321,23 @@ fn fit_panel(
     ph: f32,
     view: f32,
     scroll: f32,
+    sticky: f32,
+    content: f32,
 ) {
-    let body_top = y + PANEL_HEAD;
+    // `sticky` keeps a band just below the header (for example the preference
+    // tabs) out of the scrolling body so a scrolled panel never shows a
+    // half-clipped tab row.
+    let body_top = y + PANEL_HEAD + sticky;
     let body_end = y + ph - PANEL_FOOT;
     let visible_end = y + view - PANEL_FOOT;
-    let scroll = scroll.clamp(0., (ph - view).max(0.));
+    let body_view = (visible_end - body_top).max(1.);
+    let (scroll_range, body_content) = if content > 0. {
+        let body_content = (content - PANEL_HEAD - PANEL_FOOT).max(0.);
+        ((body_content - body_view).max(0.), body_content)
+    } else {
+        ((ph - view).max(0.), (body_end - body_top).max(1.))
+    };
+    let scroll = scroll.clamp(0., scroll_range);
     let old = f.cmds.split_off(start);
     let mut body_clip = false;
     let mut original_clips = Vec::new();
@@ -379,22 +409,35 @@ fn fit_panel(
             z.y -= ph - view;
         }
     }
-    if view < ph {
-        let track = (visible_end - body_top).max(1.);
-        let thumb = (track * track / (body_end - body_top)).clamp(12., track);
-        rect(f, x + pw - 5., body_top, 2., track, [0.5, 0.5, 0.5, 0.12]);
+    if scroll_range > 0. {
+        let track = body_view;
+        let thumb = (track * track / body_content.max(1.)).clamp(12., track);
+        // A 2 DIP hairline was easy to miss on the tall settings/online panels.
+        rect(f, x + pw - 6., body_top, 4., track, [0.5, 0.5, 0.5, 0.10]);
         rect(
             f,
-            x + pw - 5.,
-            body_top + scroll / (ph - view) * (track - thumb),
-            2.,
+            x + pw - 6.,
+            body_top + scroll / scroll_range * (track - thumb),
+            4.,
             thumb,
-            [0.78, 0.65, 0.38, 0.7],
+            [0.78, 0.65, 0.38, 0.75],
         );
     }
 }
 pub(crate) fn label(f: &mut Frame, x: f32, y: f32, s: impl Into<String>, t: &Theme) {
     text(f, x, y, FONT_HINT, s, tokens(t).muted);
+}
+fn button_label(f: &mut Frame, x: f32, y: f32, w: f32, s: &str, c: [f32; 4]) {
+    // Keep the readable font size even on narrow windows. The clip prevents a
+    // long file or action name from painting over the neighbouring control.
+    f.push(DrawCmd::PushClip {
+        x,
+        y,
+        w: w.max(0.),
+        h: 20.,
+    });
+    text(f, x, y, 15., s, c);
+    f.push(DrawCmd::PopClip);
 }
 pub(crate) fn btn(
     f: &mut Frame,
@@ -413,16 +456,16 @@ pub(crate) fn btn(
         x,
         y,
         w,
-        32.,
+        34.,
         8.,
         if primary { p.accent } else { p.surface2 },
         if primary { None } else { Some(p.line2) },
     );
-    text(
+    button_label(
         f,
         x + 11.,
-        y + 8.,
-        FONT_HINT,
+        y + 7.,
+        w - 22.,
         s,
         if primary {
             [0.13, 0.09, 0.035, 1.]
@@ -434,7 +477,7 @@ pub(crate) fn btn(
         x,
         y,
         w,
-        h: 32.,
+        h: 34.,
         action: a,
     });
 }
@@ -455,7 +498,7 @@ fn small_btn(
         x,
         y,
         w,
-        25.,
+        34.,
         6.,
         if selected {
             alpha(p.accent, 0.1)
@@ -468,11 +511,11 @@ fn small_btn(
             p.line
         }),
     );
-    text(
+    button_label(
         f,
         x + 8.,
-        y + 5.,
-        FONT_HINT,
+        y + 7.,
+        w - 16.,
         s,
         if selected { p.accent } else { p.muted },
     );
@@ -480,14 +523,14 @@ fn small_btn(
         x,
         y,
         w,
-        h: 25.,
+        h: 34.,
         action: a,
     });
 }
 fn disabled(f: &mut Frame, x: f32, y: f32, w: f32, s: &str, t: &Theme) {
     let p = tokens(t);
-    round(f, x, y, w, 25., 6., alpha(p.bg2, 0.8), Some(p.line));
-    text(f, x + 7., y + 5., FONT_HINT, s, alpha(p.muted, 0.5));
+    round(f, x, y, w, 34., 6., alpha(p.bg2, 0.8), Some(p.line));
+    button_label(f, x + 7., y + 7., w - 14., s, alpha(p.muted, 0.5));
 }
 fn hit_box(hs: &mut Vec<Hit>, x: f32, y: f32, w: f32, h: f32, action: Action) {
     hs.push(Hit { x, y, w, h, action });
@@ -503,6 +546,9 @@ fn text_block(
     s: &str,
     color: [f32; 4],
 ) {
+    // Wrap with the same clamped size the drawing helper uses; otherwise a
+    // caller passing 13.5 wraps wider than the 15 DIP glyphs and overflows.
+    let size = size.max(15.);
     for (i, l) in wrap(s, (w / size).max(1.) as usize)
         .into_iter()
         .take(max_lines)
@@ -568,17 +614,28 @@ fn icon(f: &mut Frame, kind: &str, x: f32, y: f32, size: f32, color: [f32; 4]) {
         }
     }
 }
+fn header_keycap(f: &mut Frame, x: f32, y: f32, key: &str, t: &Theme) {
+    let p = tokens(t);
+    round(f, x, y, 36., 28., 6., p.surface2, Some(p.line2));
+    mono(f, x + 7., y + 4., 15., key, p.muted);
+}
 fn panel_header(f: &mut Frame, hs: &mut Vec<Hit>, m: Modal, x: f32, y: f32, pw: f32, t: &Theme) {
     let p = tokens(t);
     let (icon_name, title, desc, key) = match m {
-        Modal::Load => (
-            "clipboard",
-            "载文",
-            "从剪贴板、群文、本地文库或在线取一篇",
-            "F2",
+        Modal::Library => (
+            "book",
+            "文库",
+            "本地文库、单字表与 TXT；剪贴板 Ctrl+V 直接开打",
+            "—",
         ),
-        Modal::Groups => ("group", "群与通道", "从 QQ 群取赛文，把成绩带回去", "F6"),
+        Modal::Groups => ("group", "群与通道", "从 QQ 群取赛文，把成绩带回去", "F5"),
         Modal::Appearance => ("palette", "外观", "主题、材质与词提；改动即时生效", "F7"),
+        Modal::Preferences => (
+            "palette",
+            "跟打器设置",
+            "词提显示、成绩单和自定义配色",
+            "F1",
+        ),
         Modal::Heatmap => (
             "keyboard",
             "本段按键热力图",
@@ -587,9 +644,9 @@ fn panel_header(f: &mut Frame, hs: &mut Vec<Hit>, m: Modal, x: f32, y: f32, pw: 
         ),
         Modal::FullAnalysis => (
             "chart",
-            "文章理论分析",
-            "理论码长与选重 · 按文章序 · 滚轮翻看",
-            "Esc",
+            "理论码长详情",
+            "全文逐词编码 · 理论码长与选重 · 滚轮翻看",
+            "F10",
         ),
         Modal::Confirm => ("!", "确认操作", "当前练习的内容将发生改变", "Esc"),
         _ => ("", "", "", ""),
@@ -605,21 +662,11 @@ fn panel_header(f: &mut Frame, hs: &mut Vec<Hit>, m: Modal, x: f32, y: f32, pw: 
         Some(alpha(p.accent, 0.35)),
     );
     icon(f, icon_name, x + 27., y + 22., 18., p.accent);
-    text(f, x + 64., y + 13., FONT_LABEL, title, p.text);
-    text(f, x + 64., y + 35., FONT_HINT, desc, p.muted);
-    small_btn(
-        f,
-        hs,
-        x + pw - 86.,
-        y + 20.,
-        30.,
-        key,
-        Action::None,
-        t,
-        false,
-    );
-    text(f, x + pw - 42., y + 16., 24., "×", p.muted);
-    hit_box(hs, x + pw - 48., y + 12., 36., 38., Action::Close);
+    text(f, x + 62., y + 10., 20., title, p.text);
+    text(f, x + 62., y + 38., 15., desc, p.muted);
+    header_keycap(f, x + pw - 104., y + 17., key, t);
+    text(f, x + pw - 52., y + 13., 25., "×", p.muted);
+    hit_box(hs, x + pw - 58., y + 10., 42., 42., Action::Close);
     line(f, x, y + PANEL_HEAD - 1., pw, p.line);
 }
 fn footer(f: &mut Frame, x: f32, y: f32, pw: f32, ph: f32, t: &Theme) {
@@ -634,520 +681,120 @@ fn footer(f: &mut Frame, x: f32, y: f32, pw: f32, ph: f32, t: &Theme) {
     );
     line(f, x, y + ph - PANEL_FOOT, pw, p.line);
 }
-fn draw_load(
+fn draw_library(
     f: &mut Frame,
     hs: &mut Vec<Hit>,
     m: &Model,
-    sess: &Session,
-    cfg: &Config,
     t: &Theme,
     x: f32,
     y: f32,
     pw: f32,
     ph: f32,
 ) {
+    // 【减法 2026-11-09】原 F2 载文窗退役后的轻量文库面板：本地文库 +
+    // 单字表 + TXT。剪贴板走 Ctrl+V 直载、群文走 F4、在线走 F8。
     let p = tokens(t);
-    let side = load_side(pw);
-    let body_h = ph - PANEL_HEAD - PANEL_FOOT;
-    rect(f, x + 1., y + PANEL_HEAD, side - 1., body_h, p.bg2);
-    rect(f, x + side, y + PANEL_HEAD, 1., body_h, p.line);
-    text(f, x + 22., y + 80., FONT_HINT, "来源", p.muted);
-    let draft = m.field("load_text");
-    let sources = [
-        (
-            0u8,
-            "剪贴板",
-            format!("{} 字 · 可编辑", draft.chars().count()),
-            "clipboard",
-        ),
-        (
-            2,
-            "群文",
-            if m.groups.is_empty() {
-                "连接 QQ 读取当前群文".into()
-            } else {
-                format!("{} 个会话", m.groups.len())
-            },
-            "group",
-        ),
-        (
-            1,
-            "本地文库",
-            format!("{} 篇 · 本地文本", m.books.len()),
-            "folder",
-        ),
-        (3, "在线", "晴发文 · 在线书架".into(), "globe"),
-    ];
-    for (i, (tab, title, sub, icon_name)) in sources.iter().enumerate() {
-        let sy = y + 100. + i as f32 * 55.;
-        if m.load_tab == *tab {
-            round(
-                f,
-                x + 13.,
-                sy,
-                side - 26.,
-                52.,
-                9.,
-                p.surface2,
-                Some(p.line),
-            );
-            round(f, x + 13., sy + 4., 2., 44., 1., p.accent, None);
-        }
-        icon(
-            f,
-            icon_name,
-            x + 25.,
-            sy + 13.,
-            17.,
-            if m.load_tab == *tab {
-                p.accent
-            } else {
-                p.muted
-            },
-        );
-        text(f, x + 51., sy + 9., FONT_HINT, *title, p.text2);
-        text(
-            f,
-            x + 51.,
-            sy + 30.,
-            FONT_HINT,
-            elide(sub, ((side - 72.) / FONT_HINT) as usize),
-            p.muted,
-        );
-        right(f, x + side - 25., sy + 17., 12., "›", p.muted);
-        hit_box(hs, x + 13., sy, side - 26., 52., Action::LoadTab(*tab));
-    }
-    line(f, x + 22., y + ph - 138., side - 44., p.line);
-    text(f, x + 22., y + ph - 124., FONT_HINT, "当前文档", p.muted);
-    text(
-        f,
-        x + 22.,
-        y + ph - 105.,
-        FONT_HINT,
-        elide(&sess.title, ((side - 44.) / FONT_HINT) as usize),
-        p.text2,
-    );
-    let rx = x + side + 20.;
-    let rw = pw - side - 40.;
-    let top = y + 80.;
-    match m.load_tab {
-        0 => {
-            let group = m.bound.and_then(|i| m.groups.get(i));
-            let chip_w = (rw - 220.).clamp(130., 230.);
-            round(f, rx, top, chip_w, 30., 15., p.surface2, Some(p.line));
-            round(f, rx + 4., top + 4., 22., 22., 6., p.accent, None);
-            body_text(
-                f,
-                rx + 10.,
-                top + 6.,
-                12.,
-                group
-                    .and_then(|s| s.chars().next())
-                    .unwrap_or('文')
-                    .to_string(),
-                [0.13, 0.09, 0.035, 1.],
-            );
-            text(
-                f,
-                rx + 34.,
-                top + 8.,
-                FONT_HINT,
-                group
-                    .map(|s| elide(s, ((chip_w - 50.) / FONT_HINT) as usize))
-                    .unwrap_or_else(|| "剪贴板 / 自定义".into()),
-                p.text2,
-            );
-            small_btn(
-                f,
-                hs,
-                rx + rw - 178.,
-                top + 3.,
-                98.,
-                "读取剪贴板",
-                Action::LoadClipboard,
-                t,
-                false,
-            );
-            small_btn(
-                f,
-                hs,
-                rx + rw - 72.,
-                top + 3.,
-                72.,
-                if m.load_editing {
-                    "预览"
-                } else if draft.trim().is_empty() {
-                    "开始编辑"
-                } else {
-                    "编辑"
-                },
-                Action::LoadEdit,
-                t,
-                m.load_editing,
-            );
-            let parsed = if draft.contains("-----第") {
-                gale_core::segment::parse_group_text(&draft)
-            } else {
-                gale_core::segment::ParsedGroupText {
-                    title: "自定义文字".into(),
-                    difficulty: None,
-                    segments: gale_core::segment::split_smart(&draft, cfg.seg_chars),
-                }
-            };
-            let char_count: usize = parsed.segments.iter().map(|s| s.text.chars().count()).sum();
-            round(f, rx, y + 121., rw, ph - 224., 12., p.surface, Some(p.line));
-            let title = if m.load_editing {
-                "编辑原文".to_string()
-            } else if draft.trim().is_empty() {
-                "等待一篇文字".into()
-            } else {
-                parsed.title.clone()
-            };
-            body_text(
-                f,
-                rx + 18.,
-                y + 138.,
-                19.,
-                elide(&title, ((rw - 36.) / 19.) as usize),
-                p.text,
-            );
-            text(
-                f,
-                rx + 18.,
-                y + 169.,
-                FONT_HINT,
-                if m.load_editing {
-                    "保留标题和段标；纯文本按设置字数切段".into()
-                } else if draft.trim().is_empty() {
-                    "剪贴板 / 自定义文字".into()
-                } else {
-                    format!(
-                        "{} 段  ·  {} 字  ·  首键计时",
-                        parsed.segments.len(),
-                        char_count
-                    )
-                },
-                p.muted,
-            );
-            if m.load_editing {
-                // Native editor FieldSpec starts at y+204, below title and metadata.
-                round(
-                    f,
-                    rx + 17.,
-                    y + 203.,
-                    rw - 34.,
-                    ph - 342.,
-                    6.,
-                    p.bg2,
-                    Some(p.line),
-                );
-            } else if draft.trim().is_empty() {
-                body_text(f, rx + 18., y + 217., 17., "把想练的文字放在这里", p.text2);
-                text_block(f, rx + 18., y + 259., rw - 36., FONT_HINT, 27., 4,
-                    "按 Ctrl+V 读取剪贴板，或点击“开始编辑”直接输入。\n本地文库支持打开 TXT；在线来源可从晴发文取文。", p.muted);
-                btn(
-                    f,
-                    hs,
-                    rx + 18.,
-                    y + 352.,
-                    110.,
-                    "开始编辑",
-                    Action::LoadEdit,
-                    t,
-                    false,
-                );
-                btn(
-                    f,
-                    hs,
-                    rx + 138.,
-                    y + 352.,
-                    110.,
-                    "打开 TXT",
-                    Action::LoadFile,
-                    t,
-                    false,
-                );
-            } else {
-                let preview = parsed
-                    .segments
-                    .iter()
-                    .take(2)
-                    .map(|s| s.text.as_str())
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                text_block(
-                    f,
-                    rx + 18.,
-                    y + 205.,
-                    rw - 36.,
-                    13.5,
-                    27.3,
-                    6,
-                    &preview,
-                    p.text2,
-                );
-                text(f, rx + 18., y + ph - 170., FONT_HINT, "分段", p.muted);
-                let max_chips = (((rw - 60.) / 104.).floor() as usize).clamp(1, 5);
-                for (i, segment) in parsed.segments.iter().take(max_chips).enumerate() {
-                    let sx = rx + 50. + i as f32 * 104.;
-                    round(
-                        f,
-                        sx,
-                        y + ph - 174.,
-                        96.,
-                        22.,
-                        5.,
-                        if i == 0 { alpha(p.accent, 0.08) } else { p.bg2 },
-                        Some(if i == 0 { alpha(p.accent, 0.4) } else { p.line }),
-                    );
-                    text(
-                        f,
-                        sx + 7.,
-                        y + ph - 170.,
-                        FONT_HINT,
-                        format!(
-                            "{}·{}字",
-                            elide(&segment.mark, 3),
-                            segment.text.chars().count()
-                        ),
-                        if i == 0 { p.accent } else { p.muted },
-                    );
-                }
-            }
-            line(f, rx + 18., y + ph - 132., rw - 36., p.line);
-            text(
-                f,
-                rx + 18.,
-                y + ph - 119.,
-                FONT_HINT,
-                if m.load_editing {
-                    "正在编辑原文 · 点击预览查看分段"
-                } else {
-                    "剪贴板 · 保留标题与段标"
-                },
-                p.muted,
-            );
-            if !m.pending_source.is_empty() {
-                small_btn(
-                    f,
-                    hs,
-                    rx + rw - 138.,
-                    y + ph - 139.,
-                    120.,
-                    "显示待读文字",
-                    Action::AcceptDraft,
-                    t,
-                    false,
-                );
-            }
-        }
-        1 => {
-            text(f, rx, top + 3., FONT_HINT, "本地文库", p.text2);
-            small_btn(
-                f,
-                hs,
-                rx + rw - 88.,
-                top,
-                88.,
-                "打开 TXT",
-                Action::LoadFile,
-                t,
-                false,
-            );
-            round(f, rx, y + 121., rw, 210., 12., p.surface, Some(p.line));
-            if m.books.is_empty() {
-                body_text(f, rx + 18., y + 146., 19., "文库还没有文章", p.text);
-                text_block(
-                    f,
-                    rx + 18.,
-                    y + 184.,
-                    rw - 36.,
-                    FONT_HINT,
-                    26.,
-                    3,
-                    "打开一个 TXT 文件，或把文本放进数据目录的文库文件夹。",
-                    p.muted,
-                );
-            } else {
-                for (row, (i, title)) in m
-                    .books
-                    .iter()
-                    .enumerate()
-                    .skip(m.scroll.max(0.) as usize)
-                    .take(5)
-                    .enumerate()
-                {
-                    small_btn(
-                        f,
-                        hs,
-                        rx + 14.,
-                        y + 136. + row as f32 * 35.,
-                        rw - 28.,
-                        &elide(title, ((rw - 50.) / 10.) as usize),
-                        Action::LoadBook(i),
-                        t,
-                        false,
-                    );
-                }
-            }
-            text(f, rx, y + 347., FONT_HINT, "单字练习", p.text2);
-            text(
-                f,
-                rx + 76.,
-                y + 349.,
-                FONT_HINT,
-                "五份内置字表 · 居中行字提",
-                p.muted,
-            );
-            for (i, (title, _)) in gale_core::single::builtin_tables().iter().enumerate() {
-                let cw = (rw - 12.) / 3.;
-                small_btn(
-                    f,
-                    hs,
-                    rx + (i % 3) as f32 * (cw + 6.),
-                    y + 371. + (i / 3) as f32 * 33.,
-                    cw,
-                    title,
-                    Action::Practice(i),
-                    t,
-                    false,
-                );
-            }
-        }
-        2 => {
-            let bound = m.bound.and_then(|i| m.groups.get(i));
-            round(f, rx, top, rw, 31., 15., p.surface2, Some(p.line));
-            text(
-                f,
-                rx + 12.,
-                top + 8.,
-                FONT_HINT,
-                bound
-                    .map(|s| elide(s, (((rw - 24.) / FONT_HINT) as usize).max(8)))
-                    .unwrap_or_else(|| "尚未选择 QQ 会话".into()),
-                p.text2,
-            );
-            round(f, rx, y + 126., rw, ph - 230., 12., p.surface, Some(p.line));
-            body_text(f, rx + 18., y + 145., 19., "从正在打开的群里取文", p.text);
-            text_block(
-                f,
-                rx + 18.,
-                y + 187.,
-                rw - 36.,
-                FONT_HINT,
-                26.,
-                4,
-                "先在 QQ 中打开目标群，再读取当前群文。也可以手动复制赛文，回到剪贴板来源粘贴。",
-                p.text2,
-            );
-            btn(
-                f,
-                hs,
-                rx + 18.,
-                y + 299.,
-                122.,
-                "群与通道 F6",
-                Action::Open(Modal::Groups),
-                t,
-                false,
-            );
-            btn(
-                f,
-                hs,
-                rx + 150.,
-                y + 299.,
-                122.,
-                "读取当前群文",
-                Action::ReadGroup,
-                t,
-                false,
-            );
-            text_block(
-                f,
-                rx + 18.,
-                y + 352.,
-                rw - 36.,
-                FONT_HINT,
-                26.,
-                3,
-                "UIA 依赖 QQ 界面结构；不能自动切群。读取失败时可使用剪贴板。",
-                p.muted,
-            );
-        }
-        _ => {
-            round(f, rx, y + 121., rw, ph - 224., 12., p.surface, Some(p.line));
-            body_text(f, rx + 22., y + 145., 23., "晴发文 · 在线书架", p.text);
-            text_block(
-                f,
-                rx + 22.,
-                y + 195.,
-                rw - 44.,
-                13.,
-                27.,
-                4,
-                "按分类、难度和字数取文。登录后可浏览书架，断网时已载入的正文仍可继续练习。",
-                p.text2,
-            );
-            btn(
-                f,
-                hs,
-                rx + 22.,
-                y + 300.,
-                150.,
-                "打开在线发文 F8",
-                Action::Open(Modal::Online),
-                t,
-                true,
-            );
-        }
-    }
-    footer(f, x, y, pw, ph, t);
-    if pw > 700. {
-        text(
-            f,
-            x + 20.,
-            y + ph - 36.,
-            FONT_HINT,
-            "Ctrl V 读取剪贴板 · Esc 返回",
-            p.muted,
-        );
-    }
-    let fy = y + ph - 47.;
-    btn(
+    let rx = x + 24.;
+    let rw = pw - 48.;
+    text(f, rx, y + 84., FONT_HINT, "本地文库", p.text2);
+    small_btn(
         f,
         hs,
-        x + pw - 292.,
-        fy,
-        78.,
-        "清洗",
-        Action::Open(Modal::Rules),
+        rx + rw - 88.,
+        y + 76.,
+        88.,
+        "打开 TXT",
+        Action::LoadFile,
         t,
         false,
     );
+    round(f, rx, y + 104., rw, 112., 12., p.surface, Some(p.line));
+    if m.books.is_empty() {
+        body_text(f, rx + 18., y + 122., 19., "文库还没有文章", p.text);
+        text_block(
+            f,
+            rx + 18.,
+            y + 157.,
+            rw - 36.,
+            FONT_HINT,
+            25.,
+            2,
+            "打开一个 TXT 文件，或把文本放进数据目录的文库文件夹。",
+            p.muted,
+        );
+    } else {
+        for (row, (i, title)) in m
+            .books
+            .iter()
+            .enumerate()
+            .skip(m.scroll.max(0.) as usize)
+            .take(2)
+            .enumerate()
+        {
+            small_btn(
+                f,
+                hs,
+                rx + 14.,
+                y + 119. + row as f32 * 39.,
+                rw - 28.,
+                &elide(title, ((rw - 50.) / 14.) as usize),
+                Action::LoadBook(i),
+                t,
+                false,
+            );
+        }
+        text(
+            f,
+            rx + 16.,
+            y + 203.,
+            14.,
+            format!("共 {} 篇 · 滚轮浏览文库", m.books.len()),
+            p.muted,
+        );
+    }
+    text(f, rx, y + 246., 17., "单字与词组练习", p.text2);
+    text(
+        f,
+        rx,
+        y + 274.,
+        14.,
+        "乱序 / 段长 / 达标击力在单字练习屏顶部快捷条调整。",
+        p.muted,
+    );
+    round(f, rx, y + 296., rw, 190., 12., p.surface, Some(p.line));
+    for (i, (title, _)) in gale_core::single::builtin_tables().iter().enumerate() {
+        let cw = (rw - 38.) / 2.;
+        small_btn(
+            f,
+            hs,
+            rx + 14. + (i % 2) as f32 * (cw + 10.),
+            y + 310. + (i / 2) as f32 * 36.,
+            cw,
+            title,
+            Action::Practice(i),
+            t,
+            false,
+        );
+    }
+    footer(f, x, y, pw, ph, t);
     btn(
         f,
         hs,
-        x + pw - 206.,
-        fy,
-        66.,
+        x + pw - 132.,
+        y + ph - 50.,
+        110.,
         "关闭",
         Action::Close,
         t,
         false,
     );
-    let (label, action) = match m.load_tab {
-        2 => ("读取当前群文", Action::ReadGroup),
-        3 => ("在线取文", Action::Open(Modal::Online)),
-        1 => ("打开 TXT", Action::LoadFile),
-        _ => ("载入并开始  ↵", Action::LoadText),
-    };
-    btn(f, hs, x + pw - 132., fy, 112., label, action, t, true);
 }
 fn draw_groups(
     f: &mut Frame,
     hs: &mut Vec<Hit>,
     m: &Model,
     sess: &Session,
+    cfg: &Config,
     t: &Theme,
     x: f32,
     y: f32,
@@ -1188,7 +835,7 @@ fn draw_groups(
             FONT_HINT,
             26.,
             5,
-            "打开 QQ 和目标群后扫描。\n也可以手动复制赛文，按 F2 载入。",
+            "打开 QQ 和目标群后扫描。\n也可以手动复制赛文，Ctrl+V 直接开打。",
             p.muted,
         );
     } else {
@@ -1252,18 +899,34 @@ fn draw_groups(
                 x + 66.,
                 gy + 39.,
                 FONT_HINT,
-                if selected {
-                    "已选择 · 请在 QQ 手动打开"
-                } else {
-                    "QQ 会话 · 点击选择"
-                },
+                elide(
+                    if selected {
+                        if side < 260. {
+                            "已选择"
+                        } else {
+                            "已选择 · 选群即切群"
+                        }
+                    } else if side < 260. {
+                        "点击选择"
+                    } else {
+                        "QQ 会话 · 点击选择"
+                    },
+                    ((side - 90.) / FONT_HINT).max(4.) as usize,
+                ),
                 p.muted,
             );
             hit_box(hs, x + 12., gy, side - 24., 64., Action::SelectGroup(i));
         }
     }
     line(f, x + 22., y + ph - 108., side - 44., p.line);
-    text(f, x + 22., y + ph - 92., FONT_HINT, "剪贴板通道始终可用", p.muted);
+    text(
+        f,
+        x + 22.,
+        y + ph - 92.,
+        FONT_HINT,
+        "剪贴板通道始终可用",
+        p.muted,
+    );
     let rx = x + side + 20.;
     let rw = pw - side - 40.;
     let group = m.bound.and_then(|i| m.groups.get(i));
@@ -1282,31 +945,68 @@ fn draw_groups(
     text(
         f,
         rx + 54.,
-        y + 83.,
-        14.,
+        y + 81.,
+        16.,
         group
-            .map(|s| elide(s, ((rw - 54.) / 14.) as usize))
+            .map(|s| elide(s, ((rw - 54.) / 16.) as usize))
             .unwrap_or_else(|| "选择一个会话".into()),
         p.text,
     );
     text(
         f,
         rx + 54.,
-        y + 107.,
+        y + 104.,
         FONT_HINT,
-        "只读取当前打开会话；不会自动切群",
+        if rw < 420. {
+            "独立聊天窗选群即自动切换"
+        } else {
+            "独立聊天窗选群即自动切换；主面板条目需在 QQ 点开"
+        },
         p.muted,
     );
-    round(f, rx, y + 138., rw, 51., 9., p.surface2, Some(p.line));
-    let vals = [
-        (
-            "会话",
-            if group.is_some() {
-                "已选择".to_string()
-            } else {
-                "待选择".into()
-            },
+    // Channel status belongs next to the session identity. `m.status` is the
+    // general trainer status ("词提已就绪"), not the QQ channel; derive the dot
+    // from the actual session list so F6 cannot claim a connected QQ with 0 rows.
+    let qq_ready = !m.groups.is_empty();
+    let bad = ["失败", "错误", "离线", "不可用", "未连接"]
+        .iter()
+        .any(|k| m.status.contains(k));
+    let dot = if qq_ready {
+        p.green
+    } else if bad {
+        p.red
+    } else {
+        p.muted
+    };
+    let channel = if qq_ready {
+        format!("QQ 已连接 · {} 个会话", m.groups.len())
+    } else if m.status.contains("UIA") || m.status.contains("未返回") {
+        "已找到 QQ，但 UIA 未返回会话；重启 QQ 或打开群聊窗口后重试".into()
+    } else {
+        "尚未读取到 QQ 会话 · 点击扫描".into()
+    };
+    round(f, rx, y + 130., 6., 6., 3., dot, None);
+    text(
+        f,
+        rx + 12.,
+        y + 124.,
+        14.,
+        elide(
+            &format!("通道 · {channel}"),
+            ((rw - 16.) / 14.).max(6.) as usize,
         ),
+        if bad {
+            p.red
+        } else if qq_ready {
+            p.green
+        } else {
+            p.muted
+        },
+    );
+    // Three metrics only: the selected session is already the header, repeating
+    // it as a KPI read like a placeholder.
+    round(f, rx, y + 146., rw, 58., 9., p.surface2, Some(p.line));
+    let vals = [
         (
             "最近成绩",
             m.latest
@@ -1318,19 +1018,19 @@ fn draw_groups(
         ("输入方式", "真实输入".into()),
     ];
     for (i, (l, v)) in vals.into_iter().enumerate() {
-        let sx = rx + i as f32 * rw / 4.;
+        let sx = rx + i as f32 * rw / 3.;
         if i > 0 {
-            rect(f, sx, y + 138., 1., 51., p.line);
+            rect(f, sx, y + 146., 1., 58., p.line);
         }
-        mono(f, sx + 10., y + 149., 13., v, p.text2);
-        text(f, sx + 10., y + 169., FONT_HINT, l, p.muted);
+        text(f, sx + 12., y + 158., 14., l, p.muted);
+        mono(f, sx + 12., y + 176., 20., v, p.text2);
     }
-    round(f, rx, y + 201., rw, 69., 10., p.surface, Some(p.line));
-    body_text(f, rx + 12., y + 214., 16., "文", p.accent);
+    round(f, rx, y + 214., rw, 69., 10., p.surface, Some(p.line));
+    body_text(f, rx + 12., y + 227., 16., "文", p.accent);
     text(
         f,
         rx + 44.,
-        y + 213.,
+        y + 226.,
         FONT_HINT,
         elide(&sess.title, ((rw - 64.) / FONT_HINT) as usize),
         p.text2,
@@ -1338,7 +1038,7 @@ fn draw_groups(
     text(
         f,
         rx + 44.,
-        y + 237.,
+        y + 250.,
         FONT_HINT,
         format!(
             "当前文档 · {} 段 · {} 字",
@@ -1350,12 +1050,12 @@ fn draw_groups(
         ),
         p.muted,
     );
-    round(f, rx, y + 282., rw, 126., 10., p.surface2, Some(p.line));
-    text(f, rx + 12., y + 296., FONT_HINT, "UIA 读取通道", p.text2);
+    round(f, rx, y + 296., rw, 118., 10., p.surface2, Some(p.line));
+    text(f, rx + 12., y + 310., FONT_HINT, "UIA 读取通道", p.text2);
     text_block(
         f,
         rx + 12.,
-        y + 320.,
+        y + 334.,
         rw - 24.,
         FONT_HINT,
         22.,
@@ -1366,9 +1066,9 @@ fn draw_groups(
     round(
         f,
         rx + 12.,
-        y + 359.,
+        y + 372.,
         rw - 24.,
-        35.,
+        34.,
         6.,
         alpha(p.accent, 0.055),
         Some(alpha(p.accent, 0.23)),
@@ -1376,24 +1076,80 @@ fn draw_groups(
     text_block(
         f,
         rx + 20.,
-        y + 366.,
+        y + 379.,
         rw - 40.,
         FONT_HINT,
-        24.,
+        22.,
         2,
         "QQ 更新可能使 UIA 失效。失败时请手动复制，通过剪贴板载入。",
         p.accent,
     );
-    line(f, rx, y + ph - 139., rw, p.line);
-    text(f, rx, y + ph - 126., FONT_HINT, "通道状态", p.muted);
+    // Reading order: users repeatedly ask what to do after opening QQ.
+    round(f, rx, y + 426., rw, 58., 10., p.surface, Some(p.line));
+    text(f, rx + 12., y + 438., 14., "群流程", p.muted);
+    let narrow = rw < 520.;
     text(
         f,
-        rx,
-        y + ph - 105.,
-        FONT_HINT,
-        elide(&m.status, ((rw / FONT_HINT) as usize).max(8)),
+        rx + 78.,
+        y + 438.,
+        14.,
+        if narrow {
+            "扫描 › 点选 › F4 读文 › 打完自动发"
+        } else {
+            "扫描  ›  点选（自动切群）  ›  F4 读文  ›  打完自动发成绩"
+        },
         p.text2,
     );
+    if !narrow {
+        text(
+            f,
+            rx + 12.,
+            y + 460.,
+            14.,
+            "发送前自动校验目标群；失败内容保留在剪贴板，绝不错发。",
+            p.muted,
+        );
+    }
+    // 【群三件套】自动发成绩开关（cfg.auto_send_score，默认开）
+    round(
+        f,
+        rx,
+        y + 494.,
+        rw,
+        40.,
+        9.,
+        if cfg.auto_send_score {
+            alpha(p.accent, 0.07)
+        } else {
+            p.surface2
+        },
+        Some(if cfg.auto_send_score {
+            alpha(p.accent, 0.3)
+        } else {
+            p.line
+        }),
+    );
+    text(
+        f,
+        rx + 12.,
+        y + 506.,
+        14.,
+        "打完自动发成绩到群",
+        if cfg.auto_send_score { p.text } else { p.muted },
+    );
+    text(
+        f,
+        rx + 12.,
+        y + 522.,
+        FONT_HINT,
+        if cfg.auto_send_score {
+            "晴兼容成绩单 · 发送前校验目标群"
+        } else {
+            "关闭后仅复制成绩，可手动粘贴"
+        },
+        p.muted,
+    );
+    hit_box(hs, rx, y + 494., rw, 40., Action::ToggleAutoSend);
     footer(f, x, y, pw, ph, t);
     if pw > 740. {
         text(
@@ -1401,7 +1157,7 @@ fn draw_groups(
             x + 20.,
             y + ph - 35.,
             FONT_HINT,
-            "发成绩时先复制，再确认目标群并粘贴",
+            "发文 = 把当前段按晴发文格式发到群，随后可 F4 读回",
             p.muted,
         );
     }
@@ -1409,11 +1165,22 @@ fn draw_groups(
     btn(
         f,
         hs,
+        x + pw - 442.,
+        fy,
+        96.,
+        "发成绩到群",
+        Action::SendScoreToGroup,
+        t,
+        false,
+    );
+    btn(
+        f,
+        hs,
         x + pw - 330.,
         fy,
-        108.,
-        "复制本段成绩",
-        Action::CopyScore,
+        72.,
+        "发文",
+        Action::PostArticle,
         t,
         false,
     );
@@ -1475,8 +1242,36 @@ fn appearance_preview(
         );
         return;
     }
-    let fs = (cfg.font_size / 2.).clamp(12., 32.);
-    let lh = fs * (1. + cfg.line_gap) + 9.;
+    let fs = (cfg.font_size / 2.).clamp(14., 32.);
+    let hint_fs = cfg.hint_font_size.max(14.);
+    let hints_visible = gale_core::rules::hints_effective(m.hints, m.race) && cfg.hint_style != 2;
+    let lh = if hints_visible {
+        (fs * (1. + cfg.line_gap) + 9.).max(fs + hint_fs + 11.)
+    } else {
+        fs * (1. + cfg.line_gap) + 9.
+    };
+    let word_colors: Vec<_> = m
+        .words
+        .iter()
+        .map(|word| {
+            (hints_visible && cfg.hint_color_words)
+                .then(|| {
+                    word.code.as_deref().and_then(|code| {
+                        crate::ui::hint_word_tint(
+                            &p,
+                            &word.text,
+                            code,
+                            if m.max_code_length == 0 {
+                                4
+                            } else {
+                                m.max_code_length
+                            },
+                        )
+                    })
+                })
+                .flatten()
+        })
+        .collect();
     let columns = (w / fs).floor().max(1.) as usize;
     let rows = (h / lh).floor().max(1.) as usize;
     let start = sess.comparer.pos.saturating_sub(6);
@@ -1500,7 +1295,8 @@ fn appearance_preview(
         }
         let yy = y + row as f32 * lh;
         let current = sess.comparer.pos;
-        if gale_core::rules::hints_effective(m.hints, m.race) && current >= offset && current < end {
+        if gale_core::rules::hints_effective(m.hints, m.race) && current >= offset && current < end
+        {
             let highlight = if cfg.hint_style == 1 {
                 (current, 1)
             } else {
@@ -1536,11 +1332,25 @@ fn appearance_preview(
         }
         let mut spans = Vec::new();
         let mut utf16_pos = 0;
+        let mut word_at = m
+            .words
+            .partition_point(|word| word.start.saturating_add(word.len) <= offset);
         for (i, ch) in sample[offset..end].iter().enumerate() {
-            let color = match sess.comparer.states.get(offset + i) {
-                Some(gale_core::compare::CharState::Correct) => p.text,
+            let char_at = offset + i;
+            while word_at < m.words.len()
+                && m.words[word_at].start.saturating_add(m.words[word_at].len) <= char_at
+            {
+                word_at += 1;
+            }
+            let tint = m
+                .words
+                .get(word_at)
+                .filter(|word| word.start <= char_at)
+                .and_then(|_| word_colors[word_at]);
+            let color = match sess.comparer.states.get(char_at) {
+                Some(gale_core::compare::CharState::Correct) => tint.unwrap_or(p.text),
                 Some(gale_core::compare::CharState::Wrong) => p.red,
-                _ => p.text2,
+                _ => tint.unwrap_or(p.text2),
             };
             spans.push((utf16_pos, ch.len_utf16() as u32, color));
             utf16_pos += ch.len_utf16() as u32;
@@ -1554,37 +1364,30 @@ fn appearance_preview(
             spans,
             color: p.text2,
         });
-        if gale_core::rules::hints_effective(m.hints, m.race) && cfg.hint_style != 2 {
+        if hints_visible {
             for (i, word) in m.words.iter().enumerate() {
-                let visible = if cfg.hint_style == 1 {
-                    true
-                } else {
-                    i >= word_index && i < word_index + 3 && word.len > 1
-                };
-                if !visible || word.start < offset || word.start >= end {
+                if word.start < offset || word.start >= end {
                     continue;
                 }
                 if let Some(code) = &word.code {
-                    let c = if word.rank > 1 {
-                        p.red
-                    } else {
-                        match code.len() {
-                            1 => p.accent,
-                            2 => p.copper,
-                            3 => p.jade,
-                            _ => p.muted,
-                        }
-                    };
+                    let c = word_colors[i].unwrap_or(p.text2);
                     let xx = x + (word.start - offset) as f32 * fs;
-                    mono(f, xx, yy + fs + 5., 7.5, code, c);
-                    if word.rank > 1 {
+                    let hint_size = hint_fs;
+                    if cfg.hint_show_code {
+                        mono(f, xx, yy + fs + 5., hint_size, code, c);
+                    }
+                    if cfg.hint_show_rank && word.rank > 1 {
                         mono(
                             f,
-                            xx + code.len() as f32 * 4.5,
+                            xx + if cfg.hint_show_code {
+                                code.chars().count() as f32 * hint_size * 0.6
+                            } else {
+                                0.
+                            },
                             yy + fs + 2.,
-                            6.,
+                            hint_size,
                             word.rank.to_string(),
-                            p.red,
+                            c,
                         );
                     }
                 }
@@ -1681,11 +1484,11 @@ fn draw_appearance(
         cfg.theme == "跟随虎符",
     );
     let swatches = [
-        (p.bg, "back_color"),
-        (p.text, "text_color"),
-        (p.accent, "hilited_back"),
-        (p.red, "hilited_label"),
-        (p.line2, "border_color"),
+        (p.bg, "背景"),
+        (p.text, "文字"),
+        (p.accent, "强调"),
+        (p.red, "错字"),
+        (p.line2, "边框"),
     ];
     for (i, (c, label)) in swatches.iter().enumerate() {
         let col = i % 3;
@@ -1693,7 +1496,7 @@ fn draw_appearance(
         let sx = cx + 12. + col as f32 * (cw - 24.) / 3.;
         let sy = y + 232. + row as f32 * 17.;
         round(f, sx, sy, 8., 8., 1.5, *c, Some(alpha(p.text, 0.2)));
-        mono(f, sx + 14., sy - 1., 7.5, *label, p.muted);
+        text(f, sx + 14., sy - 1., 14., *label, p.muted);
     }
     text(
         f,
@@ -1735,7 +1538,7 @@ fn draw_appearance(
             Action::Accent(s.to_string()),
         );
     }
-    text(f, col2, y + 301., FONT_HINT, "材质   三态", p.muted);
+    text(f, col2, y + 301., FONT_HINT, "材质（仅纯色可用）", p.muted);
     small_btn(
         f,
         hs,
@@ -1752,13 +1555,18 @@ fn draw_appearance(
     text(
         f,
         col2,
-        y + 356.,
+        y + 363.,
         FONT_HINT,
-        "当前构建使用纯色，保证原生输入兼容",
+        "磨砂 / 透明：原生输入兼容，已禁用",
         p.muted,
     );
     text(f, cx, y + 385., FONT_HINT, "动效强度   四档", p.muted);
-    for (i, s) in ["关", "轻", "标准", "丰富"].iter().enumerate() {
+    let motion_labels = if half < 190. {
+        ["关", "轻", "中", "强"]
+    } else {
+        ["关", "轻", "标准", "丰富"]
+    };
+    for (i, s) in motion_labels.iter().enumerate() {
         small_btn(
             f,
             hs,
@@ -1777,14 +1585,14 @@ fn draw_appearance(
         y + 445.,
         FONT_HINT,
         if m.reduced_motion {
-            "系统减少动态已开启，优先于此处设置"
+            "尊重系统减少动态"
         } else {
-            "动效只在输入、出错或打开面板时触发"
+            "输入时触发动效"
         },
         p.muted,
     );
     text(f, col2, y + 385., FONT_HINT, "字号 / 行高", p.muted);
-    let slider_w = (half - 128.).max(30.);
+    let slider_w = (half - 146.).max(0.);
     for (row, (name, value, minus, plus)) in [
         (
             "字号",
@@ -1802,29 +1610,40 @@ fn draw_appearance(
     .into_iter()
     .enumerate()
     {
-        let sy = y + 412. + row as f32 * 32.;
+        let sy = y + 408. + row as f32 * 39.;
         text(f, col2, sy + 3., FONT_HINT, name, p.muted);
-        line(f, col2 + 34., sy + 11., slider_w, p.line2);
         let ratio = if row == 0 {
             (cfg.font_size - 24.) / 40.
         } else {
             cfg.line_gap / 1.2
         };
-        let filled = slider_w * ratio.clamp(0., 1.);
-        rect(f, col2 + 34., sy + 11., filled, 2., p.accent);
-        round(f, col2 + 30. + filled, sy + 7., 8., 8., 4., p.accent, None);
-        small_btn(f, hs, col2 + half - 88., sy, 23., "−", minus, t, false);
-        small_btn(f, hs, col2 + half - 62., sy, 23., "+", plus, t, false);
+        if half >= 190. {
+            let filled = slider_w * ratio.clamp(0., 1.);
+            line(f, col2 + 34., sy + 11., slider_w, p.line2);
+            rect(f, col2 + 34., sy + 11., filled, 2., p.accent);
+            round(f, col2 + 30. + filled, sy + 7., 8., 8., 4., p.accent, None);
+        }
+        small_btn(f, hs, col2 + half - 108., sy, 32., "−", minus, t, false);
+        small_btn(f, hs, col2 + half - 72., sy, 32., "+", plus, t, false);
         right(f, col2 + half, sy + 4., FONT_HINT, value, p.text2);
     }
-    text(f, cx, y + 483., FONT_HINT, "词提样式", p.muted);
+    text(f, cx, y + 493., FONT_HINT, "词提样式", p.muted);
+    text(f, cx + cw - 126., y + 497., 15., "详细设置 ›", p.accent);
+    hit_box(
+        hs,
+        cx + cw - 130.,
+        y + 490.,
+        130.,
+        30.,
+        Action::Open(Modal::Preferences),
+    );
     let hw = (cw - 8.) / 3.;
     for (i, s) in ["词级柔光", "字级编码", "极简下划线"].iter().enumerate() {
         small_btn(
             f,
             hs,
             cx + i as f32 * (hw + 4.),
-            y + 505.,
+            y + 516.,
             hw,
             s,
             Action::HintStyle(i as u8),
@@ -1835,7 +1654,7 @@ fn draw_appearance(
     text(
         f,
         cx,
-        y + 544.,
+        y + 561.,
         FONT_HINT,
         if m.race {
             // 晴口径（research-digest §B）：赛制只关词提；字提保留、停手 5s 后显示
@@ -1848,7 +1667,14 @@ fn draw_appearance(
     let card_x = px + 14.;
     let card_w = preview_w - 28.;
     text(f, card_x, y + 79., FONT_HINT, "实时预览", p.muted);
-    right(f, px + preview_w - 14., y + 79., FONT_HINT, &t.name, p.muted);
+    right(
+        f,
+        px + preview_w - 14.,
+        y + 79.,
+        FONT_HINT,
+        &t.name,
+        p.muted,
+    );
     round(
         f,
         card_x,
@@ -1900,7 +1726,7 @@ fn draw_appearance(
         card_x + 13.,
         y + 421.,
         FONT_HINT,
-        "最近已结算成绩；没有成绩时显示 —",
+        "最近已结算成绩；无成绩显示 —",
         p.muted,
     );
     line(f, card_x + 13., y + ph - 166., card_w - 26., p.line);
@@ -1921,35 +1747,19 @@ fn draw_appearance(
         ),
         p.muted,
     );
-    // 词提四色（整改 9）：前四色可点——每点一次在预设色板里循环到下一色，
-    // 即时生效并随 config.color_overrides 落盘（错字色走主题打错色，不在词提四色内）。
-    for (i, (c, name, key)) in [
-        (p.hint_code, "编码", "词提编码色"),
-        (p.hint_badge, "角标", "词提角标色"),
-        (p.hint_underline, "下划线", "词提下划线色"),
-        (p.hint_bg, "底色", "词提底色"),
-        (p.red, "错字", ""),
+    for (i, (word, code, name)) in [
+        ("简码", "ab", "简码"),
+        ("二字", "abcd", "二字"),
+        ("三个字", "abcd", "三字"),
+        ("四字以上", "abcd", "四字+"),
     ]
     .iter()
     .enumerate()
     {
-        let sx = card_x + i as f32 * card_w / 5.;
-        rect(f, sx, y + ph - 122., 4., 4., *c);
-        if key.is_empty() {
-            text(f, sx + 8., y + ph - 126., FONT_HINT, *name, p.muted);
-        } else {
-            btn(
-                f,
-                hs,
-                sx + 8.,
-                y + ph - 130.,
-                44.,
-                *name,
-                crate::aux_marker(&format!("hint_color:{key}")),
-                t,
-                false,
-            );
-        }
+        let sx = card_x + i as f32 * card_w / 4.;
+        let c = crate::ui::hint_word_tint(&p, word, code, 4).unwrap_or(p.text);
+        rect(f, sx, y + ph - 122., 5., 5., c);
+        text(f, sx + 10., y + ph - 127., 14., *name, c);
     }
     btn(
         f,
@@ -1977,17 +1787,17 @@ fn draw_appearance(
     text(
         f,
         x + 20.,
-        y + ph - 36.,
+        y + ph - 38.,
         FONT_HINT,
-        "F7 随时呼出 · 只修改跟打器外观",
+        "改动即时生效 · 详细设置在上方「词提样式」右侧",
         p.muted,
     );
     btn(
         f,
         hs,
-        x + pw - 194.,
+        x + pw - 216.,
         y + ph - 47.,
-        102.,
+        124.,
         "打开数据目录",
         Action::Folder,
         t,
@@ -2005,24 +1815,7 @@ fn draw_appearance(
         true,
     );
 }
-/// 整改 13：明细表行数缓存（panel() 读它计算 FullAnalysis 面板高度）。
-static FULL_ANALYSIS_ROWS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-fn full_analysis_rows() -> usize {
-    FULL_ANALYSIS_ROWS.load(std::sync::atomic::Ordering::Relaxed)
-}
-fn mix4(a: [f32; 4], b: [f32; 4], k: f32) -> [f32; 4] {
-    let k = k.clamp(0., 1.);
-    [
-        a[0] + (b[0] - a[0]) * k,
-        a[1] + (b[1] - a[1]) * k,
-        a[2] + (b[2] - a[2]) * k,
-        a[3] + (b[3] - a[3]) * k,
-    ]
-}
-
-/// 整改 12：本段按键热力图。数据 = Session::last_vk_histogram（结算时
-/// 冻结的 VK 直方图；口径见 main.rs heatmap_vk：主区字母/数字/标点 +
-/// 空格/回车/退格）。色阶：0 = 面板底 → 最大频次 = 强调色加深。
+/// The actual and theoretical heatmaps share the same complete physical keyboard.
 fn draw_heatmap(
     f: &mut Frame,
     hs: &mut Vec<Hit>,
@@ -2035,142 +1828,261 @@ fn draw_heatmap(
 ) {
     let p = tokens(t);
     let hist = &sess.last_vk_histogram;
-    let iw = pw - 56.;
-    let gap = 5.;
-    let rows: [&[(&str, u8)]; 5] = [
-        &[
-            ("`", 0xC0u8),
-            ("1", 0x31),
-            ("2", 0x32),
-            ("3", 0x33),
-            ("4", 0x34),
-            ("5", 0x35),
-            ("6", 0x36),
-            ("7", 0x37),
-            ("8", 0x38),
-            ("9", 0x39),
-            ("0", 0x30),
-            ("-", 0xBD),
-            ("=", 0xBB),
-        ],
-        &[
-            ("Q", 0x51), ("W", 0x57), ("E", 0x45), ("R", 0x52), ("T", 0x54), ("Y", 0x59),
-            ("U", 0x55), ("I", 0x49), ("O", 0x4F), ("P", 0x50), ("[", 0xDB), ("]", 0xDD),
-        ],
-        &[
-            ("A", 0x41), ("S", 0x53), ("D", 0x44), ("F", 0x46), ("G", 0x47), ("H", 0x48),
-            ("J", 0x4A), ("K", 0x4B), ("L", 0x4C), (";", 0xBA), ("'", 0xDE),
-        ],
-        &[
-            ("Z", 0x5A), ("X", 0x58), ("C", 0x43), ("V", 0x56), ("B", 0x42), ("N", 0x4E),
-            ("M", 0x4D), (",", 0xBC), (".", 0xBE), ("/", 0xBF),
-        ],
-        &[("退格", 0x08), ("空格", 0x20), ("回车", 0x0D)],
-    ];
+    let total: u32 = hist.values().sum();
     let max = hist.values().copied().max().unwrap_or(0);
-    let deep = [p.accent[0] * 0.72, p.accent[1] * 0.72, p.accent[2] * 0.72, 1.];
-    if hist.is_empty() {
+    let keyboard_top = if ph >= 480. { 112. } else { 76. };
+    if ph >= 480. {
         text(
             f,
-            x + 24.,
-            y + 210.,
-            FONT_LABEL,
-            "本段暂无按键记录",
-            p.text2,
-        );
-        text(
-            f,
-            x + 24.,
-            y + 240.,
-            FONT_HINT,
-            "完成一段跟打并结算后生成 · 换文章后清空",
+            x + 28.,
+            y + 78.,
+            14.,
+            if total == 0 {
+                "本段暂无按键记录 · 完成一段后生成"
+            } else {
+                if pw - 56. < 760. {
+                    "本段按键分布 · 窄窗仅显示主键区"
+                } else {
+                    "本段按键分布 · 含修饰键与数字区 · 不含界面快捷键"
+                }
+            },
             p.muted,
         );
-        footer(f, x, y, pw, ph, t);
-        return;
     }
-    let kh = 46.;
-    let top0 = y + 82.;
-    for (r, row) in rows.iter().enumerate() {
-        let ky = top0 + r as f32 * (kh + 6.);
-        // 底行功能键（退格 | 空格 | 回车）：占位 2 / 6.5 / 2 键宽。
-        let n = row.len() as f32;
-        let kw = (iw - (n - 1.) * gap) / n;
-        for (c, (label, vk)) in row.iter().enumerate() {
-            let (kx, kwd) = if r == 4 {
-                let full = iw / 10.5;
-                match c {
-                    0 => (x + 28., full * 2. + gap),
-                    1 => (x + 28. + full * 2. + gap * 2., full * 6.5),
-                    _ => (x + 28. + full * 8.5 + gap * 3., full * 2.),
-                }
-            } else {
-                (x + 28. + c as f32 * (kw + gap), kw)
-            };
-            let count = hist.get(vk).copied().unwrap_or(0);
-            let k01 = if max == 0 {
-                0.
-            } else {
-                (count as f32 / max as f32).powf(0.75)
-            };
-            let fill = mix4(p.surface2, deep, k01);
-            round(f, kx, ky, kwd, kh, 5., fill, Some(alpha(p.line, 0.5)));
-            let fg = if k01 > 0.6 {
-                mix4(p.text, [0., 0., 0., 1.], 0.55)
-            } else {
-                p.text2
-            };
-            // 居中近似：字母 ~7.5px/字、汉字 ~13px/字。
-            let label_w = label.chars().fold(0., |a, ch| {
-                a + if ch.is_ascii() { 7.5 } else { 13. }
-            });
-            text(
-                f,
-                kx + (kwd - label_w).max(2.) / 2.,
-                ky + 8.,
-                FONT_HINT,
-                *label,
-                fg,
-            );
-            mono(
-                f,
-                kx + (kwd - (if count >= 10 { 15. } else { 8. })).max(2.) / 2.,
-                ky + 26.,
-                FONT_HINT,
-                if count == 0 { "·".into() } else { count.to_string() },
-                if count == 0 { alpha(p.muted, 0.4) } else { fg },
-            );
-        }
-    }
-    // 底部：合计 + 色阶图例（0 → 最大频次）。
-    let total: u32 = hist.values().sum();
+    crate::keyboard::draw(
+        f,
+        t,
+        x + 28.,
+        y + keyboard_top,
+        pw - 56.,
+        ph - keyboard_top - 74.,
+        |key| hist.get(&key).copied().unwrap_or(0),
+    );
+    footer(f, x, y, pw, ph, t);
     text(
         f,
         x + 28.,
-        y + ph - 88.,
-        FONT_HINT,
-        format!("合计击键 {} 次 · 最大单键 {} 次（色阶 = 频次比例）", total, max),
+        y + ph - 49.,
+        14.,
+        format!("总计 {total} 次 · 单键最高 {max} 次"),
         p.muted,
     );
-    for i in 0..16 {
-        let k01 = (i as f32 / 15.).powf(0.75);
-        rect(
-            f,
-            x + 28. + i as f32 * 13.,
-            y + ph - 68.,
-            12.,
-            8.,
-            mix4(p.surface2, deep, k01),
-        );
-    }
-    right(f, x + pw - 28., y + ph - 88., FONT_HINT, format!("{} → {}", 0, max), p.muted);
-    footer(f, x, y, pw, ph, t);
+    text(
+        f,
+        x + 28.,
+        y + ph - 29.,
+        14.,
+        "颜色越深，频次越高 · 左右修饰键分别计数",
+        p.muted,
+    );
+    btn(
+        f,
+        hs,
+        x + pw - 112.,
+        y + ph - 47.,
+        84.,
+        "完成",
+        Action::Close,
+        t,
+        true,
+    );
 }
-
-/// 整改 13：文章理论分析（Session::full_analysis，Y1 代理后台回填；
-/// None = 旧版虎符服务无该端点）。顶部三张汇总卡 + 按文章序明细表，
-/// rank>1（理论选重）行画强调色"选"徽标。滚轮滚动走通用 panel_scroll
-/// （面板高度由明细行数驱动，见 panel()）。
+fn analysis_font(m: &Model) -> f32 {
+    m.field("analysis_font")
+        .parse::<f32>()
+        .ok()
+        .filter(|n| n.is_finite())
+        .unwrap_or(20.)
+        .clamp(12., 36.)
+}
+fn analysis_auto4(m: &Model) -> bool {
+    m.fields
+        .get("analysis_auto4")
+        .map(|v| v != "false")
+        .unwrap_or(true)
+}
+fn analysis_is_heatmap(m: &Model) -> bool {
+    m.fields
+        .get("analysis_view")
+        .map(|v| v == "heatmap")
+        .unwrap_or(false)
+}
+fn analysis_char_width(ch: char, size: f32, mono_font: bool) -> f32 {
+    if ch.is_ascii() {
+        size * if mono_font { 0.63 } else { 0.88 }
+    } else {
+        size * 1.04
+    }
+}
+fn analysis_text_width(s: &str, size: f32, mono_font: bool) -> f32 {
+    s.chars()
+        .map(|c| analysis_char_width(c, size, mono_font))
+        .sum()
+}
+/// Conservative wrapping keeps the word and its key recipe in one aligned block.
+/// A long dictionary entry can occupy several lines without clipping its encoding.
+fn analysis_wrap(s: &str, width: f32, size: f32, mono_font: bool) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut buf = String::new();
+    let mut used = 0.;
+    for ch in s.chars() {
+        if ch == '\r' {
+            continue;
+        }
+        if ch == '\n' {
+            lines.push(std::mem::take(&mut buf));
+            used = 0.;
+            continue;
+        }
+        let cw = analysis_char_width(ch, size, mono_font);
+        if !buf.is_empty() && used + cw > width.max(size) {
+            lines.push(std::mem::take(&mut buf));
+            used = 0.;
+        }
+        buf.push(ch);
+        used += cw;
+    }
+    if !buf.is_empty() || lines.is_empty() {
+        lines.push(buf);
+    }
+    lines
+}
+#[derive(Debug)]
+struct AnalysisBlock {
+    source_index: usize,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    words: Vec<String>,
+    keys: Vec<String>,
+    missing: bool,
+}
+fn analysis_blocks(fa: &crate::FullAnalysis, m: &Model, width: f32) -> (Vec<AnalysisBlock>, f32) {
+    let fs = analysis_font(m);
+    let ks = (fs * 0.68).max(14.);
+    let available = width.max(fs * 2.);
+    let gap = (fs * 0.56).max(9.);
+    let mut x = 0.;
+    let mut y = 0.;
+    let mut row_height: f32 = 0.;
+    let mut out = Vec::new();
+    for (source_index, entry) in fa.entries.iter().enumerate() {
+        if entry.word == "\n" || entry.word == "\r\n" {
+            y += row_height.max(fs * 2.7);
+            x = 0.;
+            row_height = 0.;
+            continue;
+        }
+        let recipe = crate::analysis::entry_keys(entry, analysis_auto4(m), fa.max_code_length);
+        let missing = entry.code.is_none()
+            && recipe.is_empty()
+            && entry.word.chars().any(|c| !c.is_whitespace());
+        let keys = if missing {
+            "缺字".into()
+        } else if entry.rank > 1 && entry.code.is_some() {
+            format!(
+                "{}{}",
+                crate::analysis::display_keys(entry.code.as_deref().unwrap()),
+                entry.rank
+            )
+        } else {
+            crate::analysis::display_keys(&recipe)
+        };
+        let key_label = if keys.is_empty() { "—" } else { &keys };
+        let word_width = analysis_text_width(&entry.word, fs, false);
+        let key_width = analysis_text_width(key_label, ks, true);
+        let block_width = word_width.max(key_width).max(fs * 0.7).min(available);
+        if x > 0. && x + block_width > available {
+            y += row_height;
+            x = 0.;
+            row_height = 0.;
+        }
+        let words = analysis_wrap(&entry.word, block_width, fs, false);
+        let keys = analysis_wrap(key_label, block_width, ks, true);
+        let block_height = words.len() as f32 * fs * 1.4 + keys.len() as f32 * ks * 1.4 + gap;
+        out.push(AnalysisBlock {
+            source_index,
+            x,
+            y,
+            w: block_width,
+            h: block_height,
+            words,
+            keys,
+            missing,
+        });
+        row_height = row_height.max(block_height);
+        x += block_width + gap;
+        if entry.word.contains('\n') {
+            y += row_height;
+            x = 0.;
+            row_height = 0.;
+        }
+    }
+    (out, y + row_height)
+}
+fn analysis_body_height(ph: f32) -> f32 {
+    (ph - 274.).max(24.)
+}
+pub fn analysis_scroll_max(sess: &Session, m: &Model, pw: f32, ph: f32) -> f32 {
+    if analysis_is_heatmap(m) {
+        return 0.;
+    }
+    sess.full_analysis
+        .as_ref()
+        .map(|fa| {
+            let (_, height) = analysis_blocks(fa, m, (pw - 64.).max(80.));
+            (height - analysis_body_height(ph)).max(0.)
+        })
+        .unwrap_or(0.)
+}
+fn analysis_button(
+    f: &mut Frame,
+    hs: &mut Vec<Hit>,
+    x: f32,
+    y: f32,
+    w: f32,
+    label: &str,
+    marker: &str,
+    t: &Theme,
+    selected: bool,
+) {
+    let p = tokens(t);
+    round(
+        f,
+        x,
+        y,
+        w,
+        34.,
+        6.,
+        if selected {
+            alpha(p.accent, 0.13)
+        } else {
+            p.surface2
+        },
+        Some(if selected {
+            alpha(p.accent, 0.55)
+        } else {
+            p.line2
+        }),
+    );
+    text(
+        f,
+        x + 12.,
+        y + 9.,
+        13.,
+        label,
+        if selected { p.accent } else { p.text2 },
+    );
+    hs.push(Hit {
+        x,
+        y,
+        w,
+        h: 34.,
+        action: crate::aux_marker(marker),
+    });
+}
+/// Fixed header, summary and controls; only the complete article scrolls.
 fn draw_full_analysis(
     f: &mut Frame,
     hs: &mut Vec<Hit>,
@@ -2183,104 +2095,280 @@ fn draw_full_analysis(
     ph: f32,
 ) {
     let p = tokens(t);
-    footer(f, x, y, pw, ph, t);
-    text(
-        f,
-        x + 20.,
-        y + ph - 36.,
-        FONT_HINT,
-        "理论口径：以当前方案码表对全文逐词编码 · 选重 = 首选之外的理论候选",
-        p.muted,
-    );
-    let fa = match &sess.full_analysis {
-        Some(fa) => fa,
-        None => {
-            text(
+    let auto4 = analysis_auto4(m);
+    let heatmap = analysis_is_heatmap(m);
+    let body_y = y + 150.;
+    let body_h = analysis_body_height(ph);
+    let body_w = (pw - 64.).max(80.);
+    let fs = analysis_font(m);
+    text(f, x + 24., y + 72., 14., "【当前词库】", p.accent);
+    if let Some(fa) = &sess.full_analysis {
+        f.push(DrawCmd::PushClip {
+            x: x + 128.,
+            y: y + 68.,
+            w: pw - 152.,
+            h: 24.,
+        });
+        text(f, x + 128., y + 72., 13., &fa.schema, p.muted);
+        f.push(DrawCmd::PopClip);
+        right(f, x + pw - 24., y + 71., 14., "滚轮翻页", p.muted);
+        let summary = crate::analysis::summarize(fa, auto4);
+        let items = [
+            ("码长", format!("{:.4}", summary.avg_code_len)),
+            ("字数", summary.char_count.to_string()),
+            ("选重", summary.select_count.to_string()),
+            ("缺字", summary.missing_chars.to_string()),
+            ("已知键数", summary.known_keys.to_string()),
+        ];
+        let step = (pw - 48.) / 5.;
+        for (i, (label, value)) in items.iter().enumerate() {
+            let sx = x + 24. + i as f32 * step;
+            text(f, sx, y + 101., 13., *label, p.muted);
+            mono(
                 f,
-                x + 24.,
-                y + 180.,
-                FONT_LABEL,
-                "当前文章暂无分析（需新版虎符服务）",
-                p.text2,
+                sx,
+                y + 121.,
+                18.,
+                value,
+                if i == 3 && summary.missing_chars > 0 {
+                    p.red
+                } else {
+                    p.text
+                },
             );
-            text(
-                f,
-                x + 24.,
-                y + 210.,
-                FONT_HINT,
-                "升级服务端后重新载入本文，分析会自动生成",
-                p.muted,
-            );
-            let _ = m;
-            return;
         }
-    };
-    let iw = pw - 48.;
-    // 三张汇总卡：理论码长 / 平均码长·字 / 理论选重。
-    let cw = (iw - 24.) / 3.;
-    for (i, (title, big, unit)) in [
-        ("理论码长", fa.total_code_len.to_string(), "键"),
-        (
-            "平均码长 / 字",
-            format!("{:.2}", fa.avg_code_len_per_char),
-            "键",
-        ),
-        ("理论选重", fa.select_count.to_string(), "次"),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let cx = x + 24. + i as f32 * (cw + 12.);
-        round(f, cx, y + 72., cw, 64., 9., p.surface2, Some(p.line));
-        text(f, cx + 12., y + 84., FONT_HINT, title, p.muted);
-        mono(f, cx + 12., y + 104., 20., big, if i == 2 && fa.select_count > 0 { p.red } else { p.text });
-        text(f, cx + 12., y + 122., FONT_HINT, unit, p.muted);
-    }
-    // 明细表：词 / 编码 / 码长 / 位次（rank>1 加"选"徽标）。
-    let c_word = x + 36.;
-    let c_code = x + 300.;
-    let c_len = x + 620.;
-    let c_rank = x + 770.;
-    let c_badge = x + 812.;
-    text(f, c_word, y + 160., FONT_HINT, "词", p.muted);
-    text(f, c_code, y + 160., FONT_HINT, "编码", p.muted);
-    right(f, c_len + 60., y + 160., FONT_HINT, "码长", p.muted);
-    right(f, c_rank + 40., y + 160., FONT_HINT, "位次", p.muted);
-    line(f, x + 24., y + 176., iw, p.line);
-    let cap = 600usize;
-    let n = fa.entries.len().min(cap);
-    FULL_ANALYSIS_ROWS.store(n, std::sync::atomic::Ordering::Relaxed);
-    for (i, e) in fa.entries.iter().take(cap).enumerate() {
-        let ry = y + 188. + i as f32 * 26.;
-        if i % 2 == 0 {
-            rect(f, x + 24., ry - 5., iw, 26., alpha(p.text, 0.02));
+        line(f, x + 24., y + 145., pw - 48., p.line);
+        f.push(DrawCmd::PushClip {
+            x: x + 24.,
+            y: body_y,
+            w: pw - 48.,
+            h: body_h,
+        });
+        if heatmap {
+            crate::keyboard::draw(f, t, x + 32., body_y + 6., body_w, body_h - 8., |key| {
+                summary.key_counts.get(&key).copied().unwrap_or(0)
+            });
+        } else {
+            let (blocks, total_h) = analysis_blocks(fa, m, body_w);
+            let scroll = m.scroll.clamp(0., (total_h - body_h).max(0.));
+            let ks = (fs * 0.68).max(14.);
+            for block in blocks
+                .iter()
+                .filter(|b| b.y + b.h >= scroll && b.y < scroll + body_h)
+            {
+                let bx = x + 32. + block.x;
+                let by = body_y + block.y - scroll;
+                f.push(DrawCmd::PushClip {
+                    x: bx,
+                    y: by,
+                    w: block.w + 2.,
+                    h: block.h,
+                });
+                // Keep the semantic word-length colours here too: users read
+                // the analysis page as a colour-coded copy of the practice text.
+                let entry = &fa.entries[block.source_index];
+                let color = if block.missing {
+                    p.red
+                } else {
+                    let code = entry.code.as_deref().unwrap_or("");
+                    // Single-character drills have no word-length category;
+                    // colour them by code length so 理论 is still readable as a
+                    // heat map instead of a wall of white glyphs.
+                    if entry.word.chars().filter(|c| c.is_alphanumeric()).count() <= 1 {
+                        let n = code.chars().count().max(1);
+                        p.word_colors[(n - 1).min(p.word_colors.len() - 1)]
+                    } else {
+                        crate::ui::hint_word_tint(&p, &entry.word, code, fa.max_code_length)
+                            .unwrap_or(p.text)
+                    }
+                };
+                let key_color = color;
+                for (i, word) in block.words.iter().enumerate() {
+                    crate::ui::body_text(f, bx, by + i as f32 * fs * 1.4, fs, word, color);
+                }
+                let key_y = by + block.words.len() as f32 * fs * 1.4;
+                for (i, keys) in block.keys.iter().enumerate() {
+                    mono(f, bx, key_y + i as f32 * ks * 1.4, ks, keys, key_color);
+                }
+                f.push(DrawCmd::PopClip);
+            }
+            if total_h > body_h {
+                let thumb = (body_h * body_h / total_h).clamp(16., body_h);
+                rect(f, x + pw - 28., body_y, 3., body_h, alpha(p.text, 0.06));
+                rect(
+                    f,
+                    x + pw - 28.,
+                    body_y + scroll / (total_h - body_h) * (body_h - thumb),
+                    3.,
+                    thumb,
+                    alpha(p.accent, 0.65),
+                );
+            }
         }
-        let sel = e.rank > 1;
-        if sel {
-            // 选重行：强调色左侧条 + 词面红化 + "选"徽标。
-            rect(f, x + 24., ry - 5., 2., 26., p.accent);
-        }
-        body_text(f, c_word, ry, FONT_HINT, &e.word, if sel { p.red } else { p.text2 });
-        match &e.code {
-            Some(code) => mono(f, c_code, ry, FONT_HINT, code, p.hint_code),
-            None => text(f, c_code, ry, FONT_HINT, "— 生词无码", alpha(p.muted, 0.6)),
-        }
-        right(f, c_len + 60., ry, FONT_HINT, e.code_len.to_string(), p.text2);
-        right(f, c_rank + 40., ry, FONT_HINT, e.rank.to_string(), if sel { p.red } else { p.text2 });
-        if sel {
-            round(f, c_badge, ry - 3., 22., 19., 5., alpha(p.accent, 0.85), None);
-            text(f, c_badge + 5., ry, 13., "选", [0.1, 0.08, 0.04, 1.]);
-        }
-    }
-    if fa.entries.len() > cap {
+        f.push(DrawCmd::PopClip);
+    } else {
+        let loading = m.field("analysis_loading") == "true";
+        let error = m.field("analysis_error");
         text(
             f,
-            x + 24.,
-            y + 196. + cap as f32 * 26.,
-            FONT_HINT,
-            format!("…共 {} 条，仅列前 {} 条", fa.entries.len(), cap),
-            p.muted,
+            x + 32.,
+            body_y + 8.,
+            16.,
+            if loading {
+                "正在分析全文，请稍候…"
+            } else if error.is_empty() {
+                "当前文章尚未取得理论分析"
+            } else {
+                "理论分析未完成"
+            },
+            p.text2,
         );
+        if !loading {
+            let detail = if error.is_empty() {
+                "可重新请求；加载成功后会在此显示全文及每词编码。"
+            } else {
+                &error
+            };
+            let lines = analysis_wrap(detail, body_w, 13., false);
+            let max_lines = (((body_h - 70.) / 19.).floor().max(1.) as usize).min(4);
+            for (i, line) in lines.iter().take(max_lines).enumerate() {
+                text(
+                    f,
+                    x + 32.,
+                    body_y + 36. + i as f32 * 19.,
+                    13.,
+                    line,
+                    p.muted,
+                );
+            }
+            analysis_button(
+                f,
+                hs,
+                x + 32.,
+                body_y + body_h - 34.,
+                104.,
+                "重新分析",
+                "analysis_retry",
+                t,
+                false,
+            );
+        }
+    }
+    let fy = y + ph - 108.;
+    line(f, x, fy - 9., pw, p.line);
+    round(
+        f,
+        x + 24.,
+        fy + 8.,
+        16.,
+        16.,
+        3.,
+        if auto4 { p.accent } else { p.surface2 },
+        Some(p.line2),
+    );
+    if auto4 {
+        text(f, x + 27., fy + 7., 13., "✓", p.bg);
+    }
+    text(f, x + 49., fy + 8., 15., "四码首选自动上屏", p.text2);
+    text(
+        f,
+        x + 286.,
+        fy + 8.,
+        15.,
+        if pw < 760. {
+            "灰码 · 铜选 · 红缺"
+        } else {
+            "词色按词长 / 单字按码长 · 红=缺字"
+        },
+        p.muted,
+    );
+    hs.push(Hit {
+        x: x + 20.,
+        y: fy,
+        w: 230.,
+        h: 34.,
+        action: crate::aux_marker("analysis_auto4"),
+    });
+    analysis_button(
+        f,
+        hs,
+        x + pw - 192.,
+        fy,
+        168.,
+        if heatmap {
+            "返回全文编码"
+        } else {
+            "按键热力图"
+        },
+        "analysis_view",
+        t,
+        heatmap,
+    );
+    let sy = y + ph - 48.;
+    text(f, x + 24., sy + 3., 13., "字号", p.muted);
+    let slider_x = x + 70.;
+    let slider_w = (pw - 430.).clamp(80., 250.);
+    let ratio = (fs - 12.) / 24.;
+    rect(f, slider_x, sy + 11., slider_w, 3., p.line2);
+    rect(f, slider_x, sy + 11., slider_w * ratio, 3., p.accent);
+    round(
+        f,
+        slider_x + slider_w * ratio - 5.,
+        sy + 7.,
+        10.,
+        10.,
+        5.,
+        p.accent,
+        None,
+    );
+    for size in 12..=36 {
+        let center = slider_x + slider_w * (size - 12) as f32 / 24.;
+        hs.push(Hit {
+            x: center - slider_w / 48.,
+            y: sy - 2.,
+            w: slider_w / 24. + 1.,
+            h: 34.,
+            action: crate::aux_marker(&format!("analysis_font:{size}")),
+        });
+    }
+    mono(
+        f,
+        slider_x + slider_w + 14.,
+        sy + 3.,
+        13.,
+        format!("{fs:.0}"),
+        p.text2,
+    );
+    analysis_button(
+        f,
+        hs,
+        x + pw - 240.,
+        sy - 3.,
+        140.,
+        "复制当前图片",
+        "analysis_copy",
+        t,
+        false,
+    );
+    btn(
+        f,
+        hs,
+        x + pw - 88.,
+        sy - 3.,
+        64.,
+        "关闭",
+        Action::Close,
+        t,
+        true,
+    );
+}
+
+fn modal_content_height(m: &Model, pw: f32) -> f32 {
+    match m.modal {
+        Modal::Preferences => preferences::content_height(m, pw),
+        Modal::Online => crate::secondary_panels::content_height_online(m),
+        Modal::Rules => 900.,
+        _ => 0.,
     }
 }
 
@@ -2297,7 +2385,7 @@ pub fn draw(
 ) {
     let p = tokens(t);
     if m.modal != Modal::None {
-        let full_page = matches!(m.modal, Modal::Result | Modal::Report);
+        let full_page = m.modal == Modal::Report;
         let (x, y, pw, ph) = panel(m.modal, w, h);
         if full_page {
             hs.retain(|hit| hit.y < 55. || hit.y >= h - 37.);
@@ -2327,9 +2415,10 @@ pub fn draw(
                 panel_header(f, hs, m.modal, x, y, pw, t);
             }
             match m.modal {
-                Modal::Load => draw_load(f, hs, m, sess, cfg, t, x, y, pw, ph),
-                Modal::Groups => draw_groups(f, hs, m, sess, t, x, y, pw, ph),
+                Modal::Library => draw_library(f, hs, m, t, x, y, pw, ph),
+                Modal::Groups => draw_groups(f, hs, m, sess, cfg, t, x, y, pw, ph),
                 Modal::Appearance => draw_appearance(f, hs, m, sess, cfg, t, x, y, pw, ph),
+                Modal::Preferences => preferences::draw(f, hs, m, t, x, y, pw, ph),
                 Modal::Heatmap => draw_heatmap(f, hs, sess, t, x, y, pw, ph),
                 Modal::FullAnalysis => draw_full_analysis(f, hs, m, sess, t, x, y, pw, ph),
                 Modal::Online | Modal::Rules => {
@@ -2373,17 +2462,25 @@ pub fn draw(
                 }
                 _ => {}
             }
-            fit_panel(
-                f,
-                hs,
-                command_start,
-                x,
-                y,
-                pw,
-                ph,
-                panel_view(ph, h),
-                m.panel_scroll,
-            );
+            if m.modal != Modal::FullAnalysis {
+                fit_panel(
+                    f,
+                    hs,
+                    command_start,
+                    x,
+                    y,
+                    pw,
+                    ph,
+                    panel_view(ph, h),
+                    m.panel_scroll,
+                    if m.modal == Modal::Preferences {
+                        50.
+                    } else {
+                        0.
+                    },
+                    modal_content_height(m, pw),
+                );
+            }
         }
     }
     if let Some((msg, at)) = &m.toast {
@@ -2433,22 +2530,252 @@ pub fn wrap(s: &str, n: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn analysis_session(entries: usize) -> Session {
+        let mut s = Session::new(100);
+        s.full_analysis = Some(crate::FullAnalysis {
+            schema: "测试词库".into(),
+            max_code_length: 4,
+            entries: (0..entries)
+                .map(|i| crate::FullAnalysisEntry {
+                    word: if i + 1 == entries {
+                        "最后一词".into()
+                    } else {
+                        "理论编码".into()
+                    },
+                    code: Some("abcd".into()),
+                    rank: 1,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        });
+        s
+    }
+    #[test]
+    fn physical_heatmap_uses_visible_height_and_keeps_footer_button_complete() {
+        for (w, h) in [(800., 600.), (640., 420.)] {
+            let mut model = Model::default();
+            model.open(Modal::Heatmap);
+            let (x, y, pw, ph) = panel(model.modal, w, h);
+            assert!(ph <= h - 48.);
+            let mut frame = Frame::new(w, h);
+            let mut hits = Vec::new();
+            draw_heatmap(
+                &mut frame,
+                &mut hits,
+                &Session::new(100),
+                &crate::ui::theme("墨玉"),
+                x,
+                y,
+                pw,
+                ph,
+            );
+            let close = hits.iter().find(|hit| hit.action == Action::Close).unwrap();
+            assert_eq!(close.h, 34.);
+            assert!(close.y >= 0. && close.y + close.h <= h);
+            // The keyboard rectangle ends twelve pixels above the footer.
+            let top = if ph >= 480. { 112. } else { 76. };
+            assert!(y + top + (ph - top - 74.) <= y + ph - PANEL_FOOT);
+        }
+    }
+    #[test]
+    fn full_analysis_scroll_reaches_entries_beyond_old_limit_without_moving_controls() {
+        let s = analysis_session(1600);
+        let mut m = Model::default();
+        m.open(Modal::FullAnalysis);
+        let cfg = Config::default();
+        let t = crate::ui::theme("墨玉");
+        let (_, _, pw, ph) = panel(m.modal, 1280., 800.);
+        let max = analysis_scroll_max(&s, &m, pw, ph);
+        assert!(max > ph);
+        let mut top = Frame::new(1280., 800.);
+        let mut top_hits = Vec::new();
+        draw(&mut top, &mut top_hits, &m, &s, &cfg, &t, 1280., 800., 0.);
+        m.scroll = max;
+        let mut bottom = Frame::new(1280., 800.);
+        let mut bottom_hits = Vec::new();
+        draw(
+            &mut bottom,
+            &mut bottom_hits,
+            &m,
+            &s,
+            &cfg,
+            &t,
+            1280.,
+            800.,
+            0.,
+        );
+        assert!(bottom
+            .cmds
+            .iter()
+            .any(|c| matches!(c, DrawCmd::TextRun { text, .. } if text == "最后一词")));
+        let copy = crate::aux_marker("analysis_copy");
+        let a = top_hits.iter().find(|h| h.action == copy).unwrap();
+        let b = bottom_hits.iter().find(|h| h.action == copy).unwrap();
+        assert_eq!((a.x, a.y, a.w, a.h), (b.x, b.y, b.w, b.h));
+        assert!(bottom_hits.iter().all(|h| h.y >= 0. && h.y + h.h <= 800.));
+    }
+    #[test]
+    fn full_analysis_fits_small_viewport_and_has_all_footer_actions() {
+        let s = analysis_session(12);
+        let mut m = Model::default();
+        m.open(Modal::FullAnalysis);
+        let (_, y, _, ph) = panel(m.modal, 640., 420.);
+        assert!(y >= 0. && y + ph <= 420.);
+        let mut f = Frame::new(640., 420.);
+        let mut hits = Vec::new();
+        draw(
+            &mut f,
+            &mut hits,
+            &m,
+            &s,
+            &Config::default(),
+            &crate::ui::theme("墨玉"),
+            640.,
+            420.,
+            0.,
+        );
+        for marker in [
+            "analysis_auto4",
+            "analysis_view",
+            "analysis_copy",
+            "analysis_font:12",
+            "analysis_font:36",
+        ] {
+            let h = hits
+                .iter()
+                .find(|h| h.action == crate::aux_marker(marker))
+                .unwrap();
+            assert!(h.x >= 0. && h.y >= 0. && h.x + h.w <= 640. && h.y + h.h <= 420.);
+        }
+    }
+    #[test]
+    fn analysis_wrap_keeps_long_word_and_recipe_in_bounded_blocks() {
+        let mut s = analysis_session(1);
+        let fa = s.full_analysis.as_mut().unwrap();
+        fa.entries[0].word = "很长的词条".repeat(20);
+        fa.entries[0].code = Some("abcdefghijklmnop".repeat(12));
+        let (blocks, height) = analysis_blocks(fa, &Model::default(), 250.);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].words.concat(), fa.entries[0].word);
+        assert_eq!(
+            blocks[0].keys.concat(),
+            crate::analysis::display_keys(&crate::analysis::entry_keys(&fa.entries[0], true, 4))
+        );
+        assert!(blocks[0].w <= 250. && height > 100.);
+    }
+    #[test]
+    fn analysis_colors_only_words_and_shows_selection_rank_without_changing_key_counts() {
+        let entry = |word: &str, code: Option<&str>, rank, tail: &str| crate::FullAnalysisEntry {
+            word: word.into(),
+            code: code.map(str::to_owned),
+            rank,
+            tail: tail.into(),
+            ..Default::default()
+        };
+        let fa = crate::FullAnalysis {
+            max_code_length: 4,
+            entries: vec![
+                entry("甲", Some("a"), 1, "_"),
+                entry("词组", Some("ab"), 2, ";"),
+                entry("，", None, 0, ""),
+                entry("另一词", Some("cd"), 3, "'"),
+                entry("缺字", None, 0, ""),
+                entry("乙", Some("e"), 1, "_"),
+                entry("最后词", Some("fg"), 1, "_"),
+            ],
+            ..Default::default()
+        };
+        let (blocks, _) = analysis_blocks(&fa, &Model::default(), 900.);
+        let p = tokens(&crate::ui::theme("墨玉"));
+        let colors: Vec<_> = blocks
+            .iter()
+            .map(|block| {
+                let entry = &fa.entries[block.source_index];
+                entry.code.as_deref().and_then(|code| {
+                    crate::ui::hint_word_tint(&p, &entry.word, code, fa.max_code_length)
+                })
+            })
+            .collect();
+        let short = crate::ui::hint_word_tint(&p, "简码", "ab", 4).unwrap();
+        assert_eq!(
+            colors,
+            vec![
+                None,
+                Some(short),
+                None,
+                Some(short),
+                None,
+                None,
+                Some(short)
+            ]
+        );
+        assert_eq!(blocks[0].keys.concat(), "a_");
+        assert_eq!(blocks[1].keys.concat(), "ab2");
+        assert_eq!(blocks[3].keys.concat(), "cd3");
+        assert!(blocks[4].missing);
+        let summary = crate::analysis::summarize(&fa, true);
+        assert_eq!(summary.key_counts.get(&0xba), Some(&1));
+        assert_eq!(summary.key_counts.get(&0xde), Some(&1));
+        assert!(!summary.key_counts.contains_key(&b'2'));
+        assert!(!summary.key_counts.contains_key(&b'3'));
+    }
+    #[test]
+    fn appearance_preview_uses_all_word_hints_and_keeps_single_characters_uncolored() {
+        let mut s = Session::new(100);
+        s.load_book("预览", "甲乙丙丁戊己庚辛壬癸");
+        let mut m = Model::default();
+        m.hints = true;
+        m.words = (0..5)
+            .map(|i| HintWord {
+                text: ["甲", "乙丙", "丁戊", "己庚", "辛壬癸"][i].into(),
+                code: Some(format!("a{i}")),
+                tail: ";".into(),
+                start: [0, 1, 3, 5, 7][i],
+                len: [1, 2, 2, 2, 3][i],
+                rank: if i == 0 { 2 } else { 1 },
+            })
+            .collect();
+        let cfg = Config::default();
+        let t = crate::ui::theme("墨玉");
+        let p = tokens(&t);
+        let mut frame = Frame::new(800., 300.);
+        appearance_preview(&mut frame, &s, &m, &cfg, &t, 0., 0., 700., 250.);
+        let codes: Vec<_> = frame
+            .cmds
+            .iter()
+            .filter_map(|cmd| match cmd {
+                DrawCmd::TextRun { text, color, .. } if text.starts_with('a') => {
+                    Some((text.as_str(), *color))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(codes.len(), 5);
+        assert_eq!(codes[0].1, p.text2);
+        assert_eq!(
+            codes[1].1,
+            crate::ui::hint_word_tint(&p, "乙丙", "a1", 4).unwrap()
+        );
+        assert_eq!(
+            codes[4].1,
+            crate::ui::hint_word_tint(&p, "辛壬癸", "a4", 4).unwrap()
+        );
+        assert!(frame.cmds.iter().any(|cmd| matches!(cmd,
+            DrawCmd::TextRun { text, color, .. } if text == "2" && *color == p.text2)));
+    }
     #[test]
     fn small_panel_keeps_primary_actions_visible() {
         let mut m = Model::default();
-        m.open(Modal::Load);
-        m.load_editing = true;
+        m.open(Modal::Library);
         let s = Session::new(100);
         let cfg = Config::default();
         let t = crate::ui::theme("墨玉");
         let mut f = Frame::new(640., 420.);
         let mut hits = Vec::new();
         draw(&mut f, &mut hits, &m, &s, &cfg, &t, 640., 420., 0.);
-        let load = hits.iter().find(|h| h.action == Action::LoadText).unwrap();
-        assert!(load.y >= 0. && load.y + load.h <= 420.);
-        let fields = fields(&m, 640., 420.);
-        assert!(fields[0].h > 60.);
-        assert!(fields[0].y + fields[0].h <= load.y);
+        let close = hits.iter().find(|h| h.action == Action::Close).unwrap();
+        assert!(close.y >= 0. && close.y + close.h <= 420.);
     }
     #[test]
     fn rules_editors_scroll_within_viewport() {
@@ -2481,9 +2808,11 @@ mod tests {
             y: 573.,
             w: 80.,
             h: 32.,
-            action: Action::LoadText,
+            action: Action::Close,
         }];
-        fit_panel(&mut f, &mut hits, 0, 16., 24., 608., 596., 372., 100.);
+        fit_panel(
+            &mut f, &mut hits, 0, 16., 24., 608., 596., 372., 100., 0., 0.,
+        );
         let mut depth = 0;
         for c in &f.cmds {
             match c {

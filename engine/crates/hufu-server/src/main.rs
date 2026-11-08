@@ -921,6 +921,13 @@ fn main() {
                     .filter(|p| p.is_file())
                 {
                     let mut c = std::process::Command::new(shell); // zi-ok: shell=ShellExecuteW 回退链首选项路径（非解释器）
+                    // 【2026-11-09 根治】子进程不继承本进程 stdio：server 曾被
+                    // codex 运行时拉起（管道句柄后失效），其拉起的设置壳/跟打器
+                    // 全部死于 main 之前（零日志）。显式接 null，子进程不再受
+                    // 父进程句柄状态牵连。
+                    c.stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null());
                     c.arg("--url").arg(url.clone());
                     match c.spawn() {
                         Ok(child) => {

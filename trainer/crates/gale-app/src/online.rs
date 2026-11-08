@@ -91,16 +91,23 @@ impl From<&WenlaiAccount> for AccountSummary {
 
 /// 密码只在本次登录中使用，不持久化，也不实现Debug。
 pub enum OnlineCommand {
-    Login { username: String, password: String },
+    Login {
+        username: String,
+        password: String,
+    },
     Logout,
-    SetServer { base_url: String },
+    SetServer {
+        base_url: String,
+    },
     Fetch(FetchParams),
     Categories,
     Bookshelf,
     CurrentUser,
     /// 注册第一步：POST /api/auth/register/sendCode（60s 服务端冷却，
     /// 错误 msg 透传）；成功回 CodeSent，UI 侧启动 60 秒重发冷却。
-    RegisterSendCode { email: String },
+    RegisterSendCode {
+        email: String,
+    },
     /// 注册第二步：POST /api/auth/register（core 内成功后自动 login 拿
     /// token），成功按 Login 同型回 Account 并落盘凭据。
     Register {
@@ -312,9 +319,7 @@ impl OnlineWorker {
                             match r {
                                 Ok(account) => {
                                     persist = Some(account.clone());
-                                    Ok(OnlinePayload::Account(Some(AccountSummary::from(
-                                        &account,
-                                    ))))
+                                    Ok(OnlinePayload::Account(Some(AccountSummary::from(&account))))
                                 }
                                 Err(e) => Err(e),
                             }

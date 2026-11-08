@@ -90,9 +90,10 @@ pub fn rewrap_words(
             return None;
         }
         let end2 = out[i + 1].0 + out[i + 1].1.chars().count();
-        multi.iter().copied().find(|&(s, l)| {
-            s >= out[i].0 && s < boundary && s + l > boundary && s + l <= end2
-        })
+        multi
+            .iter()
+            .copied()
+            .find(|&(s, l)| s >= out[i].0 && s < boundary && s + l > boundary && s + l <= end2)
     };
     if (0..lines.len() - 1).all(|i| straddle(lines, i).is_none()) {
         return None;
@@ -163,7 +164,9 @@ fn move_chars_down(out: &mut [(usize, String, Vec<f32>)], i: usize, k: usize) {
         let avg = out[i + 1].2.last().copied().unwrap_or(0.) / m.max(1) as f32;
         out[i + 1].2 = (0..=m).map(|j| j as f32 * avg).collect();
     }
-    let old_adv: Vec<f32> = (0..m).map(|j| out[i + 1].2[j + 1] - out[i + 1].2[j]).collect();
+    let old_adv: Vec<f32> = (0..m)
+        .map(|j| out[i + 1].2[j + 1] - out[i + 1].2[j])
+        .collect();
     let mut pos = Vec::with_capacity(m + k + 1);
     pos.push(0.0_f32);
     let mut acc = 0.0_f32;
@@ -536,6 +539,7 @@ impl FontKit {
 
 /// 完整渲染器（D3D11 + DXGI + DComp + D2D + DWrite + FontKit）
 pub struct Renderer {
+    hwnd: isize,
     _d3d: ID3D11Device,
     dcomp_device: IDCompositionDevice,
     _dcomp_target: IDCompositionTarget,
@@ -697,6 +701,7 @@ impl Renderer {
             let fonts = FontKit::new();
 
             let mut r = Self {
+                hwnd,
                 _d3d: d3d,
                 dcomp_device,
                 _dcomp_target: dcomp_target,
@@ -1049,6 +1054,22 @@ impl Renderer {
 
     /// Export the rendered frame directly from the D3D surface. No shell or screen capture.
     pub fn save_bmp(&mut self, path: &Path) -> Result<(), String> {
+        self.render_export_frame()?;
+        self.write_target_bmp(path)
+    }
+
+    /// Copy the rendered frame, or a pixel-space crop, as a native CF_DIB image.
+    /// Replaying is necessary because Present has already flipped the back buffer.
+    pub fn copy_bmp_to_clipboard(
+        &mut self,
+        crop: Option<(u32, u32, u32, u32)>,
+    ) -> Result<(), String> {
+        self.render_export_frame()?;
+        let dib = self.read_target_dib(crop)?;
+        crate::clipboard_bridge::try_write_dib(self.hwnd, &dib)
+    }
+
+    fn render_export_frame(&mut self) -> Result<(), String> {
         unsafe {
             let cmds = self
                 .last_frame
@@ -1056,6 +1077,8 @@ impl Renderer {
                 .ok_or("没有可导出的画面")?
                 .cmds
                 .clone();
+            let mut previous_transform = windows::Foundation::Numerics::Matrix3x2::default();
+            self.d2d_ctx.GetTransform(&mut previous_transform);
             self.d2d_ctx.BeginDraw();
             self.d2d_ctx.Clear(Some(&D2D1_COLOR_F {
                 r: 1.,
@@ -1074,19 +1097,65 @@ impl Renderer {
                     M32: 0.,
                 });
             self.exec_cmds(&cmds);
-            self.d2d_ctx
-                .EndDraw(None, None)
-                .map_err(|e| e.to_string())?;
+            let result = self.d2d_ctx.EndDraw(None, None);
+            self.d2d_ctx.SetTransform(&previous_transform);
+            result.map_err(|e| e.to_string())
         }
-        self.write_target_bmp(path)
     }
 
     fn write_target_bmp(&self, path: &Path) -> Result<(), String> {
+        let dib = self.read_target_dib(None)?;
+        let size = dib.len().checked_add(14).ok_or("图像尺寸过大")?;
+        let file_size = u32::try_from(size).map_err(|_| "图像尺寸过大")?;
+        let mut out = Vec::new();
+        out.try_reserve_exact(size)
+            .map_err(|_| "无法分配图像内存")?;
+        out.extend_from_slice(b"BM");
+        out.extend_from_slice(&file_size.to_le_bytes());
+        out.extend_from_slice(&[0; 4]);
+        out.extend_from_slice(&54u32.to_le_bytes());
+        out.extend_from_slice(&dib);
+        std::fs::write(path, out).map_err(|e| e.to_string())
+    }
+
+    /// BITMAPINFOHEADER followed by tightly packed, top-down BGRx pixels.
+    fn read_target_dib(&self, crop: Option<(u32, u32, u32, u32)>) -> Result<Vec<u8>, String> {
         use windows::Win32::Graphics::Direct3D11::*;
         unsafe {
             let source: ID3D11Texture2D = self.swapchain.GetBuffer(0).map_err(|e| e.to_string())?;
             let mut desc = D3D11_TEXTURE2D_DESC::default();
             source.GetDesc(&mut desc);
+            if desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM || desc.SampleDesc.Count != 1 {
+                return Err("渲染表面的像素格式不支持导出".into());
+            }
+            let (x, y, width, height) = crop.unwrap_or((0, 0, desc.Width, desc.Height));
+            if width == 0
+                || height == 0
+                || x >= desc.Width
+                || y >= desc.Height
+                || width > desc.Width - x
+                || height > desc.Height - y
+                || width > i32::MAX as u32
+                || height > i32::MAX as u32
+            {
+                return Err("导出范围为空或超出画面".into());
+            }
+            let row = (width as usize).checked_mul(4).ok_or("图像尺寸过大")?;
+            let pixels = row.checked_mul(height as usize).ok_or("图像尺寸过大")?;
+            let image_size = u32::try_from(pixels).map_err(|_| "图像尺寸过大")?;
+            let size = 40usize.checked_add(pixels).ok_or("图像尺寸过大")?;
+            let mut out = Vec::new();
+            out.try_reserve_exact(size)
+                .map_err(|_| "无法分配图像内存")?;
+            out.extend_from_slice(&40u32.to_le_bytes());
+            out.extend_from_slice(&(width as i32).to_le_bytes());
+            out.extend_from_slice(&(-(height as i32)).to_le_bytes());
+            out.extend_from_slice(&1u16.to_le_bytes());
+            out.extend_from_slice(&32u16.to_le_bytes());
+            out.extend_from_slice(&0u32.to_le_bytes()); // BI_RGB
+            out.extend_from_slice(&image_size.to_le_bytes());
+            out.extend_from_slice(&[0; 16]);
+            out.resize(size, 0);
             desc.Usage = D3D11_USAGE_STAGING;
             desc.BindFlags = 0;
             desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
@@ -1101,31 +1170,32 @@ impl Renderer {
             let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
             ctx.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
                 .map_err(|e| e.to_string())?;
-            let row = (desc.Width as usize).checked_mul(4).ok_or("图像尺寸过大")?;
-            let pixels = row
-                .checked_mul(desc.Height as usize)
-                .ok_or("图像尺寸过大")?;
-            let mut out = Vec::with_capacity(54 + pixels);
-            out.extend_from_slice(b"BM");
-            out.extend_from_slice(&((54 + pixels) as u32).to_le_bytes());
-            out.extend_from_slice(&[0; 4]);
-            out.extend_from_slice(&54u32.to_le_bytes());
-            out.extend_from_slice(&40u32.to_le_bytes());
-            out.extend_from_slice(&(desc.Width as i32).to_le_bytes());
-            out.extend_from_slice(&(-(desc.Height as i32)).to_le_bytes());
-            out.extend_from_slice(&1u16.to_le_bytes());
-            out.extend_from_slice(&32u16.to_le_bytes());
-            out.extend_from_slice(&[0; 24]);
-            for y in 0..desc.Height as usize {
+            if mapped.pData.is_null() || (mapped.RowPitch as usize) < desc.Width as usize * 4 {
+                ctx.Unmap(&staging, 0);
+                return Err("无法读取渲染表面的像素".into());
+            }
+            // No fallible operation between Map and Unmap: every successful map
+            // is released before returning, including invalid mapping metadata.
+            for line in 0..height as usize {
                 let src = std::slice::from_raw_parts(
-                    (mapped.pData as *const u8).add(y * mapped.RowPitch as usize),
+                    (mapped.pData as *const u8)
+                        .add((y as usize + line) * mapped.RowPitch as usize + x as usize * 4),
                     row,
                 );
-                out.extend_from_slice(src);
+                let dst = &mut out[40 + line * row..40 + (line + 1) * row];
+                dst.copy_from_slice(src);
+                // CF_DIB/BI_RGB ignores alpha. Flatten premultiplied pixels on
+                // white and mark them opaque, matching the export replay clear.
+                for pixel in dst.chunks_exact_mut(4) {
+                    let white = 255 - pixel[3];
+                    for channel in &mut pixel[..3] {
+                        *channel = channel.saturating_add(white);
+                    }
+                    pixel[3] = 255;
+                }
             }
             ctx.Unmap(&staging, 0);
-            std::fs::write(path, out).map_err(|e| e.to_string())?;
-            Ok(())
+            Ok(out)
         }
     }
 
@@ -1162,7 +1232,8 @@ impl Renderer {
         }
         lines
     }
-    fn text_positions(&mut self, text: &str, size: f32) -> Vec<f32> {        unsafe {
+    fn text_positions(&mut self, text: &str, size: f32) -> Vec<f32> {
+        unsafe {
             let mut out = vec![0.];
             let Ok(fmt) = self.fonts.format(FontFamily::Lxgw, size) else {
                 return out;
@@ -1564,7 +1635,11 @@ mod tests {
     /// CJK 全宽假设：每字推进 10.0（真实路径来自 DirectWrite，此处只用等差近似验证算法）。
     fn line(base: usize, text: &str) -> (usize, String, Vec<f32>) {
         let n = text.chars().count();
-        (base, text.to_string(), (0..=n).map(|i| i as f32 * 10.).collect())
+        (
+            base,
+            text.to_string(),
+            (0..=n).map(|i| i as f32 * 10.).collect(),
+        )
     }
 
     #[test]
@@ -1596,7 +1671,11 @@ mod tests {
             "字符守恒"
         );
         for w in out.windows(2) {
-            assert_eq!(w[1].0 - w[0].0, w[0].1.chars().count(), "相邻行 base 必须连续");
+            assert_eq!(
+                w[1].0 - w[0].0,
+                w[0].1.chars().count(),
+                "相邻行 base 必须连续"
+            );
         }
     }
 
@@ -1607,6 +1686,46 @@ mod tests {
         // 没有跨行词时也走快路径
         let lines2 = vec![line(0, "ABCD"), line(4, "EF")];
         assert!(rewrap_words(&lines2, &[(0, 2), (2, 2), (4, 2)]).is_none());
+    }
+
+    #[test]
+    #[ignore = "Native D3D/D2D readback fixture; requires a Windows desktop"]
+    fn native_dib_crop_is_top_down_and_opaque() {
+        let _com = crate::window::ComSta::new().unwrap();
+        crate::window::enable_per_monitor_dpi_awareness();
+        let window = crate::window::MainWindow::create("DIB crop fixture", 64, 48).unwrap();
+        let mut renderer = Renderer::new(window.hwnd, 64, 48).unwrap();
+        let scale = crate::window::dpi_scale();
+        let mut frame = Frame::new(64.0 / scale, 48.0 / scale);
+        frame.push(DrawCmd::Rect {
+            x: 0.0,
+            y: 0.0,
+            w: frame.size.w,
+            h: 24.0 / scale,
+            color: [1.0, 0.0, 0.0, 1.0],
+        });
+        frame.push(DrawCmd::Rect {
+            x: 0.0,
+            y: 24.0 / scale,
+            w: frame.size.w,
+            h: 24.0 / scale,
+            color: [0.0, 0.0, 1.0, 0.5],
+        });
+        renderer.draw_frame(&frame).unwrap();
+        renderer.render_export_frame().unwrap();
+        let dib = renderer.read_target_dib(Some((5, 20, 7, 8))).unwrap();
+        assert_eq!(dib.len(), 40 + 7 * 8 * 4);
+        assert_eq!(i32::from_le_bytes(dib[4..8].try_into().unwrap()), 7);
+        assert_eq!(i32::from_le_bytes(dib[8..12].try_into().unwrap()), -8);
+        assert_eq!(&dib[40..44], &[0, 0, 255, 255]);
+        let bottom = &dib[dib.len() - 4..];
+        assert_eq!(bottom[0], 255);
+        assert!((126..=129).contains(&bottom[1]));
+        assert!((126..=129).contains(&bottom[2]));
+        assert_eq!(bottom[3], 255);
+        assert!(renderer.read_target_dib(Some((63, 0, 2, 1))).is_err());
+        assert!(renderer.read_target_dib(Some((0, 0, 0, 1))).is_err());
+        assert!(renderer.read_target_dib(Some((u32::MAX, 0, 2, 1))).is_err());
     }
 
     #[test]

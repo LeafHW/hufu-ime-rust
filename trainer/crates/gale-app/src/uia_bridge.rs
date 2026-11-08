@@ -189,10 +189,31 @@ fn child_texts_joined(uia: &IUIAutomation, el: &IUIAutomationElement) -> String 
     out
 }
 
-/// 会话列表容器（精确类名优先，带后缀版本回退 contains 扫描）。
-fn session_list(uia: &IUIAutomation, root: &IUIAutomationElement) -> Option<IUIAutomationElement> {
-    find_by_exact_class(uia, root, "recent-contact-list")
-        .or_else(|| find_by_class_contains(uia, root, "recent-contact-list"))
+/// 全部会话列表容器。NTQQ 9.9.x 把会话列表拆成多个容器
+/// （置顶区 + 消息区各一个，类名带不同后缀），只取第一个会漏掉置顶会话。
+fn session_lists(uia: &IUIAutomation, root: &IUIAutomationElement) -> Vec<IUIAutomationElement> {
+    let mut out = Vec::new();
+    unsafe {
+        let Ok(cond) = uia.CreateTrueCondition() else {
+            return out;
+        };
+        let Ok(all) = root.FindAll(TreeScope_Descendants, &cond) else {
+            return out;
+        };
+        for i in 0..all.Length().unwrap_or(0).min(10_000) {
+            let Ok(el) = all.GetElement(i) else {
+                continue;
+            };
+            let Ok(cls) = el.CurrentClassName() else {
+                continue;
+            };
+            let cls = cls.to_string();
+            if cls == "recent-contact-list" || cls.contains("recent-contact-list") {
+                out.push(el);
+            }
+        }
+    }
+    out
 }
 
 /// 消息区虚拟列表容器（同上：精确优先、contains 兜底）。
@@ -225,6 +246,10 @@ fn item_texts_joined(uia: &IUIAutomation, item: &IUIAutomationElement, limit: i3
                 if s.contains(':') || s.contains("未读") {
                     break;
                 }
+                // 置顶项首节点可能是置顶角标文字，跳过而不截断
+                if s.trim() == "置顶" || s.trim() == "公告" {
+                    continue;
+                }
                 joined.push_str(s.trim());
             }
         }
@@ -239,31 +264,34 @@ pub fn list_sessions(hwnd: isize) -> Vec<String> {
     let Some(root) = panel_root(&uia, hwnd) else {
         return vec![];
     };
-    let list = session_list(&uia, &root).or_else(|| {
+    // 多容器：置顶区 + 消息区分别枚举，全部并入；容器级精确过滤失败回退 TrueCondition 扫描。
+    let mut items: Vec<IUIAutomationElement> = Vec::new();
+    let mut lists = session_lists(&uia, &root);
+    if lists.is_empty() {
         std::thread::sleep(std::time::Duration::from_millis(250));
-        session_list(&uia, &root)
-    });
-    let Some(list) = list else { return vec![] };
-    // 优先服务端精确类名过滤；为空回退 TrueCondition 扫描（≤2000，防巨树）
-    let items = find_all_by_class(&uia, &list, &["recent-contact-item"]).unwrap_or_else(|| {
+        lists = session_lists(&uia, &root);
+    }
+    for list in lists.iter() {
+        items.extend(find_all_by_class(&uia, list, &["recent-contact-item"]).into_iter().flatten());
+    }
+    // 根级兜底：容器类名改版时仍按条目类名前缀抓（≤2000，防巨树）。
+    if items.is_empty() {
         unsafe {
-            let Ok(cond) = uia.CreateTrueCondition() else {
-                return vec![];
-            };
-            let Ok(all) = list.FindAll(TreeScope_Descendants, &cond) else {
-                return vec![];
-            };
-            (0..all.Length().unwrap_or(0).min(2000))
-                .filter_map(|i| all.GetElement(i).ok())
-                .filter(|item| {
-                    item.CurrentClassName()
-                        .ok()
-                        .map(|n| n.to_string().starts_with("recent-contact-item"))
-                        .unwrap_or(false)
-                })
-                .collect()
+            if let Ok(cond) = uia.CreateTrueCondition() {
+                if let Ok(all) = root.FindAll(TreeScope_Descendants, &cond) {
+                    items = (0..all.Length().unwrap_or(0).min(2000))
+                        .filter_map(|i| all.GetElement(i).ok())
+                        .filter(|item| {
+                            item.CurrentClassName()
+                                .ok()
+                                .map(|n| n.to_string().starts_with("recent-contact-item"))
+                                .unwrap_or(false)
+                        })
+                        .collect();
+                }
+            }
         }
-    });
+    }
     let mut names = Vec::new();
     for item in items.iter().take(2000) {
         let name = item_texts_joined(&uia, item, 3).trim().to_string();
@@ -309,26 +337,27 @@ pub fn read_message_bodies(hwnd: isize) -> Option<Vec<String>> {
     let groups = find_all_by_class(
         &uia,
         &pane,
-        &["msg-content-container--others", "msg-content-container--self"],
+        &[
+            "msg-content-container--others",
+            "msg-content-container--self",
+        ],
     )
-    .unwrap_or_else(|| {
-        unsafe {
-            let Ok(cond) = uia.CreateTrueCondition() else {
-                return vec![];
-            };
-            let Ok(all) = pane.FindAll(TreeScope_Descendants, &cond) else {
-                return vec![];
-            };
-            (0..all.Length().unwrap_or(0).min(10_000))
-                .filter_map(|i| all.GetElement(i).ok())
-                .filter(|el| {
-                    el.CurrentClassName()
-                        .ok()
-                        .map(|n| n.to_string().contains("msg-content-container"))
-                        .unwrap_or(false)
-                })
-                .collect()
-        }
+    .unwrap_or_else(|| unsafe {
+        let Ok(cond) = uia.CreateTrueCondition() else {
+            return vec![];
+        };
+        let Ok(all) = pane.FindAll(TreeScope_Descendants, &cond) else {
+            return vec![];
+        };
+        (0..all.Length().unwrap_or(0).min(10_000))
+            .filter_map(|i| all.GetElement(i).ok())
+            .filter(|el| {
+                el.CurrentClassName()
+                    .ok()
+                    .map(|n| n.to_string().contains("msg-content-container"))
+                    .unwrap_or(false)
+            })
+            .collect()
     });
     let mut total = 0usize;
     for el in groups.iter().take(10_000) {

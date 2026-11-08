@@ -12,6 +12,7 @@ pub mod mini_toml;
 pub mod report;
 pub mod rules;
 pub mod score;
+pub mod scorecard;
 pub mod segment;
 pub mod single;
 pub mod stats;

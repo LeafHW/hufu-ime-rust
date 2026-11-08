@@ -57,6 +57,12 @@ pub struct SingleDrillConfig {
     /// 每段字数（clamp 5..=100）
     #[serde(default = "default_single_segment_chars")]
     pub segment_chars: u16,
+    #[serde(default = "default_target_keystroke")]
+    pub target_keystroke_x10: u16,
+}
+
+fn default_target_keystroke() -> u16 {
+    30
 }
 
 fn default_single_shuffle() -> bool {
@@ -71,6 +77,7 @@ impl Default for SingleDrillConfig {
         Self {
             shuffle: true,
             segment_chars: SINGLE_SEGMENT_DEFAULT,
+            target_keystroke_x10: default_target_keystroke(),
         }
     }
 }
@@ -80,7 +87,10 @@ impl SingleDrillConfig {
     pub fn clamped(&self) -> Self {
         Self {
             shuffle: self.shuffle,
-            segment_chars: self.segment_chars.clamp(SINGLE_SEGMENT_MIN, SINGLE_SEGMENT_MAX),
+            target_keystroke_x10: self.target_keystroke_x10.clamp(10, 120),
+            segment_chars: self
+                .segment_chars
+                .clamp(SINGLE_SEGMENT_MIN, SINGLE_SEGMENT_MAX),
         }
     }
     /// 读取 sidecar 配置：缺失/损坏/越界一律回退（clamped 后）合法值，
@@ -94,7 +104,8 @@ impl SingleDrillConfig {
     }
     /// 持久化 sidecar 配置（小 JSON，直接覆写）。
     pub fn save(&self, path: &Path) -> GaleResult<()> {
-        let bytes = serde_json::to_vec(self).map_err(|e| crate::GaleError::Format(e.to_string()))?;
+        let bytes =
+            serde_json::to_vec(self).map_err(|e| crate::GaleError::Format(e.to_string()))?;
         if bytes.len() > 4096 {
             return Err(crate::GaleError::Format("单字配置过大".into()));
         }
@@ -904,11 +915,13 @@ mod tests {
         assert_eq!(d.segment_chars, SINGLE_SEGMENT_DEFAULT);
         // 越界 → clamp
         let raw = SingleDrillConfig {
+            target_keystroke_x10: 30,
             shuffle: false,
             segment_chars: 999,
         };
         assert_eq!(raw.clamped().segment_chars, SINGLE_SEGMENT_MAX);
         let raw = SingleDrillConfig {
+            target_keystroke_x10: 30,
             shuffle: true,
             segment_chars: 1,
         };
@@ -925,6 +938,7 @@ mod tests {
     #[test]
     fn drill_build_shuffle_keeps_multiset_and_segment_lengths() {
         let cfg = SingleDrillConfig {
+            target_keystroke_x10: 30,
             shuffle: true,
             segment_chars: 20,
         };
@@ -934,7 +948,10 @@ mod tests {
         // 无重复丢失：全量字符多重集与原表一致
         let original: Vec<char> = DRILL_BODY.chars().collect();
         let joined: String = s.items.concat();
-        assert_eq!(count_chars(&s.items), count_chars(&original.iter().map(|c| c.to_string()).collect::<Vec<_>>()));
+        assert_eq!(
+            count_chars(&s.items),
+            count_chars(&original.iter().map(|c| c.to_string()).collect::<Vec<_>>())
+        );
         assert_eq!(joined.chars().count(), DRILL_BODY.chars().count());
         // 段长：前 n-1 段恰 20 字，末段为余数
         let mut group = s.clone();
@@ -954,6 +971,7 @@ mod tests {
         assert_ne!(s.items, s3.items, "不同种子应产生不同排列");
         // 原表顺序下的段内容与洗牌后的段内容（组内）多重集一致
         let plain = SingleDrillConfig {
+            target_keystroke_x10: 30,
             shuffle: false,
             segment_chars: 20,
         }
@@ -976,6 +994,7 @@ mod tests {
     #[test]
     fn drill_build_no_shuffle_preserves_order_and_seed_zero() {
         let cfg = SingleDrillConfig {
+            target_keystroke_x10: 30,
             shuffle: false,
             segment_chars: 7,
         };

@@ -262,10 +262,55 @@ pub fn copy_and_show_chat(chat_hwnd: isize, text: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Compatibility entry point, deliberately cannot claim an unobserved send.
-pub fn send_text_to(chat_hwnd: isize, text: &str, _gale_hwnd: isize) -> Result<(), String> {
-    copy_and_show_chat(chat_hwnd, text)?;
-    Err("已复制并打开QQ，请确认目标群后手动粘贴发送（尚未发送）".into())
+/// 【群三件套】选群即切换：独立聊天窗直接置前；主面板条目（hwnd=主面板）
+/// 无法程序化切会话，激活面板并返回 false，由调用方提示用户点开该群。
+pub fn focus_chat(chat: &ChatWindow) -> bool {
+    if let Some(p) = main_panel() {
+        if p.hwnd == chat.hwnd {
+            let _ = activate(p.hwnd);
+            return false;
+        }
+    }
+    activate(chat.hwnd)
+}
+
+/// 【群三件套 2026-11-09】增强发送（可行性报告 · 通道C 增强模式③）：
+/// 复制 → 激活 QQ → UIA 校验当前会话标题 → Ctrl+V → 回车。
+/// 任一步失败立即中止并保留剪贴板，绝不错发到别的群。
+/// 首次 UIA 连接可能返回不完整树，故激活后等待再校验（200ms 级）。
+pub fn send_message_enhanced(chat: &ChatWindow, text: &str) -> Result<(), String> {
+    if text.is_empty() || text.len() > 1024 * 1024 {
+        return Err("待发送内容为空或过大".into());
+    }
+    if !is_qq_window(chat.hwnd) {
+        return Err("QQ目标窗口已失效，请重新选择".into());
+    }
+    // 1) 先写剪贴板（失败不激活、不动 QQ）
+    unsafe {
+        gale_win::clipboard_bridge::try_write_text(text)?;
+    }
+    // 2) 激活目标窗口
+    if !activate(chat.hwnd) {
+        return Err("已复制，但无法打开QQ；请手动切到目标群粘贴".into());
+    }
+    // 3) 等 Chromium UIA 树稳定后校验当前会话就是目标群
+    thread::sleep(Duration::from_millis(220));
+    let cur = crate::uia_bridge::current_session_title(chat.hwnd);
+    match cur {
+        Some(name) if name == chat.title || name.contains(&chat.title) => {}
+        Some(other) => {
+            return Err(format!(
+                "已中止：QQ 当前会话是「{other}」不是「{}」，内容已留在剪贴板",
+                chat.title
+            ))
+        }
+        None => {
+            return Err("已中止：无法校验 QQ 当前会话（UIA 读取失败），内容已留在剪贴板".into())
+        }
+    }
+    // 4) 粘贴 + 回车
+    gale_win::keys::paste_and_enter();
+    Ok(())
 }
 
 /// UIA-only reading replaces unsafe Ctrl+A/C injection (which can copy an old
