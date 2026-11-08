@@ -1709,14 +1709,16 @@ impl Engine {
                 session.chinese = !session.chinese;
                 // 【切英文态清锁大写 2026-10-12】同其余切换路径口径。
                 session.caps_lock = false;
-                session.pair.reset();
+                // 【引号配对跨中英切换 2026-11-08】切英文不再清 PairState：
+                // 中文态打的 “ 需要切回后仍输出 ” 闭合（引号配对是文档
+                // 上下文属性，中间英文片段不影响；晴/搜狗同口径）。
                 return KeyOutcome::consumed(self.state(session));
             }
             let raw = std::mem::take(&mut session.raw);
             session.candidates.clear();
             session.chinese = false;
             session.caps_lock = false;
-            session.pair.reset();
+            // 同上：编码上屏切英文同样保持引号配对状态。
             if self.config.general.commit_raw_on_en_switch {
                 return KeyOutcome::commit(raw, self.state(session));
             }
@@ -7961,6 +7963,46 @@ mod tests {
         );
         assert_eq!(st.selected, 2, "高亮 = 第 3 项（页内下标 2）");
         assert!(st.raw.is_empty(), "选重后编码已清");
+    }
+
+    // 【引号配对跨中英切换 2026-11-08】中文态打 “ 后 Shift 切英文打字
+    // 再切回，下一引号必须是 ”（闭合）。修复前：内建切换路径的
+    // session.pair.reset() 清状态，导致切回后永远输出 “（用户实锤）。
+    #[test]
+    fn quote_pair_survives_en_switch() {
+        let (mut eng, _dir) = test_engine("quote_pair_switch");
+        let mut s = Session::new(true);
+        // 中文态打 " → 左引号 “
+        let o = eng.process_key(
+            &mut s,
+            KeyInput { key: KeyCode::Char('"'), modifiers: Modifiers::default(), is_press: true },
+        );
+        assert_eq!(o.commit.as_deref(), Some("“"), "第一个双引号=左引号");
+        // Shift 切英文（空态内建切换，shift_switch 默认开）
+        eng.process_key(
+            &mut s,
+            KeyInput { key: KeyCode::ShiftLeft, modifiers: Modifiers::default(), is_press: true },
+        );
+        assert!(!s.chinese, "已切英文");
+        // 英文态打几个字母（直出，不碰组字）
+        for c in ['a', 'b', 'c'] {
+            eng.process_key(
+                &mut s,
+                KeyInput { key: KeyCode::Char(c), modifiers: Modifiers::default(), is_press: true },
+            );
+        }
+        // Shift 切回中文
+        eng.process_key(
+            &mut s,
+            KeyInput { key: KeyCode::ShiftLeft, modifiers: Modifiers::default(), is_press: true },
+        );
+        assert!(s.chinese, "已切回中文");
+        // 再打 " → 必须闭合 ”
+        let o = eng.process_key(
+            &mut s,
+            KeyInput { key: KeyCode::Char('"'), modifiers: Modifiers::default(), is_press: true },
+        );
+        assert_eq!(o.commit.as_deref(), Some("”"), "切英文打字再切回后引号仍配对（右引号）");
     }
 
     // 【` 键四态 2026-09-06】空态单击=反查、反查态再按=「·」上屏、

@@ -52,11 +52,23 @@ impl Default for Config {
 #[serde(default)]
 pub struct TrainerSection {
     pub enabled: bool,
+    /// 跟打器全局热键（老板键 toggle：按一次开、再按一次关）。
+    /// 格式：小写、加号分隔，修饰键 ctrl/alt/shift/win 至少一个 + 主键 a-z/0-9/f1-f12，
+    /// 如 "ctrl+alt+g"；空串=禁用热键。解析见 hufu-server trainer::parse_hotkey。
+    #[serde(default = "default_trainer_hotkey")]
+    pub hotkey: String,
+}
+
+fn default_trainer_hotkey() -> String {
+    "ctrl+alt+g".into()
 }
 
 impl Default for TrainerSection {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            hotkey: default_trainer_hotkey(),
+        }
     }
 }
 

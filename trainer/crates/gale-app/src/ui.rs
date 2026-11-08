@@ -121,6 +121,15 @@ pub struct Palette {
     pub green: [f32; 4],
     pub copper: [f32; 4],
     pub jade: [f32; 4],
+    /// 对打三态字符底（整改 4）：未打 / 打对 / 打错。
+    pub bg_pending: [f32; 4],
+    pub bg_done: [f32; 4],
+    pub bg_wrong: [f32; 4],
+    /// 词提四色（整改 9）：编码下显文字 / 角标与尾码点 / 下划线 / 词底。
+    pub hint_code: [f32; 4],
+    pub hint_badge: [f32; 4],
+    pub hint_underline: [f32; 4],
+    pub hint_bg: [f32; 4],
 }
 pub fn tokens(t: &Theme) -> Palette {
     let light = matches!(t.name.as_str(), "宣纸" | "青瓷");
@@ -139,6 +148,13 @@ pub fn tokens(t: &Theme) -> Palette {
         green: hex(if light { "2b6f4e" } else { "63c08d" }),
         copper: hex(if light { "a8703e" } else { "cf9a63" }),
         jade: hex(if light { "4f8f79" } else { "7fbfa6" }),
+        bg_pending: rgba(t.get("对打未打底色")),
+        bg_done: rgba(t.get("对打打对底色")),
+        bg_wrong: rgba(t.get("对打打错底色")),
+        hint_code: rgba(t.get("词提编码色")),
+        hint_badge: rgba(t.get("词提角标色")),
+        hint_underline: rgba(t.get("词提下划线色")),
+        hint_bg: rgba(t.get("词提底色")),
     }
 }
 pub fn button(
@@ -258,6 +274,19 @@ pub fn theme(name: &str) -> Theme {
     ] {
         t.set(k, Color::from_hex_no_hash(v).unwrap());
     }
+    // v2.1 视觉整改：三态底/词提四色的预设适配（用户 color_overrides 仍可覆盖）。
+    // 浅色主题三态底换浅色系；词提编码/下划线跟各主题强调色、角标跟打错色。
+    if t.name == "宣纸" || t.name == "青瓷" {
+        t.set("对打未打底色", Color(0, 0, 0, 11)); // rgba(0,0,0,0.045)
+        t.set("对打打对底色", Color(43, 111, 78, 36)); // rgba(43,111,78,0.14)
+        t.set("对打打错底色", Color(168, 60, 46, 41)); // rgba(168,60,46,0.16)
+    }
+    let acc = Color::from_hex_no_hash(accent).unwrap();
+    let bad = Color::from_hex_no_hash(wrong).unwrap();
+    t.set("词提编码色", acc);
+    t.set("词提角标色", bad);
+    t.set("词提下划线色", acc);
+    // 词提底色保持 Theme::default 的全透明（显式自定义时才会画底）。
     t
 }
 #[derive(Default)]
@@ -629,18 +658,6 @@ fn draw_chrome(
         );
     }
 }
-fn hint_color(z: &crate::modals::HintWord, p: &Palette) -> [f32; 4] {
-    if z.rank > 1 {
-        p.red
-    } else {
-        match z.code.as_ref().map_or(0, |s| s.chars().count()) {
-            1 => p.accent,
-            2 => p.copper,
-            3 => p.jade,
-            _ => p.muted,
-        }
-    }
-}
 fn rail(f: &mut Frame, sess: &Session, p: &Palette, x: f32, y: f32, bw: f32) {
     let n = sess.total_segments().max(1);
     let visible = n.min(8);
@@ -747,30 +764,80 @@ pub fn build(
     let count = sess.current_segment().text.chars().count();
     let elapsed = sess.elapsed_ms(now_ms) as f64 / 1000.;
     let top;
+    // 顶栏两行式（整改 6）：第一行 = 段号/进度（FONT_LABEL+1）· 计时 · 当前速度
+    // （accent 伪粗）；第二行 = 错字/退格/废码/码长/键准小指标（FONT_HINT、竖线
+    // 分隔、等距分组）。窄窗（cw<720）自动省略低优先级的码长/键准。
+    let head1 = 78.;
+    let head2 = 104.;
+    let para_title_size = FONT_LABEL + 1.;
+    // 当前速度：accent + 伪粗（0.6px 偏移二次描画；D2D 无独立粗体）。
+    let mut speed_mono = |f: &mut Frame, x: f32, y: f32, size: f32, s: &str, c: [f32; 4]| {
+        mono(f, x + 0.6, y + 0.4, size, s, c);
+        mono(f, x, y, size, s, c);
+    };
+    // 第二行指标组：label + 等宽值水平排布，组间竖线分隔。
+    let metric_row = |f: &mut Frame, x: f32, y: f32, w: f32, p: &Palette, items: &[(String, String, bool)]| {
+        let n = items.iter().filter(|z| z.2).count().max(1);
+        let pitch = (w / n as f32).min(128.);
+        let mut i = 0;
+        for (label, value, shown) in items {
+            if !shown {
+                continue;
+            }
+            let gx = x + i as f32 * pitch;
+            if i > 0 {
+                rect(f, gx - 14., y - 11., 1., 16., p.line);
+            }
+            text(f, gx, y, FONT_HINT, label, p.muted);
+            mono(f, gx + 40., y, FONT_HINT, value, p.text2);
+            i += 1;
+        }
+    };
     if single {
         text(
             &mut f,
             x,
-            80.,
-            FONT_HINT,
+            head1,
+            para_title_size,
             format!(
-                "单字练习   ·   {}   |   第 {} / {} 组",
-                elide(&sess.title, 24),
+                "第 {} / {} 组 · {} · 单字练习",
                 sess.index + 1,
-                sess.total_segments()
+                sess.total_segments(),
+                elide(&sess.title, 18)
             ),
-            p.muted,
+            p.text2,
         );
         right(
             &mut f,
-            x + bw,
-            79.,
+            x + bw - 96.,
+            head1 + 2.,
             FONT_HINT,
-            format!(
-                "{:.1} 字/分   |   {:.2} 键/秒   |   {:.1}% 键准",
-                live.para_speed, live.para_keys_per_sec, live.para_accuracy
-            ),
-            p.text2,
+            format!("{:02}:{:04.1}", (elapsed / 60.) as u64, elapsed % 60.),
+            p.muted,
+        );
+        speed_mono(&mut f, x + bw, head1 - 4., 22., &format!("{:.1}", live.para_speed), p.accent);
+        right(&mut f, x + bw, head1 + 18., FONT_HINT, "字/分", p.muted);
+        metric_row(
+            &mut f,
+            x,
+            head2,
+            bw.min(720.),
+            &p,
+            &[
+                ("错字".into(), sess.comparer.wrong.to_string(), true),
+                ("退格".into(), sess.comparer.backspaces.to_string(), true),
+                ("废码".into(), sess.stats.waste_codes.to_string(), true),
+                (
+                    "码长".into(),
+                    format!("{:.2}", live.para_code_len),
+                    bw >= 720.,
+                ),
+                (
+                    "键准".into(),
+                    format!("{:.1}%", live.para_accuracy),
+                    bw >= 720.,
+                ),
+            ],
         );
         top = 145.;
         let center = top + ((h - 127. - top) / 2.) - fs / 2.;
@@ -835,86 +902,64 @@ pub fn build(
         text(
             &mut f,
             x,
-            79.,
-            FONT_HINT,
+            head1,
+            para_title_size,
             format!(
-                "• 第 {} 段 · {} · {}",
+                "第 {} 段 · {} / {} 字 · {} · {}",
                 sess.index + 1,
-                elide(&sess.current_segment().mark, 20),
-                if m.race {
-                    "赛制 · 词提关闭"
-                } else {
-                    "自定义规则"
-                }
-            ),
-            p.muted,
-        );
-        right(
-            &mut f,
-            x + bw,
-            79.,
-            FONT_HINT,
-            format!(
-                "本段 {} / {} 字  ·  {:02}:{:04.1}",
                 pos,
                 count,
-                (elapsed / 60.) as u64,
-                elapsed % 60.
+                elide(&sess.current_segment().mark, 14),
+                if m.race {
+                    "赛制"
+                } else {
+                    "自定义"
+                }
             ),
             p.text2,
         );
-        let speed_text = format!("{:.1}", live.para_speed);
-        let speed_size = (160. / (speed_text.len() as f32 * 0.55)).min(52.);
-        mono(
+        right(
             &mut f,
-            x,
-            100. + (52. - speed_size),
-            speed_size,
-            speed_text,
-            p.text,
-        );
-        text(&mut f, x + 170., 136., FONT_HINT, "字/分", p.muted);
-        text(
-            &mut f,
-            x,
-            161.,
+            x + bw - 96.,
+            head1 + 2.,
             FONT_HINT,
-            if sess.started_ms.is_some() {
-                "实时速度 · 当前段"
-            } else {
-                "首键开始计时"
-            },
+            format!(
+                "{:02}:{:04.1}",
+                (elapsed / 60.) as u64,
+                elapsed % 60.
+            ),
             p.muted,
         );
-        let sx = x + bw - 282.;
-        for (i, (label, value, color)) in [
-            (
-                "击键 / 秒",
-                format!("{:.2}", live.para_keys_per_sec),
-                p.text2,
-            ),
-            ("键准", format!("{:.1}%", live.para_accuracy), p.text2),
-            ("码长", format!("{:.2}", live.para_code_len), p.text2),
-            (
-                "错字",
-                sess.comparer.wrong.to_string(),
-                if sess.comparer.wrong > 0 {
-                    p.red
-                } else {
-                    p.text2
-                },
-            ),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let xx = sx + i as f32 * 78.;
-            rect(&mut f, xx - 15., 139., 1., 32., p.line);
-            mono(&mut f, xx, 136., 17., value, color);
-            text(&mut f, xx, 160., FONT_HINT, label, p.muted);
-        }
-        rail(&mut f, sess, &p, x, 191., bw);
-        top = 268.;
+        speed_mono(&mut f, x + bw, head1 - 4., 22., &format!("{:.1}", live.para_speed), p.accent);
+        right(&mut f, x + bw, head1 + 18., FONT_HINT, "字/分", p.muted);
+        metric_row(
+            &mut f,
+            x,
+            head2,
+            bw.min(720.),
+            &p,
+            &[
+                (
+                    "错字".into(),
+                    sess.comparer.wrong.to_string(),
+                    true,
+                ),
+                ("退格".into(), sess.comparer.backspaces.to_string(), true),
+                ("废码".into(), sess.stats.waste_codes.to_string(), true),
+                (
+                    "码长".into(),
+                    format!("{:.2}", live.para_code_len),
+                    bw >= 720.,
+                ),
+                (
+                    "键准".into(),
+                    format!("{:.1}%", live.para_accuracy),
+                    bw >= 720.,
+                ),
+            ],
+        );
+        rail(&mut f, sess, &p, x, 128., bw);
+        top = 200.;
     }
     let bottom = (h - 127.).max(top + fs + 20.);
     let active = lines.iter().rposition(|l| l.0 <= pos).unwrap_or(0);
@@ -965,6 +1010,27 @@ pub fn build(
             let z = (now - anim.wrong_at).max(0.) as f32;
             dx = (z * 72.).sin() * 6. * (1. - z / 0.3).max(0.);
         }
+        // 对打三态字符底（整改 4）：未打=极淡灰、打对=淡绿、打错=红。
+        // 高=行高、宽=字符宽+2px、圆角 3px，先画底再画字符（字符色逻辑不变）。
+        for (j, _ch) in line_text.chars().enumerate() {
+            let bg = match sess.comparer.states.get(offset + j) {
+                Some(CharState::Correct) => p.bg_done,
+                Some(CharState::Wrong) => p.bg_wrong,
+                _ => p.bg_pending,
+            };
+            let a = widths.get(j).copied().unwrap_or(0.);
+            let b = widths.get(j + 1).copied().unwrap_or(a + fs);
+            round(
+                &mut f,
+                xx + dx + a - 1.,
+                yy,
+                (b - a + 2.).max(4.),
+                lh,
+                3.,
+                bg,
+                None,
+            );
+        }
         // Word glow and drill-character focus sit behind the actual DirectWrite line.
         if gale_core::rules::hints_effective(m.hints, m.race) && cfg.hint_style != 2 {
             if single {
@@ -991,16 +1057,18 @@ pub fn build(
                         .get((z.start - offset + z.len).min(widths.len() - 1))
                         .copied()
                         .unwrap_or(bw);
-                    for pad in [12., 7., 2.] {
+                    // 词提底色（整改 9）：默认全透明不画；自定义非透明时画
+                    // 单层衬底 + 下划线色细描边（替代原三层 accent 微光晕）。
+                    if p.hint_bg[3] > 0.004 {
                         round(
                             &mut f,
-                            xx + start - pad,
-                            yy - pad / 2.,
-                            end - start + pad * 2.,
-                            fs + 12. + pad,
+                            xx + start - 12.,
+                            yy - 6.,
+                            end - start + 24.,
+                            fs + 12.,
                             8.,
-                            alpha(p.accent, 0.018),
-                            None,
+                            p.hint_bg,
+                            Some(alpha(p.hint_underline, 0.25)),
                         );
                     }
                 }
@@ -1106,16 +1174,15 @@ pub fn build(
                         wx + 1.,
                         yy + fs + 4.,
                         (ww - 2.).max(1.),
-                        alpha(p.accent, if show { 0.3 } else { 0.07 }),
+                        alpha(p.hint_underline, if show { 0.3 } else { 0.07 }),
                     );
                 }
                 if !show {
                     continue;
                 }
                 if let Some(code) = &z.code {
-                    let color = hint_color(z, &p);
                     let hx = wx + (ww - code.chars().count() as f32 * 6.3).max(0.) / 2.;
-                    let code_color = alpha(color, if z.start <= pos { 1. } else { 0.55 });
+                    let code_color = alpha(p.hint_code, if z.start <= pos { 1. } else { 0.55 });
                     // 隔词交替加粗（晴口径 B：相邻词的编码下显第一词粗、第二词常规循环）：
                     // D2D 无独立粗体 Mono，用 0.6px 偏移二次描画模拟。
                     if zi % 2 == 0 {
@@ -1129,13 +1196,12 @@ pub fn build(
                             yy + fs + 5.,
                             7.,
                             z.rank.to_string(),
-                            p.red,
+                            p.hint_badge,
                         );
                     }
                 } else if !z.tail.is_empty() && z.tail != "_" {
                     // 尾码圆点角标：与完整编码下显互斥（有下显不画），且
                     // tail=="_"（空格上屏）不画。
-                    let color = hint_color(z, &p);
                     round(
                         &mut f,
                         wx + ww - 3.,
@@ -1144,7 +1210,7 @@ pub fn build(
                         3.5,
                         0.5,
                         [0.; 4],
-                        Some(alpha(color, 0.6)),
+                        Some(alpha(p.hint_badge, 0.6)),
                     );
                 }
             }
@@ -1162,24 +1228,28 @@ pub fn build(
         ly,
         FONT_HINT,
         if single {
-            "字提分级"
+            "字提示色"
         } else {
-            "词提分级"
+            "词提示色"
         },
         p.muted,
     );
-    for (i, (name, c)) in [
-        ("金 · 1 简", p.accent),
-        ("铜 · 2 简", p.copper),
-        ("青 · 3 简", p.jade),
-        ("灰 · 4 码", p.muted),
-        ("朱 · 选重", p.red),
+    // 词提配色图例（整改 9）：四色全部来自主题（编码下显/角标尾码/下划线/底色）。
+    for (i, (name, c, hollow)) in [
+        ("编码下显", p.hint_code, false),
+        ("角标 · 选重位次", p.hint_badge, false),
+        ("下划线", p.hint_underline, false),
+        ("词底 · 默认透明", p.hint_bg, true),
     ]
     .into_iter()
     .enumerate()
     {
-        let xx = x + 70. + i as f32 * 82.;
-        round(&mut f, xx, ly + 4., 5., 5., 1., c, None);
+        let xx = x + 70. + i as f32 * 108.;
+        if hollow && c[3] <= 0.004 {
+            round(&mut f, xx, ly + 4., 5., 5., 1., [0.; 4], Some(p.muted));
+        } else {
+            round(&mut f, xx, ly + 4., 5., 5., 1., c, None);
+        }
         text(&mut f, xx + 10., ly, FONT_HINT, name, p.muted);
     }
     if single {

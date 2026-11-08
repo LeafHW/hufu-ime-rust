@@ -14,6 +14,7 @@ use gale_core::{
     rules::{CleaningPreset, CleaningRule, TrainingMode},
     score::{format_score_report, ScoreStore},
     segment::parse_group_text,
+    single::SingleDrillConfig,
     wenlai::{Difficulty, FetchParams, WenlaiArticle},
 };
 use gale_win::{
@@ -23,20 +24,104 @@ use gale_win::{
     window::{MainWindow, MouseEv},
 };
 use modals::{Action, Modal, Model};
-use online::{OnlineCommand, OnlinePayload, OnlineWorker};
-use session::{Phase, Session};
+use online::{OnlineCommand, OnlinePayload, OnlinePrefs, OnlineWorker};
+use session::{Phase, Session, SessionSource};
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     io::{Read, Write},
     path::{Path, PathBuf},
     sync::mpsc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, ReleaseCapture};
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, ReleaseCapture, VK_CONTROL};
 use windows::Win32::{
     Foundation::{ERROR_ALREADY_EXISTS, GetLastError, BOOL, HWND, LPARAM, WPARAM},
     UI::WindowsAndMessaging::*,
 };
+
+/// 整改13：server `/api/trainer/analyze?include_full=true` 返回的全篇理论
+/// 码长分析（`full_analysis` 字段）。字段名与 server 端严格一致——视觉代理
+/// 的分析页模态按此消费；任务14（词提全文显示）同源复用 entries。
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct FullAnalysis {
+    #[serde(default)]
+    pub entries: Vec<FullAnalysisEntry>,
+    #[serde(default)]
+    pub total_code_len: u64,
+    #[serde(default)]
+    pub avg_code_len_per_char: f64,
+    #[serde(default)]
+    pub select_count: u64,
+}
+
+/// 分析词条：word=词面、code=编码（生词无码时 None）、code_len=码长、rank=词频名次
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct FullAnalysisEntry {
+    #[serde(default)]
+    pub word: String,
+    #[serde(default)]
+    pub code: Option<String>,
+    #[serde(default)]
+    pub code_len: u64,
+    #[serde(default)]
+    pub rank: u64,
+}
+
+/// 整改12：热力图 VK 口径（任务指定区段）。wParam 低 16 位里的修饰/扫描码
+/// 高位标志已由 `& 0xFF` 剥离；小键盘（0x60-0x6F）、Tab、OEM ` 与重映射
+/// 0xE5 不计（比 stats 的 is_stat_key 窄一档，与热力图需求对齐）。
+fn heatmap_vk(vk: u32) -> Option<u8> {
+    match vk & 0xFF {
+        0x08 | 0x0D | 0x20 => Some(vk as u8),
+        0x30..=0x39 | 0x41..=0x5A => Some(vk as u8),
+        0xBA..=0xBF | 0xDB..=0xDE => Some(vk as u8),
+        _ => None,
+    }
+}
+
+/// 私有标记通道（整改2/5/8/13）：modals.rs（禁改域）暂无对应 Action 变体，
+/// 借用 `Action::Theme(String)` 载荷携带 `\u{e000}` 前缀命令。真实主题名
+/// 永不含 U+E000，不会与外观页主题切换冲突；modals.rs 落正式变体（如
+/// Action::OnlineRegister / ShowFullAnalysis / SingleShuffle / SingleSegStep）
+/// 后，把发射点换绑即可，main.rs 这边的解码可原样退役。
+const AUX_PREFIX: char = '\u{e000}';
+const AUX_REGISTER: &str = "online_register";
+const AUX_AUTO_NEXT: &str = "online_auto_next";
+const AUX_SINGLE_SHUFFLE: &str = "single_shuffle";
+const AUX_SINGLE_SEG_PLUS: &str = "single_seg+5";
+const AUX_SINGLE_SEG_MINUS: &str = "single_seg-5";
+const AUX_SHOW_FULL: &str = "show_full_analysis";
+const AUX_SHOW_HEATMAP: &str = "show_heatmap";
+
+enum AuxAction {
+    OnlineRegister,
+    OnlineAutoNext,
+    SingleShuffle,
+    SingleSeg(i32),
+    ShowFullAnalysis,
+    ShowHeatmap,
+}
+
+fn aux_action(a: &Action) -> Option<AuxAction> {
+    let Action::Theme(s) = a else {
+        return None;
+    };
+    let cmd = s.strip_prefix(AUX_PREFIX)?;
+    Some(match cmd {
+        AUX_REGISTER => AuxAction::OnlineRegister,
+        AUX_AUTO_NEXT => AuxAction::OnlineAutoNext,
+        AUX_SINGLE_SHUFFLE => AuxAction::SingleShuffle,
+        AUX_SINGLE_SEG_PLUS => AuxAction::SingleSeg(5),
+        AUX_SINGLE_SEG_MINUS => AuxAction::SingleSeg(-5),
+        AUX_SHOW_FULL => AuxAction::ShowFullAnalysis,
+        AUX_SHOW_HEATMAP => AuxAction::ShowHeatmap,
+        _ => return None,
+    })
+}
+
+pub(crate) fn aux_marker(cmd: &str) -> Action {
+    Action::Theme(format!("{AUX_PREFIX}{cmd}"))
+}
 pub fn data_dir() -> PathBuf {
     if let Some(v) =
         cli_value("--data").or_else(|| std::env::var_os("HUFU_TRAINER_DATA").map(PathBuf::from))
@@ -160,6 +245,8 @@ enum Bg {
     Skin(u64, Result<gale_core::theme::Theme, String>),
     RuleTest(u64, Result<gale_core::rules::CleaningResult, String>),
     RuleApply(u64, u64, Result<Session, String>),
+    /// 整改13：全篇理论分析（None=旧版服务无 full_analysis 字段，静默降级）
+    FullAnalysis(u64, Option<FullAnalysis>),
 }
 enum Persist {
     Snapshot(Vec<u8>),
@@ -283,6 +370,14 @@ struct App {
     generation: u64,
     analyzing: bool,
     analyzed: u64,
+    /// 整改14：整篇文章的词提（全文坐标，一次分析缓存；换段本地切片，
+    /// 不再打到哪段才请求哪段）。full_words_ver=生成它的 schema 版本；
+    /// full_words_of=生成时的全文快照（文本变化自动失效缓存）。
+    full_words: Vec<modals::HintWord>,
+    full_words_ver: String,
+    full_words_of: String,
+    /// 本次 analyze 是否按整篇请求（false=超长回退单段，响应为段内坐标）。
+    last_analyze_whole: bool,
     theme_generation: u64,
     rule_generation: u64,
     rule_busy: bool,
@@ -292,6 +387,19 @@ struct App {
     online_logged_in: bool,
     /// P2：CTF 输入通道自检失败（启动时探测一次）——状态栏持续警示标记。
     tsf_broken: bool,
+    /// 整改2b：自动下一段开关（online.json）+ 结算后自动取文的到期时刻
+    online_auto_next: bool,
+    auto_next_at: Option<u64>,
+    /// 整改2a：当前会话正文是否来自在线文（自动下一段的判据）
+    online_article_current: bool,
+    /// 整改6：Ctrl+滚轮字号防抖落盘时刻（800ms）
+    font_save_due: Option<u64>,
+    /// 整改7：QQ 会话列表上次扫描时刻（屏开期间每 10s 刷新）
+    qq_scan_at: u64,
+    /// 整改8：单字练习配置（single.json：乱序 + 段长）
+    single_cfg: SingleDrillConfig,
+    /// 整改13：已请求过全篇分析的文章指纹（同文重打不重复请求）
+    full_fetch_hash: Option<String>,
 }
 fn main() {
     if let Err(e) = run() {
@@ -403,7 +511,7 @@ fn run() -> Result<(), String> {
         model,
         theme,
         library,
-        dir,
+        dir: dir.clone(),
         persist,
         pending_scores: VecDeque::new(),
         pending_snapshot: None,
@@ -430,6 +538,10 @@ fn run() -> Result<(), String> {
         generation: 1,
         analyzing: false,
         analyzed: 0,
+        full_words: Vec::new(),
+        full_words_ver: String::new(),
+        full_words_of: String::new(),
+        last_analyze_whole: false,
         theme_generation: 0,
         rule_generation: 0,
         rule_busy: false,
@@ -438,7 +550,18 @@ fn run() -> Result<(), String> {
         online_pending: 0,
         online_logged_in: false,
         tsf_broken: !host_ctf_ok,
+        online_auto_next: OnlinePrefs::load(&dir.join("online.json")).auto_next,
+        auto_next_at: None,
+        online_article_current: false,
+        font_save_due: None,
+        qq_scan_at: 0,
+        single_cfg: SingleDrillConfig::load(&dir.join("single.json")),
+        full_fetch_hash: None,
     };
+    app.model
+        .fields
+        .insert("online_auto_next".into(), app.online_auto_next.to_string());
+    app.sync_single_fields();
     app.sync_rule_model();
     if app.cfg.theme == "跟随虎符" {
         app.fetch_skin();
@@ -527,6 +650,15 @@ fn run() -> Result<(), String> {
         } else {
             let _ = gale_win::input_host::drain_commit_causes();
         }
+        // 整改12：每帧取走击键时间戳队列（poll 之后、选重 20ms 配对已消费本帧
+        // 击键），按热力图口径计入本段 VK 直方图；模态打开时只清队列不记账。
+        for (vk, _) in gale_win::input_host::drain_key_times(1024) {
+            if accept_host {
+                if let Some(k) = heatmap_vk(vk) {
+                    *app.sess.vk_histogram.entry(k).or_insert(0) += 1;
+                }
+            }
+        }
         // P1-6：VK_BACK 弹起边沿（帧粒度观测，见 bs_down_prev 注释）
         let bs_down = unsafe { GetKeyState(0x08) } as u16 & 0x8000 != 0;
         if bs_down_prev && !bs_down {
@@ -612,6 +744,47 @@ fn run() -> Result<(), String> {
                 app.pending_scores.push_back((id, record));
                 app.open(Modal::Result);
                 app.snapshot();
+                // 整改2b：在线练习（正文来自文来）结算后 1.5s 自动取下一段；
+                // 赛制（竞赛段）结算不自动跳，等发文确认。
+                if app.online_auto_next
+                    && app.online_logged_in
+                    && app.online_article_current
+                    && app.article.is_some()
+                    && app.sess.rules.mode != TrainingMode::Race
+                {
+                    app.auto_next_at = Some(now + 1500);
+                }
+            }
+        }
+        // 整改2b：自动下一段到期触发。仍在成绩单上（用户未接管：未回车进赛报/
+        // 未开其他面板）才发相邻段请求；取回的正文经 collect_online 自动载入。
+        if let Some(at) = app.auto_next_at {
+            if now >= at {
+                app.auto_next_at = None;
+                if app.online_auto_next
+                    && app.online_logged_in
+                    && app.online_article_current
+                    && app.article.is_some()
+                    && app.model.modal == Modal::Result
+                    && app.sess.phase == Phase::Done
+                    && app.sess.rules.mode != TrainingMode::Race
+                {
+                    app.act(Action::OnlineFetch(1), false);
+                }
+            }
+        }
+        // 整改7：QQ 读取屏（F6 群屏 / F2 第三 tab）打开期间每 10s 刷新会话列表。
+        let qq_screen = app.model.modal == Modal::Groups
+            || (app.model.modal == Modal::Load && app.model.load_tab == 2);
+        if qq_screen && !app.qq_busy && now.saturating_sub(app.qq_scan_at) >= 10_000 {
+            app.qq_scan_at = now;
+            app.act(Action::ScanGroups, false);
+        }
+        // 整改6：Ctrl+滚轮字号防抖 800ms 后落盘。
+        if let Some(due) = app.font_save_due {
+            if now >= due {
+                app.font_save_due = None;
+                app.save_config();
             }
         }
         gale_win::input_host::set_round_done(app.sess.phase == Phase::Done);
@@ -646,6 +819,19 @@ fn run() -> Result<(), String> {
                     }
                 }
                 MouseEv::Wheel { delta, .. } => {
+                    // 整改6：Ctrl+滚轮 = 实时字号（10..=60，滚轮向上放大），
+                    // 不滚面板；800ms 防抖后统一落盘（见主循环 font_save_due）。
+                    if unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0 {
+                        let step = (delta / 120).clamp(-1, 1);
+                        if step != 0 {
+                            app.cfg.font_size =
+                                (app.cfg.font_size + step as f32).clamp(10., 60.);
+                            app.apply_style();
+                            app.font_save_due = Some(app.ms() + 800);
+                            gale_win::window::request_frame();
+                        }
+                        continue;
+                    }
                     let (_, _, _, ph) = modals::panel(
                         app.model.modal,
                         0.,
@@ -717,6 +903,8 @@ fn run() -> Result<(), String> {
             || app.online_pending > 0
             || app.analyzing
             || app.qq_busy
+            || app.font_save_due.is_some()
+            || app.auto_next_at.is_some()
             || !app.pending_scores.is_empty()
             || app.pending_snapshot.is_some()
             || app
@@ -834,7 +1022,226 @@ impl App {
         self.model.words.clear();
         self.generation = self.generation.wrapping_add(1);
         self.analyze();
+        self.fetch_full_analysis();
         gale_win::window::request_frame();
+    }
+    /// 整改2a：在线文章直达跟打区（预览流程退役的唯一载入口）。
+    /// 打字中（规则已冻结）或成绩积压时降级为待读草稿，不抢正文。
+    fn load_online_article(&mut self) {
+        let Some(a) = self.article.clone() else {
+            self.toast("请先取文");
+            return;
+        };
+        if a.text.chars().count() > 100000 {
+            self.toast("在线正文超过100000字，请重新取较短文段");
+            return;
+        }
+        if self.sess.frozen_rules.is_some() || self.pending_scores.len() >= 32 {
+            self.defer_draft("在线文章".into(), a.text);
+            return;
+        }
+        self.sess.load_group(gale_core::segment::ParsedGroupText {
+            title: a.title,
+            // P2 难度带分值（任务 6d）：文来 API 的 difficulty_score（0=无分值）
+            // 拼成 "普 1.84" 风格——DifficultyTag::parse 在 session.load_group 内
+            // 解析，结算进成绩单 难度普(1.84)。
+            difficulty: Some(if a.difficulty_score > 0. {
+                format!("{} {}", a.difficulty.label(), a.difficulty_score)
+            } else {
+                a.difficulty.label().to_string()
+            }),
+            segments: vec![gale_core::segment::Segment {
+                mark: a.seg_mark,
+                text: a.text,
+            }],
+        });
+        self.online_article_current = true;
+        self.reset_host();
+        self.open(Modal::None);
+        self.snapshot();
+    }
+    /// 整改8：单字配置同步到 model.fields（modals.rs 侧控件读这里显示状态）
+    fn sync_single_fields(&mut self) {
+        self.model
+            .fields
+            .insert("single_shuffle".into(), self.single_cfg.shuffle.to_string());
+        self.model
+            .fields
+            .insert("single_seg".into(), self.single_cfg.segment_chars.to_string());
+    }
+    /// 整改13：文章载入后（在线/本地全文均可）后台请求全篇理论分析。
+    /// 同一文章（指纹一致）不重复请求；server 旧版无 full_analysis 字段=
+    /// 无此功能，静默降级（Bg::FullAnalysis(None) 丢弃）。
+    fn fetch_full_analysis(&mut self) {
+        let full: String = self
+            .sess
+            .segments
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if full.trim().is_empty() {
+            return;
+        }
+        let hash = gale_core::rules::fingerprint(full.as_bytes());
+        if self.full_fetch_hash.as_deref() == Some(&hash) {
+            return;
+        }
+        self.full_fetch_hash = Some(hash);
+        let g = self.generation;
+        let single = self.sess.source == SessionSource::Single;
+        let tx = self.tx.clone();
+        let hwnd = self.win.hwnd;
+        std::thread::spawn(move || {
+            let body = serde_json::json!({ "text": full, "single": single });
+            // 失败静默：local_json 报错或旧版服务无 full_analysis 字段都归 None
+            let v = local_json(local_port(), "/api/trainer/analyze?include_full=true", Some(body))
+                .ok()
+                .and_then(|v| v.get("full_analysis").cloned());
+            let parsed = v
+                .filter(|v| !v.is_null())
+                .and_then(|v| serde_json::from_value::<FullAnalysis>(v).ok())
+                .filter(|f| !f.entries.is_empty());
+            let _ = tx.send(Bg::FullAnalysis(g, parsed));
+            let _ = wake(hwnd);
+        });
+    }
+    /// 整改13：把 full_analysis 移交给展示模态的触发点。modals.rs 尚无
+    /// Modal::FullAnalysis 变体（禁改域，待视觉代理/Y2 添加），当前以提示
+    /// 收尾；变体就位后此函数改为 self.open(Modal::FullAnalysis) 即接通。
+    fn show_full_analysis(&mut self) {
+        match &self.sess.full_analysis {
+            Some(f) if !f.entries.is_empty() => {
+                // 整改13收口：分析页模态（Y2 域已就绪）直接打开，不再只提示。
+                self.model.modal = Modal::FullAnalysis;
+                self.model.modal_epoch += 1;
+                let _ = f;
+            }
+            Some(_) => self.toast("理论分析无词条"),
+            None => self.toast("当前服务未提供全文理论分析（需新版虎符服务）"),
+        }
+    }
+
+    /// 整改12收口：打开当前段落键盘热力图模态（数据=最近结算段
+    /// last_vk_histogram；尚无记录时提示而非弹空图）。
+    fn show_heatmap(&mut self) {
+        if self.sess.last_vk_histogram.is_empty() {
+            self.toast("还没有按键记录——打完一段结算后可看热力图");
+            return;
+        }
+        self.model.modal = Modal::Heatmap;
+        self.model.modal_epoch += 1;
+    }
+
+    /// 整改9收口：词提四色循环选色。白名单外键拒绝（防伪造 aux 串）；
+    /// 当前色不在色板内（主题派生色）则跳到首色。即时生效+落盘。
+    fn cycle_hint_color(&mut self, key: &str) -> bool {
+        const SWATCH: [&str; 12] = [
+            "e7b75c", "63c08d", "7fb0e8", "e08a6a", "c88fd8", "8ad0c0", "e0d06a", "8a9ae0",
+            "e0746a", "a8d46a", "6ad4d4", "f0ede6",
+        ];
+        if !matches!(
+            key,
+            "词提编码色" | "词提角标色" | "词提下划线色" | "词提底色"
+        ) {
+            return false;
+        }
+        let cur = self.theme.get(key);
+        let cur_hex = format!("{:02x}{:02x}{:02x}", cur.0, cur.1, cur.2);
+        let next = match SWATCH.iter().position(|s| *s == cur_hex) {
+            Some(i) => SWATCH[(i + 1) % SWATCH.len()],
+            None => SWATCH[0],
+        };
+        let Some(c) = gale_core::theme::Color::from_hex_no_hash(next) else {
+            return false;
+        };
+        self.theme.set(key, c);
+        self.cfg.color_overrides.insert(key.into(), next.into());
+        self.apply_style();
+        self.save_config();
+        true
+    }
+
+    /// 整改14：把全文词提（full_words，全文坐标）切成当前段子集（段内坐标）
+    /// 填给渲染层——换段时零网络延迟，全文词提一次到位。
+    fn refill_segment_words(&mut self) {
+        let idx = self.sess.current_index();
+        let base: usize = self.sess.segments[..idx]
+            .iter()
+            .map(|s| s.text.chars().count())
+            .sum();
+        let n = self.sess.current_segment().text.chars().count();
+        let mut v: Vec<modals::HintWord> = self
+            .full_words
+            .iter()
+            .filter(|w| w.start >= base && w.len > 0 && w.start + w.len <= base + n)
+            .map(|w| {
+                let mut c = w.clone();
+                c.start -= base;
+                c
+            })
+            .collect();
+        v.sort_by_key(|w| w.start);
+        self.model.words = v;
+    }
+    /// 私有标记动作执行（aux_action 解码后）
+    fn run_aux(&mut self, aux: AuxAction) {
+        match aux {
+            AuxAction::OnlineRegister => {
+                // 整改2c：注册/账号入口（默认站首页；URL 实查结论见 wenlai.rs）
+                let url = gale_core::wenlai::register_url_for(&self.cfg.wenlai_domain);
+                let wide: Vec<u16> = url.encode_utf16().chain(Some(0)).collect();
+                unsafe {
+                    let r = windows::Win32::UI::Shell::ShellExecuteW(
+                        self.win.hwnd(),
+                        windows::core::w!("open"),
+                        windows::core::PCWSTR(wide.as_ptr()),
+                        None,
+                        None,
+                        SW_SHOWNORMAL,
+                    );
+                    if r.0 as isize <= 32 {
+                        self.toast("无法打开注册页面，请检查默认浏览器");
+                    }
+                }
+            }
+            AuxAction::OnlineAutoNext => {
+                self.online_auto_next = !self.online_auto_next;
+                let prefs = OnlinePrefs {
+                    auto_next: self.online_auto_next,
+                };
+                if let Err(e) = prefs.save(&self.dir.join("online.json")) {
+                    self.toast(format!("在线偏好保存失败：{e}"));
+                }
+                self.model
+                    .fields
+                    .insert("online_auto_next".into(), self.online_auto_next.to_string());
+                if !self.online_auto_next {
+                    self.auto_next_at = None;
+                }
+            }
+            AuxAction::SingleShuffle => {
+                self.single_cfg.shuffle = !self.single_cfg.shuffle;
+                self.save_single_cfg();
+            }
+            AuxAction::SingleSeg(d) => {
+                let c = self.single_cfg.clamped();
+                self.single_cfg.segment_chars =
+                    (c.segment_chars as i32 + d).clamp(
+                        gale_core::single::SINGLE_SEGMENT_MIN as i32,
+                        gale_core::single::SINGLE_SEGMENT_MAX as i32,
+                    ) as u16;
+                self.save_single_cfg();
+            }
+            AuxAction::ShowFullAnalysis => self.show_full_analysis(),
+            AuxAction::ShowHeatmap => self.show_heatmap(),
+        }
+    }
+    fn save_single_cfg(&mut self) {
+        if let Err(e) = self.single_cfg.save(&self.dir.join("single.json")) {
+            self.toast(format!("单字配置保存失败：{e}"));
+        }
+        self.sync_single_fields();
     }
     fn apply_style(&mut self) {
         let bg = ui::rgba(self.theme.get("窗体背景色"));
@@ -1068,13 +1475,38 @@ impl App {
         let tx = self.tx.clone();
         let hwnd = self.win.hwnd;
         let generation = self.generation;
-        let text = self.sess.current_segment().text.clone();
+        // 整改14：词提一次性分析整篇文章（全文坐标）；换段只做本地切片，
+        // 不再“打到哪段才请求哪段”。段间直接拼接（无分隔符），
+        // start=全文累计字符偏移。超长文（>9500 字）会撞 server 10000 字
+        // 上限，退回单段请求（段内坐标，refill 不适用——清全文缓存）。
+        let full_text: String = self
+            .sess
+            .segments
+            .iter()
+            .flat_map(|s| s.text.chars())
+            .collect();
+        let whole_book = full_text.chars().count() <= 9500;
+        let text = if whole_book {
+            full_text
+        } else {
+            self.sess.current_segment().text.clone()
+        };
+        if !whole_book && !self.full_words.is_empty() {
+            self.full_words.clear();
+            self.full_words_ver.clear();
+            self.full_words_of.clear();
+        }
+        self.last_analyze_whole = whole_book;
         let hints = gale_core::rules::hints_effective(self.sess.rules.word_hints, self.model.race);
         let single = self.sess.source == session::SessionSource::Single || self.cfg.hint_style == 1;
-        let known_version = if self.model.words.is_empty() {
+        // 缓存仅当：有词提数据 且 schema 版本未变 且 正文未变（换书/清洗自动失效）。
+        let known_version = if self.full_words.is_empty()
+            || self.full_words_of != text
+            || self.full_words_ver.is_empty()
+        {
             String::new()
         } else {
-            self.model.schema_ver.clone()
+            self.full_words_ver.clone()
         };
         std::thread::spawn(move || {
             let port = local_port();
@@ -1111,23 +1543,64 @@ impl App {
                                 self.model.schema = v["schema"].as_str().unwrap_or("").into();
                                 self.model.schema_ver =
                                     v["schema_ver"].as_str().unwrap_or("").into();
-                                if v["words_unchanged"] != true {
-                                    self.model.words = serde_json::from_value(v["words"].clone())
-                                        .unwrap_or_default();
+                                // 整改14：words 是全文坐标；缓存命中（words_unchanged）
+                                // 沿用 full_words，仅重切当前段。超长回退
+                                // （last_analyze_whole=false）时响应为段内坐标，
+                                // 走旧段内校验直填，不动全文缓存。
+                                if !self.last_analyze_whole {
+                                    let chars: Vec<char> =
+                                        self.sess.current_segment().text.chars().collect();
+                                    let parsed: Vec<modals::HintWord> =
+                                        serde_json::from_value(v["words"].clone())
+                                            .unwrap_or_default();
+                                    self.model.words = parsed
+                                        .into_iter()
+                                        .filter(|word| {
+                                            word.len > 0
+                                                && word.start <= chars.len()
+                                                && word.len <= chars.len() - word.start
+                                                && chars[word.start..word.start + word.len]
+                                                    .iter()
+                                                    .copied()
+                                                    .eq(word.text.chars())
+                                                && word
+                                                    .code
+                                                    .as_ref()
+                                                    .is_none_or(|c| c.len() <= 32)
+                                                && word.tail.len() <= 16
+                                        })
+                                        .collect();
+                                } else if v["words_unchanged"] != true {
+                                    let parsed: Vec<modals::HintWord> =
+                                        serde_json::from_value(v["words"].clone())
+                                            .unwrap_or_default();
+                                    // 全文校验：词面与正文逐字对齐（防分词漂移）。
+                                    let full: Vec<char> = self
+                                        .sess
+                                        .segments
+                                        .iter()
+                                        .flat_map(|s| s.text.chars())
+                                        .collect();
+                                    self.full_words = parsed
+                                        .into_iter()
+                                        .filter(|word| {
+                                            word.len > 0
+                                                && word.start <= full.len()
+                                                && word.len <= full.len() - word.start
+                                                && full[word.start..word.start + word.len]
+                                                    .iter()
+                                                    .copied()
+                                                    .eq(word.text.chars())
+                                                && word.code.as_ref().is_none_or(|c| c.len() <= 32)
+                                                && word.tail.len() <= 16
+                                        })
+                                        .collect();
+                                    self.full_words_ver = self.model.schema_ver.clone();
+                                    self.full_words_of = full.into_iter().collect();
                                 }
-                                let chars: Vec<char> =
-                                    self.sess.current_segment().text.chars().collect();
-                                self.model.words.retain(|word| {
-                                    word.len > 0
-                                        && word.start <= chars.len()
-                                        && word.len <= chars.len() - word.start
-                                        && chars[word.start..word.start + word.len]
-                                            .iter()
-                                            .copied()
-                                            .eq(word.text.chars())
-                                        && word.code.as_ref().is_none_or(|c| c.len() <= 32)
-                                        && word.tail.len() <= 16
-                                });
+                                if self.last_analyze_whole {
+                                    self.refill_segment_words();
+                                }
                                 self.model.status = format!(
                                     "{} · {}",
                                     self.model.schema,
@@ -1158,11 +1631,27 @@ impl App {
                 }
                 Bg::Chats(v) => {
                     self.qq_busy = false;
+                    // 整改7：刷新不丢选择——按标题把旧 bound 重绑到新列表位置；
+                    // 标题消失（窗口关闭/会话移除）才解绑。
+                    let prev_title = self
+                        .model
+                        .bound
+                        .and_then(|i| self.chats.get(i))
+                        .map(|c| c.title.clone());
                     self.chats = v;
                     self.model.groups = self.chats.iter().map(|c| c.title.clone()).collect();
-                    self.model.bound = None;
+                    self.model.bound = prev_title
+                        .as_ref()
+                        .and_then(|t| self.chats.iter().position(|c| &c.title == t));
                     if self.chats.is_empty() {
-                        self.toast("未发现 QQ 会话，请打开 QQ 后重试");
+                        self.toast("未检测到 QQ：请打开并登录 QQ 后重试");
+                    }
+                }
+                Bg::FullAnalysis(g, v) => {
+                    // 整改13：旧版服务无 full_analysis 字段（None）=无此功能，静默
+                    if g == self.generation {
+                        self.sess.full_analysis = v;
+                        self.snapshot_dirty = true;
                     }
                 }
                 Bg::Article(g, bound, revision, r) => {
@@ -1402,6 +1891,10 @@ impl App {
                     );
                     self.model.online_article = Some(a.clone());
                     self.article = Some(a);
+                    // 整改2a：去预览——取到正文直接载入跟打区，第一段起打
+                    //（成绩单期间由自动下一段触发时，载入本身就会关闭成绩单）。
+                    // 开打中（规则已冻结）或成绩积压时降级为待读草稿，不抢正文。
+                    self.load_online_article();
                 }
                 Ok(OnlinePayload::Categories(c)) => {
                     let selected = self
@@ -1498,6 +1991,7 @@ impl App {
         } else {
             self.sess.load_book("自定义文字", &text);
         }
+        self.online_article_current = false;
         self.reset_host();
         self.open(Modal::None);
         gale_win::input_host::diag_log(&format!(
@@ -1542,6 +2036,24 @@ impl App {
     }
     fn act(&mut self, a: Action, confirmed: bool) {
         self.capture_fields();
+        // 私有标记通道（整改2/5/8/13）：modals.rs 暂无正式变体的动作在这里
+        // 先行解码执行，不再走后面的公共分支（真实 Theme 动作不受影响）。
+        // 整改9收口：词提四色循环选色（aux 前缀带参数，不进 AuxAction 枚举）。
+        if let Action::Theme(s) = &a {
+            if let Some(key) =
+                s.strip_prefix(AUX_PREFIX).and_then(|c| c.strip_prefix("hint_color:"))
+            {
+                if self.cycle_hint_color(key) {
+                    gale_win::window::request_frame();
+                    return;
+                }
+            }
+        }
+        if let Some(aux) = aux_action(&a) {
+            self.run_aux(aux);
+            gale_win::window::request_frame();
+            return;
+        }
         if gale_win::input_host::diagnostics_enabled() {
             gale_win::input_host::diag_log(&format!(
                 "action={a:?} confirmed={confirmed} phase={:?} modal={:?} load_chars={}",
@@ -1586,36 +2098,14 @@ impl App {
             self.toast("成绩正在保存，请稍候再开始下一段");
             return;
         }
-        if confirmed
-            && self.sess.phase == Phase::Typing
+        // 整改5：F1-F4 跳段/取文不再弹"是否中断打文"确认——直接执行。
+        // 打字中触发载文件/读群文时，先把未完成段按中断处理（jump 复位本段），
+        // 与原确认后路径的语义一致；Esc 停表语义不变（主循环 Escape 分支）。
+        if self.sess.phase == Phase::Typing
             && matches!(a, Action::LoadFile | Action::ReadGroup)
         {
             self.sess.jump(self.sess.index);
             self.reset_host();
-        }
-        if !confirmed
-            && self.sess.phase == Phase::Typing
-            && matches!(
-                a,
-                Action::Previous
-                    | Action::Restart
-                    | Action::Next
-                    | Action::ToggleRace
-                    | Action::LoadText
-                    | Action::LoadClipboard
-                    | Action::LoadFile
-                    | Action::LoadBook(_)
-                    | Action::Practice(_)
-                    | Action::OnlineLoadOnly
-                    | Action::OnlineLoad
-                    | Action::ReadGroup
-                    | Action::Exit
-            )
-        {
-            self.model.confirm = "本段还未完成。继续将中止当前练习，本段不会作为完成成绩。".into();
-            self.model.pending = Some(a);
-            self.open(Modal::Confirm);
-            return;
         }
         match a {
             Action::None => {}
@@ -1704,13 +2194,24 @@ impl App {
                     rules.mode = TrainingMode::Practice;
                     rules.word_hints = true;
                     let _ = self.sess.set_rules(rules);
-                    self.sess.load_single(gale_core::single::SingleSession {
-                        title: title.into(),
-                        group_size: 10,
-                        items: gale_core::single::parse_items(body, if i == 4 { 2 } else { 1 }),
-                        group_index: 0,
-                        seed: 0,
-                    });
+                    // 整改8：段长/乱序走 single.json（shuffle 默认开、段长默认 20）。
+                    // 乱序开时种子取时钟毫秒——每次进入练习都是新排列（重打本组
+                    // 由 SingleSession.seed 固定复现）；关时 seed=0 保持原序。
+                    let seed = if self.single_cfg.shuffle {
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64
+                    } else {
+                        0
+                    };
+                    self.sess.load_single(self.single_cfg.build_session(
+                        title,
+                        body,
+                        if i == 4 { 2 } else { 1 },
+                        seed,
+                    ));
+                    self.online_article_current = false;
                     self.model.race = false;
                     self.model.hints = true;
                     self.reset_host();
@@ -1876,6 +2377,7 @@ impl App {
                     let name = b.name.clone();
                     let text = b.raw_text.clone();
                     self.sess.load_book(&name, &text);
+                    self.online_article_current = false;
                     self.reset_host();
                     self.open(Modal::None);
                     self.snapshot();
@@ -1916,7 +2418,8 @@ impl App {
                 self.save_config();
             }
             Action::Font(d) => {
-                self.cfg.font_size = (self.cfg.font_size + d as f32).clamp(24., 64.);
+                // 整改6：外观页字号 +/- 与 Ctrl+滚轮统一口径（10..=60）
+                self.cfg.font_size = (self.cfg.font_size + d as f32).clamp(10., 60.);
                 self.save_config();
             }
             Action::Motion => {
@@ -1977,6 +2480,8 @@ impl App {
             Action::ScanGroups => {
                 if !self.qq_busy {
                     self.qq_busy = true;
+                    // 整改7：QQ 读取屏扫描节流锚点（开屏 10s 后自动刷新用）
+                    self.qq_scan_at = self.ms();
                     let tx = self.tx.clone();
                     let hwnd = self.win.hwnd;
                     std::thread::spawn(move || {
@@ -1986,18 +2491,8 @@ impl App {
                                 windows::Win32::System::Com::COINIT_MULTITHREADED,
                             );
                         }
-                        let mut chats = Vec::new();
-                        if let Some(p) = qq_bridge::main_panel() {
-                            for n in uia_bridge::list_sessions(p.hwnd) {
-                                chats.push(qq_bridge::ChatWindow {
-                                    title: n,
-                                    hwnd: p.hwnd,
-                                });
-                            }
-                        }
-                        if chats.is_empty() {
-                            chats = qq_bridge::list_chat_windows();
-                        }
+                        // 整改7：主面板会话列表 ∪ 独立聊天窗，按标题去重（主面板优先）
+                        let chats = qq_bridge::list_sessions_merged();
                         let _ = tx.send(Bg::Chats(chats));
                         wake(hwnd);
                     });
@@ -2112,34 +2607,7 @@ impl App {
                     }));
                 }
             }
-            Action::OnlineLoad => {
-                if let Some(a) = self.article.clone() {
-                    if a.text.chars().count() > 100000 {
-                        self.toast("在线正文超过100000字，请重新取较短文段");
-                        return;
-                    }
-                    self.sess.load_group(gale_core::segment::ParsedGroupText {
-                        title: a.title,
-                        // P2 难度带分值（任务 6d）：文来 API 的 difficulty_score
-                        //（0=无分值）拼成 "普 1.84" 风格——DifficultyTag::parse
-                        // 在 session.load_group 内解析，结算进成绩单 难度普(1.84)。
-                        difficulty: Some(if a.difficulty_score > 0. {
-                            format!("{} {}", a.difficulty.label(), a.difficulty_score)
-                        } else {
-                            a.difficulty.label().to_string()
-                        }),
-                        segments: vec![gale_core::segment::Segment {
-                            mark: a.seg_mark,
-                            text: a.text,
-                        }],
-                    });
-                    self.reset_host();
-                    self.open(Modal::None);
-                    self.snapshot();
-                } else {
-                    self.toast("请先取得并预览文章");
-                }
-            }
+            Action::OnlineLoad => self.load_online_article(),
             Action::RuleSelect(i) => {
                 self.model.rule_selected = i;
                 self.sync_rule_model();

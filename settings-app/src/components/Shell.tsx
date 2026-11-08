@@ -7,6 +7,7 @@ export const PAGE_TITLE: Record<Route, string> = {
   overview: '概览',
   schemes: '方案',
   input: '输入',
+  trainer: '跟打器',
   keymap: '键位编辑',
   skin: '皮肤工作室',
   motion: '动效',
@@ -25,6 +26,7 @@ const GROUPS: { label: string; items: { key: Route; label: string; icon: string 
       { key: 'overview', label: '概览', icon: 'home' },
       { key: 'schemes', label: '方案', icon: 'grid' },
       { key: 'input', label: '输入', icon: 'keyboard' },
+      { key: 'trainer', label: '跟打器', icon: 'play' },
     ],
   },
   {

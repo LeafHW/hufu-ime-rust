@@ -25,8 +25,12 @@
     color:var(--text); -webkit-font-smoothing:antialiased;
   }
   body.light{background:#e9e2d3;color-scheme:light}
+  /* 【整改11 2026-11-08】小视口适配：原先固定 1280×800，视口小于该尺寸时
+     .window 溢出屏幕，nav-item hover 位移后 elementFromPoint 落在窗外，
+     点击判定失效（控件点不动）。改为随视口收缩（上限仍 1280×800），
+     纵向滚动交给 .main 的 overflow-y，横向由 .screen 的 min-width 保底。 */
   .window{
-    width:1280px; height:800px; background:var(--bg); border-radius:14px; overflow:hidden;
+    width:min(1280px,100vw); height:min(800px,100vh); background:var(--bg); border-radius:14px; overflow:hidden;
     display:flex; flex-direction:column; box-shadow:var(--shadow); position:relative;
     border:1px solid rgba(255,255,255,.06);
   }
@@ -126,6 +130,7 @@
   body[data-screen="sync"] #s-sync{display:block}
   body[data-screen="schemes"] #s-schemes{display:block}
   body[data-screen="input"] #s-input{display:block}
+  body[data-screen="trainer"] #s-trainer{display:block}
   body[data-screen="keymap"] #s-keymap{display:block}
   body[data-screen="sentence"] #s-sentence{display:block}
   body[data-screen="buddy"] #s-buddy{display:block}
@@ -711,8 +716,12 @@ body.webview .window{width:100vw;height:100vh;border-radius:0;border:0;box-shado
 body.webview .shell{height:100%}
 
 /* ── DPI / responsive layout ─────────────────────────────────────────── */
-.main{overflow-y:auto;scrollbar-width:none}
+/* 【整改11 2026-11-08】窗口随视口收缩后：纵向滚动保持 overflow-y:auto；
+   横向给每页一个可用最小宽度，更窄时横向滚动兜底（滚动条隐藏、滚轮/触控板仍可滚），
+   避免控件被挤压到无法点击。 */
+.main{overflow-y:auto;overflow-x:auto;scrollbar-width:none}
 .main::-webkit-scrollbar{display:none}
+.main > .screen{min-width:560px}
 .params-toggle,.params-close{display:none!important}
 
 @media (max-width:1180px){

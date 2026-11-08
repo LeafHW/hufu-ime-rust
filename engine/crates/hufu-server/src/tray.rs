@@ -346,6 +346,7 @@ extern "system" {
     fn DestroyMenu(hmenu: isize) -> i32;
     fn PostQuitMessage(exitcode: i32);
     fn PostMessageW(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> i32;
+    fn FindWindowW(lpclassname: *const u16, lpwindowname: *const u16) -> isize;
     fn KillTimer(hwnd: isize, idevent: usize) -> i32;
     fn LoadImageW(hinst: isize, name: *const u16, typ: u32, cx: i32, cy: i32, load: u32) -> isize;
 }
@@ -448,10 +449,76 @@ fn trainer_enabled() -> bool {
     TRAINER_ENABLED_CACHED.load(Ordering::SeqCst)
 }
 
+/// 当前生效热键配置串缓存（菜单文案/try_lock 失败回退用；空串=禁用）。
+static TRAINER_HOTKEY_CACHED: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+/// 热键注册失败标志（托盘 tooltip 提示用；当前无托盘常驻图标，
+/// 主要可见通道是日志 eprintln）。
+static TRAINER_HOTKEY_FAILED: AtomicBool = AtomicBool::new(false);
+
+/// "ctrl+alt+g" → "Ctrl+Alt+G"（菜单/设置页显示口径；f5 → F5 同理）。
+fn hotkey_display(s: &str) -> String {
+    s.trim()
+        .split('+')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(|p| {
+            let mut cs = p.chars();
+            match cs.next() {
+                Some(h) => h.to_uppercase().collect::<String>() + cs.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("+")
+}
+
 unsafe fn apply_trainer_shortcut(hwnd: isize) {
     let _ = UnregisterHotKey(hwnd, HOTKEY_ID_TRAINER);
-    if trainer_enabled() {
-        let _ = RegisterHotKey(hwnd, HOTKEY_ID_TRAINER, 0x2 | 0x1 | 0x4000, 0x54);
+    TRAINER_HOTKEY_FAILED.store(false, Ordering::SeqCst);
+    let cached = || TRAINER_HOTKEY_CACHED.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    if !trainer_enabled() {
+        *TRAINER_HOTKEY_CACHED.lock().unwrap_or_else(|p| p.into_inner()) = String::new();
+        return;
+    }
+    // 配置热键串：try_lock 拿不到（配置保存高峰）时回退缓存值，
+    // 下一次配置变化（apply_config → refresh_trainer_shortcut）会再刷新。
+    let hotkey = match SHARED.get().and_then(|h| h.try_lock().ok()) {
+        Some(host) => host.engine.config.trainer.hotkey.trim().to_string(),
+        None => cached(),
+    };
+    *TRAINER_HOTKEY_CACHED.lock().unwrap_or_else(|p| p.into_inner()) = hotkey.clone();
+    match crate::trainer::parse_hotkey(&hotkey) {
+        Some((mods, vk)) => {
+            if RegisterHotKey(hwnd, HOTKEY_ID_TRAINER, mods, vk) == 0 {
+                TRAINER_HOTKEY_FAILED.store(true, Ordering::SeqCst);
+                eprintln!(
+                    "跟打器热键注册失败：{hotkey:?}（可能与其他软件冲突，可在设置页更换）"
+                );
+            }
+        }
+        // 空串=明确禁用热键：正常态，不报失败。
+        None if hotkey.is_empty() => {}
+        None => {
+            TRAINER_HOTKEY_FAILED.store(true, Ordering::SeqCst);
+            eprintln!(
+                "跟打器热键配置非法：{hotkey:?}（格式：ctrl/alt/shift/win 组合 + a-z/0-9/f1-f12，如 ctrl+alt+g）"
+            );
+        }
+    }
+}
+
+/// 跟打器老板键 toggle：窗口已开 → 优雅关闭（WM_CLOSE 走 gale-win 退出
+/// 路径：capture_fields/snapshot/flush_persistence/save_config 落盘后退出）；
+/// 未开 → 走 open_trainer 拉起（含 BUSY 单飞重试与缺件弹窗）。
+fn toggle_trainer(hwnd: isize) {
+    unsafe {
+        let class: Vec<u16> = "HuFuTrainerWindow\0".encode_utf16().collect();
+        let existing = FindWindowW(class.as_ptr(), std::ptr::null());
+        if existing != 0 {
+            let _ = PostMessageW(existing, WM_CLOSE, 0, 0);
+        } else {
+            open_trainer(hwnd);
+        }
     }
 }
 
@@ -467,6 +534,7 @@ pub fn on_ime_state(active: bool) {
         }
     }
 }
+const WM_CLOSE: u32 = 0x0010;
 const WM_DESTROY: u32 = 0x0002;
 const WM_COMMAND: u32 = 0x0111;
 const WM_LBUTTONDBLCLK: u32 = 0x0203;
@@ -636,7 +704,10 @@ extern "system" fn wnd_proc(hwnd: isize, msg: u32, wparam: usize, lparam: isize)
                     crate::sys_win::raise_settings_window();
                 }
                 if wparam == HOTKEY_ID_TRAINER as usize && trainer_enabled() {
-                    open_trainer(hwnd);
+                    // 【整改10 2026-11-08】老板键语义：开→关（优雅关闭），
+                    // 关→开（原拉起路径）。trainer_enabled() 的 try_lock 缓存
+                    // 保证此高频路径不阻塞等引擎锁。
+                    toggle_trainer(hwnd);
                 }
                 0
             }
@@ -673,12 +744,21 @@ extern "system" fn wnd_proc(hwnd: isize, msg: u32, wparam: usize, lparam: isize)
                         let s2: Vec<u16> = "退出 HuFu\u{0}".encode_utf16().collect();
                         AppendMenuW(hmenu, MF_STRING, IDM_SETTINGS, s1.as_ptr());
                         let enabled = trainer_enabled();
+                        // 【整改10】菜单项改为 toggle 语义文案，并显示当前热键。
+                        let hotkey =
+                            TRAINER_HOTKEY_CACHED.lock().unwrap_or_else(|p| p.into_inner()).clone();
                         let trainer: Vec<u16> = if enabled {
-                            "打开跟打器 (Ctrl+Alt+T)\0"
+                            let label = if hotkey.trim().is_empty() {
+                                "跟打器 开/关（热键未设置）".to_string()
+                            } else {
+                                format!("跟打器 开/关（{}）", hotkey_display(&hotkey))
+                            };
+                            label
                         } else {
-                            "跟打器已关闭（在设置页启用）\0"
+                            "跟打器已关闭（在设置页启用）".to_string()
                         }
                         .encode_utf16()
+                        .chain(std::iter::once(0))
                         .collect();
                         AppendMenuW(
                             hmenu,

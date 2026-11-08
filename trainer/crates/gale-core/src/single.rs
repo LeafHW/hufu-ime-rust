@@ -37,6 +37,98 @@ const PRACTICE_TARGET_CHARS: usize = 80;
 const PRACTICE_TOP_CHARS: usize = 30;
 
 // ─────────────────────────────────────────────────────────────
+// 单字练习配置（整改8：乱序开关 + 段长，持久化 sidecar JSON）
+// ─────────────────────────────────────────────────────────────
+
+/// 段长下限（含）
+pub const SINGLE_SEGMENT_MIN: u16 = 5;
+/// 段长上限（含）
+pub const SINGLE_SEGMENT_MAX: u16 = 100;
+/// 段长默认值
+pub const SINGLE_SEGMENT_DEFAULT: u16 = 20;
+
+/// 单字练习用户配置。config.toml 归 gale-app 主配置（本 crate 不持有），
+/// 该小节独立持久化在数据目录 `single.json`（与 online.json 同一 sidecar 口径）。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SingleDrillConfig {
+    /// 词表乱序（组内种子化洗牌；关=原序）
+    #[serde(default = "default_single_shuffle")]
+    pub shuffle: bool,
+    /// 每段字数（clamp 5..=100）
+    #[serde(default = "default_single_segment_chars")]
+    pub segment_chars: u16,
+}
+
+fn default_single_shuffle() -> bool {
+    true
+}
+fn default_single_segment_chars() -> u16 {
+    SINGLE_SEGMENT_DEFAULT
+}
+
+impl Default for SingleDrillConfig {
+    fn default() -> Self {
+        Self {
+            shuffle: true,
+            segment_chars: SINGLE_SEGMENT_DEFAULT,
+        }
+    }
+}
+
+impl SingleDrillConfig {
+    /// 段长夹取到合法区间（洗牌开关原样保留）。
+    pub fn clamped(&self) -> Self {
+        Self {
+            shuffle: self.shuffle,
+            segment_chars: self.segment_chars.clamp(SINGLE_SEGMENT_MIN, SINGLE_SEGMENT_MAX),
+        }
+    }
+    /// 读取 sidecar 配置：缺失/损坏/越界一律回退（clamped 后）合法值，
+    /// 与主配置 load_or_create 的宽容口径一致，不因坏文件阻断练习。
+    pub fn load(path: &Path) -> Self {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<Self>(&s).ok())
+            .map(|c| c.clamped())
+            .unwrap_or_default()
+    }
+    /// 持久化 sidecar 配置（小 JSON，直接覆写）。
+    pub fn save(&self, path: &Path) -> GaleResult<()> {
+        let bytes = serde_json::to_vec(self).map_err(|e| crate::GaleError::Format(e.to_string()))?;
+        if bytes.len() > 4096 {
+            return Err(crate::GaleError::Format("单字配置过大".into()));
+        }
+        std::fs::write(path, bytes)?;
+        Ok(())
+    }
+    /// 由字表文本构建一次练单会话：乱序开→按段长做组内种子化洗牌
+    /// （同 seed 可复现，重打本段重现同一段）；切段 = segment_chars。
+    pub fn build_session(
+        &self,
+        title: &str,
+        body: &str,
+        word_len: usize,
+        seed: u64,
+    ) -> SingleSession {
+        let c = self.clamped();
+        let group = c.segment_chars.max(1) as usize;
+        let items = parse_items(body, word_len);
+        let (items, seed) = if c.shuffle {
+            (shuffle_grouped(&items, group, seed), seed)
+        } else {
+            (items, 0)
+        };
+        SingleSession {
+            title: title.to_string(),
+            group_size: group,
+            items,
+            group_index: 0,
+            seed,
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
 // 内置语料（zhouzhou-typing Apache-2.0；_research\drill-corpus\ 存档核对）
 // ─────────────────────────────────────────────────────────────
 
@@ -784,5 +876,112 @@ mod tests {
         std::fs::write(&p, "not json").unwrap();
         assert_eq!(ErrorBook::open(&p).error_log.len(), 0);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── 整改8：乱序 + 段长配置 ──
+
+    const DRILL_BODY: &str = "的一是了不在有和人这中大为上个国我以要他时来用们生到作地于出就分对成会可主发年动同工也能下过子说产种面而方后多定行学法所民得经十三之进着等部度家电力里如水化高自二理起小物现实加量都两体制机当使点从业本去了把性强应十开由己从进";
+
+    fn count_chars(items: &[String]) -> std::collections::BTreeMap<char, usize> {
+        let mut m = std::collections::BTreeMap::new();
+        for it in items {
+            for c in it.chars() {
+                *m.entry(c).or_insert(0) += 1;
+            }
+        }
+        m
+    }
+
+    #[test]
+    fn drill_config_defaults_clamp_and_roundtrip() {
+        let dir = crate::test_util::tmp("single-cfg");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // 缺省文件 → 默认（shuffle=true, segment=20）
+        let p = dir.join("single.json");
+        let d = SingleDrillConfig::load(&p);
+        assert_eq!(d, SingleDrillConfig::default());
+        assert_eq!(d.segment_chars, SINGLE_SEGMENT_DEFAULT);
+        // 越界 → clamp
+        let raw = SingleDrillConfig {
+            shuffle: false,
+            segment_chars: 999,
+        };
+        assert_eq!(raw.clamped().segment_chars, SINGLE_SEGMENT_MAX);
+        let raw = SingleDrillConfig {
+            shuffle: true,
+            segment_chars: 1,
+        };
+        assert_eq!(raw.clamped().segment_chars, SINGLE_SEGMENT_MIN);
+        // 存取往返（落盘带 clamp）
+        raw.save(&p).unwrap();
+        assert_eq!(SingleDrillConfig::load(&p), raw.clamped());
+        // 坏文件 → 回默认
+        std::fs::write(&p, "{nope").unwrap();
+        assert_eq!(SingleDrillConfig::load(&p), SingleDrillConfig::default());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn drill_build_shuffle_keeps_multiset_and_segment_lengths() {
+        let cfg = SingleDrillConfig {
+            shuffle: true,
+            segment_chars: 20,
+        };
+        let s = cfg.build_session("前500", DRILL_BODY, 1, 12345);
+        assert_eq!(s.group_size, 20);
+        assert_eq!(s.total_groups(), (DRILL_BODY.chars().count() + 19) / 20);
+        // 无重复丢失：全量字符多重集与原表一致
+        let original: Vec<char> = DRILL_BODY.chars().collect();
+        let joined: String = s.items.concat();
+        assert_eq!(count_chars(&s.items), count_chars(&original.iter().map(|c| c.to_string()).collect::<Vec<_>>()));
+        assert_eq!(joined.chars().count(), DRILL_BODY.chars().count());
+        // 段长：前 n-1 段恰 20 字，末段为余数
+        let mut group = s.clone();
+        for i in 0..group.total_groups() {
+            group.group_index = i;
+            let len = group.current_segment().text.chars().count();
+            if i + 1 < group.total_groups() {
+                assert_eq!(len, 20, "segment {i}");
+            } else {
+                assert_eq!(len, DRILL_BODY.chars().count() % 20, "tail segment");
+            }
+        }
+        // 乱序确实生效且同 seed 复现
+        let s2 = cfg.build_session("前500", DRILL_BODY, 1, 12345);
+        assert_eq!(s.items, s2.items);
+        let s3 = cfg.build_session("前500", DRILL_BODY, 1, 67890);
+        assert_ne!(s.items, s3.items, "不同种子应产生不同排列");
+        // 原表顺序下的段内容与洗牌后的段内容（组内）多重集一致
+        let plain = SingleDrillConfig {
+            shuffle: false,
+            segment_chars: 20,
+        }
+        .build_session("前500", DRILL_BODY, 1, 0);
+        for i in 0..plain.total_groups() {
+            let mut a = s.clone();
+            let mut b = plain.clone();
+            a.group_index = i;
+            b.group_index = i;
+            let av: Vec<char> = a.current_segment().text.chars().collect();
+            let bv: Vec<char> = b.current_segment().text.chars().collect();
+            let mut av2 = av.clone();
+            let mut bv2 = bv.clone();
+            av2.sort_unstable();
+            bv2.sort_unstable();
+            assert_eq!(av2, bv2, "组 {i} 成员集合一致（洗牌不换成员）");
+        }
+    }
+
+    #[test]
+    fn drill_build_no_shuffle_preserves_order_and_seed_zero() {
+        let cfg = SingleDrillConfig {
+            shuffle: false,
+            segment_chars: 7,
+        };
+        let s = cfg.build_session("t", DRILL_BODY, 1, 999);
+        assert_eq!(s.seed, 0, "乱序关=原序（seed 0）");
+        let expect: String = DRILL_BODY.chars().take(7).collect();
+        assert_eq!(s.current_segment().text, expect);
     }
 }

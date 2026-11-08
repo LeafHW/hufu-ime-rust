@@ -2,6 +2,7 @@ export type Route =
   | 'overview'
   | 'schemes'
   | 'input'
+  | 'trainer'
   | 'keymap'
   | 'skin'
   | 'motion'
@@ -36,7 +37,9 @@ export interface EngineState {
 }
 
 export interface Config {
-  trainer?: { enabled?: boolean };
+  /* 【整改10 2026-11-08】trainer 段：enabled=内置入口开关；
+     hotkey=全局老板键（"ctrl+alt+g" 小写加号串，空串=禁用，服务端默认 ctrl+alt+g）。 */
+  trainer?: { enabled?: boolean; hotkey?: string };
   appearance?: {
     anim?: boolean;
     anim_flash?: boolean;

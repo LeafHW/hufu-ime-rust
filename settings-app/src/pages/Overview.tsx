@@ -10,7 +10,6 @@ import { Badge, PageHead } from '../components/ui';
 import { useBodyLight } from '../hooks';
 import { skinSwatch } from '../skinSwatch';
 import { SEARCH_ITEMS } from './searchIndex';
-import { TrainerSettings } from '../components/TrainerSettings';
 
 const shortName = (n: string) => n.replace(/（.*?）|\(.*?\)/g, '').trim() || n;
 
@@ -222,7 +221,7 @@ export function Overview({
         }
       />
 
-      <TrainerSettings data={data} notify={notify} refresh={refresh} />
+      {/* 【整改10 2026-11-08】跟打练习卡已整体挪到独立「跟打器」页（trainer），此处不再重复。 */}
 
       <div className="status-grid">
         <div

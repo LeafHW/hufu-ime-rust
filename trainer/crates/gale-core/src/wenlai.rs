@@ -982,6 +982,19 @@ impl WenlaiClient for MockWenlaiClient {
 }
 
 /// HTTPS origin only: bearer tokens never cross domains or redirect to another origin.
+/// 整改2c：文来注册/账号入口（跟打器"注册账号"按钮打开）。
+/// 实查 2026-11-08：`qingfawen.fcxxz.com/register`、`/login` 均 HTTP 404
+/// （晴发文为站长在「用户管理」添加账号的模式，无公开注册页）；
+/// `dazi.wenlai.cn/register` 返回 200 但全站 JS 跳转、无表单实证，
+/// 且是另一套服务（账号与本站不互通）。按兜底口径打开站点首页，
+/// 用户在站内自行走账号入口；确认到真实注册页后替换此常量即可。
+pub const REGISTER_URL: &str = "https://qingfawen.fcxxz.com/";
+
+/// 注册/账号入口：配置了合法自定义服务域则开其根，否则默认站。
+pub fn register_url_for(domain: &str) -> String {
+    normalize_base_url(domain).unwrap_or_else(|_| REGISTER_URL.to_string())
+}
+
 pub fn normalize_base_url(value: &str) -> Result<String, String> {
     let value = value.trim().trim_end_matches('/');
     let authority = value

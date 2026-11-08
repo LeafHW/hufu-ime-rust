@@ -18,12 +18,16 @@ use std::{
 };
 
 const MAX_CHARS: usize = 10_000;
-const SENTENCE_HINT_UNAVAILABLE: &str = "当前整句模式会动态改变候选，静态词提暂不可用";
+/// 【整改13】全文理论分析仅对 ≤2000 字文章开放（逐词聚合预算护栏）。
+const FULL_ANALYSIS_MAX_CHARS: usize = 2_000;
 static ANALYZING: AtomicBool = AtomicBool::new(false);
 struct CachedAnalysis {
     text: String,
     version: String,
     single: bool,
+    /// 【整改13】full_analysis 是否随响应缓存（同文同版本但 include_full
+    /// 不同的请求不得互相命中）。
+    include_full: bool,
     response: Response,
     // Retain dictionary allocations while the pointer identity is in a cache key.
     // This prevents allocator reuse from making a reloaded dictionary look unchanged.
@@ -172,6 +176,60 @@ pub fn open(host: &Mutex<Host>) -> Result<(), String> {
         .map_err(|e| format!("无法打开跟打器：{e}"))
 }
 
+/// Win32 RegisterHotKey 修饰键位（与 tray.rs 手写 FFI 同值；Windows SDK 常量）。
+pub const MOD_ALT: u32 = 0x1;
+pub const MOD_CONTROL: u32 = 0x2;
+pub const MOD_SHIFT: u32 = 0x4;
+pub const MOD_WIN: u32 = 0x8;
+pub const MOD_NOREPEAT: u32 = 0x4000;
+
+/// 解析 trainer.hotkey 配置串 → (mods, vk)。
+/// 格式：小写、加号分隔；修饰键 ctrl/alt/shift/win（至少一个，可组合、顺序任意）
+/// + 主键 a-z / 0-9 / f1-f12。MOD_NOREPEAT 恒加（长按不重复触发）。
+/// 空串或纯空白 = 禁用热键 → None；非法组合（裸主键/未知键名/缺主键）→ None。
+/// 大小写宽容（手改 config.json 常见）。
+pub fn parse_hotkey(s: &str) -> Option<(u32, u32)> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None; // 空串=禁用
+    }
+    let binding = s.to_ascii_lowercase();
+    let parts: Vec<&str> = binding
+        .split('+')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .collect();
+    if parts.len() < 2 {
+        return None; // 裸主键（无修饰键）会吞掉全局打字，拒绝注册
+    }
+    let (main, mods_str) = parts.split_last()?;
+    let mut mods = MOD_NOREPEAT;
+    let mut seen_any = false;
+    for m in mods_str {
+        let bit = match *m {
+            "ctrl" | "control" => MOD_CONTROL,
+            "alt" => MOD_ALT,
+            "shift" => MOD_SHIFT,
+            "win" | "meta" => MOD_WIN,
+            _ => return None,
+        };
+        mods |= bit;
+        seen_any = true;
+    }
+    if !seen_any {
+        return None;
+    }
+    let vk = match main.chars().collect::<Vec<char>>()[..] {
+        [c] if c.is_ascii_alphabetic() => c.to_ascii_uppercase() as u32,
+        [c] if c.is_ascii_digit() => c as u32,
+        _ => {
+            let n: u32 = main.strip_prefix('f')?.parse().ok()?;
+            (1..=12).contains(&n).then_some(0x6F + n)? // VK_F1=0x70 … VK_F12=0x7B
+        }
+    };
+    Some((mods, vk))
+}
+
 pub fn route(host: &Mutex<Host>, req: &Request) -> Response {
     match (req.method.as_str(), req.path.as_str()) {
         ("POST", "/api/trainer/open") => match open(host) {
@@ -179,6 +237,9 @@ pub fn route(host: &Mutex<Host>, req: &Request) -> Response {
             Err(e) => Response::err(if e == DISABLED_MESSAGE { 403 } else { 503 }, &e),
         },
         ("GET", "/api/trainer/status") => {
+            // 【整改4 2026-11-08】整句模式词提已放开（码表编码口径），
+            // 不再因 sentence_active 下发 hint_unavailable_reason；
+            // 快照超限（用户词过大）仍是真实的词提不可用，保留。
             let (schema, schema_ver, enabled, max_code_length, sentence, unavailable) =
                 match snapshot(host) {
                     Ok((s, cfg, sentence)) => (
@@ -187,7 +248,7 @@ pub fn route(host: &Mutex<Host>, req: &Request) -> Response {
                         cfg.trainer.enabled,
                         cfg.input.max_code_length,
                         sentence,
-                        sentence.then_some(SENTENCE_HINT_UNAVAILABLE),
+                        None,
                     ),
                     Err(reason) => {
                         // A dictionary snapshot limit disables hints, not the feature switch.
@@ -229,7 +290,17 @@ pub fn route(host: &Mutex<Host>, req: &Request) -> Response {
                 },
                 None => false,
             };
-            if text.chars().count() > MAX_CHARS {
+            // 【整改13 2026-11-08】include_full=true 时附全文理论码长/选重分析；
+            // 仅文长 ≤2000 字时返回（预算护栏），否则静默省略 full_analysis 字段。
+            let include_full = match v.get("include_full") {
+                Some(value) => match value.as_bool() {
+                    Some(b) => b,
+                    None => return Response::err(400, "include_full 必须为布尔值"),
+                },
+                None => false,
+            };
+            let char_count = text.chars().count();
+            if char_count > MAX_CHARS {
                 return Response::err(413, "文章最多 10000 字");
             }
             if ANALYZING
@@ -246,22 +317,57 @@ pub fn route(host: &Mutex<Host>, req: &Request) -> Response {
             };
             let ver = version(&s, &cfg, sentence);
             if let Some(cache) = CACHE.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
-                if cache.text == text && cache.version == ver && cache.single == single {
+                if cache.text == text
+                    && cache.version == ver
+                    && cache.single == single
+                    && cache.include_full == include_full
+                {
                     return cache.response.clone();
                 }
             }
             match Analyzer::new(&s, &cfg, sentence).analyze_mode(text, started, single) {
                 Ok(words) => {
-                    let response = Response::json(
-                        &serde_json::json!({"schema":s.name,"schema_ver":ver,
-                        "max_code_length":cfg.input.max_code_length,"hint_scope":"dictionary",
-                        "sentence_active":sentence,"hint_unavailable_reason":sentence.then_some(SENTENCE_HINT_UNAVAILABLE),
-                        "single":single,"words":words,"elapsed_ms":started.elapsed().as_secs_f64()*1000.0}),
-                    );
+                    // 全文分析按词提分词口径逐词聚合；words 已在锁外算完，
+                    // 这里只做算术聚合（同样在锁外）。rank>1 每词至多计 1 次选重。
+                    let full_analysis = if include_full && char_count <= FULL_ANALYSIS_MAX_CHARS {
+                        let mut entries = Vec::with_capacity(words.len());
+                        let mut total_code_len = 0usize;
+                        let mut select_count = 0usize;
+                        for w in &words {
+                            let code_len = w.hint.code.as_ref().map_or(0, |c| c.len());
+                            total_code_len += code_len;
+                            if w.hint.rank > 1 {
+                                select_count += 1;
+                            }
+                            entries.push(serde_json::json!({
+                                "word": w.text,
+                                "code": w.hint.code,
+                                "code_len": code_len,
+                                "rank": w.hint.rank,
+                            }));
+                        }
+                        Some(serde_json::json!({
+                            "entries": entries,
+                            "total_code_len": total_code_len,
+                            "avg_code_len_per_char": total_code_len as f64 / char_count as f64,
+                            "select_count": select_count,
+                        }))
+                    } else {
+                        None
+                    };
+                    let mut body = serde_json::json!({"schema":s.name,"schema_ver":ver,
+                    "max_code_length":cfg.input.max_code_length,"hint_scope":"dictionary",
+                    "sentence_active":sentence,"hint_unavailable_reason":null,
+                    "single":single,"words":words,"elapsed_ms":started.elapsed().as_secs_f64()*1000.0});
+                    if let Some(fa) = full_analysis {
+                        body["full_analysis"] = fa;
+                    }
+                    let response = Response::json(&body);
                     *CACHE.lock().unwrap_or_else(|p| p.into_inner()) = Some(CachedAnalysis {
                         text: text.into(),
                         version: ver,
                         single,
+                        include_full,
                         response: response.clone(),
                         _dict: s.dict.clone(),
                         _personal: s.personal.clone(),
@@ -497,14 +603,25 @@ impl<'a> Analyzer<'a> {
             true
         }
     }
+    /// 编码可打性过滤（两模式共用）：反查前缀占用/超长/非编码字母表/
+    /// 键位映射（自定义键位方案）/opencc 转换。整句模式同样保留这些
+    /// 保守限制（整改4：用户只点名放开整句的"跳过"，未放开过滤）。
+    fn code_typable(&self, code: &str) -> bool {
+        !(code.is_empty()
+            || code.contains(self.cfg.reverse.prefix)
+            || code.len() > self.cfg.input.max_code_length.clamp(1, 16)
+            || !code
+                .chars()
+                .all(|c| c.is_ascii_lowercase() && self.cfg.input.alphabet.contains(c))
+            || code
+                .chars()
+                .enumerate()
+                .any(|(i, c)| self.mapped(c, i == 0))
+            || self.cfg.opencc.enabled
+            || self.cfg.opencc.emoji)
+    }
     fn hint(&mut self, text: &str) -> Hint {
         if !self.budget(1) {
-            return Hint::missing();
-        }
-        // Even short exact codes can be reordered by sentence phrase merging,
-        // top-frequency single-character promotion and reranking. Without a decoder
-        // snapshot there is no safe executable dictionary recipe, including rank 1.
-        if self.sentence {
             return Hint::missing();
         }
         if let Some(h) = self.hints.get(text) {
@@ -522,6 +639,48 @@ impl<'a> Analyzer<'a> {
         codes.sort();
         codes.dedup();
         codes.truncate(256);
+        // 【整改4 2026-11-08】整句模式词提放开（用户拍板）：hints=该词在码表中的
+        // 编码 + 码表候选位次（信息展示口径，不依赖运行时候选——整句下运行时
+        // 候选窗是整句预测，位次会错）。多编码取 rank 最优、同 rank 取更短码。
+        // tail 沿用 sentence 语义（rank>1 不给选重键），且不因无 tail 拒绝编码。
+        if self.sentence {
+            let mut best = Hint::missing();
+            let mut best_key = (usize::MAX, usize::MAX);
+            for code in codes {
+                if !self.budget(1) {
+                    break;
+                }
+                if !self.code_typable(&code) {
+                    continue;
+                }
+                let entries = self
+                    .candidates
+                    .entry(code.clone())
+                    .or_insert_with(|| self.s.candidates(&code));
+                let count = entries.len();
+                let rank = entries
+                    .iter()
+                    .position(|e| e.text == text)
+                    .map_or(0, |i| i + 1);
+                let key = (if rank == 0 { usize::MAX } else { rank }, code.len());
+                if key < best_key || (key == best_key && best.code.is_none()) {
+                    best_key = key;
+                    let tail = if rank > 0 {
+                        self.tail(&code, rank, count)
+                    } else {
+                        None
+                    }
+                    .unwrap_or_default();
+                    best = Hint {
+                        code: Some(code),
+                        rank,
+                        tail,
+                    };
+                }
+            }
+            self.hints.insert(text.into(), best.clone());
+            return best;
+        }
         let mut best = Hint::missing();
         let mut best_cost = usize::MAX;
         for code in codes {
@@ -530,19 +689,7 @@ impl<'a> Analyzer<'a> {
             }
             // Special namespaces and output conversions require their own
             // runtime state. Missing hints are preferable to a false recipe.
-            if code.is_empty()
-                || code.contains(self.cfg.reverse.prefix)
-                || code.len() > self.cfg.input.max_code_length.clamp(1, 16)
-                || !code
-                    .chars()
-                    .all(|c| c.is_ascii_lowercase() && self.cfg.input.alphabet.contains(c))
-                || code
-                    .chars()
-                    .enumerate()
-                    .any(|(i, c)| self.mapped(c, i == 0))
-                || self.cfg.opencc.enabled
-                || self.cfg.opencc.emoji
-            {
+            if !self.code_typable(&code) {
                 continue;
             }
             let entries = self
@@ -796,8 +943,13 @@ mod tests {
         server.join().unwrap();
     }
 
+    // analyze 端点带进程级单飞锁（ANALYZING），cargo test 默认并行线程
+    // 会让两个发 analyze 的测试互相撞 429——用共享锁把它们串行化。
+    static ANALYZE_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn trainer_setting_guards_open_and_single_analysis_has_separate_cache() {
+        let _analyze_gate = ANALYZE_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
         let dir =
             std::env::temp_dir().join(format!("hufu-trainer-integration-{}", std::process::id()));
         struct Cleanup(std::path::PathBuf);
@@ -999,7 +1151,11 @@ mod tests {
         let mut c = Config::default();
         c.input.auto_select_unique = true;
         assert_eq!(Analyzer::new(&s, &c, false).hint("甲").tail, "");
-        assert!(Analyzer::new(&s, &c, true).hint("甲").code.is_none());
+        // 【整改4】整句模式词提放开：给码表编码（自动顶屏不再适用于整句，
+        // tail 语义见 tail() 的 sentence 分支）。
+        let sh = Analyzer::new(&s, &c, true).hint("甲");
+        assert_eq!(sh.code.as_deref(), Some("abcd"));
+        assert_eq!(sh.rank, 1);
         c.candidates.second_select = 'q';
         c.candidates.custom_select_keys = vec!['2'];
         // q extends the code and digit 2 is custom rank 1: no false rank 2 recipe.
@@ -1213,12 +1369,34 @@ mod tests {
             committed, "两次",
             "real engine phrase merge overrides dictionary rank 1"
         );
+        // 【整改4 2026-11-08】整句模式词提已放开：hints=码表编码（信息口径）。
+        // 即便真实引擎按整句合并把 mlwe 打成「两次」，词提仍标注 𠓅→mlwe/两→ml/次→we
+        // 的码表编码与位次（整句下位次是码表口径，非运行时候选口径）。
         let words = Analyzer::new(&engine.schema, &engine.config, true)
             .analyze("𠓅两次", Instant::now())
             .unwrap();
-        assert!(words
+        let top: Vec<(String, String, usize)> = words
             .iter()
-            .all(|w| w.hint.code.is_none() && w.chars.iter().all(|c| c.hint.code.is_none())));
+            .filter(|w| w.len > 1 || w.hint.code.is_some())
+            .map(|w| {
+                (
+                    w.text.clone(),
+                    w.hint.code.clone().unwrap_or_default(),
+                    w.hint.rank,
+                )
+            })
+            .collect();
+        assert_eq!(
+            top,
+            vec![
+                ("𠓅".into(), "mlwe".into(), 1),
+                ("两".into(), "ml".into(), 1),
+                ("次".into(), "we".into(), 1),
+            ],
+            "sentence hints carry dictionary codes"
+        );
+        // 整句下不给选重键（rank>1 词提的 tail 为空），这是维持的保守语义。
+        assert!(words.iter().all(|w| w.hint.tail.is_empty() || w.hint.rank <= 1));
     }
 
     #[test]
@@ -1278,5 +1456,138 @@ mod tests {
             Analyzer::new(&engine.schema, &cfg, false).hint("乙").tail,
             "!"
         );
+    }
+
+    #[test]
+    fn parse_hotkey_accepts_legal_and_rejects_illegal() {
+        // 空串/纯空白 = 禁用热键
+        assert_eq!(parse_hotkey(""), None);
+        assert_eq!(parse_hotkey("   "), None);
+        // 默认热键 ctrl+alt+g → MOD_CONTROL|MOD_ALT|MOD_NOREPEAT, 'G'=0x47
+        assert_eq!(
+            parse_hotkey("ctrl+alt+g"),
+            Some((MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 0x47))
+        );
+        // 大小写宽容、修饰键顺序任意、win/meta 别名
+        assert_eq!(
+            parse_hotkey("Shift+Win+F5"),
+            Some((MOD_SHIFT | MOD_WIN | MOD_NOREPEAT, 0x74))
+        );
+        assert_eq!(
+            parse_hotkey("meta+z"),
+            Some((MOD_WIN | MOD_NOREPEAT, 0x5A))
+        );
+        // 数字与 f12
+        assert_eq!(
+            parse_hotkey("alt+7"),
+            Some((MOD_ALT | MOD_NOREPEAT, 0x37))
+        );
+        assert_eq!(
+            parse_hotkey("shift+f12"),
+            Some((MOD_SHIFT | MOD_NOREPEAT, 0x7B))
+        );
+        // 容忍多余空格与空段（手改 config 常见）
+        assert_eq!(
+            parse_hotkey(" ctrl + alt + g "),
+            Some((MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 0x47))
+        );
+        // 非法：裸主键（无修饰键会吞掉全局打字）
+        assert_eq!(parse_hotkey("g"), None);
+        // 非法：只有修饰键（末段按主键解析必失败）
+        assert_eq!(parse_hotkey("ctrl+alt"), None);
+        assert_eq!(parse_hotkey("ctrl"), None);
+        // 非法：未知修饰键 / 未知主键 / f13 越界 / 主键后多一段
+        assert_eq!(parse_hotkey("ctrl+alt+zz"), None);
+        assert_eq!(parse_hotkey("ctrl+alt+g+g"), None);
+        assert_eq!(parse_hotkey("caps+g"), None);
+        assert_eq!(parse_hotkey("ctrl+f13"), None);
+        assert_eq!(parse_hotkey("ctrl+alt+space"), None);
+    }
+
+    #[test]
+    fn real_http_full_analysis_numbers_and_gating() {
+        let _analyze_gate = ANALYZE_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        let dir = std::env::temp_dir().join(format!(
+            "hufu-trainer-full-analysis-{}",
+            std::process::id()
+        ));
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(dir.clone());
+        let schema_dir = dir.join("码表/test");
+        std::fs::create_dir_all(&schema_dir).unwrap();
+        // 你 jx 唯一（rank1）；ab 两词乙 rank1 / 丙 rank2（选重 1）；
+        // 你好 jxbh（rank1，4 码）；字 z 无码（SingleChar，code_len 0）。
+        std::fs::write(
+            schema_dir.join("test.dict.yaml"),
+            "---\nname: test\nsort: by_weight\n...\n你\tjx\t900\n好\tbh\t900\n乙\tab\t800\n丙\tab\t700\n你好\tjxbh\t950\n",
+        )
+        .unwrap();
+        let mut cfg = Config::default();
+        cfg.schema.current = "test".into();
+        cfg.sentence.enabled = false;
+        cfg.save(&dir.join("config.json")).unwrap();
+        let host = Arc::new(Mutex::new(Host::new(&dir).unwrap()));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            crate::http::serve_test_requests(listener, |req| crate::route(&host, req), 8);
+        });
+        let post = |body: &str| {
+            let mut stream = TcpStream::connect(address).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let head = format!("POST /api/trainer/analyze HTTP/1.1\r\nHost: {address}\r\nOrigin: http://{address}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+            stream.write_all(head.as_bytes()).unwrap();
+            stream.write_all(body.as_bytes()).unwrap();
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).unwrap();
+            let split = response.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+            serde_json::from_slice::<serde_json::Value>(&response[split + 4..]).unwrap()
+        };
+        // 不带 include_full → 无 full_analysis 字段
+        let v = post(r#"{"text":"你好乙丙"}"#);
+        assert!(v.get("full_analysis").is_none());
+        // include_full=true：词提分词口径 你好|乙|丙 → jxbh(4) + ab(2) + ab(2)
+        let v = post(r#"{"text":"你好乙丙","include_full":true}"#);
+        let fa = v["full_analysis"].clone();
+        assert_eq!(fa["total_code_len"], 8, "4+2+2");
+        assert_eq!(fa["select_count"], 1, "丙 rank2；乙 rank1 不计");
+        assert_eq!(fa["avg_code_len_per_char"], 8.0 / 4.0);
+        let entries = fa["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0]["word"], "你好");
+        assert_eq!(entries[0]["code"], "jxbh");
+        assert_eq!(entries[0]["code_len"], 4);
+        assert_eq!(entries[0]["rank"], 1);
+        assert_eq!(entries[2]["word"], "丙");
+        assert_eq!(entries[2]["code"], "ab");
+        assert_eq!(entries[2]["rank"], 2);
+        // 无码字（字）计 0 码长、rank 0，不增加选重
+        let v = post(r#"{"text":"乙字","include_full":true}"#);
+        let fa = &v["full_analysis"];
+        assert_eq!(fa["total_code_len"], 2);
+        assert_eq!(fa["select_count"], 0);
+        assert_eq!(fa["avg_code_len_per_char"], 1.0);
+        let entries = fa["entries"].as_array().unwrap();
+        assert_eq!(entries[1]["word"], "字");
+        assert_eq!(entries[1]["code_len"], 0);
+        assert_eq!(entries[1]["rank"], 0);
+        // 超长（>2000 字）请求：正常词提，但省略 full_analysis
+        let long = format!(
+            "{{\"text\":\"{}\",\"include_full\":true}}",
+            "乙".repeat(FULL_ANALYSIS_MAX_CHARS + 1)
+        );
+        let v = post(&long);
+        assert!(v.get("full_analysis").is_none());
+        assert!(v["words"].as_array().unwrap().len() > 0);
+        drop(server);
     }
 }

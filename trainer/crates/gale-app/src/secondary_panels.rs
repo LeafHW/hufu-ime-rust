@@ -1799,12 +1799,14 @@ fn draw_online(
         ] {
             text(f, x + 16., y + yy, 8.5, label, p.muted);
         }
+        // 整改2c：登录行三键（登录 | 注册账号 | 退出登录）——注册走
+        // U+E000 标记动作，main.rs aux 解码后 ShellExecuteW 开站点账号入口
         action(
             f,
             hs,
             x + 16.,
             y + 245.,
-            (iw - 12.) / 2.,
+            (iw - 20.) / 3.,
             "登录",
             Action::OnlineLogin,
             t,
@@ -1813,9 +1815,20 @@ fn draw_online(
         action(
             f,
             hs,
-            x + 22. + (iw - 12.) / 2.,
+            x + 22. + (iw - 20.) / 3.,
             y + 245.,
-            (iw - 12.) / 2.,
+            (iw - 20.) / 3.,
+            "注册账号",
+            crate::aux_marker("online_register"),
+            t,
+            false,
+        );
+        action(
+            f,
+            hs,
+            x + 28. + (iw - 20.) / 3. * 2.,
+            y + 245.,
+            (iw - 20.) / 3.,
             "退出登录",
             Action::OnlineLogout,
             t,
@@ -2047,6 +2060,20 @@ fn draw_online(
                 p.muted,
             );
         }
+        // 整改2b：自动下一段（结算 1.5s 后 fetch_adjacent，赛制除外）——
+        // 开关状态经 model.fields("online_auto_next") 透出，main.rs 启动时播种、
+        // 标记动作回写；默认开，持久化在数据目录 online.json。
+        let auto_next = m.field("online_auto_next") != "false";
+        toggle(
+            f,
+            hs,
+            x + left - 87.,
+            fy + 160.,
+            auto_next,
+            crate::aux_marker("online_auto_next"),
+            t,
+        );
+        text(f, x + left - 55., fy + 163., 7.5, "自动下一段", p.muted);
         let shelf_y = y + ph - 62. - 134.;
         line(f, x + 12., shelf_y, iw, p.line2);
         text(
@@ -2184,7 +2211,8 @@ fn draw_online(
             100.,
             11.,
             23.,
-            "取到的正文会先显示在这里。\n确认内容后，再载入跟打。",
+            // 整改2a：预览步骤退役——取到的正文直接进跟打区，第一段起打
+            "取到的正文会直接载入跟打区开始，无需预览。\\n\"自动下一段\"开启时，一段结算 1.5 秒后自动接下一段。",
             p.muted,
         );
     } else {
@@ -2214,17 +2242,7 @@ fn draw_online(
             })
             .unwrap_or_else(|| format!("{} 字 · 晴发文正文", m.online_preview.chars().count()));
         clipped_text(f, rx + 15., doc_y + 47., rw - 30., 7.5, &meta, p.muted);
-        paragraph(
-            f,
-            rx + 15.,
-            doc_y + 72.,
-            rw - 30.,
-            doc_h - 158.,
-            12.,
-            23.4,
-            &m.online_preview,
-            p.text2,
-        );
+        // 整改2a：正文不再重复预览（已在跟打区），此卡只保留取文元信息
         if let Some(a) = &m.online_article {
             let yy = doc_y + doc_h - 73.;
             text(f, rx + 15., yy, 7.5, "分段", p.muted);
@@ -2269,7 +2287,8 @@ fn draw_online(
             rx + 15.,
             doc_y + doc_h - 15.,
             7.5,
-            "晴发文 · 当前预览保留至切换账号或服务",
+            // 整改2a：正文在跟打区，此卡仅保留取文信息备查
+            "晴发文 · 正文已在跟打区，此处仅存取文信息",
             p.muted,
         );
     }
@@ -2294,24 +2313,37 @@ fn draw_online(
             p.muted,
         );
     }
-    action(
+    // 整改13：理论分析入口（打开整篇理论码长/选重分析模态）
+    link(
         f,
         hs,
-        x + pw - 207.,
-        y + ph - 46.,
-        80.,
-        "仅载入",
-        Action::OnlineLoadOnly,
+        x + pw - 320.,
+        y + ph - 41.,
+        60.,
+        "理论分析",
+        crate::aux_marker("show_full_analysis"),
         t,
-        false,
     );
+    // 整改12：当前段键盘热力图入口（最近结算段 VK 直方图）
+    link(
+        f,
+        hs,
+        x + pw - 250.,
+        y + ph - 41.,
+        60.,
+        "热力图",
+        crate::aux_marker("show_heatmap"),
+        t,
+    );
+    // 整改2a：去预览步骤后两键合一——“仅载入/载入并开始”语义相同，保留
+    // 单一“载入正文并开始”（重取文后手动回载入口）
     action(
         f,
         hs,
         x + pw - 119.,
         y + ph - 46.,
         99.,
-        "载入并开始  ↵",
+        "载入正文并开始",
         Action::OnlineLoad,
         t,
         true,

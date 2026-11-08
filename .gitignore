@@ -39,3 +39,4 @@ platform/windows/deploy-88/_probe/
 
 # settings 复查工作目录（本地审查产物）
 settings-app/.review/
+.review/

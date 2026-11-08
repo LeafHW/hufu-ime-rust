@@ -111,6 +111,33 @@ pub fn list_chat_windows() -> Vec<ChatWindow> {
     ctx.out
 }
 
+/// 整改7：QQ 读取屏的实时会话列表 = 主面板 UIA 会话列表 ∪ 独立聊天窗，
+/// 按标题去重（主面板优先——read_current_article 的核验路径挂主面板；
+/// 独立窗兜底，无主面板时也可选）。QQ 未开 → 空列表（调用方提示"未检测到 QQ"）。
+pub fn list_sessions_merged() -> Vec<ChatWindow> {
+    fn push_unique(out: &mut Vec<ChatWindow>, w: ChatWindow) {
+        if !w.title.is_empty() && !out.iter().any(|c| c.title == w.title) {
+            out.push(w);
+        }
+    }
+    let mut out = Vec::new();
+    if let Some(p) = main_panel() {
+        for name in crate::uia_bridge::list_sessions(p.hwnd) {
+            push_unique(
+                &mut out,
+                ChatWindow {
+                    title: name,
+                    hwnd: p.hwnd,
+                },
+            );
+        }
+    }
+    for w in list_chat_windows() {
+        push_unique(&mut out, w);
+    }
+    out
+}
+
 /// 找 QQ 主面板 hwnd（标题恰为 "QQ"、可见、QQ/微信进程）。
 /// 群选会话/抓文/发成绩的 UIA 路径都挂在主面板上（不再要求独立聊天窗）。
 pub fn main_panel() -> Option<ChatWindow> {

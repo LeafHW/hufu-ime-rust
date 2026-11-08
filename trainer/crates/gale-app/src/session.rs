@@ -78,6 +78,19 @@ pub struct Session {
     /// “组字期退格”账、Correction 归“回改”账。纯运行态，不入快照。
     #[serde(skip)]
     bs_router: RouterCell,
+    /// 整改12：本段 VK 击键直方图（热力图数据源）。运行态，不入快照；
+    /// reset_current 清零，结算时快照进 last_vk_histogram。
+    #[serde(skip)]
+    pub vk_histogram: std::collections::HashMap<u8, u32>,
+    /// 整改12：最近一次结算段的 VK 直方图快照（finalize 时冻结），
+    /// UI 热力图按此字段消费；新文章载入时清空。
+    #[serde(skip)]
+    pub last_vk_histogram: std::collections::HashMap<u8, u32>,
+    /// 整改13：当前文章全篇理论码长分析（server /api/trainer/analyze?include_full=true）。
+    /// 结构定义在 crate 根（main.rs::FullAnalysis）；None = 旧版服务无此功能。
+    /// 新文章载入时清空，后台取到后回填。
+    #[serde(skip)]
+    pub full_analysis: Option<crate::FullAnalysis>,
 }
 impl Session {
     pub fn new(seg_chars: usize) -> Self {
@@ -118,6 +131,9 @@ impl Session {
             paused_at: None,
             paused_ms: 0,
             bs_router: RouterCell::default(),
+            vk_histogram: std::collections::HashMap::new(),
+            last_vk_histogram: std::collections::HashMap::new(),
+            full_analysis: None,
         }
     }
     fn loaded(&mut self) {
@@ -127,6 +143,9 @@ impl Session {
         self.results = vec![None; self.segments.len()];
         self.cleaned = false;
         self.difficulty = None;
+        // 新文章：热力图快照与全篇分析随旧文作废（整改12/13）
+        self.last_vk_histogram.clear();
+        self.full_analysis = None;
         self.recount();
         self.reset_current();
     }
@@ -195,6 +214,8 @@ impl Session {
         self.last_clock_ms = 0;
         // protect 窗随段清零：换段/重打后第一个退格按裸状态裁决
         self.bs_router = RouterCell::default();
+        // 整改12：本段直方图随段清零（last_vk_histogram 保留至下一次结算覆盖）
+        self.vk_histogram.clear();
     }
     fn recount(&mut self) {
         let a = self.aggregate();
@@ -481,6 +502,8 @@ impl Session {
         });
         self.results[self.index] = Some(rec.clone());
         self.recorded = true;
+        // 整改12：结算即快照——本段 VK 直方图冻结进 last_vk_histogram（UI 热力图消费）
+        self.last_vk_histogram = self.vk_histogram.clone();
         self.recount();
         Some(rec)
     }
@@ -1380,5 +1403,40 @@ mod tests {
             "{}",
             gale_core::score::format_score_report(&r)
         );
+    }
+
+    /// 整改12：直方图随段清零、结算冻结进 last_vk_histogram、换段保留快照。
+    #[test]
+    fn vk_histogram_clears_on_reset_and_freezes_on_finalize() {
+        let mut s = session();
+        *s.vk_histogram.entry(0x41).or_insert(0) += 2;
+        *s.vk_histogram.entry(0x08).or_insert(0) += 1;
+        round(&mut s, 100, 1100, "甲乙丙丁戊");
+        s.finalize_current_at(1100, 123).unwrap();
+        assert_eq!(s.last_vk_histogram.get(&0x41), Some(&2));
+        assert_eq!(s.last_vk_histogram.get(&0x08), Some(&1));
+        s.next_segment(); // reset_current：清本段、留快照
+        assert!(s.vk_histogram.is_empty());
+        assert_eq!(s.last_vk_histogram.get(&0x41), Some(&2));
+    }
+
+    /// 整改12/13：新文章载入清空热力图快照与全篇分析；快照序列化跳过新字段。
+    #[test]
+    fn new_article_clears_heatmap_snapshot_and_full_analysis() {
+        let mut s = session();
+        round(&mut s, 100, 1100, "甲乙丙丁戊");
+        // 先有按键才有热力图：模拟本段打过 A 键（无键则快照为空，非空断言无意义）
+        *s.vk_histogram.entry(0x41).or_insert(0) += 1;
+        s.finalize_current_at(1100, 123).unwrap();
+        assert!(!s.last_vk_histogram.is_empty());
+        s.full_analysis = Some(crate::FullAnalysis::default());
+        s.load_book("新书", "另一篇正文的完整内容，足够五字以上。");
+        assert!(s.last_vk_histogram.is_empty());
+        assert!(s.full_analysis.is_none());
+        // serde(skip)：快照字节不含直方图/分析字段（旧快照可恢复）
+        let bytes = s.snapshot_bytes_bounded().unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(!text.contains("vk_histogram"));
+        assert!(!text.contains("full_analysis"));
     }
 }

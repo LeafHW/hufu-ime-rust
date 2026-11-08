@@ -18,6 +18,38 @@ mod session;
 #[path = "../src/ui.rs"]
 mod ui;
 
+// —— Shim（2026-11-08）——aux_marker / FullAnalysis 定义在 bin 根 main.rs，
+// example 编译单元的 crate 根是本文件，看不到它们；此处镜像一份（字段与
+// main.rs 严格一致；重构收口时若挪进共享模块可整体删除本段）。
+const AUX_PREFIX: char = '\u{e000}';
+pub fn aux_marker(cmd: &str) -> modals::Action {
+    modals::Action::Theme(format!("{AUX_PREFIX}{cmd}"))
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct FullAnalysis {
+    #[serde(default)]
+    pub entries: Vec<FullAnalysisEntry>,
+    #[serde(default)]
+    pub total_code_len: u64,
+    #[serde(default)]
+    pub avg_code_len_per_char: f64,
+    #[serde(default)]
+    pub select_count: u64,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct FullAnalysisEntry {
+    #[serde(default)]
+    pub word: String,
+    #[serde(default)]
+    pub code: Option<String>,
+    #[serde(default)]
+    pub code_len: u64,
+    #[serde(default)]
+    pub rank: u64,
+}
+
 use gale_core::{
     compare::InputEvent,
     config::Config,

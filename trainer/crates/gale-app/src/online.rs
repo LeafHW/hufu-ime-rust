@@ -12,6 +12,7 @@ use gale_core::wenlai::{
     self, FetchParams, HttpMethod, HttpRequest, HttpResponse, HttpTransport, ShelfBook,
     WenlaiAccount, WenlaiArticle, WenlaiClient, WenlaiHttpClient,
 };
+use serde::{Deserialize, Serialize};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{LocalFree, HLOCAL};
 use windows::Win32::Networking::WinHttp::*;
@@ -39,6 +40,43 @@ pub struct AccountSummary {
     pub username: String,
     pub display_name: String,
     pub user_id: i64,
+}
+
+/// 整改2b：在线练习偏好（"自动下一段"开关，默认开）。
+/// config.toml 归 gale-core 主配置（本域禁改），此处独立持久化在
+/// 数据目录 `online.json`（即 %LOCALAPPDATA%\HuFu\trainer\online.json，
+/// 与凭据文件同目录的 sidecar 口径）。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OnlinePrefs {
+    /// 一段结算（成绩单弹出）后 1.5s 自动 fetch_adjacent 载下一段
+    #[serde(default = "default_auto_next")]
+    pub auto_next: bool,
+}
+
+fn default_auto_next() -> bool {
+    true
+}
+
+impl Default for OnlinePrefs {
+    fn default() -> Self {
+        Self { auto_next: true }
+    }
+}
+
+impl OnlinePrefs {
+    pub fn load(path: &Path) -> Self {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+    pub fn save(&self, path: &Path) -> Result<(), String> {
+        let bytes = serde_json::to_vec(self).map_err(|e| e.to_string())?;
+        if bytes.len() > 4096 {
+            return Err("在线偏好文件过大".into());
+        }
+        std::fs::write(path, bytes).map_err(|e| e.to_string())
+    }
 }
 impl From<&WenlaiAccount> for AccountSummary {
     fn from(a: &WenlaiAccount) -> Self {

@@ -20,6 +20,10 @@ pub enum Modal {
     Online,
     Rules,
     Confirm,
+    /// 整改 12：本段按键热力图（结算后，数据 Session::last_vk_histogram）。
+    Heatmap,
+    /// 整改 13：文章理论分析（数据 Session::full_analysis，None=旧版服务）。
+    FullAnalysis,
 }
 #[derive(Clone, Debug, PartialEq)]
 pub enum Action {
@@ -205,6 +209,13 @@ pub fn panel(m: Modal, w: f32, h: f32) -> (f32, f32, f32, f32) {
         Modal::Appearance => (1064., 668.),
         Modal::Rules => (1040., 660.),
         Modal::Confirm => (560., 300.),
+        Modal::Heatmap => (780., 474.),
+        // 整改 13：明细表行数驱动面板高度（draw_full_analysis 每帧更新；
+        // 首帧前用上一次缓存值，上限 600 行防极端长文）。
+        Modal::FullAnalysis => (
+            900.,
+            620f32.max(202. + full_analysis_rows() as f32 * 26.),
+        ),
         _ => (880., 596.),
     };
     let pw = ideal_w.min((w - 32.).max(200.));
@@ -532,6 +543,20 @@ fn icon(f: &mut Frame, kind: &str, x: f32, y: f32, size: f32, color: [f32; 4]) {
             outline(5., 0., 8., 18., 4.);
             line(f, x, y + 8.5 * u, size, color);
         }
+        // 整改 12：键盘（两排键块 + 空格条）。
+        "keyboard" => {
+            for (kx, kw) in [(0., 3.), (4.5, 3.), (9., 3.), (13.5, 4.5)] {
+                outline(kx, 0., kw, 4.5, 1.);
+                outline(kx, 6.5, kw, 4.5, 1.);
+            }
+            outline(4.5, 13., 9., 4.5, 2.);
+        }
+        // 整改 13：柱状图（三根高低柱）。
+        "chart" => {
+            outline(0., 9., 4., 9., 1.);
+            outline(6.5, 4., 4., 14., 1.);
+            outline(13., 0., 4., 18., 1.);
+        }
         _ => {
             outline(2., 2., 14., 16., 2.);
             outline(6., 0., 6., 4., 1.);
@@ -549,6 +574,18 @@ fn panel_header(f: &mut Frame, hs: &mut Vec<Hit>, m: Modal, x: f32, y: f32, pw: 
         ),
         Modal::Groups => ("group", "群与通道", "从 QQ 群取赛文，把成绩带回去", "F6"),
         Modal::Appearance => ("palette", "外观", "主题、材质与词提；改动即时生效", "F7"),
+        Modal::Heatmap => (
+            "keyboard",
+            "本段按键热力图",
+            "最近一次结算段的按键频次 · 滚轮关闭",
+            "Esc",
+        ),
+        Modal::FullAnalysis => (
+            "chart",
+            "文章理论分析",
+            "理论码长与选重 · 按文章序 · 滚轮翻看",
+            "Esc",
+        ),
         Modal::Confirm => ("!", "确认操作", "当前练习的内容将发生改变", "Esc"),
         _ => ("", "", "", ""),
     };
@@ -1879,19 +1916,35 @@ fn draw_appearance(
         ),
         p.muted,
     );
-    for (i, (c, name)) in [
-        (p.accent, "1简"),
-        (p.copper, "2简"),
-        (p.jade, "3简"),
-        (p.muted, "4码"),
-        (p.red, "选重"),
+    // 词提四色（整改 9）：前四色可点——每点一次在预设色板里循环到下一色，
+    // 即时生效并随 config.color_overrides 落盘（错字色走主题打错色，不在词提四色内）。
+    for (i, (c, name, key)) in [
+        (p.hint_code, "编码", "词提编码色"),
+        (p.hint_badge, "角标", "词提角标色"),
+        (p.hint_underline, "下划线", "词提下划线色"),
+        (p.hint_bg, "底色", "词提底色"),
+        (p.red, "错字", ""),
     ]
     .iter()
     .enumerate()
     {
         let sx = card_x + i as f32 * card_w / 5.;
         rect(f, sx, y + ph - 122., 4., 4., *c);
-        text(f, sx + 8., y + ph - 126., 7.5, *name, p.muted);
+        if key.is_empty() {
+            text(f, sx + 8., y + ph - 126., FONT_HINT, *name, p.muted);
+        } else {
+            btn(
+                f,
+                hs,
+                sx + 8.,
+                y + ph - 130.,
+                44.,
+                *name,
+                crate::aux_marker(&format!("hint_color:{key}")),
+                t,
+                false,
+            );
+        }
     }
     btn(
         f,
@@ -1947,6 +2000,285 @@ fn draw_appearance(
         true,
     );
 }
+/// 整改 13：明细表行数缓存（panel() 读它计算 FullAnalysis 面板高度）。
+static FULL_ANALYSIS_ROWS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+fn full_analysis_rows() -> usize {
+    FULL_ANALYSIS_ROWS.load(std::sync::atomic::Ordering::Relaxed)
+}
+fn mix4(a: [f32; 4], b: [f32; 4], k: f32) -> [f32; 4] {
+    let k = k.clamp(0., 1.);
+    [
+        a[0] + (b[0] - a[0]) * k,
+        a[1] + (b[1] - a[1]) * k,
+        a[2] + (b[2] - a[2]) * k,
+        a[3] + (b[3] - a[3]) * k,
+    ]
+}
+
+/// 整改 12：本段按键热力图。数据 = Session::last_vk_histogram（结算时
+/// 冻结的 VK 直方图；口径见 main.rs heatmap_vk：主区字母/数字/标点 +
+/// 空格/回车/退格）。色阶：0 = 面板底 → 最大频次 = 强调色加深。
+fn draw_heatmap(
+    f: &mut Frame,
+    hs: &mut Vec<Hit>,
+    sess: &Session,
+    t: &Theme,
+    x: f32,
+    y: f32,
+    pw: f32,
+    ph: f32,
+) {
+    let p = tokens(t);
+    let hist = &sess.last_vk_histogram;
+    let iw = pw - 56.;
+    let gap = 5.;
+    let rows: [&[(&str, u8)]; 5] = [
+        &[
+            ("`", 0xC0u8),
+            ("1", 0x31),
+            ("2", 0x32),
+            ("3", 0x33),
+            ("4", 0x34),
+            ("5", 0x35),
+            ("6", 0x36),
+            ("7", 0x37),
+            ("8", 0x38),
+            ("9", 0x39),
+            ("0", 0x30),
+            ("-", 0xBD),
+            ("=", 0xBB),
+        ],
+        &[
+            ("Q", 0x51), ("W", 0x57), ("E", 0x45), ("R", 0x52), ("T", 0x54), ("Y", 0x59),
+            ("U", 0x55), ("I", 0x49), ("O", 0x4F), ("P", 0x50), ("[", 0xDB), ("]", 0xDD),
+        ],
+        &[
+            ("A", 0x41), ("S", 0x53), ("D", 0x44), ("F", 0x46), ("G", 0x47), ("H", 0x48),
+            ("J", 0x4A), ("K", 0x4B), ("L", 0x4C), (";", 0xBA), ("'", 0xDE),
+        ],
+        &[
+            ("Z", 0x5A), ("X", 0x58), ("C", 0x43), ("V", 0x56), ("B", 0x42), ("N", 0x4E),
+            ("M", 0x4D), (",", 0xBC), (".", 0xBE), ("/", 0xBF),
+        ],
+        &[("退格", 0x08), ("空格", 0x20), ("回车", 0x0D)],
+    ];
+    let max = hist.values().copied().max().unwrap_or(0);
+    let deep = [p.accent[0] * 0.72, p.accent[1] * 0.72, p.accent[2] * 0.72, 1.];
+    if hist.is_empty() {
+        text(
+            f,
+            x + 24.,
+            y + 210.,
+            FONT_LABEL,
+            "本段暂无按键记录",
+            p.text2,
+        );
+        text(
+            f,
+            x + 24.,
+            y + 240.,
+            FONT_HINT,
+            "完成一段跟打并结算后生成 · 换文章后清空",
+            p.muted,
+        );
+        footer(f, x, y, pw, ph, t);
+        return;
+    }
+    let kh = 46.;
+    let top0 = y + 82.;
+    for (r, row) in rows.iter().enumerate() {
+        let ky = top0 + r as f32 * (kh + 6.);
+        // 底行功能键（退格 | 空格 | 回车）：占位 2 / 6.5 / 2 键宽。
+        let n = row.len() as f32;
+        let kw = (iw - (n - 1.) * gap) / n;
+        for (c, (label, vk)) in row.iter().enumerate() {
+            let (kx, kwd) = if r == 4 {
+                let full = iw / 10.5;
+                match c {
+                    0 => (x + 28., full * 2. + gap),
+                    1 => (x + 28. + full * 2. + gap * 2., full * 6.5),
+                    _ => (x + 28. + full * 8.5 + gap * 3., full * 2.),
+                }
+            } else {
+                (x + 28. + c as f32 * (kw + gap), kw)
+            };
+            let count = hist.get(vk).copied().unwrap_or(0);
+            let k01 = if max == 0 {
+                0.
+            } else {
+                (count as f32 / max as f32).powf(0.75)
+            };
+            let fill = mix4(p.surface2, deep, k01);
+            round(f, kx, ky, kwd, kh, 5., fill, Some(alpha(p.line, 0.5)));
+            let fg = if k01 > 0.6 {
+                mix4(p.text, [0., 0., 0., 1.], 0.55)
+            } else {
+                p.text2
+            };
+            // 居中近似：字母 ~7.5px/字、汉字 ~13px/字。
+            let label_w = label.chars().fold(0., |a, ch| {
+                a + if ch.is_ascii() { 7.5 } else { 13. }
+            });
+            text(
+                f,
+                kx + (kwd - label_w).max(2.) / 2.,
+                ky + 8.,
+                FONT_HINT,
+                *label,
+                fg,
+            );
+            mono(
+                f,
+                kx + (kwd - (if count >= 10 { 15. } else { 8. })).max(2.) / 2.,
+                ky + 26.,
+                FONT_HINT,
+                if count == 0 { "·".into() } else { count.to_string() },
+                if count == 0 { alpha(p.muted, 0.4) } else { fg },
+            );
+        }
+    }
+    // 底部：合计 + 色阶图例（0 → 最大频次）。
+    let total: u32 = hist.values().sum();
+    text(
+        f,
+        x + 28.,
+        y + ph - 88.,
+        FONT_HINT,
+        format!("合计击键 {} 次 · 最大单键 {} 次（色阶 = 频次比例）", total, max),
+        p.muted,
+    );
+    for i in 0..16 {
+        let k01 = (i as f32 / 15.).powf(0.75);
+        rect(
+            f,
+            x + 28. + i as f32 * 13.,
+            y + ph - 68.,
+            12.,
+            8.,
+            mix4(p.surface2, deep, k01),
+        );
+    }
+    right(f, x + pw - 28., y + ph - 88., FONT_HINT, format!("{} → {}", 0, max), p.muted);
+    footer(f, x, y, pw, ph, t);
+}
+
+/// 整改 13：文章理论分析（Session::full_analysis，Y1 代理后台回填；
+/// None = 旧版虎符服务无该端点）。顶部三张汇总卡 + 按文章序明细表，
+/// rank>1（理论选重）行画强调色"选"徽标。滚轮滚动走通用 panel_scroll
+/// （面板高度由明细行数驱动，见 panel()）。
+fn draw_full_analysis(
+    f: &mut Frame,
+    hs: &mut Vec<Hit>,
+    m: &Model,
+    sess: &Session,
+    t: &Theme,
+    x: f32,
+    y: f32,
+    pw: f32,
+    ph: f32,
+) {
+    let p = tokens(t);
+    footer(f, x, y, pw, ph, t);
+    text(
+        f,
+        x + 20.,
+        y + ph - 36.,
+        FONT_HINT,
+        "理论口径：以当前方案码表对全文逐词编码 · 选重 = 首选之外的理论候选",
+        p.muted,
+    );
+    let fa = match &sess.full_analysis {
+        Some(fa) => fa,
+        None => {
+            text(
+                f,
+                x + 24.,
+                y + 180.,
+                FONT_LABEL,
+                "当前文章暂无分析（需新版虎符服务）",
+                p.text2,
+            );
+            text(
+                f,
+                x + 24.,
+                y + 210.,
+                FONT_HINT,
+                "升级服务端后重新载入本文，分析会自动生成",
+                p.muted,
+            );
+            let _ = m;
+            return;
+        }
+    };
+    let iw = pw - 48.;
+    // 三张汇总卡：理论码长 / 平均码长·字 / 理论选重。
+    let cw = (iw - 24.) / 3.;
+    for (i, (title, big, unit)) in [
+        ("理论码长", fa.total_code_len.to_string(), "键"),
+        (
+            "平均码长 / 字",
+            format!("{:.2}", fa.avg_code_len_per_char),
+            "键",
+        ),
+        ("理论选重", fa.select_count.to_string(), "次"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let cx = x + 24. + i as f32 * (cw + 12.);
+        round(f, cx, y + 72., cw, 64., 9., p.surface2, Some(p.line));
+        text(f, cx + 12., y + 84., FONT_HINT, title, p.muted);
+        mono(f, cx + 12., y + 104., 20., big, if i == 2 && fa.select_count > 0 { p.red } else { p.text });
+        text(f, cx + 12., y + 122., FONT_HINT, unit, p.muted);
+    }
+    // 明细表：词 / 编码 / 码长 / 位次（rank>1 加"选"徽标）。
+    let c_word = x + 36.;
+    let c_code = x + 300.;
+    let c_len = x + 620.;
+    let c_rank = x + 770.;
+    let c_badge = x + 812.;
+    text(f, c_word, y + 160., FONT_HINT, "词", p.muted);
+    text(f, c_code, y + 160., FONT_HINT, "编码", p.muted);
+    right(f, c_len + 60., y + 160., FONT_HINT, "码长", p.muted);
+    right(f, c_rank + 40., y + 160., FONT_HINT, "位次", p.muted);
+    line(f, x + 24., y + 176., iw, p.line);
+    let cap = 600usize;
+    let n = fa.entries.len().min(cap);
+    FULL_ANALYSIS_ROWS.store(n, std::sync::atomic::Ordering::Relaxed);
+    for (i, e) in fa.entries.iter().take(cap).enumerate() {
+        let ry = y + 188. + i as f32 * 26.;
+        if i % 2 == 0 {
+            rect(f, x + 24., ry - 5., iw, 26., alpha(p.text, 0.02));
+        }
+        let sel = e.rank > 1;
+        if sel {
+            // 选重行：强调色左侧条 + 词面红化 + "选"徽标。
+            rect(f, x + 24., ry - 5., 2., 26., p.accent);
+        }
+        body_text(f, c_word, ry, FONT_HINT, &e.word, if sel { p.red } else { p.text2 });
+        match &e.code {
+            Some(code) => mono(f, c_code, ry, FONT_HINT, code, p.hint_code),
+            None => text(f, c_code, ry, FONT_HINT, "— 生词无码", alpha(p.muted, 0.6)),
+        }
+        right(f, c_len + 60., ry, FONT_HINT, e.code_len.to_string(), p.text2);
+        right(f, c_rank + 40., ry, FONT_HINT, e.rank.to_string(), if sel { p.red } else { p.text2 });
+        if sel {
+            round(f, c_badge, ry - 3., 22., 19., 5., alpha(p.accent, 0.85), None);
+            text(f, c_badge + 5., ry, 13., "选", [0.1, 0.08, 0.04, 1.]);
+        }
+    }
+    if fa.entries.len() > cap {
+        text(
+            f,
+            x + 24.,
+            y + 196. + cap as f32 * 26.,
+            FONT_HINT,
+            format!("…共 {} 条，仅列前 {} 条", fa.entries.len(), cap),
+            p.muted,
+        );
+    }
+}
+
 pub fn draw(
     f: &mut Frame,
     hs: &mut Vec<Hit>,
@@ -1993,6 +2325,8 @@ pub fn draw(
                 Modal::Load => draw_load(f, hs, m, sess, cfg, t, x, y, pw, ph),
                 Modal::Groups => draw_groups(f, hs, m, sess, t, x, y, pw, ph),
                 Modal::Appearance => draw_appearance(f, hs, m, sess, cfg, t, x, y, pw, ph),
+                Modal::Heatmap => draw_heatmap(f, hs, sess, t, x, y, pw, ph),
+                Modal::FullAnalysis => draw_full_analysis(f, hs, m, sess, t, x, y, pw, ph),
                 Modal::Online | Modal::Rules => {
                     crate::secondary_panels::draw(f, hs, m, sess, cfg, t, x, y, pw, ph)
                 }

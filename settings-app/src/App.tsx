@@ -12,6 +12,7 @@ import { Sync } from './pages/Sync';
 import { SchemesPage } from './pages/Schemes';
 import { DataPage } from './pages/Data';
 import { InputPage } from './pages/Input';
+import { Trainer } from './pages/Trainer';
 import { KeymapPage } from './pages/Keymap';
 import { SentencePage } from './pages/Sentence';
 import { BuddyPage } from './pages/Buddy';
@@ -19,15 +20,16 @@ import { fallbackBootstrap, type Bootstrap, type Route, type ThemeMode } from '.
 import { getDirtyPages, subscribeDirty } from './dirtyGuard';
 import './styles/app.css';
 
-const ROUTES: Route[] = ['overview', 'schemes', 'input', 'keymap', 'skin', 'motion', 'buddy', 'sentence', 'data', 'sync', 'about', 'donate'];
+const ROUTES: Route[] = ['overview', 'schemes', 'input', 'trainer', 'keymap', 'skin', 'motion', 'buddy', 'sentence', 'data', 'sync', 'about', 'donate'];
 
 /* 【2026-11-03】页面全部常驻挂载，切页只改 body[data-screen]。
-   用 memo 包一层：切页/轮询引起的 App state 变化不再把 11 个页面整树重渲染，
+   用 memo 包一层：切页/轮询引起的 App state 变化不再把 13 个页面整树重渲染，
    切页时主线程只剩「新页首次布局」，转场起点更快（memo 依赖 props 引用稳定：
    notify / navigate / refresh 已 useCallback，data 只在轮询返回时换新对象）。 */
 const OverviewView = memo(Overview);
 const SchemesView = memo(SchemesPage);
 const InputView = memo(InputPage);
+const TrainerView = memo(Trainer);
 const KeymapView = memo(KeymapPage);
 const SkinView = memo(SkinStudio);
 const MotionView = memo(MotionPage);
@@ -209,10 +211,10 @@ export default function App() {
     };
   }, [refresh]);
 
-  /* 首帧后按空闲分批预挂载其余页：启动不被 12 页整树渲染拖慢，
+  /* 首帧后按空闲分批预挂载其余页：启动不被 13 页整树渲染拖慢，
      用户真正点过去时（通常 >1s）已经挂载好，切页仍然零成本。 */
   useEffect(() => {
-    const order: Route[] = ['skin', 'motion', 'input', 'schemes', 'sync', 'data', 'keymap', 'buddy', 'sentence', 'about', 'donate'];
+    const order: Route[] = ['skin', 'motion', 'input', 'trainer', 'schemes', 'sync', 'data', 'keymap', 'buddy', 'sentence', 'about', 'donate'];
     let i = 0;
     let cancelled = false;
     const idle = (cb: () => void) => {
@@ -619,7 +621,7 @@ export default function App() {
     return () => window.removeEventListener('keydown', onKey, true);
   }, [closeConfirm]);
 
-  /* 引用稳定：下面 11 个 memo 页面组件靠它跳过无关重渲染。 */
+  /* 引用稳定：下面 13 个 memo 页面组件靠它跳过无关重渲染。 */
   const notify = useCallback((msg: string) => {
     setToast(msg);
     window.clearTimeout(toastTimer.current);
@@ -648,6 +650,9 @@ export default function App() {
           </section>
           <section className="screen" id="s-input">
             {mountedPages.has('input') ? <InputView data={data} notify={notify} /> : null}
+          </section>
+          <section className="screen" id="s-trainer">
+            {mountedPages.has('trainer') ? <TrainerView data={data} notify={notify} refresh={refresh} /> : null}
           </section>
           <section className="screen" id="s-keymap">
             {mountedPages.has('keymap') ? <KeymapView data={data} notify={notify} /> : null}
