@@ -1761,7 +1761,7 @@ mod render_cache_tests {
     #[test]
     fn native_helper_deadline_reaps_child_and_preserves_success() {
         let spawn = |sleep: bool| {
-            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap()); // zi-ok: 测试自重入 current_exe（非解释器）
             command.args(["--exact", "render_cache_tests::native_helper_fixture"])
                 .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
             if sleep { command.env("HUFU_RENDER_WAIT_TEST_SLEEP", "1"); }
