@@ -816,7 +816,19 @@ fn dpapi(data: &[u8], encrypt: bool) -> Result<Vec<u8>, String> {
 
 #[cfg(test)]
 fn save_account(path: &Path, account: &WenlaiAccount) -> Result<(), String> {
+    store_account(path, account)
+}
+
+/// 供云同步 profile 导入登录态（JWT）用；不会写明文口令。
+pub fn store_account(path: &Path, account: &WenlaiAccount) -> Result<(), String> {
     save_account_impl(path, account, None).map(|_| ())
+}
+
+/// 读本机 DPAPI 登录态，供 profile.json 带上会话（跨机免重输密码）。
+pub fn export_account(data_dir: &Path, server: &str) -> Option<WenlaiAccount> {
+    load_account(&data_dir.join("online-auth.dpapi"), server)
+        .ok()
+        .flatten()
 }
 
 fn save_account_impl(

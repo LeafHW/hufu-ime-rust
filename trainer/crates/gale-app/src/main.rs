@@ -556,6 +556,11 @@ struct App {
     full_retry_at: u64,
     /// 当前单字练习使用的内置表索引（配置变更后原表重开）。
     single_table: usize,
+    /// 云同步的晴账号（profile.json，随虎符云同步走）。
+    sync_online_user: String,
+    sync_online_password: String,
+    /// 本次登录提交的明文口令：登录成功后才写入 profile，避免存错密码。
+    pending_login_password: Option<String>,
 }
 fn main() {
     if let Err(e) = run() {
@@ -592,6 +597,51 @@ fn run() -> Result<(), String> {
     let dir = data_dir();
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let mut cfg = Config::load_or_create(&dir.join("config.toml")).map_err(|e| e.to_string())?;
+    // 【云同步 2026-11-10】跟打器配置 + 晴账号由虎符云同步以 profile.json 走；
+    // 云端更新（updated_at 晚于本机 config.toml）优先落地，随后照常写回。
+    let mut sync_online_user = String::new();
+    let mut sync_online_password = String::new();
+    let mut sync_account: Option<gale_core::wenlai::WenlaiAccount> = None;
+    let profile_path = dir.join("profile.json");
+    if let Ok(raw) = std::fs::read_to_string(&profile_path) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+            let updated = v.get("updated_at").and_then(|x| x.as_u64()).unwrap_or(0);
+            let local_mtime = std::fs::metadata(dir.join("config.toml"))
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            if updated > local_mtime {
+                if let Some(toml) = v.get("config_toml").and_then(|x| x.as_str()) {
+                    if let Ok(c) = Config::from_toml_text(toml) {
+                        cfg = c;
+                        let _ = cfg.save(&dir.join("config.toml"));
+                    }
+                }
+            }
+            sync_online_user = v
+                .get("online_user")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            sync_online_password = v
+                .get("online_password")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            sync_account = v
+                .get("online_account")
+                .and_then(|x| serde_json::from_value(x.clone()).ok());
+        }
+    }
+    // 另一台机器同步下来的登录态：本机没有 DPAPI 凭据时先落地，
+    // 由 OnlineWorker 启动时照常恢复（无需重新输密码）。
+    if sync_account.is_some() && !dir.join("online-auth.dpapi").is_file() {
+        if let Some(account) = &sync_account {
+            let _ = crate::online::store_account(&dir.join("online-auth.dpapi"), account);
+        }
+    }
     // Native child editors require the opaque redirection surface in this build.
     cfg.material = gale_core::config::Material::Solid;
     cfg.score_fields = canonical_score_fields(&cfg.score_fields);
@@ -609,6 +659,13 @@ fn run() -> Result<(), String> {
     let ww = ((cfg.win_w.max(800) as f32 * sc) as i32).min((work.right - work.left - 20).max(600));
     let hh = ((cfg.win_h.max(600) as f32 * sc) as i32).min((work.bottom - work.top - 20).max(440));
     let win = MainWindow::create("虎符跟打 · 静室", ww, hh).map_err(|e| e.to_string())?;
+    // 恢复用户上次调好的位置（大小由 cfg.win_w/h 决定）；越界时夹回工作区，
+    // 至少留 160px 标题栏可见，避免多屏拔掉后窗口跑到屏幕外。
+    let wx = ((cfg.win_x as f32) * sc).round() as i32;
+    let wy = ((cfg.win_y as f32) * sc).round() as i32;
+    let wx = wx.clamp(work.left, (work.right - 160).max(work.left));
+    let wy = wy.clamp(work.top, (work.bottom - 80).max(work.top));
+    win.move_to(wx, wy);
     win.show_and_focus();
     let (cw, ch) = win.client_size();
     let renderer =
@@ -733,6 +790,9 @@ fn run() -> Result<(), String> {
         full_analyzing: false,
         full_retry_at: 0,
         single_table: 0,
+        sync_online_user: sync_online_user.clone(),
+        sync_online_password: sync_online_password.clone(),
+        pending_login_password: None,
     };
     app.model
         .fields
@@ -740,6 +800,19 @@ fn run() -> Result<(), String> {
     app.sync_single_fields();
     app.sync_preferences(true);
     app.sync_rule_model();
+    if !app.sync_online_user.is_empty() {
+        app.model
+            .fields
+            .insert("username".into(), app.sync_online_user.clone());
+    }
+    if !app.sync_online_password.is_empty() {
+        app.model
+            .fields
+            .insert("password".into(), app.sync_online_password.clone());
+        if let Some(e) = app.edits.get("password") {
+            e.set_text(&app.sync_online_password);
+        }
+    }
     if app.cfg.theme == "跟随虎符" {
         app.fetch_skin();
     }
@@ -1200,6 +1273,16 @@ impl App {
         gale_win::window::request_frame();
     }
     fn save_config(&mut self) {
+        // 用户手调过的窗口大小/位置随配置落盘；下次启动原样恢复。
+        if let Some((x, y, w, h)) = self.win.window_rect() {
+            let sc = gale_win::window::dpi_scale();
+            if sc > 0. {
+                self.cfg.win_x = (x as f32 / sc).round() as i32;
+                self.cfg.win_y = (y as f32 / sc).round() as i32;
+                self.cfg.win_w = (w as f32 / sc).round() as i32;
+                self.cfg.win_h = (h as f32 / sc).round() as i32;
+            }
+        }
         self.cfg.session_rules = self.sess.rules.clone();
         let mut saved = self.cfg.clone();
         if self.model.rule_save_preset {
@@ -1209,6 +1292,26 @@ impl App {
         }
         if let Err(e) = saved.save(&self.dir.join("config.toml")) {
             self.toast(format!("配置保存失败：{e}"));
+        } else {
+            self.write_sync_profile(&saved);
+        }
+    }
+
+    /// 把跟打器配置与晴账号写成云同步用的 profile.json（明文，走用户自己的 WebDAV）。
+    fn write_sync_profile(&self, cfg: &Config) {
+        let account = crate::online::export_account(&self.dir, &cfg.wenlai_domain);
+        let value = serde_json::json!({
+            "version": 1,
+            "updated_at": unix_secs(),
+            "config_toml": cfg.to_toml_text(),
+            "online_user": self.sync_online_user,
+            "online_password": self.sync_online_password,
+            "online_account": account,
+        });
+        let path = self.dir.join("profile.json");
+        let tmp = path.with_extension("json.tmp");
+        if std::fs::write(&tmp, value.to_string()).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
         }
     }
     fn snapshot_bytes(&self) -> Option<Vec<u8>> {
@@ -2656,6 +2759,11 @@ impl App {
             }
             match r.result {
                 Ok(OnlinePayload::Account(Some(a))) => {
+                    self.sync_online_user = a.username.clone();
+                    if let Some(p) = self.pending_login_password.take() {
+                        self.sync_online_password = p;
+                    }
+                    self.write_sync_profile(&self.cfg.clone());
                     self.online_logged_in = true;
                     self.model.online_authenticated = true;
                     self.model.online_expired = false;
@@ -3391,6 +3499,7 @@ impl App {
                 let username = self.model.field("username");
                 let password = self.model.field("password");
                 self.cfg.wenlai_username = username.clone();
+                self.pending_login_password = Some(password.clone());
                 self.submit_online(OnlineCommand::Login { username, password });
                 self.model.fields.insert("password".into(), String::new());
                 if let Some(e) = self.edits.get("password") {

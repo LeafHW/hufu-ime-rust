@@ -95,7 +95,10 @@
   .brand .be{display:flex;justify-content:center;width:100%;font-size:10.5px;letter-spacing:.18em;color:var(--gold);font-weight:600;line-height:1;white-space:nowrap}
   .brand .be-text{display:block;transform:translateX(-.09em)}
   .brand .bs{font-size:11.5px;color:var(--text2);line-height:1;white-space:nowrap;align-self:center;transform:translateY(6px)}
-  .nav{display:flex;flex-direction:column;gap:2px;position:relative}
+  /* 导航区是唯一可压缩段：窗口矮时先滚动导航，不能把左下主题/状态挤出窗口
+     （2026-11-10 用户截图：状态行被裁掉一半）。 */
+  .nav{display:flex;flex-direction:column;gap:2px;position:relative;flex:1;min-height:0;overflow-y:auto;overflow-x:hidden;scrollbar-width:none}
+  .nav::-webkit-scrollbar{display:none}
   .nav-group{font-size:13px;color:var(--text3);letter-spacing:.10em;padding:15px 10px 6px;font-weight:600}
   .nav-group:first-child{padding-top:2px}
   .nav-item{
@@ -107,7 +110,7 @@
   .nav-item.on:before{content:"";position:absolute;left:0;top:9px;bottom:9px;width:3px;border-radius:3px;background:var(--gold)}
   .nav-item.on .icon{color:var(--gold);opacity:1}
   .nav-item .hint{margin-left:auto;font-size:12px;color:var(--text3);letter-spacing:.02em}
-  .side-bottom{margin-top:auto;display:flex;flex-direction:column;gap:12px;padding-top:14px}
+  .side-bottom{margin-top:auto;flex:none;display:flex;flex-direction:column;gap:12px;padding-top:14px;padding-bottom:2px}
   .theme-seg{display:flex;gap:2px;background:var(--bg);border:1px solid var(--line);border-radius:9px;padding:3px}
   .theme-seg .ts{flex:1;height:28px;display:flex;align-items:center;justify-content:center;border-radius:6px;color:var(--text3)}
   .theme-seg .ts.on{background:var(--surface2);color:var(--text);box-shadow:0 0 0 1.5px var(--gold) inset, 0 1px 0 rgba(255,255,255,.05) inset}

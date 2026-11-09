@@ -480,10 +480,19 @@ unsafe fn apply_trainer_shortcut(hwnd: isize) {
         *TRAINER_HOTKEY_CACHED.lock().unwrap_or_else(|p| p.into_inner()) = String::new();
         return;
     }
-    // 配置热键串：try_lock 拿不到（配置保存高峰）时回退缓存值，
-    // 下一次配置变化（apply_config → refresh_trainer_shortcut）会再刷新。
-    let hotkey = match SHARED.get().and_then(|h| h.try_lock().ok()) {
-        Some(host) => host.engine.config.trainer.hotkey.trim().to_string(),
+    // 配置热键串：这里只在启动/配置变化时走，不在 WM_HOTKEY 高频路径，
+    // 必须阻塞等锁读到**新配置**；此前 try_lock 失败回退缓存旧值，设置页
+    // 改键时正好撞上保存高峰 → 永远重新注册旧的 Ctrl+Alt+G。
+    let hotkey = match SHARED.get() {
+        Some(shared) => shared
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .engine
+            .config
+            .trainer
+            .hotkey
+            .trim()
+            .to_string(),
         None => cached(),
     };
     *TRAINER_HOTKEY_CACHED.lock().unwrap_or_else(|p| p.into_inner()) = hotkey.clone();

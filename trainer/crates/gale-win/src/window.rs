@@ -1100,6 +1100,34 @@ impl MainWindow {
             (r.right - r.left, r.bottom - r.top)
         }
     }
+
+    /// 当前窗口外框（屏幕物理像素）：用户调好的位置/大小落盘用。
+    pub fn window_rect(&self) -> Option<(i32, i32, i32, i32)> {
+        unsafe {
+            let mut r = windows::Win32::Foundation::RECT::default();
+            if windows::Win32::UI::WindowsAndMessaging::GetWindowRect(self.hwnd(), &mut r).is_err() {
+                return None;
+            }
+            Some((r.left, r.top, r.right - r.left, r.bottom - r.top))
+        }
+    }
+
+    /// 启动时恢复上次保存的位置（不改大小）。
+    pub fn move_to(&self, x: i32, y: i32) {
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowPos(
+                self.hwnd(),
+                None,
+                x,
+                y,
+                0,
+                0,
+                windows::Win32::UI::WindowsAndMessaging::SWP_NOSIZE
+                    | windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER
+                    | windows::Win32::UI::WindowsAndMessaging::SWP_NOACTIVATE,
+            );
+        }
+    }
 }
 
 /// 标准消息泵（阻塞；帧驱动渲染在别处用计时器/呈现回调）

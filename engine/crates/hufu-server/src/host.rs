@@ -1315,7 +1315,11 @@ impl Host {
         // 否则 HTTP 的旧快照能静默覆盖刚从管道或同步应用的配置。
         crate::bump_config_rev();
         #[cfg(windows)]
-        if old_config.trainer.enabled != self.engine.config.trainer.enabled {
+        if old_config.trainer.enabled != self.engine.config.trainer.enabled
+            || old_config.trainer.hotkey != self.engine.config.trainer.hotkey
+        {
+            // 老板键字符串变了也必须重注册；此前只比较 enabled，
+            // 设置页改 hotkey 后仍留着旧的 Ctrl+Alt+G 注册。
             crate::tray::refresh_trainer_shortcut();
         }
         Ok((sentence_changed || schema_changed, schema_changed))

@@ -1085,6 +1085,11 @@ fn do_sync(s: &SyncSettings) -> Result<String, String> {
         mf["config"] = cfg;
     }
 
+    // 跟打器用户配置（config.toml + 晴账号）作为独立 profile 文件面同步：
+    // 不走方案目录，避免出现在云同步方案列表里；云端明文（与本项目
+    // 「云同步明文」口径一致，凭据只经用户自己的 WebDAV）。
+    let _ = sync_trainer_profile(&agent, s, &mut mf);
+
     // 设备表 + 落盘 manifest
     prune_manifest(&mut mf, s);
     bump_rev(&mut mf);
@@ -1928,6 +1933,108 @@ fn hex(b: &[u8]) -> String {
         s.push_str(&format!("{x:02x}"));
     }
     s
+}
+
+// ─────────────── 跟打器用户配置（profile.json）同步 ───────────────
+// 跟打器数据在 %LOCALAPPDATA%\HuFu\trainer，不随安装目录走；配置文件与晴
+// 账号由跟打器写成 profile.json，这里作为单个文件面跟云同步走 mtime-LWW。
+// 明文存储：与本项目云同步「云端明文」既有口径一致。
+
+fn trainer_profile_path() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("HUFU_TRAINER_DATA") {
+        return Some(PathBuf::from(dir).join("profile.json"));
+    }
+    std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .map(|p| p.join("HuFu").join("trainer").join("profile.json"))
+}
+
+fn sync_trainer_profile(
+    agent: &ureq::Agent,
+    s: &SyncSettings,
+    mf: &mut Value,
+) -> Result<(usize, usize), String> {
+    let Some(path) = trainer_profile_path() else {
+        return Ok((0, 0));
+    };
+    let remote = mf.get("trainer_profile").cloned();
+    let exists = path.is_file();
+    if !exists && remote.is_none() {
+        return Ok((0, 0));
+    }
+    let lmt = file_mtime_ms(&path).unwrap_or(0);
+    let rmt = remote
+        .as_ref()
+        .and_then(|v| v.get("mt"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let key = file_key("trainer-profile", "profile.json");
+    let mut uploaded = 0;
+    let mut downloaded = 0;
+    if exists && (remote.is_none() || lmt >= rmt) {
+        let raw = std::fs::read(&path).map_err(|e| format!("读跟打器配置失败：{e}"))?;
+        if raw.len() as u64 > MAX_FILE {
+            return Err("跟打器配置超过 32 MB，已跳过".into());
+        }
+        let hash = hash_bytes(&raw);
+        let same = remote
+            .as_ref()
+            .and_then(|v| v.get("h"))
+            .and_then(|v| v.as_str())
+            .map(|h| h == hash)
+            .unwrap_or(false);
+        if !same {
+            let url = url_join(&s.url, &format!("{FILES_DIR}/{key}"));
+            match auth_req(
+                agent.request("PUT", &url).set("Content-Type", "application/octet-stream"),
+                &s.user,
+                &s.pass,
+            )
+            .send_bytes(&raw)
+            {
+                Ok(_) => {}
+                Err(ureq::Error::Status(409, _)) => {
+                    mkcol(agent, s)?;
+                    auth_req(
+                        agent.request("PUT", &url).set("Content-Type", "application/octet-stream"),
+                        &s.user,
+                        &s.pass,
+                    )
+                    .send_bytes(&raw)
+                    .map_err(|e| format!("上传跟打器配置失败：{e}"))?;
+                }
+                Err(e) => return Err(format!("上传跟打器配置失败：{e}")),
+            }
+            uploaded = raw.len();
+        }
+        mf["trainer_profile"] = serde_json::json!({
+            "mt": lmt.max(rmt), "sz": raw.len(), "h": hash, "key": key,
+        });
+    } else if let Some(rv) = remote {
+        let rkey = rv.get("key").and_then(|v| v.as_str()).unwrap_or(&key);
+        let url = url_join(&s.url, &format!("{FILES_DIR}/{rkey}"));
+        let mut body = Vec::new();
+        match auth_req(agent.request("GET", &url), &s.user, &s.pass).call() {
+            Ok(r) => {
+                r.into_reader()
+                    .take(MAX_FILE)
+                    .read_to_end(&mut body)
+                    .map_err(|e| format!("下载跟打器配置失败：{e}"))?;
+            }
+            Err(ureq::Error::Status(404, _)) => return Ok((0, 0)),
+            Err(e) => return Err(format!("下载跟打器配置失败：{e}")),
+        }
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| format!("建跟打器目录失败：{e}"))?;
+        }
+        if path.is_file() {
+            backup_file_before_write(&path);
+        }
+        std::fs::write(&path, &body).map_err(|e| format!("写入跟打器配置失败：{e}"))?;
+        set_mtime(&path, rmt);
+        downloaded = body.len();
+    }
+    Ok((uploaded, downloaded))
 }
 
 // ─────────────────────────── 测试 ───────────────────────────
