@@ -1,0 +1,27 @@
+{
+  "checked_at": "2026-11-09T20:33:49.913010+00:00",
+  "model_link": {
+    "status": 206,
+    "content_range": "bytes 0-0/550479428",
+    "model_link_resolves": true
+  },
+  "anonymous_asset_download": {
+    "anonymous_download": true,
+    "status": 200,
+    "bytes": 27108552,
+    "sha256": "283345eed93f65c3cfc86b3154289eb1aab31edd19bf97e68340cb0d6c7d5110",
+    "matches_local_r2": true
+  },
+  "github_release": {
+    "release_id": 439610066,
+    "asset_id": 728879321,
+    "url": "https://github.com/LeafHW/hufu-ime-rust/releases/tag/v1.9.9.4",
+    "published_at": "2026-11-09T20:33:19Z",
+    "tag_target": "81c83d4e8dc8001bc8d91ef2eecfa9f36d221349",
+    "latest": true,
+    "single_exe_asset": true,
+    "body_matches_reviewed_file": true,
+    "master_unchanged": true,
+    "github_digest": "sha256:283345eed93f65c3cfc86b3154289eb1aab31edd19bf97e68340cb0d6c7d5110"
+  }
+}

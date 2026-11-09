@@ -1,0 +1,107 @@
+{
+  "version": "1.9.9.4",
+  "build_tag": "2026-11-10-v1.9.9.4-r2",
+  "built_product_source_commit": "f4ef638a8f88ec0aed92e2e8bd0ca720eb812e5b",
+  "release_tag_commit_with_reviewed_documentation": "81c83d4e8dc8001bc8d91ef2eecfa9f36d221349",
+  "tag_object": "01e0a2e9265ac0c59b3f9d041d1227efbe4a6a14",
+  "withdrawn_previous_tag_object": "b90f9f0c7ff6a6e7ab0476443ce3e9ba02fcab39",
+  "withdrawn_previous_tag_commit": "141a0e0c81cd045e0d893abf9611ab49180f0820",
+  "github": {
+    "release_id": 439610066,
+    "asset_id": 728879321,
+    "url": "https://github.com/LeafHW/hufu-ime-rust/releases/tag/v1.9.9.4",
+    "published_at": "2026-11-09T20:33:19Z",
+    "tag_target": "81c83d4e8dc8001bc8d91ef2eecfa9f36d221349",
+    "latest": true,
+    "single_exe_asset": true,
+    "body_matches_reviewed_file": true,
+    "master_unchanged": true,
+    "github_digest": "sha256:283345eed93f65c3cfc86b3154289eb1aab31edd19bf97e68340cb0d6c7d5110"
+  },
+  "anonymous_asset_download": {
+    "anonymous_download": true,
+    "status": 200,
+    "bytes": 27108552,
+    "sha256": "283345eed93f65c3cfc86b3154289eb1aab31edd19bf97e68340cb0d6c7d5110",
+    "matches_local_r2": true
+  },
+  "model_link": {
+    "status": 206,
+    "content_range": "bytes 0-0/550479428",
+    "model_link_resolves": true
+  },
+  "site": {
+    "old_head": "25d78d7106b6ff2b9f4b8da9bc4463d4465136dd",
+    "new_head": "798866cb44348f3460f8bb0663a0aae4884f6c55",
+    "files": [
+      "releases/cache.json",
+      "update.json"
+    ],
+    "latest": "1.9.9.4",
+    "size": 27108552,
+    "sha256": "283345eed93f65c3cfc86b3154289eb1aab31edd19bf97e68340cb0d6c7d5110",
+    "sources": [
+      {
+        "name": "GitHub",
+        "url": "https://github.com/LeafHW/hufu-ime-rust/releases/download/v1.9.9.4/HuFuSetup-1.9.9.4.exe"
+      }
+    ],
+    "unrelated_local_edits_preserved": true
+  },
+  "update_manifest": {
+    "path": "update.json",
+    "blob_sha": "fae9458882221c4524cc7b2c4f12f8ad67bd8ef8",
+    "commit": "10f0c6d5768cf20feb2895585f21e780a8166ee1",
+    "manifest": {
+      "latest": "1.9.9.4",
+      "min": "1.9.0",
+      "date": "2026-11-10",
+      "name": "HuFu 虎符输入法 v1.9.9.4",
+      "page_url": "https://www.hufuime.top/releases/",
+      "sha256": "283345eed93f65c3cfc86b3154289eb1aab31edd19bf97e68340cb0d6c7d5110",
+      "size": 27108552,
+      "sources": [
+        {
+          "name": "GitHub",
+          "url": "https://github.com/LeafHW/hufu-ime-rust/releases/download/v1.9.9.4/HuFuSetup-1.9.9.4.exe"
+        }
+      ]
+    },
+    "gitee_release_or_assets_changed": false
+  },
+  "metadata_verification": {
+    "checked_at": "2026-11-09T20:35:12.987527+00:00",
+    "github_site_manifest": {
+      "latest": "1.9.9.4",
+      "bytes": 27108552,
+      "sha256": "283345eed93f65c3cfc86b3154289eb1aab31edd19bf97e68340cb0d6c7d5110",
+      "source": "GitHub",
+      "metadata_matches_r2": true
+    },
+    "gitee_manifest": {
+      "latest": "1.9.9.4",
+      "bytes": 27108552,
+      "sha256": "283345eed93f65c3cfc86b3154289eb1aab31edd19bf97e68340cb0d6c7d5110",
+      "source": "GitHub",
+      "metadata_matches_r2": true
+    },
+    "website_manifest": {
+      "latest": "1.9.9.4",
+      "bytes": 27108552,
+      "sha256": "283345eed93f65c3cfc86b3154289eb1aab31edd19bf97e68340cb0d6c7d5110",
+      "source": "GitHub",
+      "metadata_matches_r2": true
+    }
+  },
+  "site_cache_verification_record": "site-cache-verification.json",
+  "zip_uploaded": false,
+  "gitee_release_or_assets_changed": false,
+  "baseline_promoted": false,
+  "post_build_changes": "Release notes, claim evidence, publication records and editorial clarification only; no product code or build artifact changed after f4ef638a.",
+  "validation_limits": [
+    "No real QQ send in this round",
+    "No production account registration/login in this round",
+    "No real multi-machine WebDAV in this round",
+    "No installer execution or restart in this round"
+  ]
+}

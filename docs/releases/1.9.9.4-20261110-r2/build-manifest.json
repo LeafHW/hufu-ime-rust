@@ -4,7 +4,7 @@
   "source_commit": "f4ef638a8f88ec0aed92e2e8bd0ca720eb812e5b",
   "branch": "dev-latency",
   "installer_engine": "rust",
-  "published": false,
+  "published": true,
   "artifacts": [
     {
       "Name": "HuFu虎符输入法-v1.9.9.4-无模型.zip",
@@ -20,5 +20,8 @@
     }
   ],
   "command": "powershell -NoProfile -ExecutionPolicy Bypass -File E:\\DSH-KF\\hufu\\发行脚本\\release.ps1 -Version 1.9.9.4 -NoGitee",
-  "sentence_benchmark": "R1 tbench/cbench results retained as prior evidence; sentence/engine algorithm sources were not changed for R2."
+  "sentence_benchmark": "R1 tbench/cbench results retained as prior evidence; sentence/engine algorithm sources were not changed for R2.",
+  "publication_record": "publication.json",
+  "release_url": "https://github.com/LeafHW/hufu-ime-rust/releases/tag/v1.9.9.4",
+  "release_tag_commit": "81c83d4e8dc8001bc8d91ef2eecfa9f36d221349"
 }

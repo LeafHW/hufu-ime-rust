@@ -1,0 +1,24 @@
+{
+  "checked_at": "2026-11-09T20:35:12.987527+00:00",
+  "github_site_manifest": {
+    "latest": "1.9.9.4",
+    "bytes": 27108552,
+    "sha256": "283345eed93f65c3cfc86b3154289eb1aab31edd19bf97e68340cb0d6c7d5110",
+    "source": "GitHub",
+    "metadata_matches_r2": true
+  },
+  "gitee_manifest": {
+    "latest": "1.9.9.4",
+    "bytes": 27108552,
+    "sha256": "283345eed93f65c3cfc86b3154289eb1aab31edd19bf97e68340cb0d6c7d5110",
+    "source": "GitHub",
+    "metadata_matches_r2": true
+  },
+  "website_manifest": {
+    "latest": "1.9.9.4",
+    "bytes": 27108552,
+    "sha256": "283345eed93f65c3cfc86b3154289eb1aab31edd19bf97e68340cb0d6c7d5110",
+    "source": "GitHub",
+    "metadata_matches_r2": true
+  }
+}
