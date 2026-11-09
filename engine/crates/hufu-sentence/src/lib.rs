@@ -729,8 +729,11 @@ impl SentenceEngine {
             );
         }
         // Very narrow beams have too little repeated LM work to repay hashing.
+        // 【C② 2026-11-09】门槛 16→8：尾窗增量重算（INC_REDO_TAIL）在
+        // 9-16 键区间同样产生大量重复 (history,cp) 事件——A/B 实测见
+        // REPORT-B2.md；8 键以下束宽窄、重复查询少，仍旁路。
         let cache_probs = CACHE_PROBS
-            && n > 16
+            && n > 8
             && matches!(self.model, Lm::Five(_))
             && w.beam_width >= 4
             && if resume.is_some() {
@@ -759,7 +762,7 @@ impl SentenceEngine {
         // Reuse the original f32 probability for identical events in this decode.
         // Full history matters for NM03, including BOS/EOS. Keep the existing
         // clamp/ln and accumulation order at every call site. Short codes and
-        // the cheaper trigram model bypass the cache. The 16-key threshold avoids
+        // the cheaper trigram model bypass the cache. The 8-key threshold avoids
         // cache overhead on short inputs; clear at 4096 entries and reuse capacity.
         // Do not even construct RandomState on the uncached specialization.
         let mut probs = CACHE_PROBS.then(ProbsCacheMap::default);
