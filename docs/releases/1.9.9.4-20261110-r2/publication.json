@@ -94,6 +94,7 @@
     }
   },
   "site_cache_verification_record": "site-cache-verification.json",
+  "release_notes_revision_record": "release-notes-revision-20261110.json",
   "zip_uploaded": false,
   "gitee_release_or_assets_changed": false,
   "baseline_promoted": false,
