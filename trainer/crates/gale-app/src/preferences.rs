@@ -1,4 +1,4 @@
-//! F1 跟打器设置：左侧四页导航 + 右侧内容区（设计规格 §6）。
+//! F1 跟打器设置：左侧五页导航 + 右侧内容区（练习/成绩单/颜色/外观/数据）。
 //!
 //! 面板几何由 `modals` 提供（960×752，与 1280×800 视口等高，内容区
 //! `y+62 .. y+ph-62`，左侧导航 208）；
@@ -12,7 +12,9 @@ use crate::ui::{
     Palette,
 };
 use gale_core::scorecard::{format_score_template, SCORE_FIELDS, SCORE_PRESETS};
+use gale_core::config::Config;
 use gale_core::theme::Theme;
+use crate::session::Session;
 use gale_win::d2d::{Align, DrawCmd, FontFamily, Frame};
 use std::path::PathBuf;
 
@@ -39,10 +41,11 @@ const T_TITLE: f32 = 16.;
 const T_LABEL: f32 = 15.;
 const T_NOTE: f32 = 13.;
 
-const PAGES: [(&str, &str); 4] = [
+const PAGES: [(&str, &str); 5] = [
     ("练习", "单字提示与字号"),
     ("成绩单", "自动复制、字段与模板"),
     ("颜色与提示", "跟打配色与提示样式"),
+    ("外观", "主题、字号、行距与动效"),
     ("数据与关于", "存储位置与版本"),
 ];
 
@@ -106,7 +109,7 @@ const DATA_CARD2_Y: f32 = 144.;
 // -------------------------------------------------------------------- 取值层
 
 fn tab(m: &Model) -> u8 {
-    m.field("pref_tab").parse::<u8>().unwrap_or(0).min(3)
+    m.field("pref_tab").parse::<u8>().unwrap_or(0).min(4)
 }
 fn enabled(m: &Model, key: &str, default: bool) -> bool {
     m.fields.get(key).map(|v| v == "true").unwrap_or(default)
@@ -1073,6 +1076,8 @@ pub(super) fn draw(
     f: &mut Frame,
     hs: &mut Vec<Hit>,
     m: &Model,
+    sess: &Session,
+    cfg: &Config,
     t: &Theme,
     x: f32,
     y: f32,
@@ -1085,9 +1090,121 @@ pub(super) fn draw(
         0 => practice_page(f, hs, m, t, bx, by, bw),
         1 => score_page(f, hs, m, t, bx, by, bw),
         2 => colors_page(f, hs, m, t, bx, by, bw),
+        3 => appearance_page(f, hs, m, sess, cfg, t, bx, by, bw),
         _ => data_page(f, hs, t, bx, by, bw),
     }
     footer(f, hs, t, x, y, pw, ph);
+}
+
+/// 外观页（原 F7 面板整体并入 F1）。
+#[allow(clippy::too_many_arguments)]
+fn appearance_page(
+    f: &mut Frame,
+    hs: &mut Vec<Hit>,
+    m: &Model,
+    sess: &Session,
+    cfg: &Config,
+    t: &Theme,
+    x: f32,
+    y: f32,
+    w: f32,
+) {
+    let p = tokens(t);
+    page_title(f, x, y, w, "外观", "主题、字号、行距与动效", &p);
+    outline_button(
+        f,
+        hs,
+        x + w - 108.,
+        y + 2.,
+        108.,
+        "恢复默认外观",
+        Action::AppearanceReset,
+        t,
+    );
+    section_label(f, x, y + 34., "主题", &p);
+    let theme_w = (w - 4. * 8.) / 5.;
+    for (i, name) in ["墨玉", "宣纸", "夜巡", "青瓷", "朱砂"].iter().enumerate() {
+        let bx = x + i as f32 * (theme_w + 8.);
+        let pt = tokens(&crate::ui::theme(name));
+        let selected = cfg.theme == *name || (i == 0 && cfg.theme == "default");
+        round(
+            f,
+            bx,
+            y + 52.,
+            theme_w,
+            36.,
+            7.,
+            pt.bg,
+            Some(if selected { p.accent } else { p.line2 }),
+        );
+        centered(f, bx + theme_w / 2., y + 61., T_LABEL, name, pt.text);
+        hit_box(hs, bx, y + 52., theme_w, 36., Action::Theme(name.to_string()));
+    }
+    let follow = cfg.theme == "跟随虎符";
+    text(f, x, y + 102., T_LABEL, "跟随虎符皮肤", p.text2);
+    note(
+        f,
+        x,
+        y + 126.,
+        w - 130.,
+        "开启后跟随虎符当前皮肤；关闭则使用上面的主题。",
+        p.muted,
+    );
+    outline_button(
+        f,
+        hs,
+        x + w - 92.,
+        y + 96.,
+        92.,
+        if follow { "已开启" } else { "开启" },
+        Action::Theme("跟随虎符".into()),
+        t,
+    );
+    line(f, x, y + 152., w, p.line);
+    for (row, (name, value, minus, plus)) in [
+        (
+            "字号",
+            format!("{:.0} px", cfg.font_size),
+            Action::Font(-2),
+            Action::Font(2),
+        ),
+        (
+            "行距",
+            format!("{:.2}", 1. + cfg.line_gap),
+            Action::LineHeight(-1),
+            Action::LineHeight(1),
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let ry = y + 162. + row as f32 * 40.;
+        text(f, x, ry + 8., T_LABEL, name, p.text2);
+        mono(f, x + w - 170., ry + 8., 14., value, p.text);
+        step_button(f, hs, x + w - 122., ry, "−", minus, t);
+        step_button(f, hs, x + w - 82., ry, "+", plus, t);
+    }
+    section_label(f, x, y + 248., "动效强度", &p);
+    let motion_w = (w - 3. * 8.) / 4.;
+    for (i, name) in ["关闭", "轻柔", "标准", "丰富"].iter().enumerate() {
+        seg_button(
+            f,
+            hs,
+            x + i as f32 * (motion_w + 8.),
+            y + 270.,
+            motion_w,
+            32.,
+            name,
+            cfg.motion_level == i as u8,
+            Action::MotionLevel(i as u8),
+            &p,
+        );
+    }
+    let py = y + 318.;
+    let ph = 108.;
+    round(f, x, py, w, ph, 9., p.article_bg, Some(p.line));
+    text(f, x + 14., py + 8., T_NOTE, "实时预览", p.text2);
+    super::appearance_preview(f, sess, m, cfg, t, x + 14., py + 28., w - 28., ph - 36.);
 }
 
 #[cfg(test)]
@@ -1107,7 +1224,18 @@ mod tests {
         let t = crate::ui::theme("墨玉");
         let mut f = Frame::new(w, h);
         let mut hs = Vec::new();
-        draw(&mut f, &mut hs, m, &t, x, y, pw, ph);
+        draw(
+            &mut f,
+            &mut hs,
+            m,
+            &Session::new(100),
+            &Config::default(),
+            &t,
+            x,
+            y,
+            pw,
+            ph,
+        );
         hs
     }
 
@@ -1174,7 +1302,18 @@ mod tests {
             let t = crate::ui::theme("墨玉");
             let mut f = Frame::new(w, h);
             let mut hs = Vec::new();
-            draw(&mut f, &mut hs, &m, &t, x, y, pw, ph);
+            draw(
+                &mut f,
+                &mut hs,
+                &m,
+                &Session::new(100),
+                &Config::default(),
+                &t,
+                x,
+                y,
+                pw,
+                ph,
+            );
             let field = fields(&m, x, y, pw, ph).remove(0);
             assert!(field.w > 0. && field.h > 0.);
             assert!(
@@ -1186,7 +1325,7 @@ mod tests {
 
     #[test]
     fn content_height_is_fixed_so_the_panel_never_jumps_between_pages() {
-        for tab in 0..=3u8 {
+        for tab in 0..=4u8 {
             let m = preference_model(tab);
             assert_eq!(content_height(&m, 960.), CONTENT_HEIGHT);
             assert_eq!(panel_for_model(&m, 800., 600.).3, CONTENT_HEIGHT);
@@ -1204,7 +1343,7 @@ mod tests {
     fn preference_tabs_are_clamped_to_the_fourth_page() {
         let mut m = preference_model(0);
         m.fields.insert("pref_tab".into(), "9".into());
-        assert_eq!(tab(&m), 3);
+        assert_eq!(tab(&m), 4);
         let hs = hit_targets(&m, 1280., 800.);
         assert!(hs.iter().any(|h| h.action == Action::Folder));
         m.fields.insert("pref_tab".into(), "x".into());
@@ -1232,7 +1371,7 @@ mod tests {
     /// 800×600 首屏（body 可视 428px）必须能点到导航与每页的主控件。
     #[test]
     fn first_screen_fits_the_nav_and_each_page_main_control_at_800x600() {
-        for tab in 0..=3u8 {
+        for tab in 0..=4u8 {
             let m = preference_model(tab);
             let (x, y, pw, ph) = panel_for_model(&m, 800., 600.);
             let view = ph.min(600. - 48.);
@@ -1241,7 +1380,7 @@ mod tests {
             let inside = |hs: &[Hit], a: &Action| {
                 hs.iter().any(|h| &h.action == a && h.y >= y && h.y + h.h <= visible_end)
             };
-            for i in 0..4 {
+            for i in 0..5 {
                 assert!(
                     inside(&hs, &crate::aux_marker(&format!("pref_tab:{i}"))),
                     "800×600 tab={tab}: 导航项 {i} 不在首屏"
@@ -1261,6 +1400,12 @@ mod tests {
                 2 => vec![
                     crate::aux_marker(&format!("pref_color_select:{}", COLORS[0].0)),
                     crate::aux_marker(&format!("pref_color_select:{}", COLORS[2].0)),
+                ],
+                3 => vec![
+                    Action::Theme("宣纸".into()),
+                    Action::Font(2),
+                    Action::MotionLevel(2),
+                    Action::AppearanceReset,
                 ],
                 _ => vec![Action::Folder],
             };
@@ -1293,9 +1438,9 @@ mod tests {
     #[test]
     fn preference_pages_expose_every_existing_action() {
         // 左侧导航在四页都常驻。
-        for tab in 0..=3u8 {
+        for tab in 0..=4u8 {
             let hs = hit_targets(&preference_model(tab), 1280., 800.);
-            for i in 0..4 {
+            for i in 0..5 {
                 assert!(hs
                     .iter()
                     .any(|h| h.action == crate::aux_marker(&format!("pref_tab:{i}"))));
@@ -1350,14 +1495,24 @@ mod tests {
                 .count(),
             1
         );
-        // 数据页：打开目录。
+        // 外观页：主题、字号、动效、恢复默认。
         let hs = hit_targets(&preference_model(3), 1280., 800.);
+        for a in [
+            Action::Theme("宣纸".into()),
+            Action::Font(2),
+            Action::MotionLevel(2),
+            Action::AppearanceReset,
+        ] {
+            assert!(hs.iter().any(|h| h.action == a));
+        }
+        // 数据页：打开目录。
+        let hs = hit_targets(&preference_model(4), 1280., 800.);
         assert!(hs.iter().any(|h| h.action == Action::Folder));
     }
 
     #[test]
     fn preference_hit_targets_do_not_overlap_at_supported_sizes() {
-        for tab in 0..=3u8 {
+        for tab in 0..=4u8 {
             for (w, h) in [(1280., 800.), (800., 600.)] {
                 let hs = hit_targets(&preference_model(tab), w, h);
                 for (i, a) in hs.iter().enumerate() {

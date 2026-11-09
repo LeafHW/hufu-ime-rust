@@ -673,46 +673,6 @@ fn draw_online(
                 dir == 0,
             );
         }
-        // 当前文章卡（替代原在线书架空卡）。
-        let cy = y + 450.;
-        card(f, ix, cy, iw, 96., t);
-        if let Some(article) = &m.online_article {
-            text(f, ix + 16., cy + 12., 12., "当前文章", p.muted);
-            f.push(DrawCmd::PushClip {
-                x: ix + 16.,
-                y: cy + 30.,
-                w: iw - 32.,
-                h: 22.,
-            });
-            text(f, ix + 16., cy + 31., 16., elide(&article.title, 40), p.text);
-            f.push(DrawCmd::PopClip);
-            let meta = format!(
-                "{} 字 · 分类 {} · 难度 {} · {}",
-                article.text.chars().count(),
-                if article.category.is_empty() {
-                    "未提供"
-                } else {
-                    &article.category
-                },
-                article.difficulty.label(),
-                if article.sort_num > 0 {
-                    format!("第 {} 段", article.sort_num)
-                } else {
-                    "未提供段号".into()
-                }
-            );
-            clipped_text(f, ix + 16., cy + 64., iw - 32., 12., &meta, p.muted);
-        } else {
-            text(f, ix + 16., cy + 14., 15., "尚未取文", p.text2);
-            text(
-                f,
-                ix + 16.,
-                cy + 40.,
-                13.,
-                "选择分类与难度后点「随机取文」，文章会直接进入跟打区。",
-                p.muted,
-            );
-        }
         let status_text = if m.online_busy {
             "正在取文，当前文章已保留…"
         } else if !m.online_status.is_empty() {
@@ -724,11 +684,11 @@ fn draw_online(
             || m.online_status.contains("过期")
             || m.online_status.contains("错误")
             || m.online_status.contains("频繁");
-        round(f, ix + 4., y + 566., 4., 4., 2., if bad { p.red } else { p.muted }, None);
+        round(f, ix + 4., y + 470., 4., 4., 2., if bad { p.red } else { p.muted }, None);
         clipped_text(
             f,
             ix + 14.,
-            y + 560.,
+            y + 464.,
             iw - 20.,
             13.,
             status_text,

@@ -571,7 +571,6 @@ fn draw_chrome(
     // 常用操作栏：文库退出主工具栏，让位给「在线发文」；理论分析回到窗口内。
     let y = 60.;
     let wide = w >= 960.;
-    let draft = !m.pending_source.is_empty();
     let left = [
         (
             "在线发文",
@@ -586,14 +585,10 @@ fn draw_chrome(
             false,
         ),
         (
-            if draft { "载入待读群文" } else { "读取群文" },
+            "读取群文",
             if wide { "F4" } else { "" },
-            if draft {
-                Action::AcceptDraft
-            } else {
-                Action::ReadGroup
-            },
-            draft,
+            Action::ReadGroup,
+            false,
         ),
         ("重打", if wide { "F3" } else { "" }, Action::Restart, false),
     ];
@@ -722,6 +717,8 @@ pub fn build(
     // 理论分析停靠面板打开时正文区让位；成绩面板是浮层，不改变正文高度。
     let bottom = if m.analysis_dock {
         crate::modals::analysis_dock_rect(w, h).1 - 8.
+    } else if m.ledger_open {
+        crate::history::panel_rect_for(m, w, h).1 - 8.
     } else {
         ledger_bar_y(h) - 8.
     };

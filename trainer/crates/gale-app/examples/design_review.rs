@@ -630,8 +630,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                 "04-groups-dark.bmp"
             }
             5 => {
-                m.open(Modal::Appearance);
-                "05-appearance-dark.bmp"
+                m.open(Modal::Preferences);
+                m.fields.insert("pref_tab".into(), "3".into());
+                "05-preferences-appearance-dark.bmp"
             }
             6 | 7 | 19 | 29 => {
                 let done = if screen == 7 { 4 } else { 2 };
@@ -764,8 +765,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                 "34-groups-small-640x420.bmp"
             }
             35 => {
-                m.open(Modal::Appearance);
-                "35-appearance-small-640x420.bmp"
+                m.open(Modal::Preferences);
+                m.fields.insert("pref_tab".into(), "3".into());
+                "35-preferences-appearance-small-640x420.bmp"
             }
             36 => {
                 cleaning_fixture(&mut cfg, &mut m);
@@ -796,7 +798,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
             43 | 44 => {
                 m.open(Modal::Preferences);
-                let tab = if screen == 43 { 1 } else { 3 };
+                let tab = if screen == 43 { 1 } else { 4 };
                 m.fields.insert("pref_tab".into(), tab.to_string());
                 cfg.score_template = gale_core::scorecard::preset("detailed").template.into();
                 if screen == 43 {
@@ -806,8 +808,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
             }
             45 => {
-                m.open(Modal::Appearance);
-                "45-appearance-small-800x600.bmp"
+                m.open(Modal::Preferences);
+                m.fields.insert("pref_tab".into(), "3".into());
+                "45-preferences-appearance-small-800x600.bmp"
             }
             46 => {
                 online_fixture(&mut m);
@@ -846,7 +849,6 @@ fn main() -> Result<(), Box<dyn Error>> {
                 if screen == 66 {
                     sess = drill_fixture();
                 }
-                m.pending_source = "虎码训练营".into();
                 m.open(Modal::More);
                 match screen {
                     53 => "53-more-1280x800.bmp",

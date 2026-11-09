@@ -494,7 +494,6 @@ struct App {
     layout: Vec<(usize, String, Vec<f32>)>,
     edits: BTreeMap<String, NativeEdit>,
     draft_revision: u64,
-    pending_draft: Option<(String, String)>,
     edit_epoch: u64,
     hits: Vec<modals::Hit>,
     /// 最近一次鼠标位置（逻辑坐标），用于悬停高亮。
@@ -687,7 +686,6 @@ fn run() -> Result<(), String> {
         layout: Vec::new(),
         edits: BTreeMap::new(),
         draft_revision: 0,
-        pending_draft: None,
         edit_epoch: u64::MAX,
         hits: Vec::new(),
         hover: None,
@@ -739,6 +737,7 @@ fn run() -> Result<(), String> {
     app.apply_style();
     app.host.show();
     app.host.focus();
+    app.host.hide_caret();
     app.analyze();
     // P2 输入诊断（任务 7）：诊断日志开启 → 启动提示；CTF 不可用 →
     // 持续状态栏警示（覆盖默认提示语；analyze 失败文案前缀重申，见 collect_background）。
@@ -884,7 +883,7 @@ fn run() -> Result<(), String> {
                     }
                 }
                 CommandKey::F1 => Some(Action::Open(Modal::Preferences)),
-                CommandKey::F7 => Some(Action::Open(Modal::Appearance)),
+                CommandKey::F7 => Some(Action::OpenAppearanceSettings),
                 CommandKey::F10 => Some(Action::ToggleAnalysis),
                 // 【2026-11-09 减法定稿】F2 载文窗整体退役（剪贴板走 Ctrl+V、
                 // 群文走 F4、在线走 F8、本地文库/单字走主界面「文库」按钮）；
@@ -895,7 +894,8 @@ fn run() -> Result<(), String> {
                 CommandKey::F8 => Some(Action::Open(Modal::Online)),
                 CommandKey::F9 => Some(Action::Open(Modal::Rules)),
                 // 【减法定稿】F2/F6 不再绑定；F2=载文窗、F6=旧选群位均已退役。
-                CommandKey::F2 | CommandKey::F6 | CommandKey::RetryResult => None,
+                CommandKey::F2 => Some(Action::PostArticle),
+                CommandKey::F6 | CommandKey::RetryResult => None,
                 CommandKey::LoadClipboard | CommandKey::AltE => Some(Action::LoadClipboard),
                 CommandKey::CopyResult => Some(Action::CopyScore),
                 CommandKey::SendResult => Some(Action::SendScore),
@@ -1019,6 +1019,7 @@ fn run() -> Result<(), String> {
                             gale_win::window::request_frame();
                         }
                         app.host.focus();
+                        app.host.hide_caret();
                     }
                 }
                 MouseEv::Move { x, y } => {
@@ -1286,16 +1287,6 @@ impl App {
             self.toast("在线正文超过100000字，请重新取较短文段");
             return;
         }
-        // A finished round keeps frozen_rules until the next text is loaded.
-        // Treating that as "still typing" made auto-next fetch the next
-        // article and then park it as a draft forever. Only an unfinished
-        // session (or a full score queue) may defer the incoming text.
-        if self.sess.phase != Phase::Done
-            && (self.sess.frozen_rules.is_some() || self.pending_scores.len() >= 32)
-        {
-            self.defer_draft("在线文章".into(), a.text);
-            return;
-        }
         self.sess.load_group(gale_core::segment::ParsedGroupText {
             title: a.title,
             // P2 难度带分值（任务 6d）：文来 API 的 difficulty_score（0=无分值）
@@ -1315,6 +1306,10 @@ impl App {
         self.reset_host();
         self.open(Modal::None);
         self.snapshot();
+        // 选了群：在线取文只要进了跟打区就自动发到群里。
+        if self.model.bound.is_some() {
+            self.act(Action::PostArticle, false);
+        }
     }
     /// 整改8：单字配置同步到 model.fields（modals.rs 侧控件读这里显示状态）
     fn sync_single_fields(&mut self) {
@@ -1410,7 +1405,7 @@ impl App {
                 if let Ok(tab) = tab.parse::<u8>() {
                     self.model
                         .fields
-                        .insert("pref_tab".into(), tab.min(3).to_string());
+                        .insert("pref_tab".into(), tab.min(4).to_string());
                     self.model.modal_epoch += 1;
                 }
                 return;
@@ -1917,6 +1912,20 @@ impl App {
         }
     }
 
+    /// 发文/发成绩会激活 QQ；发送结束（成功或失败）都切回跟打器。
+    fn focus_trainer(&mut self) {
+        unsafe {
+            use windows::Win32::UI::WindowsAndMessaging::{BringWindowToTop, SetForegroundWindow};
+            let hwnd =
+                windows::Win32::Foundation::HWND(self.win.hwnd as *mut core::ffi::c_void);
+            let _ = SetForegroundWindow(hwnd);
+            let _ = BringWindowToTop(hwnd);
+        }
+        self.host.focus();
+        self.host.hide_caret();
+        gale_win::window::request_frame();
+    }
+
     fn save_single_cfg(&mut self) {
         if let Err(e) = self.single_cfg.save(&self.dir.join("single.json")) {
             self.toast(format!("单字配置保存失败：{e}"));
@@ -1987,6 +1996,7 @@ impl App {
             self.edits.clear();
             self.host.show();
             self.host.focus();
+            self.host.hide_caret();
         }
         let now = self.ms();
         for ev in self.host.poll() {
@@ -2151,6 +2161,7 @@ impl App {
                 dpi,
             );
             self.host.show();
+            self.host.hide_caret();
         }
         let specs = modals::fields(&self.model, lw, lh);
         if self.edit_epoch != self.model.modal_epoch {
@@ -2420,22 +2431,14 @@ impl App {
                     self.analyze();
                     gale_win::window::request_frame();
                 }
-                Bg::Article(g, bound, revision, r) => {
+                Bg::Article(_g, _bound, _revision, r) => {
                     self.capture_fields();
                     self.qq_busy = false;
                     match r {
                         Ok(t) => {
-                            if g == self.generation
-                                && revision == self.draft_revision
-                                && bound == self.model.bound
-                                && self.sess.frozen_rules.is_none()
-                                && self.pending_scores.len() < 32
-                            {
-                                self.model.fields.insert("load_text".into(), t);
-                                self.load_text();
-                            } else {
-                                self.defer_draft("QQ待读群文".into(), t);
-                            }
+                            // F4 读到就立刻载入，不再做待读草稿二次确认。
+                            self.model.fields.insert("load_text".into(), t);
+                            self.load_text();
                         }
                         Err(e) => self.toast(e),
                     }
@@ -2444,14 +2447,7 @@ impl App {
                     self.capture_fields();
                     match r {
                         Ok((name, t)) => {
-                            if g != self.generation
-                                || revision != self.draft_revision
-                                || self.sess.frozen_rules.is_some()
-                                || self.pending_scores.len() >= 32
-                            {
-                                self.defer_draft(name, t);
-                                continue;
-                            }
+                            let _ = (g, revision);
                             self.model.fields.insert("load_text".into(), t);
                             self.load_text();
                             if self.sess.title == "自定义文字"
@@ -2752,11 +2748,6 @@ impl App {
             gale_win::window::request_frame();
         }
     }
-    fn defer_draft(&mut self, name: String, text: String) {
-        self.model.pending_source = name.clone();
-        self.pending_draft = Some((name, text));
-        self.toast("新文字已读取，当前草稿保留；点击待读文字可开始练习");
-    }
     fn load_text(&mut self) {
         let text = self.model.field("load_text");
         if text.trim().is_empty() {
@@ -2913,6 +2904,10 @@ impl App {
                 gale_win::window::request_frame();
             }
             Action::ToggleAnalysis => self.toggle_analysis_dock(),
+            Action::OpenAppearanceSettings => {
+                self.model.fields.insert("pref_tab".into(), "3".into());
+                self.open(Modal::Preferences);
+            }
             Action::Open(m) => {
                 if self.model.modal == m {
                     self.open(Modal::None);
@@ -3143,14 +3138,6 @@ impl App {
                 }
                 None => self.toast("剪贴板为空或不可用"),
             },
-            Action::AcceptDraft => {
-                if let Some((_, text)) = self.pending_draft.take() {
-                    self.model.fields.insert("load_text".into(), text);
-                    self.model.pending_source.clear();
-                    self.model.modal_epoch += 1;
-                    self.load_text();
-                }
-            }
             Action::LoadBook(i) => {
                 if let Some(b) = self.library.books().get(i) {
                     let name = b.name.clone();
@@ -3260,9 +3247,13 @@ impl App {
             Action::SendScoreToGroup => {
                 match self.model.bound.and_then(|i| self.chats.get(i).cloned()) {
                     Some(chat) => match self.score_text() {
-                        Some(s) => match qq_bridge::send_message_enhanced(&chat, &s) {
-                            Ok(()) => self.toast(format!("成绩已发送到「{}」", chat.title)),
-                            Err(e) => self.toast(e),
+                        Some(s) => {
+                            let sent = qq_bridge::send_message_enhanced(&chat, &s);
+                            self.focus_trainer();
+                            match sent {
+                                Ok(()) => self.toast(format!("成绩已发送到「{}」", chat.title)),
+                                Err(e) => self.toast(e),
+                            }
                         },
                         None => self.toast("当前没有可发送的成绩"),
                     },
@@ -3288,7 +3279,9 @@ impl App {
                             "[跟打]{} [{}字]\n{}\n-----第{}段-晴发文",
                             title, chars, seg.text, mark
                         );
-                        match qq_bridge::send_message_enhanced(&chat, &text) {
+                        let sent = qq_bridge::send_message_enhanced(&chat, &text);
+                        self.focus_trainer();
+                        match sent {
                             Ok(()) => self.toast(format!("第{mark}段已发文到「{}」", chat.title)),
                             Err(e) => self.toast(e),
                         }
@@ -3321,6 +3314,13 @@ impl App {
                 }
             }
             Action::SelectGroup(i) => {
+                if self.model.bound == Some(i) {
+                    // 再点一次已选群 = 取消选择（用户要求能取消群选）。
+                    self.model.bound = None;
+                    self.toast("已取消选择群聊");
+                    gale_win::window::request_frame();
+                    return;
+                }
                 if i < self.chats.len() {
                     self.model.bound = Some(i);
                     // 【群三件套】选群即切换：能自动切就切，切不动再让用户点。
@@ -3755,7 +3755,6 @@ mod persistence_tests {
         let panels = [
             Modal::None,
             Modal::Groups,
-            Modal::Appearance,
             Modal::Online,
             Modal::Rules,
             Modal::Confirm,

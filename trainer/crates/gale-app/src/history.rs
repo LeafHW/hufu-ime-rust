@@ -1,80 +1,57 @@
-//! 底栏成绩账本：常驻一条摘要，点开在原窗口内联展开，不再有独立成绩页。
+//! 底栏成绩账本：点「成绩记录」后为一张向下展开的分段成绩表，不再有独立成绩页。
 //!
-//! 面板向上展开覆盖正文下缘，行 = 一条历史成绩；点行内联手风琴展开该条详情，
-//! 详情里的「复制成绩 / 按键热力图」只对最近一次结算段可用（历史记录不保存按键分布）。
+//! 结构：表头（点它收起）+ 9 列表格（用时/重打/段号/速度/击键/码长/键准/打词/字数）。
+//! 表格占底部区域，正文区向上让位；数据直接取 ScoreRecord，不做额外加工。
 use crate::{
     modals::{Action, Hit, Modal, Model},
     session::{Phase, Session},
     ui::*,
 };
-use gale_core::{config::Config, theme::Theme};
-use gale_win::d2d::{DrawCmd, Frame};
+use gale_core::{config::Config, score::ScoreRecord, theme::Theme};
+use gale_win::d2d::{Align, DrawCmd, FontFamily, Frame};
 
-/// 面板高度：窗口的 46%，夹在 260–360。
-pub fn panel_height(h: f32) -> f32 {
-    (h * 0.46).clamp(260., 360.)
+/// 收起时的摘要条高度。
+pub const BAR_H: f32 = 36.;
+/// 表格行高。
+const ROW_H: f32 = 32.;
+/// 表头高度（列名）。
+const HEAD_H: f32 = 26.;
+/// 面板底部留白。
+const PAD_BOTTOM: f32 = 8.;
+
+fn visible_rows(m: &Model, h: f32) -> usize {
+    let max_h = (h * 0.55).max(180.);
+    let body = (max_h - BAR_H - HEAD_H - PAD_BOTTOM).max(ROW_H);
+    (body / ROW_H).floor().clamp(1., 7.) as usize
 }
-pub fn panel_rect(w: f32, h: f32) -> (f32, f32, f32, f32) {
-    let ph = panel_height(h);
-    let bottom = ledger_bar_y(h) - 8.;
-    (24., bottom - ph, (w - 48.).max(320.), ph)
+
+/// 展开后的面板高度（表头 + 可见行 + 底部留白），内容少时收短。
+pub fn panel_height(m: &Model, h: f32) -> f32 {
+    let rows = m.history.len().min(visible_rows(m, h)).max(1) as f32;
+    (BAR_H + HEAD_H + rows * ROW_H + PAD_BOTTOM).clamp(120., (h * 0.55).max(180.))
 }
-/// 内容少时面板收短，避免大片空白；内容多时到上限后滚动。
+
 pub fn panel_rect_for(m: &Model, w: f32, h: f32) -> (f32, f32, f32, f32) {
-    let content: f32 = (0..m.history.len()).map(|i| block_h(m, i)).sum();
-    let ph = (56. + content + 12.).clamp(200., panel_height(h));
-    let bottom = ledger_bar_y(h) - 8.;
+    let ph = panel_height(m, h);
+    let bottom = h - STATUS_H - 8.;
     (24., bottom - ph, (w - 48.).max(320.), ph)
 }
-const ROW_H: f32 = 44.;
-const DETAIL_H: f32 = 108.;
-fn segment_label(r: &gale_core::score::ScoreRecord) -> String {
-    // 记录里的 mark 是源文段号（可能几十万），对用户没有意义；
-    // 这里始终显示本轮的第几段（para_index 是会话内段序）。
-    format!("第 {} 段", r.para_index + 1)
+
+/// 收起状态下的摘要条。
+pub fn bar_rect(w: f32, h: f32) -> (f32, f32, f32, f32) {
+    let bottom = h - STATUS_H - 8.;
+    (24., bottom - BAR_H, (w - 48.).max(200.), BAR_H)
 }
 
-fn fmt_speed(r: &gale_core::score::ScoreRecord) -> String {
-    if r.speed.is_finite() && r.speed >= 0. && r.speed <= 1000. {
-        format!("{:.1}", r.speed)
-    } else {
-        "—".into()
-    }
-}
-
-fn fmt_accuracy(r: &gale_core::score::ScoreRecord) -> String {
-    let value = r.character_accuracy();
-    if value.is_finite() {
-        format!("{:.1}%", value.clamp(0., 100.))
-    } else {
-        "—".into()
-    }
-}
-
-fn block_h(m: &Model, idx: usize) -> f32 {
-    ROW_H
-        + if m.selected_history == Some(idx) {
-            DETAIL_H
-        } else {
-            0.
-        }
-}
-/// 滚动上限（DIP）：内容总高 - 列表可视高。
 pub fn scroll_max(m: &Model, h: f32) -> f32 {
-    let (_, _, _, ph) = panel_rect_for(m, w_for_scroll(), h);
-    let view = (ph - 56. - 12.).max(1.);
-    let content: f32 = (0..m.history.len()).map(|i| block_h(m, i)).sum();
-    (content - view).max(0.)
+    let rows = m.history.len() as f32;
+    let visible = visible_rows(m, h) as f32;
+    ((rows - visible).max(0.) * ROW_H).max(0.)
 }
-/// 某条记录在列表内容里的 y 偏移（显示顺序：最新在上）。
-fn w_for_scroll() -> f32 {
-    1280.
-}
+
 pub fn record_offset(m: &Model, idx: usize) -> f32 {
-    (idx + 1..m.history.len())
-        .rev()
-        .map(|i| block_h(m, i))
-        .sum()
+    // 列表按最新在上：第 idx 条（m.history 顺序）的距离 = (len-1-idx) 行。
+    (m.history.len().saturating_sub(1 + idx) as f32) * ROW_H
 }
 
 pub fn draw(
@@ -91,9 +68,10 @@ pub fn draw(
         return;
     }
     if m.ledger_open {
-        draw_panel(f, hs, sess, m, t, w, h);
+        draw_table(f, hs, sess, m, t, w, h);
+    } else {
+        draw_bar(f, hs, sess, m, t, w, h);
     }
-    draw_bar(f, hs, sess, m, t, w, h);
 }
 
 fn draw_bar(
@@ -106,7 +84,7 @@ fn draw_bar(
     h: f32,
 ) {
     let p = tokens(t);
-    let (x, y, bw) = (24., ledger_bar_y(h), (w - 48.).max(200.));
+    let (x, y, bw, bh) = bar_rect(w, h);
     if sess.phase == Phase::Done {
         let record = sess
             .results
@@ -149,7 +127,7 @@ fn draw_bar(
         }
         return;
     }
-    round(f, x, y, bw, LEDGER_H, 8., p.surface, Some(p.line));
+    round(f, x, y, bw, bh, 8., p.surface, Some(p.line));
     text(
         f,
         x + 14.,
@@ -165,42 +143,51 @@ fn draw_bar(
                 x + bw - 34.,
                 y + 10.,
                 13.,
-                format!(
-                    "最近 {:.1} 字/分 · 字准 {:.1}%",
-                    r.speed,
-                    r.character_accuracy()
-                ),
+                format!("最近 {} 字/分", fmt_speed(r)),
                 p.muted,
             );
         }
-    } else if bw >= 420. {
-        right(
-            f,
-            x + bw - 34.,
-            y + 10.,
-            13.,
-            "打完一段会自动记录",
-            p.muted,
-        );
     }
-    right(
-        f,
-        x + bw - 14.,
-        y + 6.,
-        16.,
-        if m.ledger_open { "⌄" } else { "›" },
-        p.muted,
-    );
+    right(f, x + bw - 14., y + 7., 16., "⌄", p.muted);
     hs.push(Hit {
         x,
         y,
         w: bw,
-        h: LEDGER_H,
+        h: bh,
         action: Action::ToggleLedger,
     });
 }
 
-fn draw_panel(
+const COLUMNS: [(&str, f32); 9] = [
+    ("用时", 0.10),
+    ("重打", 0.07),
+    ("段号", 0.11),
+    ("速度", 0.10),
+    ("击键", 0.09),
+    ("码长", 0.09),
+    ("键准", 0.10),
+    ("打词", 0.09),
+    ("字数", 0.08),
+];
+
+fn cell_text(r: &ScoreRecord) -> [String; 9] {
+    let seg = r.mark.trim().to_string();
+    [
+        duration(r.time_ms),
+        r.retype_count.to_string(),
+        seg,
+        fmt_speed(r),
+        format!("{:.2}", r.strokes_per_sec),
+        format!("{:.2}", r.code_len),
+        format!("{:.1}%", r.accuracy.clamp(0., 100.)),
+        r.word_rate
+            .map(|v| format!("{v:.0}%"))
+            .unwrap_or_else(|| "—".into()),
+        r.chars.to_string(),
+    ]
+}
+
+fn draw_table(
     f: &mut Frame,
     hs: &mut Vec<Hit>,
     sess: &Session,
@@ -211,9 +198,8 @@ fn draw_panel(
 ) {
     let p = tokens(t);
     let (x, y, pw, ph) = panel_rect_for(m, w, h);
-    round(f, x, y, pw, ph, 12., p.surface, Some(p.line2));
-    // header
-    text(f, x + 20., y + 13., 16., "成绩记录", p.text);
+    round(f, x, y, pw, ph, 10., p.surface, Some(p.line2));
+    // 表头（可点收起）
     let done = sess.results.iter().flatten().count();
     let avg = if done == 0 {
         0.
@@ -230,213 +216,127 @@ fn draw_panel(
     } else {
         format!("本轮 {done} 段 · 平均 {avg:.1} 字/分")
     };
-    text(f, x + 96., y + 15., 13., summary, p.muted);
-    text(f, x + pw - 36., y + 9., 20., "×", p.muted);
+    text(f, x + 16., y + 10., 15., "成绩记录", p.text);
+    text(
+        f,
+        x + 86.,
+        y + 12.,
+        12.,
+        format!("{} 条 · {}", m.history.len(), summary),
+        p.muted,
+    );
+    right(f, x + pw - 16., y + 9., 15., "收起 ⌃", p.muted);
     hs.push(Hit {
-        x: x + pw - 44.,
-        y: y + 6.,
-        w: 34.,
-        h: 32.,
+        x,
+        y,
+        w: pw,
+        h: BAR_H,
         action: Action::ToggleLedger,
     });
-    line(f, x + 16., y + 44., pw - 32., p.line);
-    let list_top = y + 52.;
-    let list_bottom = y + ph - 10.;
-    let view = (list_bottom - list_top).max(1.);
-    if m.history.is_empty() {
-        text(
-            f,
-            x + 20.,
-            list_top + 24.,
-            15.,
-            "还没有成绩记录",
-            p.text2,
-        );
-        text(
-            f,
-            x + 20.,
-            list_top + 50.,
-            13.,
-            "完成一段跟打后，成绩会自动记在这里。",
-            p.muted,
-        );
-        return;
+    if sess.phase == Phase::Done {
+        let has_next = sess.current_index() + 1 < sess.total_segments();
+        let mut rx = x + pw - 76.;
+        if has_next {
+            button(f, hs, rx - 90., y + 3., 84., "下一段", Action::Next, t, true);
+            rx -= 98.;
+        }
+        button(f, hs, rx - 76., y + 3., 70., "重打", Action::Restart, t, false);
     }
+    line(f, x + 12., y + BAR_H, pw - 24., p.line);
+
+    let left = x + 16.;
+    let inner = pw - 32.;
+    let total_w: f32 = COLUMNS.iter().map(|c| c.1).sum();
+    let mut col_x = [0f32; 9];
+    let mut col_w = [0f32; 9];
+    let mut cx = left;
+    for (i, (_, weight)) in COLUMNS.iter().enumerate() {
+        col_x[i] = cx;
+        col_w[i] = inner * weight / total_w;
+        cx += col_w[i];
+    }
+    for (i, (name, _)) in COLUMNS.iter().enumerate() {
+        f.push(DrawCmd::PushClip {
+            x: col_x[i] + 2.,
+            y: y + BAR_H + 5.,
+            w: col_w[i] - 4.,
+            h: 18.,
+        });
+        f.push(DrawCmd::TextRun {
+            x: col_x[i] + col_w[i] - 6.,
+            y: y + BAR_H + 5.,
+            h: 12.,
+            text: (*name).into(),
+            color: p.muted,
+            font: FontFamily::Ui,
+            align: Align::Right,
+        });
+        f.push(DrawCmd::PopClip);
+    }
+    let list_top = y + BAR_H + HEAD_H;
+    let list_h = ph - BAR_H - HEAD_H - PAD_BOTTOM;
     let max = scroll_max(m, h);
     let scroll = m.ledger_scroll.clamp(0., max);
-    let mut cy = 0.;
-    let mut first_visible = true;
+    f.push(DrawCmd::PushClip {
+        x,
+        y: list_top,
+        w: pw,
+        h: list_h.max(1.),
+    });
+    let mut row_y = list_top - scroll;
     for idx in (0..m.history.len()).rev() {
-        let bh = block_h(m, idx);
-        let top = cy - scroll;
-        if top + bh > 0. && top < view {
-            let ry = list_top + top;
-            draw_row(f, hs, sess, m, t, x, ry, pw, idx, &mut first_visible, list_top, list_bottom);
+        if row_y + ROW_H > list_top && row_y < list_top + list_h {
+            let r = &m.history[idx];
+            if idx + 1 == m.history.len() {
+                rect(f, x + 8., row_y, pw - 16., ROW_H, alpha(p.accent, 0.07));
+            }
+            let cells = cell_text(r);
+            for i in 0..9 {
+                let color = if i == 3 { p.text } else { p.text2 };
+                f.push(DrawCmd::PushClip {
+                    x: col_x[i] + 2.,
+                    y: row_y + 8.,
+                    w: col_w[i] - 4.,
+                    h: 20.,
+                });
+                f.push(DrawCmd::TextRun {
+                    x: col_x[i] + col_w[i] - 6.,
+                    y: row_y + 8.,
+                    h: 13.,
+                    text: cells[i].clone(),
+                    color,
+                    font: FontFamily::Mono,
+                    align: Align::Right,
+                });
+                f.push(DrawCmd::PopClip);
+            }
+            line(f, x + 16., row_y + ROW_H - 1., pw - 32., alpha(p.line, 0.4));
         }
-        cy += bh;
+        row_y += ROW_H;
     }
+    f.push(DrawCmd::PopClip);
     if max > 0. {
-        let thumb = (view * view / (view + max)).clamp(20., view);
-        rect(f, x + pw - 12., list_top, 5., view, alpha(p.text, 0.07));
+        let track = list_h.max(1.);
+        let content = m.history.len() as f32 * ROW_H;
+        let thumb = (track * track / content.max(1.)).clamp(18., track);
+        rect(f, x + pw - 8., list_top, 4., track, alpha(p.text, 0.06));
         rect(
             f,
-            x + pw - 12.,
-            list_top + scroll / max * (view - thumb),
-            5.,
+            x + pw - 8.,
+            list_top + scroll / max * (track - thumb),
+            4.,
             thumb,
             alpha(p.accent, 0.65),
         );
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn draw_row(
-    f: &mut Frame,
-    hs: &mut Vec<Hit>,
-    sess: &Session,
-    m: &Model,
-    t: &Theme,
-    x: f32,
-    ry: f32,
-    pw: f32,
-    idx: usize,
-    first_visible: &mut bool,
-    list_top: f32,
-    list_bottom: f32,
-) {
-    let p = tokens(t);
-    let Some(r) = m.history.get(idx) else { return };
-    let expanded = m.selected_history == Some(idx);
-    let selected = expanded;
-    if selected {
-        round(
-            f,
-            x + 12.,
-            ry - 2.,
-            pw - 24.,
-            ROW_H - 2.,
-            7.,
-            alpha(p.accent, 0.07),
-            None,
-        );
+fn fmt_speed(r: &ScoreRecord) -> String {
+    if r.speed.is_finite() && r.speed >= 0. && r.speed <= 1000. {
+        format!("{:.1}", r.speed)
+    } else {
+        "—".into()
     }
-    let pair_w = (pw - 24.).max(240.);
-    let row_text = format!(
-        "{}  {}  ·  {}  ·  {} 字",
-        if r.date.is_empty() { "记录" } else { &r.date },
-        r.title,
-        segment_label(r),
-        r.chars
-    );
-    f.push(DrawCmd::PushClip {
-        x: x + 22.,
-        y: ry + 7.,
-        w: pair_w - 236.,
-        h: 20.,
-    });
-    text(
-        f,
-        x + 22.,
-        ry + 8.,
-        14.,
-        elide_width(&row_text, pair_w - 240., 14.),
-        p.text2,
-    );
-    f.push(DrawCmd::PopClip);
-    mono(
-        f,
-        x + pw - 198.,
-        ry + 8.,
-        14.,
-        fmt_speed(r),
-        p.text2,
-    );
-    right(
-        f,
-        x + pw - 26.,
-        ry + 9.,
-        13.,
-        format!("字准 {}", fmt_accuracy(r)),
-        p.muted,
-    );
-    right(
-        f,
-        x + pw - 20.,
-        ry + 8.,
-        13.,
-        if expanded { "⌃" } else { "⌄" },
-        p.muted,
-    );
-    if *first_visible {
-        *first_visible = false;
-    }
-    hs.push(Hit {
-        x: x + 12.,
-        y: ry,
-        w: pw - 24.,
-        h: ROW_H,
-        action: Action::SelectHistory(idx),
-    });
-    if !expanded {
-        line(f, x + 20., ry + ROW_H - 1., pw - 40., alpha(p.line, 0.55));
-        return;
-    }
-    // 详情：两行指标 + 操作按钮。只在可视区内绘制，避免盖住 header/footer。
-    let dy = ry + ROW_H;
-    if dy >= list_top && dy < list_bottom {
-        let mut fy = dy + 4.;
-        let cols = [
-            ("速度", format!("{:.1}", r.speed)),
-            ("键准", format!("{:.1}%", r.accuracy)),
-            ("字准", format!("{:.1}%", r.character_accuracy())),
-            ("码长", format!("{:.2}", r.code_len)),
-            ("用时", duration(r.time_ms)),
-        ];
-        for (i, (label, value)) in cols.iter().enumerate() {
-            let cx = x + 28. + i as f32 * ((pw - 90.) / 5.);
-            text(f, cx, fy, 12., *label, p.muted);
-            mono(f, cx + 34., fy - 1., 14., value, p.text2);
-        }
-        fy += 24.;
-        let secondary = format!(
-            "总键 {}  ·  错字 {}  ·  退格 {}  ·  选重 {}  ·  重打 {}  ·  有效速度 {:.1}",
-            r.keys,
-            r.wrong,
-            r.backspaces,
-            r.select_count,
-            r.retype_count,
-            r.effective_speed
-        );
-        f.push(DrawCmd::PushClip {
-            x: x + 28.,
-            y: fy,
-            w: pw - 56.,
-            h: 20.,
-        });
-        text(f, x + 28., fy, 12., secondary, p.muted);
-        f.push(DrawCmd::PopClip);
-        let latest = idx + 1 == m.history.len();
-        let mut bx = x + 28.;
-        let by = fy + 24.;
-        if by + 28. <= list_bottom {
-            button(f, hs, bx, by, 92., "复制成绩", Action::CopyScore, t, true);
-            bx += 100.;
-            if latest && !sess.last_vk_histogram.is_empty() {
-                button(
-                    f,
-                    hs,
-                    bx,
-                    by,
-                    104.,
-                    "按键热力图",
-                    crate::aux_marker("show_heatmap"),
-                    t,
-                    false,
-                );
-            }
-        }
-    }
-    line(f, x + 20., ry + ROW_H, pw - 40., alpha(p.line, 0.4));
 }
 
 fn duration(ms: u64) -> String {

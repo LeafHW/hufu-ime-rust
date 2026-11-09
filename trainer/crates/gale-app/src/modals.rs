@@ -29,7 +29,6 @@ pub enum Modal {
     #[default]
     None,
     Groups,
-    Appearance,
     Preferences,
     Online,
     Rules,
@@ -51,6 +50,8 @@ pub enum Action {
     ToggleLedger,
     /// 主窗口底部理论分析停靠面板开关（F10）。
     ToggleAnalysis,
+    /// 打开 F1 设置并定位到「外观」页（F7）。
+    OpenAppearanceSettings,
     Exit,
     Minimize,
     Maximize,
@@ -72,7 +73,6 @@ pub enum Action {
     ToggleAutoSend,
     LoadClipboard,
     LoadFile,
-    AcceptDraft,
     LoadBook(usize),
     Practice(usize),
     Theme(String),
@@ -165,7 +165,6 @@ pub struct Model {
     pub schema_ver: String,
     pub load_tab: u8,
     pub load_editing: bool,
-    pub pending_source: String,
     pub shelf_offset: usize,
     pub books: Vec<String>,
     pub groups: Vec<String>,
@@ -247,7 +246,6 @@ pub fn panel(m: Modal, w: f32, h: f32) -> (f32, f32, f32, f32) {
         Modal::Online => (920., 740.),
         Modal::Preferences => (960., 760.),
         Modal::Groups => (720., 520.),
-        Modal::Appearance => (960., 500.),
         Modal::Library => (760., 460.),
         Modal::More => (640., 460.),
         Modal::Rules => (1040., 900.),
@@ -655,12 +653,11 @@ fn panel_header(f: &mut Frame, hs: &mut Vec<Hit>, m: Modal, x: f32, y: f32, pw: 
         Modal::Library => ("book", "载入", "本地 TXT、单字练习与剪贴板", ""),
         Modal::More => ("folder", "更多", "工具、设置与数据", ""),
         Modal::Groups => ("group", "选择群聊", "选中后读取群文或发送成绩", "F5"),
-        Modal::Appearance => ("palette", "外观", "主题、字号、行距与动效", "F7"),
-        Modal::Preferences => ("palette", "跟打器设置", "练习提示、成绩单、配色与数据", "F1"),
+        Modal::Preferences => ("palette", "跟打器设置", "练习、成绩、配色、外观与数据", "F1"),
         Modal::Heatmap => (
             "keyboard",
             "本段按键热力图",
-            "最近一次结算段的按键频次 · 滚轮关闭",
+            "当前段每个按键的按下次数 · 滚轮关闭",
             "Esc",
         ),
         Modal::Confirm => ("!", "确认操作", "当前练习的内容将发生改变", "Esc"),
@@ -710,54 +707,41 @@ fn draw_library(
     let left = x + 24.;
     let column = (pw - 68.) / 2.;
     let right_col = left + column + 20.;
-    text(f, left, y + 84., FONT_HINT, "本地文章", p.text2);
+    text(f, left, y + 84., FONT_HINT, "载入文章", p.text2);
     small_btn(
         f,
         hs,
-        left + column - 88.,
-        y + 76.,
-        88.,
-        "打开 TXT",
+        left,
+        y + 112.,
+        column,
+        "打开 TXT 文件",
         Action::LoadFile,
         t,
         false,
     );
+    small_btn(
+        f,
+        hs,
+        left,
+        y + 156.,
+        column,
+        "从剪贴板载入（Ctrl+V）",
+        Action::LoadClipboard,
+        t,
+        false,
+    );
+    text_block(
+        f,
+        left,
+        y + 206.,
+        column,
+        FONT_HINT,
+        24.,
+        2,
+        "本地文章列表已取消；TXT 与剪贴板载入后直接进入跟打区。",
+        p.muted,
+    );
     rect(f, x + pw / 2., y + 80., 1., ph - 160., p.line);
-    if m.books.is_empty() {
-        text(f, left, y + 130., 18., "还没有本地文章", p.text2);
-        text_block(
-            f,
-            left,
-            y + 165.,
-            column,
-            FONT_HINT,
-            26.,
-            3,
-            "打开 TXT 文件，或在主界面按 Ctrl+V 载入文本。",
-            p.muted,
-        );
-    } else {
-        for (row, (i, title)) in m
-            .books
-            .iter()
-            .enumerate()
-            .skip(m.scroll.max(0.) as usize)
-            .take(5)
-            .enumerate()
-        {
-            small_btn(
-                f,
-                hs,
-                left,
-                y + 118. + row as f32 * 36.,
-                column,
-                &elide(title, ((column - 16.) / 15.).max(1.) as usize),
-                Action::LoadBook(i),
-                t,
-                false,
-            );
-        }
-    }
     text(f, right_col, y + 84., FONT_HINT, "单字与词组练习", p.text2);
     for (i, (title, _)) in gale_core::single::builtin_tables().iter().enumerate() {
         small_btn(
@@ -778,11 +762,7 @@ fn draw_library(
         left,
         y + ph - 39.,
         FONT_HINT,
-        if m.books.len() > 5 {
-            format!("{} 篇文章 · 滚轮浏览", m.books.len())
-        } else {
-            "Ctrl+V 可直接载入文本".into()
-        },
+        "Ctrl+V 可直接载入文本 · 单字练习从右侧选择",
         p.muted,
     );
     btn(
@@ -797,6 +777,7 @@ fn draw_library(
         false,
     );
 }
+
 fn draw_groups(
     f: &mut Frame,
     hs: &mut Vec<Hit>,
@@ -836,6 +817,19 @@ fn draw_groups(
         t,
         false,
     );
+    if let Some(bound) = m.bound.filter(|_| !m.groups.is_empty()) {
+        small_btn(
+            f,
+            hs,
+            right_x - 64. - 8. - 88.,
+            y + 68.,
+            88.,
+            "取消选择",
+            Action::SelectGroup(bound),
+            t,
+            false,
+        );
+    }
     if m.groups.is_empty() {
         text(f, left, y + 150., 17., "没有发现群聊", p.text2);
         text_block(
@@ -1010,8 +1004,8 @@ fn draw_more(
     let row_h = 46.;
     let mut left_items: Vec<(String, String, Action, String)> = vec![
         (
-            "本地载入".into(),
-            "TXT 文件、单字表与剪贴板".into(),
+            "载入与单字".into(),
+            "TXT、剪贴板与单字练习".into(),
             Action::Open(Modal::Library),
             "".into(),
         ),
@@ -1022,14 +1016,6 @@ fn draw_more(
             "Ctrl+V".into(),
         ),
     ];
-    if !m.pending_source.is_empty() {
-        left_items.push((
-            "载入待处理文本".into(),
-            "接受刚读取的群文草稿".into(),
-            Action::AcceptDraft,
-            "".into(),
-        ));
-    }
     if sess.source != crate::session::SessionSource::Single
         && m.bound.and_then(|i| m.groups.get(i)).is_some()
     {
@@ -1037,7 +1023,7 @@ fn draw_more(
             "发送当前文章".into(),
             "按晴发文格式发到目标群".into(),
             Action::PostArticle,
-            "".into(),
+            "F2".into(),
         ));
     }
     left_items.push((
@@ -1056,12 +1042,6 @@ fn draw_more(
             "单字提示、成绩单与配色".into(),
             Action::Open(Modal::Preferences),
             "F1".into(),
-        ),
-        (
-            "外观".into(),
-            "主题、字号、行距与动效".into(),
-            Action::Open(Modal::Appearance),
-            "F7".into(),
         ),
         (
             "清洗规则".into(),
@@ -1159,7 +1139,7 @@ fn draw_more_row(
         action,
     });
 }
-fn appearance_preview(
+pub(super) fn appearance_preview(
     f: &mut Frame,
     sess: &Session,
     m: &Model,
@@ -1329,179 +1309,6 @@ fn appearance_preview(
     }
     f.push(DrawCmd::PopClip);
 }
-fn draw_appearance(
-    f: &mut Frame,
-    hs: &mut Vec<Hit>,
-    m: &Model,
-    sess: &Session,
-    cfg: &Config,
-    t: &Theme,
-    x: f32,
-    y: f32,
-    pw: f32,
-    ph: f32,
-) {
-    let p = tokens(t);
-    let preview_width = (pw * 0.35).clamp(218., 320.);
-    let controls_width = pw - preview_width;
-    let cx = x + 22.;
-    let cw = controls_width - 44.;
-    let px = x + controls_width + 18.;
-    let preview_w = preview_width - 38.;
-    rect(
-        f,
-        x + controls_width,
-        y + PANEL_HEAD,
-        1.,
-        ph - PANEL_HEAD - PANEL_FOOT,
-        p.line,
-    );
-    text(f, cx, y + 82., FONT_HINT, "主题", p.muted);
-    let preset_w = (cw - 24.) / 5.;
-    for (i, name) in ["墨玉", "宣纸", "夜巡", "青瓷", "朱砂"].iter().enumerate() {
-        let bx = cx + i as f32 * (preset_w + 6.);
-        let pt = tokens(&theme(name));
-        let selected = cfg.theme == *name || (i == 0 && cfg.theme == "default");
-        round(
-            f,
-            bx,
-            y + 107.,
-            preset_w,
-            42.,
-            7.,
-            pt.bg,
-            Some(if selected { p.accent } else { p.line2 }),
-        );
-        button_label(f, bx + 7., y + 118., preset_w - 14., name, pt.text);
-        hit_box(
-            hs,
-            bx,
-            y + 107.,
-            preset_w,
-            42.,
-            Action::Theme(name.to_string()),
-        );
-    }
-    text(f, cx, y + 175., FONT_HINT, "跟随虎符皮肤", p.text2);
-    small_btn(
-        f,
-        hs,
-        cx + cw - 62.,
-        y + 165.,
-        62.,
-        if cfg.theme == "跟随虎符" {
-            "已开启"
-        } else {
-            "开启"
-        },
-        Action::Theme("跟随虎符".into()),
-        t,
-        cfg.theme == "跟随虎符",
-    );
-    line(f, cx, y + 207., cw, p.line);
-    for (row, (name, value, minus, plus)) in [
-        (
-            "字号",
-            format!("{:.0} px", cfg.font_size),
-            Action::Font(-2),
-            Action::Font(2),
-        ),
-        (
-            "行距",
-            format!("{:.2}", 1. + cfg.line_gap),
-            Action::LineHeight(-1),
-            Action::LineHeight(1),
-        ),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let by = y + 216. + row as f32 * 48.;
-        text(f, cx, by + 7., FONT_HINT, name, p.muted);
-        right(f, cx + cw - 90., by + 7., FONT_HINT, value, p.text2);
-        small_btn(f, hs, cx + cw - 78., by, 34., "−", minus, t, false);
-        small_btn(f, hs, cx + cw - 34., by, 34., "+", plus, t, false);
-    }
-    text(f, cx, y + 323., FONT_HINT, "动效强度", p.muted);
-    let motion_w = (cw - 24.) / 4.;
-    for (i, name) in ["关闭", "轻柔", "标准", "丰富"].iter().enumerate() {
-        small_btn(
-            f,
-            hs,
-            cx + i as f32 * (motion_w + 8.),
-            y + 348.,
-            motion_w,
-            name,
-            Action::MotionLevel(i as u8),
-            t,
-            cfg.motion_level == i as u8,
-        );
-    }
-    if m.reduced_motion {
-        text(
-            f,
-            cx,
-            y + 397.,
-            FONT_HINT,
-            "已遵循系统的减少动态设置",
-            p.muted,
-        );
-    }
-    text(f, px, y + 82., FONT_HINT, "实时预览", p.muted);
-    let preview_h = (ph - 242.).max(120.);
-    round(
-        f,
-        px,
-        y + 114.,
-        preview_w,
-        preview_h,
-        10.,
-        p.bg,
-        Some(p.line),
-    );
-    appearance_preview(
-        f,
-        sess,
-        m,
-        cfg,
-        t,
-        px + 12.,
-        y + 130.,
-        preview_w - 24.,
-        preview_h - 32.,
-    );
-    text(
-        f,
-        px,
-        y + ph - 110.,
-        FONT_HINT,
-        format!("{:.0} px · 行距 {:.2}", cfg.font_size, 1. + cfg.line_gap),
-        p.muted,
-    );
-    footer(f, x, y, pw, ph, t);
-    btn(
-        f,
-        hs,
-        x + 22.,
-        y + ph - 48.,
-        88.,
-        "重置",
-        Action::AppearanceReset,
-        t,
-        false,
-    );
-    btn(
-        f,
-        hs,
-        x + pw - 110.,
-        y + ph - 48.,
-        88.,
-        "完成",
-        Action::Close,
-        t,
-        true,
-    );
-}
 /// The actual and theoretical heatmaps share the same complete physical keyboard.
 fn draw_heatmap(
     f: &mut Frame,
@@ -1514,7 +1321,11 @@ fn draw_heatmap(
     ph: f32,
 ) {
     let p = tokens(t);
-    let hist = &sess.last_vk_histogram;
+    let hist = if sess.vk_histogram.is_empty() {
+        &sess.last_vk_histogram
+    } else {
+        &sess.vk_histogram
+    };
     let total: u32 = hist.values().sum();
     let max = hist.values().copied().max().unwrap_or(0);
     let keyboard_top = if ph >= 480. { 112. } else { 76. };
@@ -1525,18 +1336,14 @@ fn draw_heatmap(
             y + 78.,
             14.,
             if total == 0 {
-                "本段暂无按键记录 · 完成一段后生成"
+                "本段暂无按键记录 · 开始跟打后这里显示每个按键的次数"
             } else {
-                if pw - 56. < 760. {
-                    "本段按键分布 · 窄窗仅显示主键区"
-                } else {
-                    "本段按键分布 · 含修饰键与数字区 · 不含界面快捷键"
-                }
+                "本段按键热力图 · 主键区 · 键帽上的数字是该键按下次数"
             },
             p.muted,
         );
     }
-    crate::keyboard::draw(
+    crate::keyboard::draw_main(
         f,
         t,
         x + 28.,
@@ -1559,7 +1366,7 @@ fn draw_heatmap(
         x + 28.,
         y + ph - 29.,
         14.,
-        "颜色越深，频次越高 · 左右修饰键分别计数",
+        "颜色越深，次数越多 · 不统计界面快捷键与按键自动重复",
         p.muted,
     );
     btn(
@@ -1826,7 +1633,7 @@ pub(crate) fn draw_analysis_dock(
         view_x,
         y + 8.,
         view_w,
-        if heatmap { "全文编码" } else { "键位图" },
+        if heatmap { "全文编码" } else { "热力图" },
         crate::aux_marker("analysis_view"),
         t,
         heatmap,
@@ -1885,15 +1692,20 @@ pub(crate) fn draw_analysis_dock(
     let body_w = (pw - 40.).max(120.);
     if let Some(fa) = &sess.full_analysis {
         if heatmap {
-            let summary = crate::analysis::summarize(fa, auto4);
+            // 当前段实际按键次数（未结算用正在累计的直方图，结算后用快照）。
+            let hist = if sess.vk_histogram.is_empty() {
+                &sess.last_vk_histogram
+            } else {
+                &sess.vk_histogram
+            };
             f.push(DrawCmd::PushClip {
                 x: x + 20.,
                 y: body_y,
                 w: body_w,
                 h: body_h,
             });
-            crate::keyboard::draw(f, t, x + 24., body_y + 2., body_w - 8., body_h - 6., |key| {
-                summary.key_counts.get(&key).copied().unwrap_or(0)
+            crate::keyboard::draw_main(f, t, x + 24., body_y + 2., body_w - 8., body_h - 6., |key| {
+                hist.get(&key).copied().unwrap_or(0)
             });
             f.push(DrawCmd::PopClip);
         } else {
@@ -2044,8 +1856,7 @@ pub fn draw(
             Modal::Library => draw_library(f, hs, m, t, x, y, pw, ph),
             Modal::More => draw_more(f, hs, m, sess, t, x, y, pw, ph),
             Modal::Groups => draw_groups(f, hs, m, sess, cfg, t, x, y, pw, ph),
-            Modal::Appearance => draw_appearance(f, hs, m, sess, cfg, t, x, y, pw, ph),
-            Modal::Preferences => preferences::draw(f, hs, m, t, x, y, pw, ph),
+            Modal::Preferences => preferences::draw(f, hs, m, sess, cfg, t, x, y, pw, ph),
             Modal::Heatmap => draw_heatmap(f, hs, sess, t, x, y, pw, ph),
             Modal::Online | Modal::Rules => {
                 crate::secondary_panels::draw(f, hs, m, sess, cfg, t, x, y, pw, ph)
@@ -2439,7 +2250,6 @@ mod tests {
             m.open(Modal::More);
             m.groups = vec!["测试群".into()];
             m.bound = Some(0);
-            m.pending_source = "待载入文章".into();
             for single in [false, true] {
                 s.source = if single {
                     crate::session::SessionSource::Single
@@ -2452,11 +2262,9 @@ mod tests {
                 for action in [
                     Action::Open(Modal::Library),
                     Action::Open(Modal::Preferences),
-                    Action::Open(Modal::Appearance),
                     Action::Open(Modal::Rules),
                     Action::ToggleRace,
                     Action::Folder,
-                    Action::AcceptDraft,
                 ] {
                     assert!(hits.iter().any(|hit| hit.action == action));
                 }

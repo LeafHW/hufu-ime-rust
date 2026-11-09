@@ -205,6 +205,33 @@ pub fn draw(
     h: f32,
     count: impl Fn(u8) -> u32,
 ) -> KeyboardSummary {
+    draw_impl(f, t, x, y, w, h, count, false)
+}
+
+/// 只画红色框里的主键盘区（Esc/F 行 + 字母数字区），不含右侧功能键与数字小键盘。
+/// 用于「当前段按键热力图」：键帽上直接显示该键按下次数。
+pub fn draw_main(
+    f: &mut Frame,
+    t: &Theme,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    count: impl Fn(u8) -> u32,
+) -> KeyboardSummary {
+    draw_impl(f, t, x, y, w, h, count, true)
+}
+
+fn draw_impl(
+    f: &mut Frame,
+    t: &Theme,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    count: impl Fn(u8) -> u32,
+    main_only: bool,
+) -> KeyboardSummary {
     let mut counts = [0u32; 256];
     for vk in 0..=255 {
         counts[vk] = count(vk as u8);
@@ -228,8 +255,10 @@ pub fn draw(
     };
     // 640-wide windows cannot show 105 caps and keep their labels legible.
     // Drop the F-row and the nav/numpad cluster, then scale the main block up.
-    let compact = w < 760.;
-    let keys: Vec<_> = if compact {
+    let compact = !main_only && w < 760.;
+    let keys: Vec<_> = if main_only {
+        all_keys.into_iter().filter(|k| k.x < 15.2).collect()
+    } else if compact {
         all_keys
             .into_iter()
             .filter(|k| k.y >= 1.2 && k.x < 15.2)
@@ -245,7 +274,7 @@ pub fn draw(
         ky1 = ky1.max(k.y + k.h);
     }
     let p = tokens(t);
-    let ux = w.max(0.) / 23.;
+    let ux = if main_only { w.max(0.) / 15.2 } else { w.max(0.) / 23. };
     let uy = h.max(0.) / 6.2;
     let mut gap = (ux * 0.08).clamp(2., 4.);
     let mut unit = 0.;
@@ -297,7 +326,7 @@ pub fn draw(
         // A zero-frequency dot under every cap read as a rendering artifact.
         // Only draw a count when there is one, and stack the label above it so
         // both lines share the same centre line on every cap.
-        let show_count = (key_show_count(kh) || compact) && n > 0;
+        let show_count = (main_only || key_show_count(kh) || compact) && n > 0;
         let block = if show_count {
             label_size + 2. + 14.
         } else {

@@ -31,7 +31,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::TextServices::{ITfContextComposition, ITfRangeACP};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallWindowProcW, CreateWindowExW, DefWindowProcW, GetCaretPos, GetParent, SendMessageW,
+    CallWindowProcW, CreateWindowExW, DefWindowProcW, GetCaretPos, GetParent, HideCaret,
+    SendMessageW,
     SetWindowLongPtrW, SetWindowPos, ShowWindow, GWLP_WNDPROC, SWP_NOZORDER, SW_HIDE, SW_SHOWNA,
     WINDOW_EX_STYLE, WM_CHAR, WM_KEYDOWN, WM_KEYUP, WM_SYSCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP,
     WS_CHILD, WS_VISIBLE,
@@ -1209,6 +1210,13 @@ impl InputHost {
     pub fn hide(&self) {
         unsafe {
             let _ = ShowWindow(HWND(self.hwnd as *mut core::ffi::c_void), SW_HIDE);
+        }
+    }
+    /// 隐藏 2×2 输入宿主自带的闪烁光标：正文光标由 DirectWrite 自绘，
+    /// 原生宿主只负责 TSF 上下文，不应在光标右下角露一个闪点。
+    pub fn hide_caret(&self) {
+        unsafe {
+            let _ = HideCaret(HWND(self.hwnd as *mut core::ffi::c_void));
         }
     }
 
