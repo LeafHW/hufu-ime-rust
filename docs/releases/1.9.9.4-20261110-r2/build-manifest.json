@@ -1,0 +1,24 @@
+{
+  "version": "1.9.9.4",
+  "build_tag": "2026-11-10-v1.9.9.4-r2",
+  "source_commit": "f4ef638a8f88ec0aed92e2e8bd0ca720eb812e5b",
+  "branch": "dev-latency",
+  "installer_engine": "rust",
+  "published": false,
+  "artifacts": [
+    {
+      "Name": "HuFu虎符输入法-v1.9.9.4-无模型.zip",
+      "Bytes": 32315329,
+      "SHA256": "C8300F65BAF2A17A701BF8878093BDC670E6150362E986D04A9A3B298C2F3C8C",
+      "Modified": "2026-11-10T03:04:16.1172971+08:00"
+    },
+    {
+      "Name": "HuFuSetup-1.9.9.4.exe",
+      "Bytes": 27108552,
+      "SHA256": "283345EED93F65C3CFC86B3154289EB1AAB31EDD19BF97E68340CB0D6C7D5110",
+      "Modified": "2026-11-10T03:04:34.7023973+08:00"
+    }
+  ],
+  "command": "powershell -NoProfile -ExecutionPolicy Bypass -File E:\\DSH-KF\\hufu\\发行脚本\\release.ps1 -Version 1.9.9.4 -NoGitee",
+  "sentence_benchmark": "R1 tbench/cbench results retained as prior evidence; sentence/engine algorithm sources were not changed for R2."
+}

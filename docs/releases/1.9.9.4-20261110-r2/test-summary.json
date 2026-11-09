@@ -1,0 +1,36 @@
+{
+  "command": "cargo test --locked --offline -p gale-app --all-targets --target x86_64-pc-windows-gnu --target-dir target -- --test-threads=1",
+  "harness_results": [
+    {
+      "passed": 99,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "passed": 62,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "passed": 62,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "passed": 11,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "passed": 11,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "passed": 11,
+      "failed": 0,
+      "ignored": 0
+    }
+  ],
+  "notes": "First harness is the 99 application unit tests. Development examples repeat shared module tests; counts are not unique test coverage."
+}

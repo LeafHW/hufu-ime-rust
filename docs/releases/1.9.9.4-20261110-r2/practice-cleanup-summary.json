@@ -1,0 +1,85 @@
+{
+  "Success": true,
+  "ClosedTrainer": [],
+  "BackupDirectory": "E:\\DSH-KF\\.testtmp\\release-1994-r2\\practice-backup",
+  "Before": [
+    {
+      "Path": "C:\\Users\\Leafyin\\AppData\\Local\\HuFu\\trainer\\session.jsonl",
+      "Existed": true,
+      "NonemptyRows": 1,
+      "Bytes": 4326
+    },
+    {
+      "Path": "C:\\Users\\Leafyin\\AppData\\Local\\HuFu\\trainer\\session.jsonl.bak",
+      "Existed": true,
+      "NonemptyRows": 1,
+      "Bytes": 4230
+    },
+    {
+      "Path": "C:\\Users\\Leafyin\\AppData\\Local\\HuFu\\trainer\\统计\\records.jsonl",
+      "Existed": true,
+      "NonemptyRows": 26,
+      "Bytes": 28989
+    }
+  ],
+  "After": [
+    {
+      "Path": "C:\\Users\\Leafyin\\AppData\\Local\\HuFu\\trainer\\session.jsonl",
+      "Exists": false,
+      "NonemptyRows": 0
+    },
+    {
+      "Path": "C:\\Users\\Leafyin\\AppData\\Local\\HuFu\\trainer\\session.jsonl.bak",
+      "Exists": false,
+      "NonemptyRows": 0
+    },
+    {
+      "Path": "C:\\Users\\Leafyin\\AppData\\Local\\HuFu\\trainer\\统计\\records.jsonl",
+      "Exists": false,
+      "NonemptyRows": 0
+    }
+  ],
+  "TodayChars": [
+    {
+      "Path": "C:\\Users\\Leafyin\\AppData\\Local\\HuFu\\trainer\\config.toml",
+      "Before": 186,
+      "After": 0
+    },
+    {
+      "Path": "C:\\Users\\Leafyin\\AppData\\Local\\HuFu\\trainer\\config.toml.bak",
+      "Before": 186,
+      "After": 0
+    },
+    {
+      "Path": "C:\\Users\\Leafyin\\AppData\\Local\\HuFu\\trainer\\profile.json:config_toml",
+      "Before": 186,
+      "After": 0
+    }
+  ],
+  "OtherProfileBytesPreserved": true,
+  "OtherConfigTextPreserved": true,
+  "SingleJsonUnchanged": true,
+  "LibraryEntries": [
+    {
+      "Path": "C:\\Users\\Leafyin\\AppData\\Local\\HuFu\\trainer\\文库\\难",
+      "Directory": true,
+      "Bytes": null
+    },
+    {
+      "Path": "C:\\Users\\Leafyin\\AppData\\Local\\HuFu\\trainer\\文库\\入门",
+      "Directory": true,
+      "Bytes": null
+    },
+    {
+      "Path": "C:\\Users\\Leafyin\\AppData\\Local\\HuFu\\trainer\\文库\\英文",
+      "Directory": true,
+      "Bytes": null
+    },
+    {
+      "Path": "C:\\Users\\Leafyin\\AppData\\Local\\HuFu\\trainer\\文库\\综合",
+      "Directory": true,
+      "Bytes": null
+    }
+  ],
+  "ImportedLibraryFilesDeleted": 0
+}
