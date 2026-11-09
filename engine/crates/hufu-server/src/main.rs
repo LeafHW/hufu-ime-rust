@@ -1171,6 +1171,31 @@ pub fn reload_sentence_bg(teardown_old: bool, resupplement: bool) {
 static NGRAM_LOAD_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static NGRAM_LOAD_PENDING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+/// 【批2-F 2026-11-09】ngram 页缓存暖走取消标志：首个真实按键到达
+/// （pipe dispatch "key"）置 true，暖走线程在 4MB 块边界让路退出。
+/// 每次模型装载（spawn_sentence_reload）重开一个暖走窗口前复位。
+pub(crate) static NGRAM_WARM_STOP: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// 【批2-F 2026-11-09】暖走线程降权：进后台调度模式（CPU+I/O 双 Very
+/// Low，等效 EcoQoS 不扰前台）。失败（含已在后台模式）静默保持原级。
+/// 线程退出时系统自动恢复默认优先级，无需显式退出后台模式。
+#[cfg(windows)]
+fn warm_thread_background_mode() {
+    use windows::Win32::System::Threading::{
+        SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN, THREAD_PRIORITY,
+    };
+    unsafe {
+        // GetCurrentThread() 伪句柄——本线程自身。
+        let h = windows::Win32::System::Threading::GetCurrentThread();
+        let _ = SetThreadPriority(
+            h,
+            THREAD_PRIORITY(THREAD_MODE_BACKGROUND_BEGIN.0 as i32),
+        );
+    }
+}
+#[cfg(not(windows))]
+fn warm_thread_background_mode() {}
 
 fn spawn_sentence_reload(shared: std::sync::Arc<std::sync::Mutex<Host>>, resupplement: bool) {
     use std::sync::atomic::Ordering;
@@ -1225,6 +1250,13 @@ fn spawn_sentence_reload(shared: std::sync::Arc<std::sync::Mutex<Host>>, resuppl
                 // 【性能】mmap 页缓存预热：v5 模型 546MB 惰性映射，首查
                 // 缺页逐条读盘。冷启动时并行顺序读整文件填 page cache；
                 // 重载时页缓存已热，顺序读很快返回。
+                // 【批2-F 2026-11-09】暖走线程不扰前台：进后台调度模式
+                // （THREAD_MODE_BACKGROUND_BEGIN——CPU+I/O 双降权，
+                // 等效 EcoQoS）；首个按键到达即取消（键路径设置
+                // NGRAM_WARM_STOP，每 4MB 块检查一次——冷启动用户
+                // 开打时暖走立即让路，不再抢盘）。每次模型装载重开一个
+                // 暖走窗口（重载/换方案后页缓存可能已失效）。
+                NGRAM_WARM_STOP.store(false, Ordering::Relaxed);
                 let mut loaded_path: Option<std::path::PathBuf> = None;
                 let mut last_err: Option<std::io::Error> = None;
                 let mut dec_opt = None;
@@ -1235,12 +1267,23 @@ fn spawn_sentence_reload(shared: std::sync::Arc<std::sync::Mutex<Host>>, resuppl
                             .name("hufu-ngram-warm".into())
                             .spawn(move || {
                                 let t0 = std::time::Instant::now();
+                                warm_thread_background_mode();
                                 if let Ok(mut f) = std::fs::File::open(&p) {
                                     use std::io::Read;
                                     let mut buf = vec![0u8; 4 << 20];
                                     while let Ok(n) = f.read(&mut buf) {
                                         if n == 0 {
                                             break;
+                                        }
+                                        // 批2-F：首键到达即让路（每块检查，
+                                        // 4MB 边界粒度足够——后台模式下
+                                        // 本就不抢前台调度）。
+                                        if NGRAM_WARM_STOP.load(Ordering::Relaxed) {
+                                            eprintln!(
+                                                "ngram 页缓存预热让路于首键（{:.1}s 处）",
+                                                t0.elapsed().as_secs_f32()
+                                            );
+                                            return;
                                         }
                                     }
                                 }
