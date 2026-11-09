@@ -385,6 +385,11 @@ enum Bg {
     RuleApply(u64, u64, Result<Session, String>),
     /// Full-article theory response with an explicit, retryable error.
     FullAnalysis(String, Result<FullAnalysis, String>),
+    /// QQ 发送完成（在工作线程里等确认后回传；主线程收到后才切回跟打器）。
+    Sent {
+        label: String,
+        result: Result<(), String>,
+    },
 }
 enum Persist {
     Snapshot(Vec<u8>),
@@ -523,6 +528,8 @@ struct App {
     rule_generation: u64,
     rule_busy: bool,
     qq_busy: bool,
+    /// QQ 后台发送中：同一时间只允许一条，避免抢焦点/重复发。
+    send_busy: bool,
     exit: bool,
     online_pending: usize,
     online_logged_in: bool,
@@ -709,6 +716,7 @@ fn run() -> Result<(), String> {
         rule_generation: 0,
         rule_busy: false,
         qq_busy: false,
+        send_busy: false,
         exit: false,
         online_pending: 0,
         online_logged_in: false,
@@ -1926,6 +1934,25 @@ impl App {
         gale_win::window::request_frame();
     }
 
+    /// 后台发送 QQ：先让最后一帧画完（300ms），工作线程粘贴+回车并等
+    /// 消息确认，完成后通过 Bg::Sent 回主线程再切回跟打器。绝不阻塞输入/结算。
+    fn spawn_send(&mut self, chat: qq_bridge::ChatWindow, text: String, ok_label: String) {
+        if self.send_busy {
+            self.toast("正在发送上一条，请稍候");
+            return;
+        }
+        self.send_busy = true;
+        self.toast(format!("正在发送到「{}」…", chat.title));
+        let tx = self.tx.clone();
+        let hwnd = self.win.hwnd;
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            let result = qq_bridge::send_message_enhanced(&chat, &text).map_err(|e| e.to_string());
+            let _ = tx.send(Bg::Sent { label: ok_label, result });
+            wake(hwnd);
+        });
+    }
+
     fn save_single_cfg(&mut self) {
         if let Err(e) = self.single_cfg.save(&self.dir.join("single.json")) {
             self.toast(format!("单字配置保存失败：{e}"));
@@ -2401,6 +2428,15 @@ impl App {
                         };
                         self.model.status = msg.into();
                         self.toast(msg);
+                    }
+                }
+                Bg::Sent { label, result } => {
+                    self.send_busy = false;
+                    // 工作线程确认 QQ 已收下消息后才回到这里切前台。
+                    self.focus_trainer();
+                    match result {
+                        Ok(()) => self.toast(label),
+                        Err(e) => self.toast(e),
                     }
                 }
                 Bg::FullAnalysis(key, result) => {
@@ -3248,13 +3284,9 @@ impl App {
                 match self.model.bound.and_then(|i| self.chats.get(i).cloned()) {
                     Some(chat) => match self.score_text() {
                         Some(s) => {
-                            let sent = qq_bridge::send_message_enhanced(&chat, &s);
-                            self.focus_trainer();
-                            match sent {
-                                Ok(()) => self.toast(format!("成绩已发送到「{}」", chat.title)),
-                                Err(e) => self.toast(e),
-                            }
-                        },
+                            let label = format!("成绩已发送到「{}」", chat.title);
+                            self.spawn_send(chat, s, label);
+                        }
                         None => self.toast("当前没有可发送的成绩"),
                     },
                     None => {
@@ -3279,12 +3311,8 @@ impl App {
                             "[跟打]{} [{}字]\n{}\n-----第{}段-晴发文",
                             title, chars, seg.text, mark
                         );
-                        let sent = qq_bridge::send_message_enhanced(&chat, &text);
-                        self.focus_trainer();
-                        match sent {
-                            Ok(()) => self.toast(format!("第{mark}段已发文到「{}」", chat.title)),
-                            Err(e) => self.toast(e),
-                        }
+                        let label = format!("第{mark}段已发文到「{}」", chat.title);
+                        self.spawn_send(chat, text, label);
                     }
                     None => {
                         self.toast("未绑定群，请先选择");
