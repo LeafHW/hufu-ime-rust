@@ -62,6 +62,11 @@ fn main() {
             args.get(3).expect("用法: cbench <方案目录> <cases.tsv> <ngram路径>"),
             args.get(4).expect("用法: cbench <方案目录> <cases.tsv> <ngram路径>"),
         ),
+        "kbench" => cmd_kbench(
+            args.get(2).expect("用法: kbench <方案目录> <cases.tsv> <ngram路径>"),
+            args.get(3).expect("用法: kbench <方案目录> <cases.tsv> <ngram路径>"),
+            args.get(4).expect("用法: kbench <方案目录> <cases.tsv> <ngram路径>"),
+        ),
         // 【审计 2026-10-26】旧内联 "codes" 臂（stdout 版）已删——上方
         // cmd_codes（30 行）先匹配恒胜出，此处原为永不可达死代码（用法
         // 签名还不一致，两代同堂易误导）。
@@ -508,6 +513,87 @@ fn cmd_cbench(dir: &str, cases_path: &str, ngram: &str) {
     println!("条数 {total}  Top1 {top1}/{total} = {:.2}%", top1 as f64 / total.max(1) as f64 * 100.0);
     for (src, (n, ok)) in &by_source {
         println!("  {src}: {ok}/{n} = {:.2}%", *ok as f64 / *n as f64 * 100.0);
+    }
+}
+
+/// 【高压非整句分键型基准 2026-11-09】cbench 同款加载（码模式），但把键
+/// 分成四类分别计时：编码键（字母）/ 空格上屏 / 退格 / 数字选重。每句：
+/// ①逐字母重放码流，在中点插一次 Backspace 并重打该键（真实回改路径）；
+/// ②偶数句用空格上屏，奇数句用数字 1 选重上屏；核对 Top-1 文本。
+fn cmd_kbench(dir: &str, cases_path: &str, ngram: &str) {
+    let schema = Schema::load(Path::new(dir)).expect("方案加载失败");
+    let cfg = bench_config();
+    let mut bench_cfg = Config::default();
+    bench_cfg.sentence.early_commit = false;
+    bench_cfg.sentence.empty_code_auto_commit = false;
+    bench_cfg.user.auto_frequency = false;
+    bench_cfg.user.log_adjust = false;
+    let mut engine = Engine::with_schema_dir(Path::new(dir), bench_cfg).expect("引擎初始化失败");
+    if ngram != "-" {
+        let dec = hufu_sentence::SentenceEngine::load(
+            Path::new(ngram),
+            schema.dict.clone(),
+            &schema.supplement,
+            { let mut w = cfg.sentence.weights.clone(); w.digit_codes = schema.dict.digit_coded; w },
+        )
+        .expect("ngram 装载失败");
+        engine.set_sentence_decoder(Some(std::sync::Arc::new(dec)));
+    }
+    let mut classes: [(&str, Vec<f64>); 4] = [("code", vec![]), ("space", vec![]), ("backspace", vec![]), ("digit", vec![])];
+    let mut total = 0usize;
+    let mut top1 = 0usize;
+    let file = std::fs::File::open(cases_path).expect("cases 打开失败");
+    use std::io::BufRead;
+    for line in std::io::BufReader::new(file).lines() {
+        let line = line.unwrap();
+        let line = line.trim_end();
+        if line.trim().is_empty() { continue; }
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() < 4 { continue; }
+        if parts[0].trim() == "id" { continue; }
+        let code = parts[2].trim();
+        let text = parts[3].trim_end();
+        if code.is_empty() { continue; }
+        total += 1;
+        let mut sess = Session::new(true);
+        let chars: Vec<char> = code.chars().collect();
+        let mid = chars.len() / 2;
+        for (i, ch) in chars.iter().enumerate() {
+            if i == mid && chars.len() > 3 {
+                let t = Instant::now();
+                engine.process_key(&mut sess, KeyInput {
+                    key: hufu_types::KeyCode::Backspace,
+                    ..KeyInput::char_key(' ')
+                });
+                classes[2].1.push(t.elapsed().as_secs_f64() * 1e6);
+                let t = Instant::now();
+                engine.process_key(&mut sess, KeyInput::char_key(*ch));
+                classes[0].1.push(t.elapsed().as_secs_f64() * 1e6);
+            } else {
+                let t = Instant::now();
+                engine.process_key(&mut sess, KeyInput::char_key(*ch));
+                classes[0].1.push(t.elapsed().as_secs_f64() * 1e6);
+            }
+        }
+        let use_space = total % 2 == 0;
+        let t = Instant::now();
+        let out = engine.process_key(&mut sess, KeyInput::char_key(if use_space { ' ' } else { '1' }));
+        classes[if use_space { 1 } else { 3 }].1.push(t.elapsed().as_secs_f64() * 1e6);
+        let got = out.commit.clone()
+            .or_else(|| sess.candidates.first().map(|c| c.text.clone()))
+            .unwrap_or_default();
+        if got == text { top1 += 1; }
+    }
+    println!("条数 {total}  Top1 {top1}/{total} = {:.2}%", top1 as f64 / total.max(1) as f64 * 100.0);
+    for (name, v) in classes {
+        if v.is_empty() { println!("{name}: n=0"); continue; }
+        let mut s = v.clone();
+        s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let n = s.len();
+        let q = |p: f64| s[(p * (n - 1) as f64) as usize];
+        let avg = s.iter().sum::<f64>() / n as f64;
+        println!("{name}: n={n} p50={:.1}µs p95={:.1}µs p99={:.1}µs max={:.1}µs avg={:.2}µs",
+            q(0.5), q(0.95), q(0.99), s[n-1], avg);
     }
 }
 
