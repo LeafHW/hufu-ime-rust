@@ -1,0 +1,21 @@
+
+—— 双产物核验（仅校验）——
+  [PASS] HuFu虎符输入法-v1.9.9.4-无模型.zip  30.9 MB  SHA256 ADF5D3B7BC5DA1E00F791E064194F9642A58E58EFE111AEA7C7A393F5C5ABAFF
+  [PASS] zip 内 hufu-server.exe
+  [PASS] zip 内 hufu-trainer.exe
+  [PASS] zip 内 hufu_tsf.dll
+  [PASS] zip 内 install.ps1
+  [PASS] zip 内 hufu-render-helper.exe
+  [PASS] zip 内 licenses/trainer/zhouzhou-LICENSE.txt
+  [PASS] zip 内 licenses/trainer/zhouzhou-NOTICE.txt
+  [PASS] 语料源 trainer\drills\前1500单字.txt
+  [PASS] 语料源 trainer\drills\常用单字前五百.txt
+  [PASS] 语料源 trainer\drills\常用单字中五百.txt
+  [PASS] 语料源 trainer\drills\常用单字后五百.txt
+  [PASS] 语料源 trainer\drills\常用词组前三百.txt
+  [PASS] zip 内 version.txt = '1.9.9.4'（应为 1.9.9.4）
+  [PASS] zip 内 install.ps1 = 仓内单一事实源（SHA256 4F96D75FCC4D…）
+  [PASS] HuFuSetup-1.9.9.4.exe  25.9 MB  SHA256 64B85EA56AAD69B96B202790F15E48EBC78D42A263513360847F5BE626A30B33
+  [PASS] 安装包版本资源 = '1.9.9.4'（应为 1.9.9.4）
+  [PASS] 双产物同版：zip version.txt='1.9.9.4' / exe='1.9.9.4'
+════ 核验全绿：双产物齐 + 版本号/指纹一致 ════

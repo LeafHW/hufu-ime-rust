@@ -1,0 +1,37 @@
+PASS: zip 不含本机账号凭据、同步 profile 或 GitHub token 文件
+PASS: zip version.txt = 1.9.9.4
+PASS: 安装器版本 = 1.9.9.4
+PASS: hufu-server.exe zip 与当前构建代码/常量段一致
+PASS: hufu-server.exe 安装器 staging 与当前构建代码/常量段一致
+PASS: hufu-server.exe 无解释器命令特征
+PASS: hufu-render-helper.exe zip 与当前构建代码/常量段一致
+PASS: hufu-render-helper.exe 安装器 staging 与当前构建代码/常量段一致
+PASS: hufu-render-helper.exe 无解释器命令特征
+PASS: hufu-trainer.exe zip 与当前构建代码/常量段一致
+PASS: hufu-trainer.exe 安装器 staging 与当前构建代码/常量段一致
+PASS: hufu-trainer.exe 无解释器命令特征
+PASS: hufu-settings.exe zip 与当前构建代码/常量段一致
+PASS: hufu-settings.exe 安装器 staging 与当前构建代码/常量段一致
+PASS: hufu-settings.exe 无解释器命令特征
+PASS: hufu_tsf.dll zip 与当前构建代码/常量段一致
+PASS: hufu_tsf.dll 安装器 staging 与当前构建代码/常量段一致
+PASS: hufu_tsf.dll 无解释器命令特征
+PASS: hufu_tsf32.dll zip 与当前构建代码/常量段一致
+PASS: hufu_tsf32.dll 安装器 staging 与当前构建代码/常量段一致
+PASS: hufu_tsf32.dll 无解释器命令特征
+PASS: 更新日志是本次版本及日期
+PASS: server 是本次新构建标识
+PASS: 设置壳是本次新构建标识
+PASS: HuFu虎符输入法-v1.9.9.4-无模型.zip 与 11 月 7 日旧包不同
+PASS: HuFuSetup-1.9.9.4.exe 与 11 月 7 日旧包不同
+
+
+Name     : HuFu虎符输入法-v1.9.9.4-无模型.zip
+Bytes    : 32366749
+SHA256   : ADF5D3B7BC5DA1E00F791E064194F9642A58E58EFE111AEA7C7A393F5C5ABAFF
+Modified : 2026-11-10T02:24:36.6661289+08:00
+
+Name     : HuFuSetup-1.9.9.4.exe
+Bytes    : 27135806
+SHA256   : 64B85EA56AAD69B96B202790F15E48EBC78D42A263513360847F5BE626A30B33
+Modified : 2026-11-10T02:25:04.1535593+08:00

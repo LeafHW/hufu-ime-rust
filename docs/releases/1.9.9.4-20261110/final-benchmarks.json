@@ -1,0 +1,140 @@
+{
+  "cli": "E:\\DSH-KF\\hufu\\engine\\target-slim\\x86_64-pc-windows-gnu\\release\\hufu-cli.exe",
+  "references": [],
+  "shards": [
+    {
+      "shard": 0,
+      "same_as_1993": true,
+      "accuracy": [
+        100,
+        100
+      ],
+      "keys": 4045,
+      "early": 1091
+    },
+    {
+      "shard": 1,
+      "same_as_1993": true,
+      "accuracy": [
+        100,
+        100
+      ],
+      "keys": 4246,
+      "early": 1151
+    },
+    {
+      "shard": 2,
+      "same_as_1993": true,
+      "accuracy": [
+        100,
+        100
+      ],
+      "keys": 4125,
+      "early": 1102
+    },
+    {
+      "shard": 3,
+      "same_as_1993": true,
+      "accuracy": [
+        100,
+        100
+      ],
+      "keys": 4179,
+      "early": 1147
+    },
+    {
+      "shard": 4,
+      "same_as_1993": true,
+      "accuracy": [
+        100,
+        100
+      ],
+      "keys": 3963,
+      "early": 1036
+    },
+    {
+      "shard": 5,
+      "same_as_1993": true,
+      "accuracy": [
+        99,
+        100
+      ],
+      "keys": 4026,
+      "early": 1100
+    },
+    {
+      "shard": 6,
+      "same_as_1993": true,
+      "accuracy": [
+        100,
+        100
+      ],
+      "keys": 4320,
+      "early": 1162
+    },
+    {
+      "shard": 7,
+      "same_as_1993": true,
+      "accuracy": [
+        100,
+        100
+      ],
+      "keys": 4242,
+      "early": 1136
+    },
+    {
+      "shard": 8,
+      "same_as_1993": true,
+      "accuracy": [
+        99,
+        100
+      ],
+      "keys": 4119,
+      "early": 1040
+    },
+    {
+      "shard": 9,
+      "same_as_1993": true,
+      "accuracy": [
+        100,
+        100
+      ],
+      "keys": 4167,
+      "early": 1099
+    },
+    {
+      "shard": 10,
+      "same_as_1993": true,
+      "accuracy": [
+        100,
+        100
+      ],
+      "keys": 4381,
+      "early": 1192
+    },
+    {
+      "shard": 11,
+      "same_as_1993": true,
+      "accuracy": [
+        100,
+        100
+      ],
+      "keys": 4303,
+      "early": 1156
+    }
+  ],
+  "notes": [
+    "tbench compares every reported non-timing line per 100-sentence shard; not an exhaustive candidate trace.",
+    "cbench uses four-column cases4.tsv; no skipped two-column fixtures.",
+    "Learning disabled; fixed local scheme/model; historical latency is not a controlled speed comparison."
+  ],
+  "cbench_same_as_reference": true,
+  "cbench_output": "条数 1200  Top1 1198/1200 = 99.83%\n  seed42: 1198/1200 = 99.83%",
+  "totals": {
+    "keys": 50116,
+    "early": 13412,
+    "correct": 1198,
+    "sentences": 1200
+  },
+  "passed": true
+}
