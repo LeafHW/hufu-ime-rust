@@ -10,19 +10,14 @@ use gale_core::theme::Theme;
 use gale_win::d2d::{Align, DrawCmd, FontFamily, Frame};
 
 const COLORS: &[(&str, &str, &str)] = &[
-    ("词提简码色", "简码词", "63c08d"),
-    ("词提二字全码色", "二字全码", "db9b55"),
-    ("词提三字全码色", "三字全码", "70a9e5"),
-    ("词提四字全码色", "四字以上全码", "df7974"),
     ("跟打区背景色", "正文背景", "111315"),
+    ("对打未打底色", "未打底色", "111315"),
     ("打对字色", "打对文字", "e7e4db"),
     ("对打打对底色", "打对底色", "173c2b"),
     ("打错字色", "打错文字", "e36b65"),
     ("对打打错底色", "打错底色", "4b2021"),
     ("词提编码色", "单字编码", "d0c9b9"),
     ("词提角标色", "选重数字", "d0c9b9"),
-    ("词提下划线色", "词下划线", "c9a766"),
-    ("词提底色", "词底色", "222a27"),
 ];
 fn field_label(label: &str) -> &str {
     label.split('（').next().unwrap_or(label)
@@ -151,70 +146,35 @@ fn centered_text(f: &mut Frame, cx: f32, y: f32, size: f32, s: &str, c: [f32; 4]
         align: Align::Center,
     });
 }
-/// A live sample of the hint rules. The old hint page ended with a short
-/// paragraph and roughly 120 DIP of dead space, so changing a toggle gave no
-/// visible feedback until the next practice.
+/// A style sample for the remaining single-character hints.
 fn hint_preview(f: &mut Frame, m: &Model, t: &Theme, x: f32, y: f32, pw: f32) {
     let p = tokens(t);
-    round(f, x + 24., y, pw - 48., 102., 7., p.surface2, Some(p.line));
-    text(f, x + 38., y + 12., 14., "实时预览", p.text);
-    text(
-        f,
-        x + 112.,
-        y + 12.,
-        14.,
-        "按当前开关与颜色绘制，改完立即生效",
-        p.muted,
-    );
+    round(f, x + 24., y, pw - 48., 118., 7., p.surface2, Some(p.line));
+    text(f, x + 38., y + 12., 15., "提示样式预览", p.text);
     let show_code = enabled(m, "hint_show_code", true);
     let show_rank = enabled(m, "hint_show_rank", true);
-    let color_words = enabled(m, "hint_color_words", true);
-    let underline = enabled(m, "hint_underline", false);
-    let word_bg = enabled(m, "hint_word_bg", false);
     let hint_size = m
         .field("hint_font_size")
         .parse::<f32>()
         .unwrap_or(14.)
-        .clamp(14., 28.)
-        .min(18.);
-    let bg = parse_color(&color_hex(m, "词提底色", "222a27")).unwrap_or(p.hint_bg);
-    let cell = ((pw - 96.) / 4.).max(80.);
-    let samples = [
-        ("简码词", "abc", "词提简码色", "63c08d"),
-        ("二字", "abcd", "词提二字全码色", "db9b55"),
-        ("三个字", "abcd", "词提三字全码色", "70a9e5"),
-        ("四字以上", "abcd", "词提四字以上全码色", "df7974"),
-    ];
-    for (i, (word, code, key, fallback)) in samples.iter().enumerate() {
+        .clamp(14., 28.);
+    let cell = (pw - 80.) / 3.;
+    for (i, (word, code)) in [("字", "a"), ("字", "ab"), ("字", "abc")]
+        .iter()
+        .enumerate()
+    {
         let sx = x + 40. + i as f32 * cell;
-        let color = if color_words {
-            parse_color(&color_hex(m, key, fallback)).unwrap_or(p.text2)
-        } else {
-            p.text2
-        };
-        let wy = y + 38.;
-        if word_bg {
-            round(
-                f,
-                sx - 8.,
-                wy - 6.,
-                92.,
-                42.,
-                6.,
-                bg,
-                Some(alpha(p.hint_underline, 0.25)),
-            );
-        }
-        body_text(f, sx, wy, 20., *word, color);
-        if underline {
-            line(f, sx, wy + 25., 72., alpha(color, 0.35));
-        }
+        body_text(f, sx, y + 42., 24., *word, p.text);
         if show_code {
-            mono(f, sx, y + 64., hint_size, *code, color);
+            mono(f, sx, y + 77., hint_size, *code, p.hint_code);
         }
         if show_rank {
-            let code_w = code.chars().count() as f32 * hint_size * 0.6;
-            mono(f, sx + code_w + 2., y + 60., hint_size, "2", color);
+            let code_w = if show_code {
+                code.chars().count() as f32 * hint_size * 0.6
+            } else {
+                0.
+            };
+            mono(f, sx + code_w + 2., y + 73., hint_size, "2", p.hint_badge);
         }
     }
 }
@@ -276,9 +236,9 @@ pub(super) fn fields(m: &Model, x: f32, y: f32, pw: f32, _ph: f32) -> Vec<FieldS
 /// the hints page fit on screen.
 pub(super) fn content_height(m: &Model, pw: f32) -> f32 {
     match tab(m) {
-        0 => 690.,
+        0 => 588.,
         1 => 930.,
-        _ => color_edit_y(pw) + 106. + 168. + 16.,
+        _ => color_edit_y(pw) + 106. + 140. + 74.,
     }
 }
 pub(super) fn draw(
@@ -297,7 +257,7 @@ pub(super) fn draw(
     // (see modals::fit_panel) so scrolling never reveals a half-cut tab.
     let tab_w = 96.;
     let tab_gap = 6.;
-    for (i, title) in ["词提", "成绩单", "颜色"].iter().enumerate() {
+    for (i, title) in ["练习", "成绩单", "颜色"].iter().enumerate() {
         let tx = x + 24. + i as f32 * (tab_w + tab_gap);
         let on = tab(m) == i as u8;
         round(
@@ -331,28 +291,20 @@ pub(super) fn draw(
     }
     match tab(m) {
         0 => {
-            text(f, x + 24., y + 125., 16., "提示内容与显示方式", p.text);
+            text(f, x + 24., y + 125., 16., "单字练习提示", p.text);
             let rows = [
                 (
                     "hint_show_code",
-                    "显示编码",
-                    "在词下方显示当前词库编码",
+                    "显示单字编码",
+                    "在练习字下方显示当前码表编码",
                     true,
                 ),
                 (
                     "hint_show_rank",
                     "显示选重数字",
-                    "使用候选位次数字，单字保持中性色",
+                    "显示候选位次，辅助练习选重",
                     true,
                 ),
-                (
-                    "hint_color_words",
-                    "多字词着色",
-                    "简码绿 / 二字全码橙 / 三字蓝 / 四字以上红",
-                    true,
-                ),
-                ("hint_underline", "词下划线", "显示词边界下划线", false),
-                ("hint_word_bg", "词底色", "使用颜色页指定的词底色", false),
             ];
             for (i, (key, title, desc, default)) in rows.iter().enumerate() {
                 row(
@@ -361,7 +313,7 @@ pub(super) fn draw(
                     m,
                     t,
                     x + 24.,
-                    y + 154. + i as f32 * 58.,
+                    y + 154. + i as f32 * 64.,
                     pw - 48.,
                     key,
                     title,
@@ -369,12 +321,12 @@ pub(super) fn draw(
                     *default,
                 );
             }
-            text(f, x + 24., y + 459., 15., "编码与选重提示字号", p.text);
+            text(f, x + 24., y + 299., 15., "编码与选重提示字号", p.text);
             let size = m.field("hint_font_size");
             mono(
                 f,
                 x + 226.,
-                y + 457.,
+                y + 297.,
                 16.,
                 if size.is_empty() { "14" } else { &size },
                 p.accent,
@@ -383,7 +335,7 @@ pub(super) fn draw(
                 f,
                 hs,
                 x + 298.,
-                y + 452.,
+                y + 290.,
                 44.,
                 "−",
                 crate::aux_marker("pref_step:hint_font_size:-1"),
@@ -394,16 +346,25 @@ pub(super) fn draw(
                 f,
                 hs,
                 x + 350.,
-                y + 452.,
+                y + 290.,
                 44.,
                 "+",
                 crate::aux_marker("pref_step:hint_font_size:1"),
                 t,
                 false,
             );
-            text_block(f, x + 24., y + 496., pw - 48., 14., 22., 2,
-                "词提只提供当前词库的静态编码；赛制规则优先。单字与标点不着词色，错字始终使用打错文字色。", p.muted);
-            hint_preview(f, m, t, x, y + 550., pw);
+            text_block(
+                f,
+                x + 24.,
+                y + 340.,
+                pw - 48.,
+                15.,
+                22.,
+                2,
+                "以上提示用于单字练习；文章练习不显示编码提示。赛制遵循本轮规则。",
+                p.muted,
+            );
+            hint_preview(f, m, t, x, y + 396., pw);
         }
         1 => {
             row(
@@ -581,7 +542,7 @@ pub(super) fn draw(
                 x + 24.,
                 y + 151.,
                 14.,
-                "选一项后输入六位十六进制颜色；默认语义：简码绿 / 二字全码橙 / 三字全码蓝 / 四字以上红。",
+                "选择要调整的文字或背景，再输入六位颜色值。",
                 p.muted,
             );
             let columns = color_columns(pw);
@@ -626,13 +587,18 @@ pub(super) fn draw(
                 );
             }
             let selected = selected_color(m);
+            let selected_label = COLORS
+                .iter()
+                .find(|(key, _, _)| *key == selected)
+                .map(|(_, label, _)| *label)
+                .unwrap_or(COLORS[0].1);
             let edit_y = y + color_edit_y(pw);
             text(
                 f,
                 x + 24.,
                 edit_y,
                 15.,
-                format!("正在编辑：{selected}"),
+                format!("正在编辑：{selected_label}"),
                 p.text,
             );
             round(
@@ -685,62 +651,41 @@ pub(super) fn draw(
                 x + 24.,
                 preview_y,
                 pw - 48.,
-                168.,
+                140.,
                 7.,
-                p.bg,
+                p.article_bg,
                 Some(p.line),
             );
-            let max_code = if m.max_code_length == 0 {
-                4
-            } else {
-                m.max_code_length
-            };
-            let full_code = "abcd"
-                .chars()
-                .cycle()
-                .take(max_code.min(16))
-                .collect::<String>();
-            let short_code = "abc"
-                .chars()
-                .cycle()
-                .take(max_code.saturating_sub(1).clamp(1, 15))
-                .collect::<String>();
-            let sample_width = (pw - 80.) / 5.;
-            for (i, (sample, code)) in [
-                ("字", "a"),
-                ("简码词", short_code.as_str()),
-                ("二字", full_code.as_str()),
-                ("三个字", full_code.as_str()),
-                ("四字以上", full_code.as_str()),
+            text(
+                f,
+                x + 38.,
+                preview_y + 10.,
+                15.,
+                "正文与单字提示预览",
+                p.text2,
+            );
+            let sample_width = (pw - 80.) / 3.;
+            for (i, (label, color, bg)) in [
+                ("未打", p.text, p.bg_pending),
+                ("打对", p.correct, p.bg_done),
+                ("打错", p.red, p.bg_wrong),
             ]
             .iter()
             .enumerate()
             {
                 let sx = x + 40. + i as f32 * sample_width;
-                let c = crate::ui::hint_word_tint(&p, sample, code, max_code).unwrap_or(p.text);
-                body_text(f, sx, preview_y + 34., 22., *sample, c);
-                mono(
-                    f,
-                    sx,
-                    preview_y + 70.,
-                    14.,
-                    *code,
-                    if i == 0 { p.hint_code } else { c },
-                );
+                text(f, sx, preview_y + 35., 15., *label, p.muted);
+                round(f, sx - 5., preview_y + 58., 66., 35., 4., *bg, None);
+                body_text(f, sx, preview_y + 61., 24., "示例", *color);
+                if i == 0 {
+                    mono(f, sx, preview_y + 104., 15., "abc", p.hint_code);
+                    mono(f, sx + 30., preview_y + 100., 15., "2", p.hint_badge);
+                }
             }
-            text_block(f, x + 40., preview_y + 106., pw - 80., 14., 23., 2,
-                &format!("当前方案最大码长为 {max_code}：编码不足 {max_code} 码的多字词用简码色；满码词按二字、三字、四字以上分色。单字与标点使用正文色。"), p.muted);
         }
     }
     line(f, x, y + ph - 62., pw, p.line);
-    text(
-        f,
-        x + 24.,
-        y + ph - 38.,
-        14.,
-        "设置独立保存 · 不更改输入法配色 · 滚轮查看更多",
-        p.muted,
-    );
+    text(f, x + 24., y + ph - 38., 14., "设置仅用于跟打器", p.muted);
     btn(
         f,
         hs,

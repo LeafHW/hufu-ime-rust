@@ -1,4 +1,4 @@
-//! Quiet Room: design tokens, native text, and distinct article / drill layouts.
+//! Quiet Room: responsive chrome, native text, and distinct article / drill layouts.
 use crate::{
     modals::{Action, Hit, Modal, Model},
     session::{Session, SessionSource},
@@ -388,7 +388,7 @@ impl Animation {
 }
 pub fn body_metrics(sess: &Session, cfg: &Config, w: f32) -> (f32, f32, f32) {
     let single = sess.source == SessionSource::Single;
-    let bw = (w - 64.).min(if single { 940. } else { 920. }).max(180.);
+    let bw = (w - 64.).min(if single { 960. } else { 1000. }).max(180.);
     let fs = (if single {
         cfg.font_size * 42. / 36.
     } else {
@@ -443,12 +443,12 @@ fn chip(
         action: a,
     });
 }
-// The chrome uses the resolved theme, including user color overrides.
+// The chrome uses the resolved theme, including user overrides.
 fn draw_chrome(
     f: &mut Frame,
     hs: &mut Vec<Hit>,
     sess: &Session,
-    cfg: &Config,
+    _cfg: &Config,
     m: &Model,
     t: &Theme,
     w: f32,
@@ -456,268 +456,27 @@ fn draw_chrome(
 ) {
     let p = tokens(t);
     rect(f, 0., 0., w, h, p.bg);
-    rect(f, 0., 0., w, 55., alpha(p.text, 0.018));
-    line(f, 0., 55., w, p.line);
-    round(
-        f,
-        22.,
-        14.,
-        26.,
-        26.,
-        7.,
-        alpha(p.accent, 0.035),
-        Some(alpha(p.accent, 0.35)),
-    );
-    for yy in [19., 35.] {
-        rect(f, 30., yy, 10., 1., p.accent);
-    }
-    for yy in [21., 32.] {
-        rect(f, 31., yy, 1., 3., p.accent);
-        rect(f, 38., yy, 1., 3., p.accent);
-    }
-    for (dx, dy) in [(0., 0.), (1., 1.), (2., 2.), (3., 3.)] {
-        rect(f, 31. + dx, 24. + dy, 1., 1., p.accent);
-        rect(f, 38. - dx, 24. + dy, 1., 1., p.accent);
-        rect(f, 31. + dx, 31. - dy, 1., 1., p.accent);
-        rect(f, 38. - dx, 31. - dy, 1., 1., p.accent);
-    }
-    text(f, 57., 18., FONT_LABEL, "虎符", p.text);
-    text(f, 94., 20., FONT_HINT, "跟打", p.muted);
-    rect(f, 132., 22., 1., 13., p.line2);
-    // The suffix ("· 第 N 段") belongs to the same width budget as the title;
-    // clipping only the title let long article names run into the mode chips or
-    // get chopped mid-glyph at the clip edge.
-    let title_w = if w > 900. {
-        if w > 1150. {
-            247.
-        } else {
-            182.
-        }
-    } else {
-        (w - 260.).max(20.)
-    };
+    rect(f, 0., 0., w, 48., p.bg2);
+    line(f, 0., 48., w, p.line);
+    body_text(f, 22., 11., 22., "符", p.accent);
+    text(f, 53., 16., FONT_LABEL, "虎符 · 跟打", p.text2);
+    rect(f, 143., 16., 1., 17., p.line2);
     f.push(DrawCmd::PushClip {
-        x: 149.,
+        x: 158.,
         y: 8.,
-        w: title_w,
-        h: 40.,
+        w: (w - 294.).max(40.),
+        h: 32.,
     });
-    let title = &sess.title;
-    let para = sess.index + 1;
-    let unit = if sess.source == SessionSource::Single {
-        "组"
-    } else {
-        "段"
-    };
-    let suffix = format!("  ·  第 {para} {unit}");
-    let budget = ((title_w / FONT_LABEL) as usize)
-        .saturating_sub(suffix.chars().count() + 1)
-        .max(4);
     text(
         f,
-        149.,
-        19.,
+        158.,
+        16.,
         FONT_LABEL,
-        format!("{}{}", elide(title, budget), suffix),
-        p.text2,
+        elide_width(&sess.title, (w - 298.).max(40.), FONT_LABEL),
+        p.muted,
     );
     f.push(DrawCmd::PopClip);
-    if w > 900. && m.modal == Modal::Report {
-        let cx = if w > 1150. { 410. } else { 345. };
-        chip(
-            f,
-            hs,
-            cx,
-            8.,
-            92.,
-            "整场赛报",
-            Action::None,
-            &p,
-            true,
-        );
-        chip(
-            f,
-            hs,
-            cx + 98.,
-            8.,
-            62.,
-            if m.race { "赛制" } else { "练习" },
-            Action::None,
-            &p,
-            false,
-        );
-        text(
-            f,
-            cx,
-            35.,
-            FONT_HINT,
-            if m.race {
-                "词提按规则关闭 · 成绩按赛制记录"
-            } else {
-                "练习成绩 · 保留规则与输入依据"
-            },
-            p.muted,
-        );
-    } else if w > 900. {
-        let cx = if w > 1150. { 410. } else { 345. };
-        chip(
-            f,
-            hs,
-            cx,
-            8.,
-            72.,
-            if m.race {
-                "赛制"
-            } else if sess.source == SessionSource::Single {
-                "单字练习"
-            } else {
-                "群文练习"
-            },
-            Action::ToggleRace,
-            &p,
-            true,
-        );
-        chip(
-            f,
-            hs,
-            cx + 78.,
-            8.,
-            78.,
-            if sess.source == SessionSource::Single {
-                if m.hints {
-                    "字提·开"
-                } else {
-                    "字提·关"
-                }
-            } else {
-                "自定义规则"
-            },
-            if sess.source == SessionSource::Single {
-                Action::ToggleHints
-            } else {
-                Action::Open(Modal::Rules)
-            },
-            &p,
-            sess.source == SessionSource::Single && m.hints,
-        );
-        chip(
-            f,
-            hs,
-            cx + 162.,
-            8.,
-            74.,
-            if sess.source == SessionSource::Single {
-                "居中行"
-            } else {
-                // 【减法 2026-11-09】词提已下线：文章模式这枚芯片改作发文入口。
-                "发文"
-            },
-            if sess.source == SessionSource::Single {
-                Action::None
-            } else {
-                Action::PostArticle
-            },
-            &p,
-            false,
-        );
-        // 【群三件套】读群文被打断/延迟时，在练习屏给出一键载入入口。
-        if sess.source != SessionSource::Single && !m.pending_source.is_empty() {
-            chip(
-                f,
-                hs,
-                cx + 240.,
-                8.,
-                150.,
-                "待读群文 · 载入",
-                Action::AcceptDraft,
-                &p,
-                true,
-            );
-        }
-        if sess.source == SessionSource::Single {
-            // 单字练习屏快捷设置行（2026-11-09）：乱序/段长/达标击力直接在练习屏
-            // 可调——此前只藏在文库弹窗，用户找不到入口。乱序与段长进下一段生效，
-            // 达标阈值即时生效（结算判定读 single_cfg）。
-            let shuffle = m.field("single_shuffle") == "true";
-            let seg: u16 = m.field("single_seg").parse().unwrap_or(20);
-            let target = m.field("single_target_keystroke");
-            chip(
-                f,
-                hs,
-                cx,
-                30.,
-                92.,
-                if shuffle { "乱序 · 开" } else { "乱序 · 关" },
-                crate::aux_marker("single_shuffle"),
-                &p,
-                shuffle,
-            );
-            chip(
-                f,
-                hs,
-                cx + 98.,
-                30.,
-                108.,
-                format!("每段 {seg} 字 ⟳").as_str(),
-                crate::aux_marker("single_seg_cycle"),
-                &p,
-                false,
-            );
-            chip(
-                f,
-                hs,
-                cx + 212.,
-                30.,
-                122.,
-                format!("达标击力 {target} ⟳").as_str(),
-                crate::aux_marker("single_target_cycle"),
-                &p,
-                false,
-            );
-            text(
-                f,
-                cx + 342.,
-                35.,
-                FONT_HINT,
-                "乱序/段长下段生效 · 击力即时 · 乱序关=原序",
-                p.muted,
-            );
-        } else {
-            text(
-                f,
-                cx,
-                35.,
-                FONT_HINT,
-                if m.race {
-                    "词提按规则关闭 · 开打后冻结规则"
-                } else if m.hints {
-                    "• 词提已开启 · 自定义规则（非赛制）"
-                } else {
-                    "自定义规则 · 首键计时"
-                },
-                p.muted,
-            );
-        }
-    }
-    if w > 1100. {
-        text(
-            f,
-            w - 239.,
-            20.,
-            FONT_HINT,
-            format!(
-                "● {} · {}",
-                t.name,
-                if matches!(t.name.as_str(), "宣纸" | "青瓷") {
-                    "浅色"
-                } else {
-                    "深色"
-                }
-            ),
-            p.muted,
-        );
-    }
-    for (i, (label, a)) in [
+    for (i, (label, action)) in [
         ("—", Action::Minimize),
         ("□", Action::Maximize),
         ("×", Action::Exit),
@@ -725,115 +484,103 @@ fn draw_chrome(
     .into_iter()
     .enumerate()
     {
-        let xx = w - 96. + i as f32 * 28.;
-        text(f, xx + 7., 18., 13., label, p.muted);
+        let xx = w - 114. + i as f32 * 36.;
+        text(f, xx + 11., 15., 14., label, p.muted);
         hs.push(Hit {
             x: xx,
-            y: 8.,
-            w: 28.,
-            h: 38.,
-            action: a,
+            y: 4.,
+            w: 36.,
+            h: 40.,
+            action,
         });
     }
-    rect(f, 0., h - 37., w, 37., alpha(p.bg2, 0.8));
-    line(f, 0., h - 37., w, p.line);
-    // Left status dot used to sit on top of the first keycap.
-    round(f, 8., h - 20., 4., 4., 2., p.accent, None);
-    let sx = 20.;
-    if w > 1250. {
-        text(
-            f,
-            700.,
-            h - 28.,
-            FONT_HINT,
-            elide(
-                if m.paused {
-                    "已暂停 · 返回窗口继续"
-                } else {
-                    &m.status
-                },
-                ((w - 1050.) / FONT_HINT).max(6.) as usize,
-            ),
-            p.muted,
-        );
-    }
-    let report = m.modal == Modal::Report;
-    let actions: Vec<(&str, &str, Action)> = if report {
-        vec![
-            ("C", "复制整份", Action::CopyRace),
-            ("S", "复制发群", Action::CopyRace),
-            ("E", "导出", Action::ExportImage),
-            ("Esc", "关闭", Action::Close),
-        ]
+    let y = 60.;
+    if m.modal == Modal::Report {
+        button(f, hs, 24., y, 100., "返回练习", Action::Close, t, false);
     } else {
-        // 【减法定稿 2026-11-09】F2 载文退役：本地文库/单字进「文库」面板，
-        // 成绩记录进「赛报」面板，全部按钮化，不再占热键。
-        vec![
-            ("F5", "选群", Action::Open(Modal::Groups)),
-            ("F1", "设置", Action::Open(Modal::Preferences)),
-            ("", "赛报", Action::Open(Modal::Report)),
-            ("", "文库", Action::Open(Modal::Library)),
-            ("F7", "外观", Action::Open(Modal::Appearance)),
-            ("F8", "在线", Action::Open(Modal::Online)),
-            ("F9", "规则", Action::Open(Modal::Rules)),
-            ("F10", "分析", crate::aux_marker("show_full_analysis")),
-        ]
-    };
-    let spacing = if report { 112. } else { ((w - 180.) / 8.).clamp(70., 106.) };
-    for (i, (key, label, a)) in actions.into_iter().enumerate() {
-        let xx = sx + i as f32 * spacing;
-        let kw = if key == "Enter" {
-            46.
-        } else if key.chars().count() >= 3 {
-            34.
-        } else {
-            29.
-        };
-        round(
-            f,
-            xx,
-            h - 27.,
-            kw,
-            22.,
-            4.,
-            alpha(p.text, 0.015),
-            Some(p.line2),
-        );
-        // Centre the key label inside its cap; the old fixed +3 offset left
-        // F10/Enter labels visibly off-centre on narrow caps.
-        f.push(DrawCmd::TextRun {
-            x: xx + kw / 2.,
-            y: h - 26.,
-            h: 14.,
-            text: key.to_string(),
-            color: p.text2,
-            font: FontFamily::Mono,
-            align: Align::Center,
-        });
-        text(f, xx + kw + 5., h - 26., FONT_HINT, label, p.muted);
-        hs.push(Hit {
-            x: xx,
-            y: h - 34.,
-            w: spacing - 2.,
-            h: 32.,
-            action: a,
-        });
-    }
-    if w > 1500. {
-        right(
-            f,
-            w - 22.,
-            h - 28.,
-            FONT_HINT,
-            format!(
-                "今日 {} 字   |   {} / {} 字",
-                cfg.today_chars,
-                sess.comparer.pos,
-                sess.current_segment().text.chars().count()
+        let draft = !m.pending_source.is_empty();
+        let mut xx = 24.;
+        for (label, ww, action, selected) in [
+            ("文库", 78., Action::Open(Modal::Library), false),
+            ("选群  F5", 100., Action::Open(Modal::Groups), false),
+            (
+                if draft {
+                    "载入待读群文"
+                } else {
+                    "读取群文  F4"
+                },
+                138.,
+                if draft {
+                    Action::AcceptDraft
+                } else {
+                    Action::ReadGroup
+                },
+                draft,
             ),
-            p.muted,
-        );
+            ("重打  F3", 100., Action::Restart, false),
+        ] {
+            button(f, hs, xx, y, ww, label, action, t, selected);
+            xx += ww + 8.;
+        }
     }
+    button(
+        f,
+        hs,
+        w - 110.,
+        y,
+        86.,
+        "更多 ⋯",
+        Action::Open(Modal::More),
+        t,
+        false,
+    );
+    line(f, 0., 104., w, p.line);
+    rect(f, 0., h - 30., w, 30., p.bg2);
+    line(f, 0., h - 30., w, p.line);
+    round(f, 20., h - 17., 4., 4., 2., p.muted, None);
+    let target = m
+        .bound
+        .and_then(|i| m.groups.get(i))
+        .map(|name| format!("目标群 · {}", elide(name, 18)))
+        .unwrap_or_else(|| "未选择群聊".into());
+    let notice = if m.status.is_empty() || m.status.starts_with("就绪") {
+        target
+    } else {
+        format!("{target} · {}", m.status)
+    };
+    f.push(DrawCmd::PushClip {
+        x: 32.,
+        y: h - 27.,
+        w: (w - 218.).max(100.),
+        h: 24.,
+    });
+    text(
+        f,
+        32.,
+        h - 24.,
+        FONT_HINT,
+        elide_width(&notice, (w - 224.).max(100.), FONT_HINT),
+        p.muted,
+    );
+    f.push(DrawCmd::PopClip);
+    right(
+        f,
+        w - 24.,
+        h - 24.,
+        FONT_HINT,
+        if m.paused {
+            "已暂停"
+        } else if m.modal == Modal::Report {
+            "成绩记录"
+        } else if sess.phase == crate::session::Phase::Done {
+            "本段完成"
+        } else if sess.started_ms.is_some() {
+            "练习中"
+        } else {
+            "首键开始计时"
+        },
+        p.muted,
+    );
 }
 /// Effective article line height. Only an actually visible hint row (codes or
 /// selection digits) may grow the line; turning both off should reclaim the
@@ -843,64 +590,6 @@ pub fn line_height_for_anchor(cfg: &Config, fs: f32, base: f32, hints_visible: b
         base.max(fs + cfg.hint_font_size + 18.)
     } else {
         base
-    }
-}
-fn rail(f: &mut Frame, sess: &Session, p: &Palette, x: f32, y: f32, bw: f32) {
-    let n = sess.total_segments().max(1);
-    let visible = n.min(8);
-    let first = if n > visible {
-        sess.index.saturating_sub(3).min(n - visible)
-    } else {
-        0
-    };
-    let gap = 15.;
-    let sw = (bw - gap * (visible - 1) as f32) / visible as f32;
-    for i in first..first + visible {
-        let xx = x + (i - first) as f32 * (sw + gap);
-        let done = sess.results.get(i).is_some_and(Option::is_some);
-        let on = i == sess.index;
-        let color = if on { p.accent } else { p.muted };
-        text(
-            f,
-            xx,
-            y,
-            FONT_HINT,
-            format!(
-                "{} · {}{}",
-                i + 1,
-                elide(&sess.segments[i].mark, ((sw - 46.) / FONT_HINT) as usize),
-                if done { " ✓" } else { "" }
-            ),
-            color,
-        );
-        rect(f, xx, y + 19., sw, if on { 3. } else { 2. }, p.line);
-        let progress = if done {
-            1.
-        } else if on {
-            sess.comparer.pos as f32 / sess.current_segment().text.chars().count().max(1) as f32
-        } else {
-            0.
-        };
-        rect(
-            f,
-            xx,
-            y + 19.,
-            sw * progress,
-            2.,
-            alpha(p.accent, if on { 1. } else { 0.38 }),
-        );
-        if on {
-            round(
-                f,
-                xx + sw * progress - 3.,
-                y + 17.,
-                7.,
-                7.,
-                3.5,
-                p.accent,
-                None,
-            );
-        }
     }
 }
 pub fn build(
@@ -922,51 +611,11 @@ pub fn build(
     if m.modal == Modal::Report {
         return f;
     }
-    // 词不拆行（P2）：main 的 wrap_text 是纯像素宽贪心、会切断词，且只在
-    // 段/字号/宽度变化时重算（词提是异步到达的）。这里每帧按词边界把跨行
-    // 词整体移到后一行；词内字符推进量取自原行的 DirectWrite 实测位置，
-    // 下划线/编码提示随新行位置自动跟随。单字练习的 words 全是 len=1，
-    // rewrap_words 走快路径返回 None。
-    let owned_lines = if m.words.is_empty() {
-        None
-    } else {
-        gale_win::d2d::rewrap_words(
-            lines,
-            &m.words.iter().map(|z| (z.start, z.len)).collect::<Vec<_>>(),
-        )
-    };
-    let lines: &[(usize, String, Vec<f32>)] =
-        owned_lines.as_ref().map(|v| v.as_slice()).unwrap_or(lines);
     let p = tokens(t);
-    if m.history_expanded && h < 680. && m.modal == Modal::None {
-        text(&mut f, 24., 78., 16., "成绩记录 · 收起后返回正文", p.text2);
-        crate::history::draw(&mut f, hs, sess, cfg, m, t, w, h);
-        return f;
-    }
-    let hints_visible = gale_core::rules::hints_effective(m.hints, m.race) && cfg.hint_style != 2;
-    let word_colors: Vec<Option<[f32; 4]>> = m
-        .words
-        .iter()
-        .map(|word| {
-            if hints_visible && cfg.hint_color_words {
-                word.code.as_deref().and_then(|code| {
-                    hint_word_tint(
-                        &p,
-                        &word.text,
-                        code,
-                        if m.max_code_length == 0 {
-                            4
-                        } else {
-                            m.max_code_length
-                        },
-                    )
-                })
-            } else {
-                None
-            }
-        })
-        .collect();
     let single = sess.source == SessionSource::Single;
+    let hints_visible = single
+        && gale_core::rules::hints_effective(m.hints, m.race)
+        && (cfg.hint_show_code || cfg.hint_show_rank);
     let (bw, fs, base_lh) = body_metrics(sess, cfg, w);
     let lh = line_height_for_anchor(cfg, fs, base_lh, hints_visible);
     let x = (w - bw) / 2.;
@@ -974,268 +623,141 @@ pub fn build(
     let live = sess.live_stats(now_ms);
     let count = sess.current_segment().text.chars().count();
     let elapsed = sess.elapsed_ms(now_ms) as f64 / 1000.;
-    // 顶栏两行式（整改 6）：第一行 = 段号/进度（FONT_LABEL+1）· 计时 · 当前速度
-    // （accent 伪粗）；第二行 = 错字/退格/废码/码长/键准小指标（FONT_HINT、竖线
-    // 分隔、等距分组）。窄窗（cw<720）自动省略低优先级的码长/键准。
-    let head1 = 78.;
-    let head2 = 104.;
-    let para_title_size = FONT_LABEL + 1.;
-    // 当前速度：accent + 伪粗（0.6px 偏移二次描画；D2D 无独立粗体）。
-    let speed_mono = |f: &mut Frame, x: f32, y: f32, size: f32, s: &str, c: [f32; 4]| {
-        mono(f, x + 0.6, y + 0.4, size, s, c);
-        mono(f, x, y, size, s, c);
-    };
-    // 第二行指标组：label + 等宽值水平排布，组间竖线分隔。
-    let metric_row =
-        |f: &mut Frame, x: f32, y: f32, w: f32, p: &Palette, items: &[(String, String, bool)]| {
-            let n = items.iter().filter(|z| z.2).count().max(1);
-            let pitch = (w / n as f32).min(128.);
-            let mut i = 0;
-            for (label, value, shown) in items {
-                if !shown {
-                    continue;
-                }
-                let gx = x + i as f32 * pitch;
-                if i > 0 {
-                    rect(f, gx - 14., y - 11., 1., 16., p.line);
-                }
-                text(f, gx, y, FONT_HINT, label, p.muted);
-                mono(f, gx + 40., y - 1., 16., value, p.text2);
-                i += 1;
-            }
-        };
-    let top = if single { 165. } else { 200. };
-    let history_h = if m.history_expanded { 192. } else { 0. };
-    let completion_h = if sess.phase == crate::session::Phase::Done {
-        48.
-    } else {
-        0.
-    };
-    let bottom = (h - 127. - history_h - completion_h).max(top + fs + 20.);
-    let ledger_top = h - 78. - history_h;
-    // Single drills at the 800x600 minimum cannot fit a previous line, the
-    // "居中行" label and the group footer without overlapping the metrics.
-    // Keep the current line, drop the decoration.
-    let tight_single = single && (bottom - top) < lh * 2.6 + 30.;
-    // The article backdrop must be painted before faded neighbouring rows,
-    // otherwise it covers the previous/next line in single-character drill.
+    let top = if single { 236. } else { 208. };
+    let bottom = h - 90.;
     rect(
         &mut f,
-        x - 14.,
-        top - 12.,
-        bw + 28.,
-        (bottom - top + 28.).max(1.),
+        x - 12.,
+        top - 8.,
+        bw + 24.,
+        (bottom - top + 16.).max(1.),
         p.article_bg,
     );
+    let speed = format!("{:.1}", live.para_speed);
+    let speed_size = 30_f32.min(112. / (speed.len().max(1) as f32 * 0.6));
+    mono(&mut f, x, 117., speed_size, speed, p.accent);
+    text(&mut f, x + 116., 135., FONT_HINT, "字/分", p.muted);
+    let duration = format!("{:02}:{:04.1}", (elapsed / 60.) as u64, elapsed % 60.);
+    let mut metrics = vec![
+        ("击键 / 秒", format!("{:.2}", live.para_keys_per_sec)),
+        ("码长", format!("{:.2}", live.para_code_len)),
+        ("键准", format!("{:.1}%", live.para_accuracy)),
+        ("错字", sess.comparer.wrong.to_string()),
+    ];
+    if w >= 900. {
+        metrics.push(("用时", duration.clone()));
+    }
+    let pitch = (bw - 156.).max(320.) / metrics.len() as f32;
+    for (i, (label, value)) in metrics.iter().enumerate() {
+        let xx = x + 156. + i as f32 * pitch;
+        text(&mut f, xx, 116., FONT_HINT, *label, p.muted);
+        mono(&mut f, xx, 138., 18., value, p.text2);
+    }
+    let progress = format!(
+        "第 {} / {} {} · {} / {} 字{}",
+        sess.index + 1,
+        sess.total_segments(),
+        if single { "组" } else { "段" },
+        pos,
+        count,
+        if m.race { " · 赛制" } else { "" }
+    );
+    text(
+        &mut f,
+        x,
+        164.,
+        FONT_HINT,
+        elide_width(&progress, if w < 900. { bw - 116. } else { bw }, FONT_HINT),
+        p.muted,
+    );
+    if w < 900. {
+        right(&mut f, x + bw, 164., FONT_HINT, duration, p.muted);
+    }
+    rect(&mut f, x, 185., bw, 2., p.line);
+    rect(
+        &mut f,
+        x,
+        185.,
+        bw * (pos as f32 / count.max(1) as f32).clamp(0., 1.),
+        2.,
+        p.accent,
+    );
     if single {
-        text(
-            &mut f,
-            x,
-            head1,
-            para_title_size,
-            format!(
-                "第 {} / {} 组 · {} · 单字练习",
-                sess.index + 1,
-                sess.total_segments(),
-                elide(&sess.title, 18)
-            ),
-            p.text2,
-        );
-        right(
-            &mut f,
-            x + bw - 96.,
-            head1 + 2.,
-            FONT_HINT,
-            format!("{:02}:{:04.1}", (elapsed / 60.) as u64, elapsed % 60.),
-            p.muted,
-        );
-        speed_mono(
-            &mut f,
-            x + bw,
-            head1 - 4.,
-            22.,
-            &format!("{:.1}", live.para_speed),
-            p.accent,
-        );
-        right(&mut f, x + bw, head1 + 18., FONT_HINT, "字/分", p.muted);
-        metric_row(
-            &mut f,
-            x,
-            head2,
-            bw.min(720.),
-            &p,
-            &[
-                ("错字".into(), sess.comparer.wrong.to_string(), true),
-                ("退格".into(), sess.comparer.backspaces.to_string(), true),
-                ("废码".into(), sess.stats.waste_codes.to_string(), true),
-                (
-                    "码长".into(),
-                    format!("{:.2}", live.para_code_len),
-                    bw >= 720.,
-                ),
-                (
-                    "键准".into(),
-                    format!("{:.1}%", live.para_accuracy),
-                    bw >= 720.,
-                ),
-            ],
-        );
-        text(
-            &mut f,
-            x,
-            132.,
-            14.,
-            format!(
-                "击键目标 ≥ {} 键/秒 · 当前 {:.2}{}",
-                if m.field("single_target_keystroke").is_empty() {
-                    "3.0".into()
+        let shuffle = m.field("single_shuffle") == "true";
+        let seg = m.field("single_seg").parse::<u16>().unwrap_or(20);
+        let target = m.field("single_target_keystroke");
+        let target = if target.is_empty() { "3.0" } else { &target };
+        let mut xx = x;
+        for (label, ww, action, on) in [
+            (
+                if shuffle {
+                    "乱序 · 开".to_string()
                 } else {
-                    m.field("single_target_keystroke")
+                    "乱序 · 关".to_string()
                 },
-                live.para_keys_per_sec,
-                if sess.phase == crate::session::Phase::Done {
-                    format!(" · {}", m.field("single_target_status"))
+                92.,
+                crate::aux_marker("single_shuffle"),
+                shuffle,
+            ),
+            (
+                format!("每组 {seg} 字 ↻"),
+                118.,
+                crate::aux_marker("single_seg_cycle"),
+                false,
+            ),
+            (
+                format!("达标 {target} 键/秒 ↻"),
+                162.,
+                crate::aux_marker("single_target_cycle"),
+                false,
+            ),
+        ] {
+            chip(&mut f, hs, xx, 199., ww, &label, action, &p, on);
+            xx += ww + 8.;
+        }
+        if !m.race {
+            chip(
+                &mut f,
+                hs,
+                xx,
+                199.,
+                98.,
+                if m.hints {
+                    "字提 · 开"
                 } else {
-                    String::new()
-                }
-            ),
-            p.muted,
-        );
-        let center = top + ((h - 127. - top) / 2.) - fs / 2.;
-        if !tight_single {
-            line(&mut f, x, center - lh - 31., bw, alpha(p.accent, 0.15));
-            text(
-                &mut f,
-                x,
-                center - lh - 45.,
-                FONT_HINT,
-                "居中行 · 逐字编码",
-                p.muted,
+                    "字提 · 关"
+                },
+                Action::ToggleHints,
+                &p,
+                m.hints,
             );
+        } else {
+            text(&mut f, xx, 203., FONT_HINT, "赛制关闭字提", p.muted);
         }
-        if gale_core::rules::hints_effective(m.hints, m.race) {
-            let seal_x = x + bw - 58.;
-            let seal_y = top + 4.;
-            round(
-                &mut f,
-                seal_x,
-                seal_y,
-                46.,
-                74.,
-                4.,
-                alpha(p.red, 0.025),
-                Some(alpha(p.red, 0.82)),
-            );
-            round(
-                &mut f,
-                seal_x + 4.,
-                seal_y + 4.,
-                38.,
-                66.,
-                2.,
-                [0.; 4],
-                Some(alpha(p.red, 0.45)),
-            );
-            body_text(&mut f, seal_x + 12., seal_y + 8., 21., "字", p.red);
-            body_text(&mut f, seal_x + 12., seal_y + 31., 21., "提", p.red);
-        }
-    } else {
-        text(
-            &mut f,
-            x,
-            head1,
-            para_title_size,
-            format!(
-                "第 {} 段 · {} / {} 字 · {} · {}",
-                sess.index + 1,
-                pos,
-                count,
-                elide(&sess.current_segment().mark, 14),
-                if m.race { "赛制" } else { "自定义" }
-            ),
-            p.text2,
-        );
-        right(
-            &mut f,
-            x + bw - 96.,
-            head1 + 2.,
-            FONT_HINT,
-            format!("{:02}:{:04.1}", (elapsed / 60.) as u64, elapsed % 60.),
-            p.muted,
-        );
-        speed_mono(
-            &mut f,
-            x + bw,
-            head1 - 4.,
-            22.,
-            &format!("{:.1}", live.para_speed),
-            p.accent,
-        );
-        right(&mut f, x + bw, head1 + 18., FONT_HINT, "字/分", p.muted);
-        metric_row(
-            &mut f,
-            x,
-            head2,
-            bw.min(720.),
-            &p,
-            &[
-                ("错字".into(), sess.comparer.wrong.to_string(), true),
-                ("退格".into(), sess.comparer.backspaces.to_string(), true),
-                ("废码".into(), sess.stats.waste_codes.to_string(), true),
-                (
-                    "码长".into(),
-                    format!("{:.2}", live.para_code_len),
-                    bw >= 720.,
-                ),
-                (
-                    "键准".into(),
-                    format!("{:.1}%", live.para_accuracy),
-                    bw >= 720.,
-                ),
-            ],
-        );
-        rail(&mut f, sess, &p, x, 128., bw);
     }
     let active = lines.iter().rposition(|l| l.0 <= pos).unwrap_or(0);
-    let rows = if single {
-        3
-    } else {
-        ((bottom - top) / lh).floor().max(1.) as usize
-    };
+    let rows = ((bottom - top) / lh).floor().max(1.) as usize;
     let first = if single {
-        active.saturating_sub(1)
+        active
+            .saturating_sub(rows / 2)
+            .min(lines.len().saturating_sub(rows))
     } else {
         active
             .saturating_sub(1)
             .min(lines.len().saturating_sub(rows))
     };
+    let visible_rows = lines.len().saturating_sub(first).min(rows);
     let stage_y = if single {
-        if lines.len() > 1 {
-            // A 20-character drill group can wrap to two rows. Center the
-            // whole block; otherwise the second row lands on the neighbour.
-            (top + (bottom - top - lines.len() as f32 * lh) / 2. - (active - first) as f32 * lh)
-                .max(top)
-        } else {
-            (top + (bottom - top) / 2. - fs / 2. - (active - first) as f32 * lh).max(top)
-        }
-    } else if lines.len() <= rows {
-        // Short articles sit in the optical centre of the practice surface
-        // instead of hugging the header and leaving a large empty bottom.
-        top + ((bottom - top) - lines.len() as f32 * lh).max(0.) / 2.
+        top + ((bottom - top) - visible_rows as f32 * lh).max(0.) / 2.
     } else {
         top
     };
     f.push(DrawCmd::PushClip {
         x: x - 14.,
-        y: top - 12.,
+        y: top - 4.,
         w: bw + 28.,
-        h: (bottom - top + 28.).max(1.),
+        h: (bottom - top + 4.).max(1.),
     });
-    let hint_cur = m
-        .words
-        .iter()
-        .position(|z| z.start.saturating_add(z.len) > pos)
-        .unwrap_or(m.words.len());
     for (li, (offset, line_text, widths)) in lines.iter().enumerate().skip(first).take(rows) {
         let yy = stage_y + (li - first) as f32 * lh;
         let xx = x;
@@ -1258,7 +780,10 @@ pub fn build(
             let bg = match state {
                 Some(CharState::Correct) => Some(p.bg_done),
                 Some(CharState::Wrong) => Some(p.bg_wrong),
-                _ => None,
+                _ => cfg
+                    .color_overrides
+                    .contains_key("对打未打底色")
+                    .then_some(p.bg_pending),
             };
             if let Some(bg) = bg {
                 let a = widths.get(j).copied().unwrap_or(0.);
@@ -1267,80 +792,30 @@ pub fn build(
             }
             j = end;
         }
-        // Word glow and drill-character focus sit behind the actual DirectWrite line.
-        if hints_visible {
-            if single {
-                if li == active {
-                    let ci = pos
-                        .saturating_sub(*offset)
-                        .min(widths.len().saturating_sub(1));
-                    let cx = xx + widths[ci];
-                    round(
-                        &mut f,
-                        cx - 1.,
-                        yy + 3.,
-                        fs + 2.,
-                        fs + 5.,
-                        4.,
-                        alpha(p.accent, 0.10),
-                        Some(alpha(p.accent, 0.22)),
-                    );
-                }
-            } else if let Some(z) = m
-                .words
-                .get(hint_cur)
-                .filter(|z| z.code.is_some() && z.len > 1)
-            {
-                if z.start >= *offset && z.start < offset + line_text.chars().count() {
-                    let start = widths.get(z.start - offset).copied().unwrap_or(0.);
-                    let end = widths
-                        .get((z.start - offset + z.len).min(widths.len() - 1))
-                        .copied()
-                        .unwrap_or(bw);
-                    // 词提底色（整改 9）：默认全透明不画；自定义非透明时画
-                    // 单层衬底 + 下划线色细描边（替代原三层 accent 微光晕）。
-                    if cfg.hint_word_bg && p.hint_bg[3] > 0.004 {
-                        round(
-                            &mut f,
-                            xx + start - 12.,
-                            yy - 6.,
-                            end - start + 24.,
-                            fs + 12.,
-                            8.,
-                            p.hint_bg,
-                            Some(alpha(p.hint_underline, 0.25)),
-                        );
-                    }
-                }
-            }
+        if hints_visible && li == active {
+            let ci = pos
+                .saturating_sub(*offset)
+                .min(widths.len().saturating_sub(1));
+            let cx = xx + widths[ci];
+            round(
+                &mut f,
+                cx - 1.,
+                yy + 3.,
+                fs + 2.,
+                fs + 5.,
+                4.,
+                alpha(p.accent, 0.10),
+                Some(alpha(p.accent, 0.22)),
+            );
         }
         let mut spans = Vec::new();
         let mut u16pos = 0;
-        let mut word_at = m
-            .words
-            .partition_point(|z| z.start.saturating_add(z.len) <= *offset);
         for (j, ch) in line_text.chars().enumerate() {
             let char_at = offset + j;
-            while word_at < m.words.len()
-                && m.words[word_at].start.saturating_add(m.words[word_at].len) <= char_at
-            {
-                word_at += 1;
-            }
-            let word_color = m
-                .words
-                .get(word_at)
-                .filter(|z| z.start <= char_at)
-                .and_then(|_| word_colors[word_at]);
             let c = match sess.comparer.states.get(char_at) {
                 Some(CharState::Wrong) => p.red,
-                Some(CharState::Correct) => {
-                    if cfg.color_overrides.contains_key("打对字色") {
-                        p.correct
-                    } else {
-                        word_color.unwrap_or(p.correct)
-                    }
-                }
-                _ => word_color.unwrap_or(p.text2),
+                Some(CharState::Correct) => p.correct,
+                _ => p.text2,
             };
             spans.push((u16pos, ch.len_utf16() as u32, alpha(c, dim)));
             u16pos += ch.len_utf16() as u32;
@@ -1412,7 +887,7 @@ pub fn build(
             }
         }
         if hints_visible {
-            for (zi, z) in m.words.iter().enumerate() {
+            for z in &m.words {
                 if z.start < *offset || z.start >= offset + line_text.chars().count() {
                     continue;
                 }
@@ -1423,21 +898,6 @@ pub fn build(
                     .copied()
                     .unwrap_or(bw)
                     - widths.get(local).copied().unwrap_or(0.);
-                let word_color = word_colors[zi];
-                let hint_color = word_color.unwrap_or(p.text2);
-                if cfg.hint_underline
-                    && z.start >= pos
-                    && !single
-                    && crate::analysis::is_multi_word(&z.text)
-                {
-                    line(
-                        &mut f,
-                        wx + 1.,
-                        yy + fs + 4.,
-                        (ww - 2.).max(1.),
-                        alpha(hint_color, 0.3),
-                    );
-                }
                 if let Some(code) = &z.code {
                     let hint_size = cfg.hint_font_size;
                     let shown_code = if cfg.hint_show_code {
@@ -1453,7 +913,7 @@ pub fn build(
                     let hint_advance = hint_size * 0.6;
                     let hx = wx
                         + (ww - (shown_code.len() + rank.len()) as f32 * hint_advance).max(0.) / 2.;
-                    let code_color = alpha(word_color.unwrap_or(p.hint_code), dim);
+                    let code_color = alpha(p.hint_code, dim);
                     if !shown_code.is_empty() {
                         mono(&mut f, hx, yy + fs + 9., hint_size, shown_code, code_color);
                     }
@@ -1464,7 +924,7 @@ pub fn build(
                             yy + fs + 5.,
                             hint_size,
                             rank,
-                            alpha(word_color.unwrap_or(p.hint_badge), dim),
+                            alpha(p.hint_badge, dim),
                         );
                     }
                 }
@@ -1472,145 +932,6 @@ pub fn build(
         }
     }
     f.push(DrawCmd::PopClip);
-    let ly = if single {
-        if m.history_expanded {
-            bottom + 18.
-        } else {
-            (top + (bottom - top) / 2. - fs / 2. + lh + fs + 34.).min(ledger_top - 110.)
-        }
-    } else {
-        bottom + 18.
-    };
-    if !tight_single {
-        text(
-            &mut f,
-            x,
-            ly,
-            FONT_HINT,
-            if single {
-                "字提示色"
-            } else {
-                "词提示色"
-            },
-            p.muted,
-        );
-        text(
-            &mut f,
-            x + 70.,
-            ly,
-            FONT_HINT,
-            "词色按码长与词长区分 · F1 自定配色",
-            p.muted,
-        );
-    }
-    if single && !m.history_expanded && !tight_single {
-        line(&mut f, x, ledger_top - 44., bw, p.line);
-        body_text(
-            &mut f,
-            x,
-            ledger_top - 32.,
-            FONT_HINT,
-            format!("「{}」", elide(&sess.current_segment().text, 18)),
-            p.muted,
-        );
-        let total = sess.total_segments();
-        let dots = total.min(18);
-        let first = sess.index.saturating_sub(8).min(total.saturating_sub(dots));
-        let dx = x + bw - 160. - dots as f32 * 8.;
-        for (j, i) in (first..first + dots).enumerate() {
-            round(
-                &mut f,
-                dx + j as f32 * 8.,
-                ledger_top - 12.,
-                if i == sess.index { 5. } else { 4. },
-                4.,
-                2.,
-                if i == sess.index {
-                    p.accent
-                } else {
-                    alpha(p.muted, 0.35)
-                },
-                None,
-            );
-        }
-        right(
-            &mut f,
-            x + bw,
-            ledger_top - 32.,
-            FONT_HINT,
-            format!("第 {}/{} 组", sess.index + 1, total),
-            p.muted,
-        );
-    }
-    // 字提行口径（research-digest §B 晴口径）：赛制=词提全关（hints_effective==false），
-    // 字提是唯一允许的提示形态，但需**停手 5 秒**才显示（开打前不显示，防起跑泄题）；
-    // 练习=字提跟词提同开同关、立即显示。
-    let idle_ms = (now - anim.last_input).max(0.) * 1000.;
-    let ziti_visible = if m.race {
-        sess.started_ms.is_some() && idle_ms >= ZITI_IDLE_MS
-    } else {
-        gale_core::rules::hints_effective(m.hints, false)
-    };
-    if ziti_visible && w >= 1060. {
-        if let Some(z) = m.words.get(hint_cur) {
-            right(
-                &mut f,
-                x + bw,
-                ly,
-                FONT_HINT,
-                format!(
-                    "当前{}  {}  ·  {}{}",
-                    if single { "字" } else { "词" },
-                    z.text,
-                    if cfg.hint_show_code {
-                        z.code.clone().unwrap_or_else(|| "—".into())
-                    } else {
-                        String::new()
-                    },
-                    if cfg.hint_show_rank && z.rank > 1 {
-                        format!(" · 选重{}", z.rank)
-                    } else if cfg.hint_show_code && z.tail == "_" {
-                        " · 空格上屏".into()
-                    } else {
-                        String::new()
-                    }
-                ),
-                word_colors
-                    .get(hint_cur)
-                    .copied()
-                    .flatten()
-                    .unwrap_or(p.text2),
-            );
-        } else if !m.status.is_empty() && w > 1000. {
-            right(
-                &mut f,
-                x + bw,
-                ly,
-                FONT_HINT,
-                if m.race {
-                    "字提需当前虎符服务支持"
-                } else if m.hints {
-                    "提示需当前虎符服务支持"
-                } else {
-                    "提示已关闭"
-                },
-                p.muted,
-            );
-        }
-    } else if !m.status.is_empty() && w > 1000. && !m.race {
-        right(
-            &mut f,
-            x + bw,
-            ly,
-            FONT_HINT,
-            if m.hints {
-                "提示需当前虎符服务支持"
-            } else {
-                "提示已关闭"
-            },
-            p.muted,
-        );
-    }
     crate::history::draw(&mut f, hs, sess, cfg, m, t, w, h);
     f
 }
@@ -1621,137 +942,135 @@ mod tests {
     use crate::modals::HintWord;
     use gale_core::segment::{ParsedGroupText, Segment};
 
-    #[test]
-    fn article_word_colors_and_full_hints_preserve_states_and_rule_gates() {
+    fn fixture() -> (Session, Model, Config, Vec<(usize, String, Vec<f32>)>) {
         let mut sess = Session::new(100);
         sess.load_group(ParsedGroupText {
-            title: "配色验收".into(),
+            title: "布局验收".into(),
             difficulty: None,
             segments: vec![Segment {
                 mark: "1".into(),
                 text: "甲乙丙丁戊己庚辛壬癸".into(),
             }],
         });
-        sess.comparer.states[0] = CharState::Correct;
-        sess.comparer.states[1] = CharState::Wrong;
-        let word = |start, len, text: &str, code: Option<&str>, rank, tail: &str| HintWord {
-            start,
-            len,
-            text: text.into(),
-            code: code.map(str::to_owned),
-            rank,
-            tail: tail.into(),
-        };
-        let mut model = Model {
+        let model = Model {
             hints: true,
-            words: vec![
-                word(0, 2, "甲乙", Some("ab"), 1, "_"),
-                word(2, 1, "丙", Some("c"), 2, ";"),
-                word(3, 2, "丁戊", Some("de"), 2, ";"),
-                word(5, 1, "己", None, 0, ""),
-                word(6, 2, "庚辛", Some("ef"), 3, "'"),
-                word(8, 2, "壬癸", Some("gh"), 1, "_"),
-            ],
+            words: vec![HintWord {
+                start: 0,
+                len: 2,
+                text: "甲乙".into(),
+                code: Some("stale-code".into()),
+                rank: 2,
+                tail: ";".into(),
+            }],
             ..Default::default()
         };
-        let mut cfg = Config {
-            font_size: 24.,
+        let cfg = Config {
+            font_size: 54.,
             ..Default::default()
         };
         let lines = vec![
             (
                 0,
                 "甲乙丙丁戊".into(),
-                (0..=5).map(|i| i as f32 * 24.).collect(),
+                (0..=5).map(|i| i as f32 * 54.).collect(),
             ),
             (
                 5,
                 "己庚辛壬癸".into(),
-                (0..=5).map(|i| i as f32 * 24.).collect(),
+                (0..=5).map(|i| i as f32 * 54.).collect(),
             ),
         ];
+        (sess, model, cfg, lines)
+    }
+
+    #[test]
+    fn article_ignores_retired_hints_and_preserves_typing_states() {
+        let (mut sess, model, cfg, lines) = fixture();
+        sess.comparer.states[0] = CharState::Correct;
+        sess.comparer.states[1] = CharState::Wrong;
         let theme = theme("墨玉");
         let p = tokens(&theme);
-        let render = |model: &Model, cfg: &Config| {
-            build(
-                &sess,
-                cfg,
-                &theme,
-                model,
-                1280.,
-                800.,
-                0,
-                0.,
-                &mut Animation::default(),
-                &mut Vec::new(),
-                &lines,
-            )
-        };
-        let frame = render(&model, &cfg);
-        let rows: Vec<_> = frame
+        let frame = build(
+            &sess,
+            &cfg,
+            &theme,
+            &model,
+            800.,
+            600.,
+            0,
+            0.,
+            &mut Animation::default(),
+            &mut Vec::new(),
+            &lines,
+        );
+        let spans = frame
             .cmds
             .iter()
-            .filter_map(|cmd| match cmd {
-                DrawCmd::StyledLine { text, spans, y, .. } => Some((text, spans, y)),
+            .find_map(|cmd| match cmd {
+                DrawCmd::StyledLine { spans, .. } => Some(spans),
                 _ => None,
             })
-            .collect();
-        assert_eq!(
-            rows[0].1[0].2, p.word_colors[0],
-            "correct multi-word text retains its word color"
-        );
-        assert_eq!(
-            rows[0].1[1].2, p.red,
-            "wrong state takes priority over word color"
-        );
-        assert_eq!(
-            rows[0].1[2].2, p.text2,
-            "single-character text stays neutral"
-        );
-        assert_eq!(
-            rows[0].1[3].2, p.word_colors[0],
-            "both abbreviated words share the semantic short-code color"
-        );
-        assert!(*rows[1].2 - *rows[0].2 >= cfg.font_size + 28.);
-        let has_run = |frame: &Frame, value: &str| {
-            frame
-                .cmds
-                .iter()
-                .any(|cmd| matches!(cmd, DrawCmd::TextRun { text, .. } if text == value))
-        };
-        assert!(
-            has_run(&frame, "gh"),
-            "codes beyond the former current+next-two window are visible"
-        );
-        assert!(has_run(&frame, "2") && has_run(&frame, "3"));
-        assert!(!has_run(&frame, ";") && !has_run(&frame, "'"));
-        assert!(has_run(&frame, "F10"));
-        cfg.hint_show_code = false;
-        let rank_only = render(&model, &cfg);
-        assert!(!has_run(&rank_only, "ab") && has_run(&rank_only, "2"));
-        cfg.hint_show_rank = false;
-        assert!(!has_run(&render(&model, &cfg), "2"));
-        cfg.hint_show_code = true;
-        cfg.hint_show_rank = true;
-        cfg.color_overrides
-            .insert("打对字色".into(), "ffffff".into());
-        let overridden = render(&model, &cfg);
-        assert!(overridden
-            .cmds
-            .iter()
-            .any(|c| matches!(c,DrawCmd::StyledLine{spans,..} if spans[0].2==p.correct)));
-        cfg.color_overrides.clear();
-        cfg.hint_style = 1;
-        assert!(
-            has_run(&render(&model, &cfg), "gh"),
-            "character hint style also covers following lines"
-        );
-        model.hints = false;
-        assert!(!has_run(&render(&model, &cfg), "ab"));
-        model.hints = true;
-        model.race = true;
-        assert!(!has_run(&render(&model, &cfg), "ab"));
+            .unwrap();
+        assert_eq!(spans[0].2, p.correct);
+        assert_eq!(spans[1].2, p.red);
+        assert_eq!(spans[2].2, p.text2);
+        assert!(!frame.cmds.iter().any(|cmd| matches!(cmd,
+            DrawCmd::TextRun { text, .. } if text == "stale-code")));
     }
+
+    #[test]
+    fn toolbar_stays_inside_small_windows_without_overlap() {
+        let (sess, mut model, cfg, _) = fixture();
+        for modal in [Modal::None, Modal::Report] {
+            model.modal = modal;
+            for width in [640., 800., 1000., 1280.] {
+                let mut hits = Vec::new();
+                draw_chrome(
+                    &mut Frame::new(width, 480.),
+                    &mut hits,
+                    &sess,
+                    &cfg,
+                    &model,
+                    &theme("墨玉"),
+                    width,
+                    480.,
+                );
+                let buttons: Vec<_> = hits.iter().filter(|h| h.y == 60.).collect();
+                for (i, a) in buttons.iter().enumerate() {
+                    assert!(a.x >= 0. && a.x + a.w <= width);
+                    for b in buttons.iter().skip(i + 1) {
+                        assert!(a.x + a.w <= b.x || b.x + b.w <= a.x);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn single_current_row_stays_visible_at_large_font_in_small_window() {
+        let (mut sess, model, cfg, lines) = fixture();
+        sess.source = SessionSource::Single;
+        sess.comparer.pos = 8;
+        let mut anim = Animation::default();
+        let frame = build(
+            &sess,
+            &cfg,
+            &theme("墨玉"),
+            &model,
+            640.,
+            480.,
+            0,
+            0.,
+            &mut anim,
+            &mut Vec::new(),
+            &lines,
+        );
+        let (_, caret_y) = anim.caret.expect("current row has a caret");
+        assert!(caret_y >= 236. && caret_y + cfg.font_size < 402.);
+        assert!(frame.cmds.iter().any(|cmd| matches!(cmd,
+            DrawCmd::StyledLine { text, .. } if text.contains('壬'))));
+    }
+
     #[test]
     fn word_semantics_follow_code_length_and_single_characters_stay_neutral() {
         let p = tokens(&theme("宣纸"));

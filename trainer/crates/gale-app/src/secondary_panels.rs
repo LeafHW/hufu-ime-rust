@@ -379,17 +379,100 @@ fn slow_estimates(sess: &Session) -> Vec<SlowEstimate> {
     out
 }
 
-/// Logical page height; the shell uses the same extent for wheel scrolling.
-pub fn content_height(modal: Modal) -> f32 {
-    match modal {
-        Modal::Report => 1280.,
-        _ => 900.,
+pub fn session_report(m: &Model) -> bool {
+    m.field("report_tab") == "session"
+}
+
+pub fn selected_report_record(m: &Model) -> Option<&ScoreRecord> {
+    m.selected_history
+        .and_then(|index| m.history.get(index))
+        .or_else(|| m.history.last())
+        .or(m.latest.as_ref())
+}
+
+fn report_columns(width: f32) -> (f32, bool, f32, usize) {
+    let cw = (width - 48.).min(980.).max(160.);
+    let wide = cw >= 720.;
+    let list_w = if !wide {
+        cw
+    } else if cw >= 900. {
+        300.
+    } else {
+        240.
+    };
+    (cw, wide, list_w, if wide { 6 } else { 3 })
+}
+
+/// Keep rendering, wheel scrolling and page buttons on the same page size.
+pub fn report_visible_rows(m: &Model, width: f32) -> usize {
+    if session_report(m) {
+        if (width - 48.).min(980.) >= 720. {
+            5
+        } else {
+            3
+        }
+    } else {
+        report_columns(width).3
+    }
+}
+
+pub fn report_scroll_cap(m: &Model, sess: &Session, width: f32) -> usize {
+    let rows = if session_report(m) {
+        sess.results.iter().flatten().count()
+    } else {
+        m.history.len()
+    };
+    rows.saturating_sub(report_visible_rows(m, width))
+}
+
+/// A narrow report stacks its detail below the list. Selecting a record should
+/// bring that actual detail into view rather than leave the selection offscreen.
+pub fn history_detail_scroll(m: &Model, sess: &Session, width: f32, viewport: f32) -> f32 {
+    let (_, wide, _, _) = report_columns(width);
+    let limit = report_visible_rows(m, width);
+    if wide {
+        return 0.;
+    }
+    let page = (m.scroll as usize).min(report_scroll_cap(m, sess, width));
+    let shown = m.history.len().saturating_sub(page).min(limit);
+    let detail_top = 80. + 34. + shown as f32 * 64. + 66.;
+    (detail_top - 16.).min((report_content_height(m, sess, width) - viewport).max(0.))
+}
+
+/// The report has a compact empty state and only scrolls when its actual content needs it.
+pub fn report_content_height(m: &Model, sess: &Session, width: f32) -> f32 {
+    if session_report(m) {
+        if sess.results.iter().all(Option::is_none) {
+            320.
+        } else {
+            1328.
+        }
+    } else if selected_report_record(m).is_none() {
+        320.
+    } else {
+        let (cw, wide, list_w, _) = report_columns(width);
+        let limit = report_visible_rows(m, width);
+        if wide {
+            let detail_h: f32 = if cw - list_w - 24. >= 480. {
+                420.
+            } else {
+                510.
+            };
+            let list_h = 34.
+                + m.history.len().min(limit) as f32 * 64.
+                + if m.history.len() > limit { 52. } else { 0. };
+            80. + detail_h.max(list_h) + 80.
+        } else {
+            let detail_h = if cw >= 480. { 420. } else { 510. };
+            80. + 34. + m.history.len().min(limit) as f32 * 64. + 66. + detail_h + 80.
+        }
     }
 }
 
 fn main_area(
     f: &mut Frame,
     m: &Model,
+    sess: &Session,
     t: &Theme,
     x: f32,
     y: f32,
@@ -400,13 +483,13 @@ fn main_area(
     rect(f, x, y, pw, ph, p.bg);
     let cw = (pw - 48.).min(980.).max(160.);
     let cx = x + (pw - cw) / 2.;
-    let maximum = (content_height(m.modal) - ph).max(0.);
+    let height = report_content_height(m, sess, pw);
+    let maximum = (height - ph).max(0.);
     let scroll = m.panel_scroll.clamp(0., maximum);
     if maximum > 0. {
-        right(f, x + pw - 24., y + 8., 14., "滚轮查看更多", p.muted);
         let viewport = (ph - 62.).max(1.);
         let track = (viewport - 42.).max(1.);
-        let body = (content_height(m.modal) - 62.).max(viewport);
+        let body = (height - 62.).max(viewport);
         let thumb = (track * viewport / body).clamp(18f32.min(track), track);
         round(f, x + pw - 10., y + 32., 3., track, 1.5, p.line, None);
         round(
@@ -453,36 +536,354 @@ fn draw_report(
     pw: f32,
     ph: f32,
 ) {
+    let first_hit = hs.len();
+    if session_report(m) {
+        draw_session_report(f, hs, m, sess, t, x, y, pw, ph);
+    } else {
+        draw_history_report(f, hs, m, sess, t, x, y, pw, ph);
+    }
+    // Body controls scroll with the drawing clip; clipped rows cannot intercept
+    // the toolbar or fixed report footer.
+    for hit in hs.iter_mut().skip(first_hit) {
+        let fixed_footer = matches!(
+            hit.action,
+            Action::Close | Action::CopyScore | Action::CopyRace | Action::ExportImage
+        ) || (hit.y >= y + ph - 48.
+            && hit.action == crate::aux_marker("report_history"));
+        if !fixed_footer {
+            let bottom = (hit.y + hit.h).min(y + ph - 62.);
+            hit.y = hit.y.max(y);
+            hit.h = (bottom - hit.y).max(0.);
+        }
+    }
+}
+
+fn report_heading(f: &mut Frame, hs: &mut Vec<Hit>, m: &Model, t: &Theme, x: f32, y: f32) {
     let p = tokens(t);
-    let (cx, by, cw) = main_area(f, m, t, x, y, pw, ph);
+    text(f, x, y + 20., 24., "成绩", p.text);
+    chip(
+        f,
+        hs,
+        x + 100.,
+        y + 14.,
+        126.,
+        "成绩记录",
+        !session_report(m),
+        crate::aux_marker("report_history"),
+        t,
+    );
+    chip(
+        f,
+        hs,
+        x + 236.,
+        y + 14.,
+        126.,
+        "本轮汇总",
+        session_report(m),
+        crate::aux_marker("report_session"),
+        t,
+    );
+}
+
+fn draw_history_report(
+    f: &mut Frame,
+    hs: &mut Vec<Hit>,
+    m: &Model,
+    sess: &Session,
+    t: &Theme,
+    x: f32,
+    y: f32,
+    pw: f32,
+    ph: f32,
+) {
+    let p = tokens(t);
+    let (cx, by, cw) = main_area(f, m, sess, t, x, y, pw, ph);
+    report_heading(f, hs, m, t, cx, by);
+    let Some(record) = selected_report_record(m) else {
+        text(f, cx, by + 140., 21., "还没有成绩记录", p.text2);
+        text(
+            f,
+            cx,
+            by + 180.,
+            15.,
+            "完成一段后会自动保存在这里，换文后仍可查看。",
+            p.muted,
+        );
+        end_clip(f);
+        return;
+    };
+
+    let (_, wide, list_w, _) = report_columns(pw);
+    let limit = report_visible_rows(m, pw);
+    let list_y = by + 80.;
+    let page = (m.scroll as usize).min(report_scroll_cap(m, sess, pw));
+    let shown = m.history.len().saturating_sub(page).min(limit);
+    text(
+        f,
+        cx,
+        list_y,
+        16.,
+        format!("全部记录 · {} 条", m.history.len()),
+        p.text2,
+    );
+    for (row, (index, item)) in m
+        .history
+        .iter()
+        .enumerate()
+        .rev()
+        .skip(page)
+        .take(limit)
+        .enumerate()
+    {
+        let yy = list_y + 34. + row as f32 * 64.;
+        let selected = std::ptr::eq(item, record);
+        if selected {
+            round(
+                f,
+                cx,
+                yy,
+                list_w,
+                58.,
+                7.,
+                alpha(p.accent, 0.10),
+                Some(alpha(p.accent, 0.28)),
+            );
+        } else {
+            line(f, cx + 10., yy + 58., list_w - 20., p.line);
+        }
+        clipped_text(
+            f,
+            cx + 12.,
+            yy + 8.,
+            list_w - 102.,
+            15.,
+            &item.title,
+            if selected { p.accent } else { p.text2 },
+        );
+        right(
+            f,
+            cx + list_w - 12.,
+            yy + 8.,
+            16.,
+            format!("{:.1}", item.speed),
+            p.text2,
+        );
+        clipped_text(
+            f,
+            cx + 12.,
+            yy + 32.,
+            list_w - 20.,
+            14.,
+            &format!(
+                "{} · 第 {} 段 · {} 字",
+                item.date,
+                item.para_index + 1,
+                item.chars
+            ),
+            p.muted,
+        );
+        hs.push(Hit {
+            x: cx,
+            y: yy,
+            w: list_w,
+            h: 58.,
+            action: Action::SelectHistory(index),
+        });
+    }
+    let list_bottom = list_y + 34. + shown as f32 * 64.;
+    if m.history.len() > limit {
+        action(
+            f,
+            hs,
+            cx,
+            list_bottom + 8.,
+            90.,
+            "较新",
+            if page > 0 {
+                crate::aux_marker(&format!("history_step:-{limit}"))
+            } else {
+                Action::None
+            },
+            t,
+            false,
+        );
+        action(
+            f,
+            hs,
+            cx + 100.,
+            list_bottom + 8.,
+            90.,
+            "较早",
+            if page + shown < m.history.len() {
+                crate::aux_marker(&format!("history_step:{limit}"))
+            } else {
+                Action::None
+            },
+            t,
+            false,
+        );
+    }
+
+    let dx = if wide { cx + list_w + 24. } else { cx };
+    let dy = if wide { list_y } else { list_bottom + 66. };
+    let dw = if wide { cw - list_w - 24. } else { cw };
+    let cols = if dw >= 480. { 3 } else { 2 };
+    let detail_h = if cols == 3 { 420. } else { 510. };
+    card(f, dx, dy, dw, detail_h, t);
+    let tx = dx + 20.;
+    let tw = dw - 40.;
+    clipped_text(f, tx, dy + 18., tw, 20., &record.title, p.text);
+    clipped_text(
+        f,
+        tx,
+        dy + 54.,
+        tw,
+        14.,
+        &format!(
+            "{} · {} · 第 {} 段 · {} 字",
+            record_time(record),
+            record.source,
+            record.para_index + 1,
+            record.chars
+        ),
+        p.muted,
+    );
+    let values = [
+        (format!("{:.1}", record.speed), "速度 · 字/分"),
+        (format!("{:.1}%", record.accuracy), "键准·按键效率"),
+        (format!("{:.1}%", record.character_accuracy()), "字准"),
+        (format!("{:.2}", record.strokes_per_sec), "击键 / 秒"),
+        (format!("{:.2}", record.code_len), "码长"),
+        (duration(record.time_ms), "用时"),
+    ];
+    for (i, (value, label)) in values.iter().enumerate() {
+        metric(
+            f,
+            tx + (i % cols) as f32 * tw / cols as f32,
+            dy + 98. + (i / cols) as f32 * 80.,
+            tw / cols as f32 - 12.,
+            value,
+            label,
+            t,
+        );
+    }
+    let extra_y = dy + 98. + (values.len() / cols) as f32 * 80.;
+    line(f, tx, extra_y + 2., tw, p.line);
+    let word_rate = record
+        .word_rate
+        .map(|rate| format!("{rate:.1}%"))
+        .unwrap_or_else(|| "—".into());
+    paragraph(
+        f,
+        tx,
+        extra_y + 18.,
+        tw,
+        62.,
+        15.,
+        26.,
+        &format!(
+            "总键 {} · 错字 {} · 退格 {} · 选重 {}\n词率 {} · 重打 {} 次",
+            record.keys,
+            record.wrong,
+            record.backspaces,
+            record.select_count,
+            word_rate,
+            record.retype_count
+        ),
+        p.text2,
+    );
+    if live_trace(sess, record) && !sess.last_vk_histogram.is_empty() {
+        link(
+            f,
+            hs,
+            tx,
+            extra_y + 86.,
+            tw,
+            "查看本段按键热力图",
+            crate::aux_marker("show_heatmap"),
+            t,
+        );
+    } else {
+        clipped_text(
+            f,
+            tx,
+            extra_y + 96.,
+            tw,
+            14.,
+            "此记录未保存按键分布。",
+            p.muted,
+        );
+    }
+    end_clip(f);
+    let ay = y + ph - 48.;
+    action(
+        f,
+        hs,
+        cx,
+        ay,
+        142.,
+        "复制这条成绩",
+        Action::CopyScore,
+        t,
+        true,
+    );
+    action(
+        f,
+        hs,
+        cx + 154.,
+        ay,
+        126.,
+        "导出图片",
+        Action::ExportImage,
+        t,
+        false,
+    );
+    if !wide {
+        action(
+            f,
+            hs,
+            cx + cw - 142.,
+            ay,
+            142.,
+            "← 全部记录",
+            crate::aux_marker("report_history"),
+            t,
+            false,
+        );
+    }
+}
+
+fn draw_session_report(
+    f: &mut Frame,
+    hs: &mut Vec<Hit>,
+    m: &Model,
+    sess: &Session,
+    t: &Theme,
+    x: f32,
+    y: f32,
+    pw: f32,
+    ph: f32,
+) {
+    let p = tokens(t);
+    let (cx, base_y, cw) = main_area(f, m, sess, t, x, y, pw, ph);
+    report_heading(f, hs, m, t, cx, base_y);
+    let by = base_y + 16.;
     let rows: Vec<_> = sess
         .results
         .iter()
         .enumerate()
         .filter_map(|(i, r)| r.as_ref().map(|r| (i, r)))
         .collect();
-    text(f, cx, by + 24., 24., "整场赛报", p.text);
     if rows.is_empty() {
         text(
             f,
             cx,
             by + 90.,
             16.,
-            "完成第一段后，可在这里查看整场统计。",
+            "本轮还没有完成的段落。历史成绩可在「成绩记录」中查看。",
             p.muted,
         );
         end_clip(f);
-        action(
-            f,
-            hs,
-            cx,
-            y + ph - 48.,
-            142.,
-            "打开文库",
-            Action::Open(Modal::Library),
-            t,
-            true,
-        );
         return;
     }
     let agg = sess.aggregate();
@@ -561,8 +962,8 @@ fn draw_report(
         "纵轴从 0 起算；虚线为已结算段总速度。",
         p.muted,
     );
-    let page = (m.scroll as usize).min(rows.len().saturating_sub(1));
-    let visible = ((cw - 70.) / 90.).floor().clamp(1., 10.) as usize;
+    let page = (m.scroll as usize).min(report_scroll_cap(m, sess, pw));
+    let visible = report_visible_rows(m, pw);
     let shown: Vec<_> = rows.iter().skip(page).take(visible).collect();
     let highest = rows.iter().map(|(_, r)| r.speed).fold(1., f64::max);
     let max = (highest / 50.).ceil().max(1.) * 50.;
@@ -629,7 +1030,7 @@ fn draw_report(
         "键准 / 字准分别表示按键效率 / 文本正确率。",
         p.muted,
     );
-    let count = if cw >= 720. { 5 } else { 3 };
+    let count = report_visible_rows(m, pw);
     for (j, (idx, r)) in rows.iter().skip(page).take(count).enumerate() {
         let yy = detail_y + 76. + j as f32 * 68.;
         line(f, cx, yy - 10., cw, p.line);
@@ -2145,6 +2546,7 @@ mod tests {
         assert!(text.iter().any(|s| s.contains("字准")));
         assert!(text.iter().any(|s| s.contains("键准")));
         assert_eq!(m.latest.as_ref().unwrap().accuracy, 100.);
+        m.fields.insert("report_tab".into(), "session".into());
         let mut report = Frame::new(1280., 800.);
         draw_report(
             &mut report,
@@ -2173,5 +2575,233 @@ mod tests {
         assert!(report_text.contains(&"键准·按键效率"));
         assert!(report_text.iter().any(|s| s.contains("100.0/0.0")));
         assert_eq!(sess.aggregate().accuracy, 100.);
+    }
+
+    #[test]
+    fn historical_detail_uses_the_selected_record_and_never_current_key_distribution() {
+        let mut sess = Session::new(100);
+        sess.load_book("当前文章", "甲");
+        sess.on_key(65, 10);
+        // Production separately drains the host's physical-key queue into this
+        // histogram; on_key only updates the score's statistical key counters.
+        *sess.vk_histogram.entry(0x41).or_insert(0) += 1;
+        sess.feed_input(
+            gale_core::compare::InputEvent::Commit {
+                chars: "甲".into()
+            },
+            20,
+        );
+        let current = sess.finalize_current_at(30, 2).unwrap();
+        assert!(!sess.last_vk_histogram.is_empty());
+        let mut older = current.clone();
+        older.title = "历史文章".into();
+        older.ts = 1;
+        older.speed = 123.4;
+        let mut m = Model::default();
+        m.modal = Modal::Report;
+        m.history = vec![older, current.clone()];
+        m.latest = Some(current);
+        m.selected_history = Some(0);
+        let mut f = Frame::new(1280., 800.);
+        let mut hits = Vec::new();
+        draw_report(
+            &mut f,
+            &mut hits,
+            &m,
+            &sess,
+            &crate::ui::theme("墨玉"),
+            0.,
+            108.,
+            1280.,
+            662.,
+        );
+        assert_eq!(selected_report_record(&m).unwrap().title, "历史文章");
+        let detail_titles: Vec<_> = f
+            .cmds
+            .iter()
+            .filter_map(|cmd| match cmd {
+                DrawCmd::TextRun { x, text, .. } if *x > 478. => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(detail_titles.contains(&"历史文章"));
+        assert!(!detail_titles.contains(&"当前文章"));
+        assert!(!hits
+            .iter()
+            .any(|hit| hit.action == crate::aux_marker("show_heatmap")));
+        assert_eq!(m.latest.as_ref().unwrap().title, "当前文章");
+        for width in [800., 640.] {
+            let viewport = 462.;
+            m.panel_scroll = history_detail_scroll(&m, &sess, width, viewport);
+            let mut frame = Frame::new(width, 600.);
+            let mut hits = Vec::new();
+            draw_report(
+                &mut frame,
+                &mut hits,
+                &m,
+                &sess,
+                &crate::ui::theme("墨玉"),
+                0.,
+                108.,
+                width,
+                viewport,
+            );
+            let detail_title = frame
+                .cmds
+                .iter()
+                .find_map(|cmd| match cmd {
+                    DrawCmd::TextRun { text, x, y, h, .. }
+                        if text == "历史文章" && *h >= 20. && (width < 768. || *x > 300.) =>
+                    {
+                        Some(*y)
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            assert!(
+                detail_title >= 108. && detail_title < 108. + viewport - 62.,
+                "selected detail should be visible at width {width}"
+            );
+            if width == 800. {
+                assert_eq!(
+                    m.panel_scroll, 0.,
+                    "800px report keeps history beside detail"
+                );
+            } else {
+                assert!(m.panel_scroll > 0.);
+                assert!(hits
+                    .iter()
+                    .any(|hit| hit.action == crate::aux_marker("report_history")
+                        && hit.y > 108. + viewport - 62.
+                        && hit.h > 0.));
+            }
+        }
+    }
+
+    #[test]
+    fn empty_report_is_compact_and_has_no_disabled_score_actions() {
+        let mut m = Model::default();
+        m.modal = Modal::Report;
+        let sess = Session::new(100);
+        assert!(report_content_height(&m, &sess, 1280.) < 400.);
+        let mut f = Frame::new(1280., 800.);
+        let mut hits = Vec::new();
+        draw_report(
+            &mut f,
+            &mut hits,
+            &m,
+            &sess,
+            &crate::ui::theme("墨玉"),
+            0.,
+            108.,
+            1280.,
+            662.,
+        );
+        assert!(!hits
+            .iter()
+            .any(|hit| matches!(hit.action, Action::CopyScore | Action::ExportImage)));
+        assert!(f
+            .cmds
+            .iter()
+            .any(|cmd| matches!(cmd, DrawCmd::TextRun { text, .. } if text == "还没有成绩记录")));
+    }
+
+    fn pagination_record() -> ScoreRecord {
+        let mut sess = Session::new(100);
+        sess.load_book("分页测试", "甲");
+        sess.on_key(0x41, 10);
+        sess.feed_input(
+            gale_core::compare::InputEvent::Commit {
+                chars: "甲".into()
+            },
+            20,
+        );
+        sess.finalize_current_at(30, 1).unwrap()
+    }
+
+    #[test]
+    fn report_history_last_page_reaches_the_oldest_record_at_each_width() {
+        let sess = Session::new(100);
+        let record = pagination_record();
+        for (width, total, visible, cap) in [(640., 4, 3, 1), (1280., 14, 6, 8)] {
+            let mut m = Model::default();
+            m.modal = Modal::Report;
+            m.history = (0..total)
+                .map(|i| {
+                    let mut item = record.clone();
+                    item.title = format!("历史记录 {i}");
+                    item.ts = i as u64;
+                    item
+                })
+                .collect();
+            assert_eq!(report_visible_rows(&m, width), visible);
+            assert_eq!(report_scroll_cap(&m, &sess, width), cap);
+            m.scroll = cap as f32;
+            let mut frame = Frame::new(width, 1038.);
+            let mut hits = Vec::new();
+            draw_report(
+                &mut frame,
+                &mut hits,
+                &m,
+                &sess,
+                &crate::ui::theme("墨玉"),
+                0.,
+                108.,
+                width,
+                900.,
+            );
+            let visible_records: Vec<_> = hits
+                .iter()
+                .filter_map(|hit| match hit.action {
+                    Action::SelectHistory(index) if hit.h > 0. => Some(index),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(visible_records, (0..visible).rev().collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn report_summary_paginates_completed_records_instead_of_unfinished_segments() {
+        let record = pagination_record();
+        let mut sess = Session::new(100);
+        sess.load_book("分页测试", "甲");
+        sess.segments = vec![sess.current_segment().clone(); 12];
+        sess.results = (0..12)
+            .map(|index| (index % 2 == 0).then(|| record.clone()))
+            .collect();
+        let mut m = Model::default();
+        m.modal = Modal::Report;
+        m.fields.insert("report_tab".into(), "session".into());
+        assert_eq!(report_visible_rows(&m, 640.), 3);
+        assert_eq!(report_scroll_cap(&m, &sess, 640.), 3);
+        assert_eq!(report_visible_rows(&m, 1280.), 5);
+        assert_eq!(report_scroll_cap(&m, &sess, 1280.), 1);
+        m.scroll = 1.;
+        let mut frame = Frame::new(1280., 1466.);
+        draw_report(
+            &mut frame,
+            &mut Vec::new(),
+            &m,
+            &sess,
+            &crate::ui::theme("墨玉"),
+            0.,
+            108.,
+            1280.,
+            1328.,
+        );
+        let details: Vec<_> = frame
+            .cmds
+            .iter()
+            .filter_map(|cmd| match cmd {
+                DrawCmd::TextRun { text, .. } if text.contains("· 已结算") => {
+                    Some(text.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(details.len(), 5);
+        assert!(details.iter().any(|text| text.starts_with("第 11 段 ·")));
+        assert!(!details.iter().any(|text| text.starts_with("第 1 段 ·")));
     }
 }

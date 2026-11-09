@@ -58,7 +58,6 @@ const HEIGHT: f32 = 800.;
 const NOW_MS: u64 = 14_300;
 const UNIX_FIXTURE: u64 = 1_794_008_400;
 const CHAR_DICT: &str = include_str!("../../../../assets/码表/虎码单字/tiger.dict.yaml");
-const WORD_DICT: &str = include_str!("../../../../assets/码表/虎码字词/tigress_ci.dict.yaml");
 const PARAGRAPHS: [&str; 4] = [
     "庆历四年春，滕子京谪守巴陵郡。越明年，政通人和，百废具兴。乃重修岳阳楼，增其旧制，刻唐贤今人诗赋于其上。属予作文以记之。",
     "予观夫巴陵胜状，在洞庭一湖。衔远山，吞长江，浩浩汤汤，横无际涯；朝晖夕阴，气象万千。此则岳阳楼之大观也，前人之述备矣。然则北通巫峡，南极潇湘，迁客骚人，多会于此，览物之情，得无异乎？",
@@ -76,23 +75,21 @@ impl Drop for HiddenWindow {
 }
 
 /// Dictionary data is compiled only into this development example. The product
-/// still gets hints from the real server; this tool does not bypass that contract.
+/// still gets single-character hints from the real server.
 fn dictionaries() -> BTreeMap<String, String> {
     let mut out: BTreeMap<String, String> = BTreeMap::new();
-    for (dict, code_column) in [(CHAR_DICT, 1), (WORD_DICT, 2)] {
-        for row in dict.lines() {
-            let cols: Vec<&str> = row.split('\t').collect();
-            if cols.len() <= code_column || cols[0].is_empty() {
-                continue;
-            }
-            let code = cols[code_column];
-            if code.is_empty() || !code.bytes().all(|b| b.is_ascii_lowercase()) {
-                continue;
-            }
-            let word = cols[0].to_string();
-            if out.get(&word).is_none_or(|old| code.len() < old.len()) {
-                out.insert(word, code.to_string());
-            }
+    for row in CHAR_DICT.lines() {
+        let cols: Vec<&str> = row.split('\t').collect();
+        if cols.len() <= 1 || cols[0].chars().count() != 1 {
+            continue;
+        }
+        let code = cols[1];
+        if code.is_empty() || !code.bytes().all(|b| b.is_ascii_lowercase()) {
+            continue;
+        }
+        let word = cols[0].to_string();
+        if out.get(&word).is_none_or(|old| code.len() < old.len()) {
+            out.insert(word, code.to_string());
         }
     }
     out
@@ -102,7 +99,7 @@ fn article(mode: TrainingMode) -> Session {
     let mut sess = Session::new(100);
     sess.set_rules(SessionRules {
         mode,
-        word_hints: mode == TrainingMode::Practice,
+        word_hints: false,
         ..SessionRules::default()
     })
     .expect("fixture rules");
@@ -202,6 +199,7 @@ fn practice_fixture() -> (Session, Model) {
     sess.jump(1);
     type_fixture(&mut sess, 48, NOW_MS - 1000, Some(10), Some(5));
     let mut m = model();
+    m.history.push(first.clone());
     m.latest = Some(first);
     (sess, m)
 }
@@ -270,10 +268,10 @@ fn full_analysis_fixture(sess: &mut Session) {
 
 fn model() -> Model {
     let mut m = Model::default();
-    m.hints = true;
+    m.hints = false;
     m.reduced_motion = false;
     m.quote_relaxed = true;
-    m.status = "虎码训练营 · 群赛第 38 期 · 布局 fixture".into();
+    m.status = "已绑定 虎码训练营".into();
     m.schema = "tiger".into();
     m.schema_ver = "2026.08.14".into();
     m.groups = ["虎码训练营", "五笔养老院", "跟打·夜场", "古文观止"]
@@ -292,129 +290,33 @@ fn model() -> Model {
     .into_iter()
     .map(str::to_string)
     .collect();
-    let mut draft = String::new();
-    for (i, paragraph) in PARAGRAPHS.iter().enumerate() {
-        draft.push_str("岳阳楼记 · 选段\n");
-        draft.push_str(paragraph);
-        draft.push_str(&format!("\n-----第{}段-晴发文\n", i + 1));
-    }
-    m.fields.insert("load_text".into(), draft);
     m
 }
 
-fn hints(sess: &Session, dict: &BTreeMap<String, String>, single: bool) -> Vec<HintWord> {
-    let chars: Vec<char> = sess.current_segment().text.chars().collect();
-    let mut out = Vec::new();
-    if !single && sess.current_segment().text == PARAGRAPHS[1] {
-        // Fixed phrase boundaries from S1. Codes still come from the real source
-        // dictionaries; a greedy fixture tokenizer would incorrectly prefer 之大.
-        let chunks = [
-            "予观夫",
-            "巴陵",
-            "胜状",
-            "，",
-            "在",
-            "洞庭",
-            "一湖",
-            "。",
-            "衔",
-            "远山",
-            "，",
-            "吞",
-            "长江",
-            "，",
-            "浩浩",
-            "汤汤",
-            "，",
-            "横",
-            "无际",
-            "涯",
-            "；",
-            "朝晖",
-            "夕阴",
-            "，",
-            "气象",
-            "万千",
-            "。",
-            "此则",
-            "岳阳楼",
-            "之",
-            "大观",
-            "也",
-            "，",
-            "前人",
-            "之述",
-            "备矣",
-            "。",
-            "然则",
-            "北通",
-            "巫峡",
-            "，",
-            "南极",
-            "潇湘",
-            "，",
-            "迁客",
-            "骚人",
-            "，",
-            "多会",
-            "于此",
-            "，",
-            "览物",
-            "之情",
-            "，",
-            "得无",
-            "异乎",
-            "？",
-        ];
-        assert_eq!(chunks.concat(), PARAGRAPHS[1]);
-        let mut start = 0;
-        for word in chunks {
-            let len = word.chars().count();
-            if !word.chars().all(|c| "，。；：？！、".contains(c)) {
-                out.push(HintWord {
-                    text: word.into(),
-                    code: dict.get(word).cloned(),
-                    tail: String::new(),
-                    start,
-                    len,
-                    rank: 1,
-                });
+fn single_hints(sess: &Session, dict: &BTreeMap<String, String>) -> Vec<HintWord> {
+    sess.current_segment()
+        .text
+        .chars()
+        .enumerate()
+        .map(|(i, ch)| {
+            let word = ch.to_string();
+            let code = dict.get(&word).cloned();
+            // Tail markers are layout samples only; no input-method recipe is inferred.
+            let tail = if code.as_ref().is_some_and(|c| c.len() == 4) {
+                "_"
+            } else {
+                ""
+            };
+            HintWord {
+                text: word,
+                code,
+                tail: tail.into(),
+                start: i,
+                len: 1,
+                rank: 1,
             }
-            start += len;
-        }
-        return out;
-    }
-    let mut i = 0;
-    while i < chars.len() {
-        let mut len = 1;
-        if !single {
-            for size in (2..=4.min(chars.len() - i)).rev() {
-                let word: String = chars[i..i + size].iter().collect();
-                if dict.contains_key(&word) {
-                    len = size;
-                    break;
-                }
-            }
-        }
-        let word: String = chars[i..i + len].iter().collect();
-        let code = dict.get(&word).cloned();
-        // Tail markers are layout samples only; no input-method recipe is inferred.
-        let tail = if single && code.as_ref().is_some_and(|c| c.len() == 4) {
-            "_"
-        } else {
-            ""
-        };
-        out.push(HintWord {
-            text: word,
-            code,
-            tail: tail.into(),
-            start: i,
-            len,
-            rank: 1,
-        });
-        i += len;
-    }
-    out
+        })
+        .collect()
 }
 
 fn drill_fixture() -> Session {
@@ -531,11 +433,8 @@ fn seed_preferences(cfg: &Config, m: &mut Model, theme: &gale_core::theme::Theme
     for (key, value) in [
         ("hint_show_code", cfg.hint_show_code),
         ("hint_show_rank", cfg.hint_show_rank),
-        ("hint_color_words", cfg.hint_color_words),
-        ("hint_underline", cfg.hint_underline),
-        ("hint_word_bg", cfg.hint_word_bg),
         ("score_auto_copy", cfg.score_auto_copy),
-        ("completion_popup", cfg.completion_popup),
+        ("auto_send_score", cfg.auto_send_score),
     ] {
         m.fields.insert(key.into(), value.to_string());
     }
@@ -547,21 +446,16 @@ fn seed_preferences(cfg: &Config, m: &mut Model, theme: &gale_core::theme::Theme
         .insert("score_template".into(), cfg.score_template.clone());
     m.fields.insert("score_preset".into(), "detailed".into());
     m.fields
-        .insert("pref_color_key".into(), "词提简码色".into());
+        .insert("pref_color_key".into(), "跟打区背景色".into());
     for key in [
-        "词提简码色",
-        "词提二字全码色",
-        "词提三字全码色",
-        "词提四字全码色",
         "跟打区背景色",
+        "对打未打底色",
         "打对字色",
         "对打打对底色",
         "打错字色",
         "对打打错底色",
         "词提编码色",
         "词提角标色",
-        "词提下划线色",
-        "词提底色",
     ] {
         let color = ui::setting_color(theme, key);
         m.fields.insert(
@@ -575,7 +469,7 @@ fn seed_preferences(cfg: &Config, m: &mut Model, theme: &gale_core::theme::Theme
         );
     }
     m.fields
-        .insert("pref_color_hex".into(), m.field("color_词提简码色"));
+        .insert("pref_color_hex".into(), m.field("color_跟打区背景色"));
 }
 
 fn completed_fixture(m: &mut Model, mode: TrainingMode, done: usize) -> Session {
@@ -584,18 +478,35 @@ fn completed_fixture(m: &mut Model, mode: TrainingMode, done: usize) -> Session 
         m.latest = Some(finish_segment(&mut sess, index));
     }
     m.race = mode == TrainingMode::Race;
-    m.hints = !m.race;
+    m.hints = false;
     m.history = sess.results.iter().flatten().cloned().collect();
     sess
 }
 
-fn history_fixture(m: &mut Model, done: bool, expanded: bool) -> Session {
-    let mut sess = completed_fixture(m, TrainingMode::Practice, 4);
-    if !done {
-        sess.jump(0);
-        type_fixture(&mut sess, 20, NOW_MS - 1000, None, None);
-    }
-    m.history_expanded = expanded;
+fn history_fixture(m: &mut Model, session_view: bool, select_older: bool) -> Session {
+    let sess = completed_fixture(m, TrainingMode::Practice, 4);
+    let mut previous = Session::new(100);
+    previous.load_group(ParsedGroupText {
+        title: "醉翁亭记".into(),
+        difficulty: None,
+        segments: vec![Segment {
+            mark: "1".into(),
+            text: "环滁皆山也。其西南诸峰，林壑尤美，望之蔚然而深秀者，琅琊也。山行六七里，渐闻水声潺潺，而泻出于两峰之间者，酿泉也。".into(),
+        }],
+    });
+    let chars = previous.current_segment().text.chars().count();
+    let end = type_fixture(&mut previous, chars, 18_200, Some(12), Some(4));
+    let mut old_record = previous
+        .finalize_current_at(end, UNIX_FIXTURE - 86_400)
+        .expect("completed history fixture");
+    old_record.input_method = "虎符".into();
+    m.history.insert(0, old_record);
+    m.selected_history = Some(if select_older { 0 } else { m.history.len() - 1 });
+    m.open(Modal::Report);
+    m.fields.insert(
+        "report_tab".into(),
+        if session_view { "session" } else { "history" }.into(),
+    );
     sess
 }
 
@@ -624,7 +535,7 @@ fn paint_field_fixtures(
             h: field.h,
         });
         let lines = if field.multi {
-            modals::wrap(&value, ((field.w - 12.) / 14.).max(1.) as usize)
+            modals::wrap(&value, ((field.w - 12.) / 15.).max(1.) as usize)
         } else {
             vec![value]
         };
@@ -633,7 +544,7 @@ fn paint_field_fixtures(
                 frame,
                 field.x + 6.,
                 field.y + 5. + row as f32 * 24.,
-                14.,
+                15.,
                 line,
                 p.text2,
             );
@@ -666,10 +577,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut renderer = Renderer::new(window.0.hwnd, WIDTH as u32, HEIGHT as u32)?;
     let dict = dictionaries();
     let mut manifest = Vec::new();
-    for screen in 1..=47 {
+    for screen in 1..=71 {
         let (mut sess, mut m) = practice_fixture();
         let mut cfg = Config {
-            font_size: 36.,
+            font_size: 54.,
             line_gap: 0.66,
             today_chars: 1284,
             smooth_caret: false,
@@ -678,8 +589,22 @@ fn main() -> Result<(), Box<dyn Error>> {
             ..Config::default()
         };
         let (width, height) = match screen {
-            21..=25 | 29 | 34..=38 | 40 => (640., 420.),
-            26..=28 | 30 | 39 | 41..=47 => (800., 600.),
+            21..=25
+            | 29
+            | 34..=38
+            | 40
+            | 48
+            | 49
+            | 52
+            | 55
+            | 57
+            | 58
+            | 61
+            | 63
+            | 65..=67
+            | 69
+            | 70 => (640., 420.),
+            26..=28 | 30 | 39 | 41..=47 | 51 | 54 | 56 | 59 | 60 | 71 => (800., 600.),
             _ => (WIDTH, HEIGHT),
         };
         let mut theme_name = "墨玉";
@@ -688,16 +613,15 @@ fn main() -> Result<(), Box<dyn Error>> {
             2 => {
                 sess = drill_fixture();
                 theme_name = "宣纸";
-                cfg.hint_style = 1;
                 "02-single-practice-light.bmp"
             }
             3 | 16 => {
-                m.open(Modal::Load);
+                m.open(Modal::Library);
                 if screen == 16 {
                     theme_name = "宣纸";
-                    "16-load-light.bmp"
+                    "16-library-light.bmp"
                 } else {
-                    "03-load-dark.bmp"
+                    "03-library-dark.bmp"
                 }
             }
             4 => {
@@ -711,19 +635,18 @@ fn main() -> Result<(), Box<dyn Error>> {
             6 | 7 | 19 | 29 => {
                 let done = if screen == 7 { 4 } else { 2 };
                 sess = completed_fixture(&mut m, TrainingMode::Race, done);
-                m.open(if screen == 7 {
-                    Modal::Report
-                } else {
-                    Modal::Result
-                });
+                if screen == 7 {
+                    m.open(Modal::Report);
+                    m.fields.insert("report_tab".into(), "session".into());
+                }
                 match screen {
-                    6 => "06-segment-result-dark.bmp",
+                    6 => "06-race-completed-dark.bmp",
                     7 => "07-race-report-dark.bmp",
                     19 => {
                         theme_name = "宣纸";
-                        "19-segment-result-light.bmp"
+                        "19-race-completed-light.bmp"
                     }
-                    _ => "29-segment-result-small-640x420.bmp",
+                    _ => "29-race-completed-small-640x420.bmp",
                 }
             }
             8 | 17 => {
@@ -760,7 +683,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     m.panel_scroll = 300.;
                 }
                 match screen {
-                    10 => "10-preferences-hints-dark.bmp",
+                    10 => "10-preferences-practice-dark.bmp",
                     11 => "11-preferences-scores-dark.bmp",
                     12 => "12-preferences-colors-dark.bmp",
                     18 => "18-preferences-colors-light.bmp",
@@ -769,13 +692,13 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
             }
             13..=15 | 25 | 28 => {
-                sess = history_fixture(&mut m, matches!(screen, 15 | 25), screen != 13);
+                sess = history_fixture(&mut m, screen == 15, matches!(screen, 13 | 25 | 28));
                 match screen {
-                    13 => "13-history-collapsed-dark.bmp",
-                    14 => "14-history-expanded-dark.bmp",
-                    15 => "15-history-completed-dark.bmp",
-                    25 => "25-history-completed-small-640x420.bmp",
-                    _ => "28-history-expanded-small-800x600.bmp",
+                    13 => "13-report-history-older-dark.bmp",
+                    14 => "14-report-history-current-dark.bmp",
+                    15 => "15-report-session-dark.bmp",
+                    25 => "25-report-history-small-640x420.bmp",
+                    _ => "28-report-history-small-800x600.bmp",
                 }
             }
             20 | 30 => {
@@ -815,13 +738,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
             }
             31 => {
-                m.open(Modal::Load);
-                m.load_tab = 1;
-                m.fields.insert("single_shuffle".into(), "true".into());
-                m.fields.insert("single_seg".into(), "20".into());
-                m.fields
-                    .insert("single_target_keystroke".into(), "3.0".into());
-                "31-load-single-practice-settings-dark.bmp"
+                m.open(Modal::Library);
+                m.books.clear();
+                "31-library-empty-dark.bmp"
             }
             32 | 33 | 37 => {
                 full_analysis_fixture(&mut sess);
@@ -849,12 +768,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                 "36-rules-small-640x420.bmp"
             }
             38 | 39 => {
-                m.open(Modal::Load);
-                m.load_tab = 0;
+                m.open(Modal::Library);
                 if screen == 39 {
-                    "39-load-small-800x600.bmp"
+                    "39-library-small-800x600.bmp"
                 } else {
-                    "38-load-small-640x420.bmp"
+                    "38-library-small-640x420.bmp"
                 }
             }
             40 => {
@@ -864,7 +782,6 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
             41 => {
                 sess = drill_fixture();
-                cfg.font_size = 54.;
                 theme_name = "宣纸";
                 "41-single-practice-800x600-light.bmp"
             }
@@ -880,7 +797,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 if screen == 43 {
                     "43-preferences-scores-small-800x600.bmp"
                 } else {
-                    "44-preferences-hints-small-800x600.bmp"
+                    "44-preferences-practice-small-800x600.bmp"
                 }
             }
             45 => {
@@ -901,18 +818,119 @@ fn main() -> Result<(), Box<dyn Error>> {
                 m.open(Modal::Rules);
                 "47-rules-small-800x600.bmp"
             }
+            48 => "48-main-practice-small-640x420.bmp",
+            49 => {
+                sess = drill_fixture();
+                "49-single-practice-small-640x420.bmp"
+            }
+            50..=52 | 68 | 69 => {
+                let done = if screen >= 68 { 4 } else { 2 };
+                sess = completed_fixture(&mut m, TrainingMode::Practice, done);
+                if screen == 51 {
+                    theme_name = "宣纸";
+                }
+                match screen {
+                    50 => "50-main-completed-1280x800.bmp",
+                    51 => "51-main-completed-800x600-light.bmp",
+                    52 => "52-main-completed-640x420.bmp",
+                    68 => "68-main-final-segment-completed-1280x800.bmp",
+                    _ => "69-main-final-segment-completed-640x420.bmp",
+                }
+            }
+            53..=55 | 66 => {
+                if screen == 66 {
+                    sess = drill_fixture();
+                }
+                m.pending_source = "虎码训练营".into();
+                m.open(Modal::More);
+                match screen {
+                    53 => "53-more-1280x800.bmp",
+                    54 => "54-more-800x600.bmp",
+                    55 => "55-more-640x420.bmp",
+                    _ => "66-more-single-640x420.bmp",
+                }
+            }
+            56 | 62 | 63 => {
+                if screen == 62 {
+                    m.groups.clear();
+                    m.bound = None;
+                } else if screen == 63 {
+                    m.bound = Some(m.groups.len() + 3);
+                }
+                m.open(Modal::Groups);
+                match screen {
+                    56 => "56-groups-800x600.bmp",
+                    62 => "62-groups-empty-1280x800.bmp",
+                    _ => "63-groups-invalid-selection-640x420.bmp",
+                }
+            }
+            57 | 58 | 67 => {
+                m.open(Modal::Preferences);
+                let tab = match screen {
+                    57 => 0,
+                    58 => 2,
+                    _ => 1,
+                };
+                m.fields.insert("pref_tab".into(), tab.to_string());
+                cfg.score_template = gale_core::scorecard::preset("detailed").template.into();
+                match screen {
+                    57 => "57-preferences-practice-small-640x420.bmp",
+                    58 => "58-preferences-colors-small-640x420.bmp",
+                    _ => "67-preferences-scores-small-640x420-top.bmp",
+                }
+            }
+            59..=61 | 70 | 71 => {
+                sess = history_fixture(&mut m, matches!(screen, 60 | 61), true);
+                match screen {
+                    59 => "59-report-history-800x600.bmp",
+                    60 => "60-report-session-800x600.bmp",
+                    61 => "61-report-session-640x420.bmp",
+                    70 => "70-report-history-640x420-selected-detail.bmp",
+                    _ => "71-report-history-800x600-selected-detail.bmp",
+                }
+            }
+            64 => {
+                sess = article(TrainingMode::Practice);
+                m.latest = None;
+                m.history.clear();
+                "64-main-ready-1280x800.bmp"
+            }
+            65 => {
+                sess = article(TrainingMode::Practice);
+                m.latest = None;
+                m.history.clear();
+                m.open(Modal::Report);
+                "65-report-history-empty-640x420.bmp"
+            }
             _ => unreachable!(),
         };
+        if m.modal == Modal::Report
+            && !secondary_panels::session_report(&m)
+            && m.selected_history == Some(0)
+            && width < 1000.
+        {
+            m.scroll = m.history.len().saturating_sub(3) as f32;
+        }
+        if matches!(screen, 70 | 71) {
+            m.panel_scroll =
+                secondary_panels::history_detail_scroll(&m, &sess, width, height - 138.);
+        }
         cfg.theme = theme_name.into();
-        let frame_now = if screen == 2 { 1663 } else { NOW_MS };
-        if screen == 2 {
-            m.status = "单字练习 · 常用单字前五百 · 布局 fixture".into();
+        let single = matches!(&sess.source, session::SessionSource::Single);
+        let frame_now = if single { 1663 } else { NOW_MS };
+        if single {
+            m.status = "单字练习 · 常用单字前五百".into();
+            m.hints = true;
         }
         let theme = ui::theme(theme_name);
         seed_preferences(&cfg, &mut m, &theme);
-        m.words = hints(&sess, &dict, screen == 2);
+        m.words = if single {
+            single_hints(&sess, &dict)
+        } else {
+            Vec::new()
+        };
         m.max_code_length = 4;
-        if screen == 2 {
+        if single {
             if let Some(word) = m.words.get_mut(4) {
                 word.rank = 2;
                 word.tail = "_".into();
@@ -962,7 +980,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         manifest.push(serde_json::json!({
             "screen":screen,"file":name,"logical_size":[width,height],"pixel_size":[width as u32,height as u32],
             "theme":theme_name,"modal":format!("{:?}",m.modal),"phase":format!("{:?}",sess.phase),
-            "panel_scroll":m.panel_scroll,"history_expanded":m.history_expanded,"history_records":m.history.len(),
+            "font_size":cfg.font_size,"single_character_hints":single,"report_tab":m.field("report_tab"),
+            "panel_scroll":m.panel_scroll,"list_scroll":m.scroll,"selected_history":m.selected_history,"history_records":m.history.len(),
             "draw_commands":frame.cmds.len(),"hit_targets":hits.len(),
             "visible_native_field_rectangles":field_manifest,"native_field_values_painted_by_d2d":true
         }));
@@ -977,7 +996,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             "screens":manifest,
         }))?,
     )?;
-    std::fs::write(output.join("README.txt"),
-        "虎符跟打器 · 开发期布局 fixture\n\n31 张 BMP 使用产品真实 ui::build、modals::draw、Frame 与 Direct2D Renderer，在单个隐藏窗口内生成。\n覆盖 1280×800、800×600 与 640×420，96 DPI；深浅主题、设置三个页签、成绩历史及完成条、在线登录注册与滚动、完整键盘，以及 F2 本地文库/单字练习设置。\nmanifest.json 逐图记录主题、尺寸、模态、滚动、绘制指令数量和原生字段矩形。\n账号、群、文章进度与成绩均为确定性样本；成绩通过真实 Session key / commit / finalize 路径生成，不读写产品成绩文件。\n原生输入字段按 FieldSpec 坐标用 D2D 绘制样本值；未创建 InputHost/RichEdit，不能替代真实 TSF、输入、焦点与滚动验证。\n没有抓取桌面、读取其他应用、访问网络或修改系统设置。\n")?;
+    std::fs::write(output.join("README.txt"), format!(
+        "虎符跟打器 · 开发期布局 fixture\n\n{} 张 BMP 使用产品真实 ui::build、modals::draw、Frame 与 Direct2D Renderer，在单个隐藏窗口内生成。\n覆盖 1280×800、800×600 与 640×420，96 DPI；正文统一使用用户字号 54。\n核心场景覆盖文章、单字练习、完成与末段完成、更多菜单、选群、外观、设置三个页签，以及成绩记录/本轮汇总。\n另保留深浅主题、在线登录注册与滚动、清洗规则、完整键盘、理论码长分析与本地载文等辅助场景。\n成绩记录同时包含《岳阳楼记》《醉翁亭记》，区分所选旧记录与本轮最新成绩；小窗口额外覆盖滚动后的详情、群聊空态与失效选择。文章不创建编码提示，单字练习从真实单字码表生成提示。\nmanifest.json 逐图记录主题、尺寸、字号、模态、滚动、历史选择、绘制指令数量和原生字段矩形。\n账号、群、文章进度与成绩均为确定性样本；成绩通过真实 Session key / commit / finalize 路径生成，不读写产品成绩文件。\n原生输入字段按 FieldSpec 坐标用 D2D 绘制样本值；未创建 InputHost/RichEdit，不能替代真实 TSF、输入、焦点与滚动验证。\n没有抓取桌面、读取其他应用、访问网络或修改系统设置。\n", manifest.len()))?;
     Ok(())
 }

@@ -319,13 +319,13 @@ impl Frame {
 }
 
 /// 字体族选择：Lxgw = 跟打正文，Ui = 界面（chip/统计/面板），Mono = 数字/编码。
-/// Lxgw 与 Ui 都解析到 [`detected_cjk_family`]（霞鹜文楷家族优先、微软雅黑回退），
-/// 仅用途语义有别；Mono 恒为系统等宽（Consolas）。
+/// Lxgw 保留系统探测的正文字体；Ui 使用微软雅黑，保证小字号标签清楚；
+/// Mono 恒为系统等宽（Consolas）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FontFamily {
     /// 跟打正文（系统探测：霞鹜文楷家族优先，回退微软雅黑）
     Lxgw,
-    /// UI 字（与正文同族——跟虎符主程序策略）
+    /// 界面标签（Microsoft YaHei UI）
     Ui,
     Mono,
 }
@@ -337,7 +337,7 @@ pub enum FontFamily {
 // 覆盖只装了中文名族或英文名族的安装形态），按下表优先级取第一个命中；
 // 都没有 → "Microsoft YaHei UI"。探测一次，进程内缓存。
 
-/// 正文/UI 家族优先级表（前 = 优先）。中英文名成对给出，
+/// 正文家族优先级表（前 = 优先）。中英文名成对给出，
 /// 对家族的任一本地化名做大小写不敏感比对。
 const CJK_FAMILY_CANDIDATES: [&str; 10] = [
     "霞鹜文楷 GB Screen",
@@ -358,7 +358,7 @@ const CJK_FAMILY_FALLBACK: &str = "Microsoft YaHei UI";
 /// 探测结果缓存（进程内一次）
 static DETECTED_CJK_FAMILY: OnceLock<String> = OnceLock::new();
 
-/// 取正文/UI 字体家族（系统探测，进程内缓存）。
+/// 取正文字体家族（系统探测，进程内缓存）。
 /// 返回值直接作 CreateTextFormat 家族名（命中候选表原样返回，未命中返回回退名）。
 pub fn detected_cjk_family() -> &'static str {
     DETECTED_CJK_FAMILY.get_or_init(detect_cjk_family)
@@ -419,7 +419,7 @@ unsafe fn localized_string(ls: &IDWriteLocalizedStrings, index: u32) -> Option<S
 }
 
 /// 字体 + 排版工具箱（一个 Renderer 一份）：
-/// - 正文/UI 家族 = [`detected_cjk_family`]（系统探测，首次用到时解析一次）；
+/// - 正文家族 = [`detected_cjk_family`]，UI = Microsoft YaHei UI；
 /// - (family, size) → IDWriteTextFormat 缓存（跟打器字号固定档位少，全缓存）；
 /// - 逐簇测宽（折行/贪吃蛇/光标定位的统一真值）。
 pub struct FontKit {
@@ -462,10 +462,10 @@ impl FontKit {
         family: FontFamily,
         size: f32,
     ) -> windows::core::Result<IDWriteTextFormat> {
-        // Lxgw/Ui 同族（虎符主程序策略：系统探测霞鹜文楷优先，回退微软雅黑）；
-        // Mono 等宽保持现状（Consolas，系统必有；Cascadia Mono 由 DWrite 匹配器兜底）
+        // 正文保留用户习惯，界面标签使用清晰的无衬线字体。
         let name: PCWSTRLike = match family {
-            FontFamily::Lxgw | FontFamily::Ui => wide_null(detected_cjk_family()),
+            FontFamily::Lxgw => wide_null(detected_cjk_family()),
+            FontFamily::Ui => wide_null("Microsoft YaHei UI"),
             FontFamily::Mono => wide_null("Consolas"),
         };
         let fmt = self.dwrite.CreateTextFormat(

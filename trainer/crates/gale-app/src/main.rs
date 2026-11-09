@@ -94,6 +94,7 @@ enum AuxAction {
     HistoryToggle,
     HistoryOpen(usize),
     HistoryStep(i32),
+    ReportTab(bool),
     SingleTarget(i32),
 }
 
@@ -125,6 +126,8 @@ fn aux_action(a: &Action) -> Option<AuxAction> {
                 .clamp(12, 36),
         ),
         "history_toggle" => AuxAction::HistoryToggle,
+        "report_history" => AuxAction::ReportTab(false),
+        "report_session" => AuxAction::ReportTab(true),
         _ if cmd.starts_with("history_open:") => {
             AuxAction::HistoryOpen(cmd.strip_prefix("history_open:")?.parse().ok()?)
         }
@@ -143,19 +146,14 @@ pub(crate) fn aux_marker(cmd: &str) -> Action {
     Action::Theme(format!("{AUX_PREFIX}{cmd}"))
 }
 const PREFERENCE_COLORS: &[&str] = &[
-    "词提简码色",
-    "词提二字全码色",
-    "词提三字全码色",
-    "词提四字全码色",
     "跟打区背景色",
+    "对打未打底色",
     "打对字色",
     "对打打对底色",
     "打错字色",
     "对打打错底色",
     "词提编码色",
     "词提角标色",
-    "词提下划线色",
-    "词提底色",
 ];
 const SCORE_FIELD_LABELS: &[(&str, &str)] = &[
     ("segment", ""),
@@ -616,7 +614,7 @@ fn run() -> Result<(), String> {
     let mut sess = Session::restore_snapshot(&dir.join("session.jsonl"))
         .unwrap_or_else(|_| Session::new(cfg.seg_chars));
     if sess.current_segment().text.is_empty() {
-        sess.load_book("欢迎来到静室","天青色等烟雨，而我在等你。\n文字落下，心也安静下来。\n按 F2 载入文字，按 F7 选择外观。按下第一个键开始计时。");
+        sess.load_book("欢迎来到静室", "天青色等烟雨，而我在等你。\n文字落下，心也安静下来。\n从文库选文，或按 Ctrl+V 载入文字。按下第一个键开始计时。");
     }
     if sess.frozen_rules.is_none() {
         let _ = sess.set_rules(cfg.session_rules.clone());
@@ -637,7 +635,7 @@ fn run() -> Result<(), String> {
     model.race = sess.rules.mode == TrainingMode::Race;
     model.quote_relaxed = sess.rules.quotes.enabled;
     model.reduced_motion = gale_win::edit::reduced_motion() || cfg.motion_level == 0;
-    model.status = "按 F2 载文 · F3 重打 · F5 赛报".into();
+    model.status = "Ctrl+V 载文 · F3 重打 · F4 群载文 · F5 选群".into();
     model.online_status = "未登录 · 登录后浏览在线书架".into();
     model.online_title = "在线书架".into();
     model
@@ -889,24 +887,30 @@ fn run() -> Result<(), String> {
                 // 【减法定稿】F2/F6 不再绑定；F2=载文窗、F6=旧选群位均已退役。
                 CommandKey::F2 | CommandKey::F6 | CommandKey::RetryResult => None,
                 CommandKey::LoadClipboard | CommandKey::AltE => Some(Action::LoadClipboard),
-                CommandKey::CopyResult => Some(if app.model.modal == Modal::Report {
-                    Action::CopyRace
-                } else {
-                    Action::CopyScore
-                }),
-                CommandKey::SendResult => Some(if app.model.modal == Modal::Report {
-                    Action::CopyRace
-                } else {
-                    Action::SendScore
-                }),
+                CommandKey::CopyResult => Some(
+                    if app.model.modal == Modal::Report
+                        && secondary_panels::session_report(&app.model)
+                    {
+                        Action::CopyRace
+                    } else {
+                        Action::CopyScore
+                    },
+                ),
+                CommandKey::SendResult => Some(
+                    if app.model.modal == Modal::Report
+                        && secondary_panels::session_report(&app.model)
+                    {
+                        Action::CopyRace
+                    } else {
+                        Action::SendScore
+                    },
+                ),
                 CommandKey::ExportResult => Some(Action::ExportImage),
                 CommandKey::CtrlLeft => Some(Action::Previous),
                 CommandKey::CtrlRight => Some(Action::Next),
-                CommandKey::Enter => completed_segment_action(
-                    cmd,
-                    app.sess.phase == Phase::Done,
-                    app.model.modal,
-                ),
+                CommandKey::Enter => {
+                    completed_segment_action(cmd, app.sess.phase == Phase::Done, app.model.modal)
+                }
                 CommandKey::Space => {
                     completed_segment_action(cmd, app.sess.phase == Phase::Done, app.model.modal)
                 }
@@ -975,7 +979,7 @@ fn run() -> Result<(), String> {
                 }
             }
         }
-        // 整改7：QQ 读取屏（F6 群屏 / F2 第三 tab）打开期间每 10s 刷新会话列表。
+        // 选群面板打开期间每 10s 刷新会话列表。
         let qq_screen = app.model.modal == Modal::Groups;
         if qq_screen && !app.qq_busy && now.saturating_sub(app.qq_scan_at) >= 10_000 {
             app.qq_scan_at = now;
@@ -1071,19 +1075,26 @@ fn run() -> Result<(), String> {
                         }
                         continue;
                     }
-                    let (_, _, _, ph) = modals::panel(
-                        app.model.modal,
-                        0.,
+                    let (_, _, _, ph) = modals::panel_for_model(
+                        &app.model,
+                        app.win.client_size().0 as f32 / gale_win::window::dpi_scale(),
                         app.win.client_size().1 as f32 / gale_win::window::dpi_scale(),
                     );
                     let max = if app.model.modal == Modal::Report {
-                        (secondary_panels::content_height(app.model.modal) - ph).max(0.)
+                        (secondary_panels::report_content_height(
+                            &app.model,
+                            &app.sess,
+                            app.win.client_size().0 as f32 / gale_win::window::dpi_scale(),
+                        ) - ph)
+                            .max(0.)
                     } else {
                         (ph - app.win.client_size().1 as f32 / gale_win::window::dpi_scale() + 48.)
                             .max(0.)
                     };
-                    let has_list =
-                        matches!(app.model.modal, Modal::Rules | Modal::Groups | Modal::Report);
+                    let has_list = matches!(
+                        app.model.modal,
+                        Modal::Rules | Modal::Groups | Modal::Report | Modal::Library
+                    );
                     if app.model.modal != Modal::None
                         && max > 0.
                         && !(has_list
@@ -1096,7 +1107,12 @@ fn run() -> Result<(), String> {
                         let cap = match app.model.modal {
                             Modal::Groups => app.model.groups.len().saturating_sub(5),
                             Modal::Rules => app.model.rules.len().saturating_sub(6),
-                            Modal::Report => app.sess.total_segments().saturating_sub(6),
+                            Modal::Report => secondary_panels::report_scroll_cap(
+                                &app.model,
+                                &app.sess,
+                                app.win.client_size().0 as f32 / gale_win::window::dpi_scale(),
+                            ),
+                            Modal::Library => app.model.books.len().saturating_sub(5),
                             _ => 0,
                         };
                         app.model.scroll =
@@ -1339,8 +1355,7 @@ impl App {
         );
     }
     fn compact_history(&self) -> bool {
-        self.model.history_expanded
-            && self.win.client_size().1 as f32 / gale_win::window::dpi_scale() < 680.
+        false // History now lives in the unified report view, never over the typing area.
     }
     fn sync_preferences(&mut self, editors: bool) {
         for (key, value) in [
@@ -1381,12 +1396,15 @@ impl App {
             self.model
                 .fields
                 .insert("score_template".into(), configured_template(&self.cfg));
-            let key = self
-                .model
+            let selected = self.model.field("pref_color_key");
+            let key = if PREFERENCE_COLORS.contains(&selected.as_str()) {
+                selected
+            } else {
+                PREFERENCE_COLORS[0].to_string()
+            };
+            self.model
                 .fields
-                .entry("pref_color_key".into())
-                .or_insert_with(|| "词提简码色".into())
-                .clone();
+                .insert("pref_color_key".into(), key.clone());
             self.model.fields.insert(
                 "pref_color_hex".into(),
                 self.model.field(&format!("color_{key}")),
@@ -1678,35 +1696,51 @@ impl App {
         v.sort_by_key(|w| w.start);
         self.model.words = v;
     }
+    fn select_history(&mut self, index: usize) {
+        if index >= self.model.history.len() {
+            return;
+        }
+        self.auto_next_at = None;
+        if self.model.modal != Modal::Report {
+            self.open(Modal::Report);
+        }
+        self.model.selected_history = Some(index);
+        self.model
+            .fields
+            .insert("report_tab".into(), "history".into());
+        let sc = gale_win::window::dpi_scale();
+        let (w, h) = self.win.client_size();
+        let (_, _, pw, ph) = modals::panel_for_model(&self.model, w as f32 / sc, h as f32 / sc);
+        self.model.panel_scroll =
+            secondary_panels::history_detail_scroll(&self.model, &self.sess, pw, ph);
+    }
+
     /// 私有标记动作执行（aux_action 解码后）
     fn run_aux(&mut self, aux: AuxAction) {
         match aux {
             AuxAction::Preference(command) => self.preference_action(&command),
             AuxAction::HistoryToggle => {
-                self.model.history_expanded = !self.model.history_expanded;
-                gale_win::window::set_focus_relay(!self.compact_history());
-                if self.compact_history() {
-                    self.host.hide();
-                    unsafe {
-                        let _ =
-                            windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(self.win.hwnd());
-                    }
-                } else {
-                    self.host.show();
-                    self.host.focus();
-                }
+                self.auto_next_at = None;
+                self.open(Modal::Report);
             }
             AuxAction::HistoryStep(delta) => {
-                self.model.history_scroll = (self.model.history_scroll as i64 + delta as i64)
-                    .clamp(0, self.model.history.len().saturating_sub(4) as i64)
-                    as usize;
+                let cap = secondary_panels::report_scroll_cap(
+                    &self.model,
+                    &self.sess,
+                    self.win.client_size().0 as f32 / gale_win::window::dpi_scale(),
+                ) as f32;
+                self.model.scroll = (self.model.scroll + delta as f32).clamp(0., cap);
             }
             AuxAction::HistoryOpen(index) => {
-                if let Some(record) = self.model.history.get(index).cloned() {
-                    self.model.latest = Some(record);
-                    self.auto_next_at = None;
-                    self.open(Modal::Report);
-                }
+                self.select_history(index);
+            }
+            AuxAction::ReportTab(session) => {
+                self.model.fields.insert(
+                    "report_tab".into(),
+                    if session { "session" } else { "history" }.into(),
+                );
+                self.model.scroll = 0.;
+                self.model.panel_scroll = 0.;
             }
             AuxAction::SingleTarget(delta) => {
                 self.single_cfg.target_keystroke_x10 =
@@ -1802,12 +1836,12 @@ impl App {
             AuxAction::SingleSegCycle => {
                 let c = self.single_cfg.clamped();
                 let next = c.segment_chars as i32 + 5;
-                self.single_cfg.segment_chars = if next > gale_core::single::SINGLE_SEGMENT_MAX as i32
-                {
-                    gale_core::single::SINGLE_SEGMENT_MIN
-                } else {
-                    next as u16
-                };
+                self.single_cfg.segment_chars =
+                    if next > gale_core::single::SINGLE_SEGMENT_MAX as i32 {
+                        gale_core::single::SINGLE_SEGMENT_MIN
+                    } else {
+                        next as u16
+                    };
                 self.save_single_cfg();
             }
             AuxAction::SingleTargetCycle => {
@@ -1918,6 +1952,12 @@ impl App {
         if m == Modal::Preferences {
             self.sync_preferences(true);
         }
+        if m == Modal::Report {
+            self.model.selected_history = None;
+            self.model
+                .fields
+                .insert("report_tab".into(), "history".into());
+        }
         self.model.open(m);
         gale_win::input_host::set_result_key_target(
             matches!(m, Modal::Report).then_some(self.win.hwnd),
@@ -1997,18 +2037,19 @@ impl App {
         let sc = gale_win::window::dpi_scale();
         let (lw, lh) = (w as f32 / sc, h as f32 / sc);
         let now = self.clock.elapsed().as_secs_f64();
-        let (_, _, _, ph) = modals::panel(self.model.modal, lw, lh);
+        let (_, _, _, ph) = modals::panel_for_model(&self.model, lw, lh);
         self.model.panel_scroll = self.model.panel_scroll.clamp(
             0.,
             if matches!(self.model.modal, Modal::Report) {
-                (secondary_panels::content_height(self.model.modal) - ph).max(0.)
+                (secondary_panels::report_content_height(&self.model, &self.sess, lw) - ph).max(0.)
             } else {
                 (ph - (lh - 48.).min(ph)).max(0.)
             },
         );
         let (bw, fs, base_lh) = ui::body_metrics(&self.sess, &self.cfg, lw);
-        let hints_visible = gale_core::rules::hints_effective(self.model.hints, self.model.race)
-            && self.cfg.hint_style != 2;
+        let hints_visible = self.sess.source == SessionSource::Single
+            && gale_core::rules::hints_effective(self.model.hints, self.model.race)
+            && (self.cfg.hint_show_code || self.cfg.hint_show_rank);
         let lheight = ui::line_height_for_anchor(&self.cfg, fs, base_lh, hints_visible);
         let key = (self.generation, fs.to_bits(), bw.to_bits());
         if self.layout_key != key {
@@ -2292,7 +2333,7 @@ impl App {
                                     if self.model.words.is_empty() {
                                         "服务已连接"
                                     } else {
-                                        "词提已就绪"
+                                        "单字提示已就绪"
                                     }
                                 );
                                 if let Some(reason) = v["hint_unavailable_reason"].as_str() {
@@ -2304,10 +2345,10 @@ impl App {
                                 // when the service is temporarily unavailable.
                                 if self.refill_from_full_words() {
                                     self.model.status =
-                                        format!("词提请求失败 · 已用本地全文缓存 · {e}");
+                                        format!("单字提示请求失败 · 已用本地缓存 · {e}");
                                 } else {
                                     self.model.words.clear();
-                                    self.model.status = format!("词提暂不可用 · {e}");
+                                    self.model.status = format!("单字提示暂不可用 · {e}");
                                 }
                             }
                         }
@@ -2337,7 +2378,7 @@ impl App {
                     if self.chats.is_empty() {
                         let panel = qq_bridge::main_panel().is_some();
                         let msg = if panel {
-                            "已找到 QQ 主面板，但 UIA 未返回会话列表；请重启 QQ 或打开群聊窗口后重试"
+                            "暂时读不到 QQ 群聊列表，请打开群聊窗口后刷新"
                         } else {
                             "未检测到 QQ：请打开并登录 QQ 后重试"
                         };
@@ -2708,7 +2749,7 @@ impl App {
     fn defer_draft(&mut self, name: String, text: String) {
         self.model.pending_source = name.clone();
         self.pending_draft = Some((name, text));
-        self.toast("新文字已读取，当前草稿保留；F2中选择显示待读文字");
+        self.toast("新文字已读取，当前草稿保留；点击待读文字可开始练习");
     }
     fn load_text(&mut self) {
         let text = self.model.field("load_text");
@@ -2736,10 +2777,7 @@ impl App {
     }
     fn score_text(&self) -> Option<String> {
         if self.model.modal == Modal::Report {
-            return self
-                .model
-                .latest
-                .as_ref()
+            return secondary_panels::selected_report_record(&self.model)
                 .map(|record| self.format_record(record));
         }
         if self.sess.phase != Phase::Done || !self.sess.recorded {
@@ -2867,6 +2905,9 @@ impl App {
                         self.sync_rule_model();
                     }
                 }
+            }
+            Action::SelectHistory(index) => {
+                self.select_history(index);
             }
             Action::OnlineAccount => {
                 self.model.online_login_expanded = !self.model.online_login_expanded;
@@ -3073,7 +3114,7 @@ impl App {
             Action::ToggleHints => {
                 // 【减法 2026-11-09】词提已下线；本开关只服务单字练习的字提。
                 if self.sess.source != session::SessionSource::Single {
-                    self.toast("词提已移除（单字练习的字提不受影响）");
+                    self.toast("编码提示仅用于单字练习");
                 } else {
                     let mut r = self.sess.rules.clone();
                     r.word_hints = !r.word_hints;
@@ -3211,52 +3252,48 @@ impl App {
                     "打完自动发成绩：关（仅复制）"
                 });
             }
-            Action::SendScoreToGroup => match self
-                .model
-                .bound
-                .and_then(|i| self.chats.get(i).cloned())
-            {
-                Some(chat) => match self.score_text() {
-                    Some(s) => match qq_bridge::send_message_enhanced(&chat, &s) {
-                        Ok(()) => self.toast(format!("成绩已发送到「{}」", chat.title)),
-                        Err(e) => self.toast(e),
+            Action::SendScoreToGroup => {
+                match self.model.bound.and_then(|i| self.chats.get(i).cloned()) {
+                    Some(chat) => match self.score_text() {
+                        Some(s) => match qq_bridge::send_message_enhanced(&chat, &s) {
+                            Ok(()) => self.toast(format!("成绩已发送到「{}」", chat.title)),
+                            Err(e) => self.toast(e),
+                        },
+                        None => self.toast("当前没有可发送的成绩"),
                     },
-                    None => self.toast("当前没有可发送的成绩"),
-                },
-                None => {
-                    self.toast("未绑定群，请先选择");
-                    self.open(Modal::Groups);
-                }
-            },
-            Action::PostArticle => match self
-                .model
-                .bound
-                .and_then(|i| self.chats.get(i).cloned())
-            {
-                Some(chat) => {
-                    let seg = self.sess.current_segment();
-                    let chars = seg.text.chars().count();
-                    let mark = if seg.mark.is_empty() {
-                        (self.sess.index + 1).to_string()
-                    } else {
-                        seg.mark.clone()
-                    };
-                    // 发文格式（跟打码生态通用）：[难度]标题 [字数]\n正文\n-----第N段-晴发文
-                    let title = crate::ui::elide(&self.sess.title, 24);
-                    let text = format!(
-                        "[跟打]{} [{}字]\n{}\n-----第{}段-晴发文",
-                        title, chars, seg.text, mark
-                    );
-                    match qq_bridge::send_message_enhanced(&chat, &text) {
-                        Ok(()) => self.toast(format!("第{mark}段已发文到「{}」", chat.title)),
-                        Err(e) => self.toast(e),
+                    None => {
+                        self.toast("未绑定群，请先选择");
+                        self.open(Modal::Groups);
                     }
                 }
-                None => {
-                    self.toast("未绑定群，请先选择");
-                    self.open(Modal::Groups);
+            }
+            Action::PostArticle => {
+                match self.model.bound.and_then(|i| self.chats.get(i).cloned()) {
+                    Some(chat) => {
+                        let seg = self.sess.current_segment();
+                        let chars = seg.text.chars().count();
+                        let mark = if seg.mark.is_empty() {
+                            (self.sess.index + 1).to_string()
+                        } else {
+                            seg.mark.clone()
+                        };
+                        // 发文格式（跟打码生态通用）：[难度]标题 [字数]\n正文\n-----第N段-晴发文
+                        let title = crate::ui::elide(&self.sess.title, 24);
+                        let text = format!(
+                            "[跟打]{} [{}字]\n{}\n-----第{}段-晴发文",
+                            title, chars, seg.text, mark
+                        );
+                        match qq_bridge::send_message_enhanced(&chat, &text) {
+                            Ok(()) => self.toast(format!("第{mark}段已发文到「{}」", chat.title)),
+                            Err(e) => self.toast(e),
+                        }
+                    }
+                    None => {
+                        self.toast("未绑定群，请先选择");
+                        self.open(Modal::Groups);
+                    }
                 }
-            },
+            }
             Action::ExportImage => {
                 if let Some(p) = file_dialog(self.win.hwnd, true, "bmp") {
                     match self.renderer.save_bmp(&p) {
@@ -3284,7 +3321,10 @@ impl App {
                     // 【群三件套】选群即切换：能自动切就切，切不动再让用户点。
                     let chat = self.chats[i].clone();
                     if qq_bridge::focus_chat(&chat) {
-                        self.toast(format!("已切到「{}」· F4 读文 / 打完自动发成绩", chat.title));
+                        self.toast(format!(
+                            "已切到「{}」· F4 读文 / 打完自动发成绩",
+                            chat.title
+                        ));
                     } else {
                         self.toast(format!(
                             "已绑定「{}」· 请在 QQ 点开该群后 F4 读文",
@@ -3667,7 +3707,7 @@ fn local_json(
         .read_to_end(&mut b)
         .map_err(|e| e.to_string())?;
     if b.len() > 4_000_000 {
-        return Err("词提响应过长".into());
+        return Err("服务响应过长".into());
     }
     let sep = b
         .windows(4)
@@ -3694,12 +3734,12 @@ fn local_json(
             });
         return Err(detail.unwrap_or_else(|| match code {
             403 => "虎符服务拒绝连接，请检查本地服务设置".into(),
-            413 => "文章超过词提服务字数上限，请缩短段落".into(),
-            429 => "词提服务正在处理其他请求，请稍后重试".into(),
+            413 => "文字超过服务字数上限，请缩短段落".into(),
+            429 => "服务正在处理其他请求，请稍后重试".into(),
             _ => format!("虎符服务返回HTTP {code}"),
         }));
     }
-    serde_json::from_slice(&b[sep + 4..]).map_err(|_| "词提数据无效".into())
+    serde_json::from_slice(&b[sep + 4..]).map_err(|_| "服务数据无效".into())
 }
 
 #[cfg(test)]
