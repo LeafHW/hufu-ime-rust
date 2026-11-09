@@ -28,6 +28,80 @@ mod model03;
 #[cfg(test)]
 mod prob_cache_tests;
 
+/// 【概率缓存哈希 2026-11-09】FxHash（RustFxHash 公有领域算法手写实现，
+/// 零新依赖）：解码内层概率 memo 的键是 ([u32;4],u32)=20B，原 std
+/// RandomState（SipHash-1-3）在长解码百万级查询上哈希税显著；Fx 为
+/// 乘法-旋转-异或链。哈希弱只退化查询速度（桶内键比较兜底），结果
+/// 仍逐位一致。该表只 get/insert/clear，无迭代序依赖（原 RandomState
+/// 的随机化也不被任何路径依赖）。
+struct FxHasher {
+    hash: u64,
+}
+
+impl Default for FxHasher {
+    #[inline]
+    fn default() -> Self {
+        FxHasher { hash: 0 }
+    }
+}
+
+impl FxHasher {
+    const SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+    #[inline]
+    fn add_to(&mut self, w: u64) {
+        self.hash = (self.hash.rotate_left(5) ^ w).wrapping_mul(Self::SEED);
+    }
+}
+
+impl std::hash::Hasher for FxHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        // 手写 8 字节步进（array_chunks 未稳定，chunks_exact 恒定块长
+        // 触发 clippy）；write 不在热键上（([u32;4],u32) 键走 write_u32）。
+        let n = bytes.len();
+        let mut i = 0;
+        while i + 8 <= n {
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&bytes[i..i + 8]);
+            self.add_to(u64::from_le_bytes(b));
+            i += 8;
+        }
+        if i < n {
+            let mut b = [0u8; 8];
+            b[..n - i].copy_from_slice(&bytes[i..]);
+            self.add_to(u64::from_le_bytes(b));
+        }
+    }
+    #[inline]
+    fn write_u8(&mut self, i: u8) {
+        self.add_to(i as u64);
+    }
+    #[inline]
+    fn write_u16(&mut self, i: u16) {
+        self.add_to(i as u64);
+    }
+    #[inline]
+    fn write_u32(&mut self, i: u32) {
+        self.add_to(i as u64);
+    }
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        self.add_to(i);
+    }
+    #[inline]
+    fn write_usize(&mut self, i: usize) {
+        self.add_to(i as u64);
+    }
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.hash
+    }
+}
+
+/// 概率 memo 表：键 ([u32;4],u32)（经 write_u32 路径喂 FxHasher）。
+type ProbsCacheMap = HashMap<([u32; 4], u32), f32, std::hash::BuildHasherDefault<FxHasher>>;
+
+
 /// 语言模型统一入口：三阶 NM02（含 NM04 量化变体）或五阶 NM03。
 /// 【NM03 接入 2026-09-25】历史状态统一为码点数组（beam 侧存 4 字符）；
 /// 三阶路径忽略前两位（行为与旧实现逐位一致），五阶走完整回退链。
@@ -125,6 +199,10 @@ pub struct SentenceEngine {
     /// 与全量档逐位一致；仅在束宽 >1500 的高束方案/长文场景起「即时
     /// 出候选」作用（quick_bound && truncated 时提交门控重解兜底）。
     quick_beam: usize,
+    /// 【is_code 截窗 2026-11-09】码表最长码的字符数（装配期一次算定）：
+    /// digit 模式 is_code 的后缀枚举窗口——长于它的后缀 lookup 必空、
+    /// completions 必空，跳过与全后缀枚举逐位一致。
+    dict_max_code_len: usize,
 }
 
 /// Injection order is significant when otherwise equal paths meet the beam.
@@ -376,6 +454,24 @@ impl Bucket {
     }
 }
 
+/// 【束宽分档纯函数 2026-11-09】自 decode_prepared 提取：shrink-resume
+/// 需在缓存侧判「新旧 base 长是否同档」（跨档时冻结桶的束宽 ≠ 全量
+/// 重解的档位束宽，结果不逐位一致，须回落全量）。档位值与原内联实现
+/// 逐位一致（含各档 max/min 收口）。
+fn beam_tier(bw: usize, n: usize) -> usize {
+    if n <= 16 {
+        (bw * 2 / 5).max(12000).min(bw)
+    } else if n <= 24 {
+        (bw * 3 / 5).max(400).min(bw)
+    } else if n <= 32 {
+        (bw / 5).max(300).min(bw)
+    } else if n <= 48 {
+        (bw / 8).max(200).min(bw)
+    } else {
+        (bw / 16).max(100).min(bw)
+    }
+}
+
 fn chars_of(s: &str) -> Vec<char> {
     s.chars().collect()
 }
@@ -462,6 +558,13 @@ impl SentenceEngine {
         // 【整句高频字过滤上限】禁用表随引擎装配一次定型（改 weights 的
         // 该键需重建引擎，与码表/模型同为装配期数据）。
         let blocked = build_blocked(&dict, weights.high_freq_limit);
+        // 【is_code 截窗 2026-11-09】先算再 move：dict 装配后进 Arc 字段。
+        let dict_max_code_len = dict
+            .entries
+            .iter()
+            .map(|e| e.code.chars().count())
+            .max()
+            .unwrap_or(0);
         SentenceEngine {
             model,
             dict,
@@ -472,6 +575,7 @@ impl SentenceEngine {
             user_words: std::sync::RwLock::new(UserWordIndex::default()),
             two_stage: two_stage_enabled(),
             quick_beam: quick_beam_value(),
+            dict_max_code_len,
         }
     }
 
@@ -558,23 +662,57 @@ impl SentenceEngine {
         resume: Option<(Vec<Bucket>, usize, usize)>,
         quick: bool,
     ) -> (SentenceDecode, Option<Vec<Bucket>>, bool) {
-        // 【数字编码 2026-09-05】数字编码表（a8=来、u3=的）：数字按
-        // 码表延续判定——是编码字符则保留（整体或任意后缀是词条，跨
-        // 段如 vvb8 的 b8=如），无延续（选重锁转的内部数字）仍做锁；
-        // 普通表数字一律锁。
-        let parsed = if self.weights.digit_codes {
-            let dict = &self.dict;
+        // 【解析复用 2026-11-09】解析体拆至 parse_raw；decode_cached 每
+        // 键已 parse 一遍 raw（算 base 长做增量判定），原实现此处对同
+        // 一 raw 再 parse 一遍——digit 模式 parse 含 is_code 后缀枚举
+        // （逐后缀 Trie 查询），双跑纯浪费。本入口供 decode_full 等
+        // 无现成解析结果的调用方；解析输出与原路径逐位一致。
+        let parsed = self.parse_raw(raw);
+        self.decode_parsed::<CACHE_PROBS>(parsed, resume, quick)
+    }
+
+    /// raw 解析（选重锁/数字编码判定）。两处调用共享同一实现。
+    /// 【数字编码 2026-09-05】数字编码表（a8=来、u3=的）：数字按
+    /// 码表延续判定——是编码字符则保留（整体或任意后缀是词条，跨
+    /// 段如 vvb8 的 b8=如），无延续（选重锁转的内部数字）仍做锁；
+    /// 普通表数字一律锁。
+    fn parse_raw(&self, raw: &str) -> hufu_engine::RankLocks {
+        if self.weights.digit_codes {
             let is_code = |p: &str| {
                 let cs: Vec<char> = p.chars().collect();
-                (1..=cs.len()).any(|j| {
-                    let s: String = cs[cs.len() - j..].iter().collect();
-                    !dict.lookup(&s).is_empty() || !dict.completions(&s, 1).is_empty()
-                })
+                self.digit_tail_is_code(&cs)
             };
             parse_rank_locks_keep_digits(raw, &is_code)
         } else {
             parse_rank_locks(raw)
-        };
+        }
+    }
+
+    /// 【is_code 零分配化 2026-11-09】原闭包对 probe 的每个后缀做
+    /// String 堆分配 + 2 次 Trie 查询。后缀长超过码表最长码时
+    /// lookup（精确匹配）必空、completions（以 s 为前缀的码）也必空
+    /// ——截窗跳过与原 any() 逐位一致。复用单个缓冲串，逐后缀只拷贝
+    /// 不分配。
+    fn digit_tail_is_code(&self, probe: &[char]) -> bool {
+        let win = probe.len().min(self.dict_max_code_len);
+        let mut buf = String::with_capacity(16);
+        for j in 1..=win {
+            buf.clear();
+            buf.extend(&probe[probe.len() - j..]);
+            if !self.dict.lookup(&buf).is_empty() || !self.dict.completions(&buf, 1).is_empty() {
+                return true;
+            }
+        }
+        false
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn decode_parsed<const CACHE_PROBS: bool>(
+        &self,
+        parsed: hufu_engine::RankLocks,
+        resume: Option<(Vec<Bucket>, usize, usize)>,
+        quick: bool,
+    ) -> (SentenceDecode, Option<Vec<Bucket>>, bool) {
         let base: Vec<char> = parsed.base.chars().collect();
         let n = base.len();
         let w = &self.weights;
@@ -624,7 +762,7 @@ impl SentenceEngine {
         // the cheaper trigram model bypass the cache. The 16-key threshold avoids
         // cache overhead on short inputs; clear at 4096 entries and reuse capacity.
         // Do not even construct RandomState on the uncached specialization.
-        let mut probs = CACHE_PROBS.then(HashMap::<([u32; 4], u32), f32>::new);
+        let mut probs = CACHE_PROBS.then(ProbsCacheMap::default);
         let mut step_prob = |history: [u32; 4], cp: u32| {
             if let Some(probs) = probs.as_mut() {
                 if let Some(&p) = probs.get(&(history, cp)) {
@@ -853,20 +991,9 @@ impl SentenceEngine {
         // 【min 收口 2026-09-08】各档 max 下限会把小束宽反向抬高
         //（beam=200 时 max(12000)=12000≠用户设定）——min(原值) 保证
         // 降档永不升束：200→200、30000→12000。
-        let beam = if n <= 16 {
-            (w.beam_width * 2 / 5).max(12000).min(w.beam_width)
-        } else if n <= 24 {
-            (w.beam_width * 3 / 5).max(400).min(w.beam_width)
-        } else if n <= 32 {
-            (w.beam_width / 5).max(300).min(w.beam_width)
-        } else if n <= 48 {
-            (w.beam_width / 8).max(200).min(w.beam_width)
-        } else {
-            // 【性能】超长句（>48 码）：尾键延迟实测 40-50ms——再降档
-            // 换响应（bench 实测：/24 无额外收益，/16 max100 最优——
-            // avg 49→24ms、p95 102→38ms、exact 90% 持平）
-            (w.beam_width / 16).max(100).min(w.beam_width)
-        };
+        // 【束宽分档纯函数 2026-11-09】档位体提取至 beam_tier()（shrink
+        // 门控复用），此处仅调用，取值与原内联逐位一致。
+        let beam = beam_tier(w.beam_width, n);
         // 【增量尾窗束宽】见 inc_tail_beam() 注释：增量重算只算尾部
         // ≤12 键，小束承载尾段组合；全束质量保留在前部复用桶。
         // 【两段式即时档 2026-10-28】miss（非增量）且 quick 时吃
@@ -1220,59 +1347,84 @@ impl SentenceEngine {
         // 增量解码：新 raw 为缓存前缀的追加（1-3 键），且 base 长度
         // 恰好增长（锁/选重后缀不增 base，走全量保证正确性）。
         // 复用前部 buckets，从 split=旧base长-尾窗 处重算。
-        let parsed_new = if self.weights.digit_codes {
-            let dict = &self.dict;
-            let is_code = |p: &str| {
-                let cs: Vec<char> = p.chars().collect();
-                (1..=cs.len()).any(|j| {
-                    let s: String = cs[cs.len() - j..].iter().collect();
-                    !dict.lookup(&s).is_empty() || !dict.completions(&s, 1).is_empty()
-                })
-            };
-            parse_rank_locks_keep_digits(raw, &is_code)
-        } else {
-            parse_rank_locks(raw)
-        };
+        // 【解析复用 2026-11-09】原实现此处内联 parse 一遍、随后
+        // decode_internal 再 parse 一遍同一 raw（digit 模式含 is_code
+        // 后缀枚举，双跑纯浪费）——改走 parse_raw 一次解析，结果直接
+        // 传入 decode_parsed。
+        let parsed_new = self.parse_raw(raw);
         let new_base_len = parsed_new.base.chars().count();
+        let mut shrink = false;
         let can = cache
             .prefix
             .as_ref()
             .map(|(p_raw, buckets)| {
                 let old_base_len = buckets.len().saturating_sub(1);
                 let delta = new_base_len as isize - old_base_len as isize;
-                if !raw.starts_with(p_raw.as_str()) || old_base_len < INC_MIN_PREFIX {
+                if old_base_len < INC_MIN_PREFIX {
                     return false;
                 }
-                // 情形A（常规追加）：base 增长 1-3。
-                if (1..=INC_MAX_DELTA as isize).contains(&delta) {
-                    return true;
+                if raw.starts_with(p_raw.as_str()) {
+                    // 情形A（常规追加）：base 增长 1-3。
+                    if (1..=INC_MAX_DELTA as isize).contains(&delta) {
+                        return true;
+                    }
+                    // 情形B（选重锁追加 2026-09-08）：raw 追加了 ≤4 字符而
+                    // base 没长 = 纯锁后缀（选重 ;' 数字）。锁字符不进 base
+                    //（桶结构不变），锁影响的段选择发生在尾部——重算区
+                    //（REDO_TAIL+4 回退）覆盖尾部锁位置，增量安全。跟打选重
+                    // 密集场景原本每选重一次 30000 全量重建（实测曲线
+                    // 52→501ms 爬升=「感觉又卡回去」的主源）。
+                    return delta == 0 && raw.len() - p_raw.len() <= 4;
                 }
-                // 情形B（选重锁追加 2026-09-08）：raw 追加了 ≤4 字符而
-                // base 没长 = 纯锁后缀（选重 ;' 数字）。锁字符不进 base
-                //（桶结构不变），锁影响的段选择发生在尾部——重算区
-                //（REDO_TAIL+4 回退）覆盖尾部锁位置，增量安全。跟打选重
-                // 密集场景原本每选重一次 30000 全量重建（实测曲线
-                // 52→501ms 爬升=「感觉又卡回去」的主源）。
-                delta == 0 && raw.len() - p_raw.len() <= 4
+                // 情形C（退格缩短 2026-11-09）：新 raw 是缓存 raw 的前缀。
+                // 不变量：buckets[i] 只依赖 base[..i]（见 decode_prepared
+                // 分桶注释）——截断到新 base 长即精确复用，零重算。
+                // 三道守卫（任一不满足即回落全量，结果仍正确）：
+                // ①新 base 长 ≥ INC_MIN_PREFIX；
+                // ②被删后缀不含锁类字符（;、'、数字——digit 模式数字
+                //   也可能是编码字符，保守一律判锁）：被删锁的锁位可能
+                //   ≤ 新 base 长，其段名次过滤仍烙在冻结桶里，而 fresh
+                //   解已无此锁——不守卫则结果≠全量；
+                // ③新旧 base 长同 beam 档（beam_tier 按 n 取档）：跨档
+                //   时冻结桶束宽 ≠ 全量档束宽。虎整句 beam=200 在
+                //   n≤48 各档同值，仅 >48 档（100）会触发回落。
+                shrink = p_raw.starts_with(raw)
+                    && new_base_len >= INC_MIN_PREFIX
+                    && !p_raw[raw.len()..]
+                        .contains(|c| matches!(c, ';' | '\'' | '0'..='9'))
+                    && beam_tier(self.weights.beam_width, old_base_len)
+                        == beam_tier(self.weights.beam_width, new_base_len);
+                shrink
             })
             .unwrap_or(false);
         let resume = if can {
             cache.prefix.take().map(|(_p_raw, mut buckets)| {
-                let old_base_len = buckets.len() - 1;
-                // split=0 时退化为全量（主循环从 BOS 起算），此处不设下限：
-                // 强制 split≥1 会丢弃 pos=0 的段展开，令全部后继桶断源
-                // （13 键候选空 bug 的根因）。
-                let split = old_base_len.saturating_sub(INC_REDO_TAIL);
-                // 再回退一个最大段长（虎码 max_code_length=4）：保留区末尾
-                // pos 的段跨界伸入重算区的展开必须重跑（end > split 的
-                // 照常 add），否则跨界路径全丢；end ≤ split 的为旧路径
-                // 复刻——decode_internal 内结构性跳过（mass 双计修复
-                // 2026-10-28，取代旧注释「add 聚合幂等重复展开无副作用」
-                // 的错误断言）。
-                let start = split.saturating_sub(4);
-                buckets.truncate(split + 1);
-                buckets.resize_with(new_base_len + 1, Bucket::new);
-                (buckets, start, split)
+                if shrink {
+                    // 截断到新 base 长（resize 无需——只缩不扩）；
+                    // start=尾窗回退一位段长，令 emit 期 segs 覆盖尾部
+                    // （max_code_len/max_tail 与既有增量口径同构）；
+                    // split=n 令全部展开被结构性跳过（skip end≤split）
+                    // ——冻结桶零改动。
+                    let n = new_base_len;
+                    buckets.truncate(n + 1);
+                    (buckets, n.saturating_sub(4), n)
+                } else {
+                    let old_base_len = buckets.len() - 1;
+                    // split=0 时退化为全量（主循环从 BOS 起算），此处不设下限：
+                    // 强制 split≥1 会丢弃 pos=0 的段展开，令全部后继桶断源
+                    // （13 键候选空 bug 的根因）。
+                    let split = old_base_len.saturating_sub(INC_REDO_TAIL);
+                    // 再回退一个最大段长（虎码 max_code_length=4）：保留区末尾
+                    // pos 的段跨界伸入重算区的展开必须重跑（end > split 的
+                    // 照常 add），否则跨界路径全丢；end ≤ split 的为旧路径
+                    // 复刻——decode_internal 内结构性跳过（mass 双计修复
+                    // 2026-10-28，取代旧注释「add 聚合幂等重复展开无副作用」
+                    // 的错误断言）。
+                    let start = split.saturating_sub(4);
+                    buckets.truncate(split + 1);
+                    buckets.resize_with(new_base_len + 1, Bucket::new);
+                    (buckets, start, split)
+                }
             })
         } else {
             None
@@ -1292,7 +1444,7 @@ impl SentenceEngine {
         // resume 不变（尾窗本就 min(inc_tail)）。上限只在严格低于档位
         // 束宽时实际降档。
         let quick = self.two_stage && resume.is_none();
-        let (out, buckets, quick_bound) = self.decode_internal::<true>(raw, resume, quick);
+        let (out, buckets, quick_bound) = self.decode_parsed::<true>(parsed_new, resume, quick);
         let out = Arc::new(out);
         // full = 该结果与全量档等效：quick 上限未实际降档时恒真（虎整句
         // 方案 beam_width=200 < quick 1500，截断两档同样发生、重解无
@@ -1768,5 +1920,181 @@ mod tests {
         drop(cache);
         let updated = e.decode_to_strings("ab");
         assert!(updated.iter().any(|s| s == "更新词"), "新用户词应进入词图: {updated:?}");
+    }
+
+    /// 【退格增量化 2026-11-09】shrink-resume 差分：走缓存路径（追加
+    /// 爬坡→逐级退格）的结果必须与「全新引擎全量解码」逐位一致
+    /// （分数/置信度逐 f64 位相等）。覆盖：偶数退格、截半段奇数退格、
+    /// 删锁后缀（守卫②回落全量，结果仍正确）、digit 模式退格（守卫②
+    /// 对数字保守回落）。beam=200 各档同值 ⇒ 虎整句方案口径。
+    fn shrink_pair_dict() -> Dict {
+        Dict::from_entries(
+            "shrink-test",
+            ["aa", "bb", "cc", "dd", "ee", "ff", "gg", "hh", "a8", "u3"]
+                .iter()
+                .zip(["甲", "乙", "丙", "丁", "戊", "己", "庚", "辛", "来", "的"])
+                .enumerate()
+                .map(|(i, (code, text))| DictEntry::new(code.to_string(), text.to_string(), i as u32))
+                .collect(),
+        )
+    }
+
+    fn shrink_engine(weights: &SentenceWeights) -> SentenceEngine {
+        let mut e = SentenceEngine::with_lm(
+            Lm::Five(model03::probability_cache_test_model()),
+            Arc::new(shrink_pair_dict()),
+            &Supplement::default(),
+            weights.clone(),
+        );
+        e.two_stage = false;
+        e
+    }
+
+    fn assert_decode_bitwise(a: &SentenceDecode, b: &SentenceDecode, ctx: &str) {
+        assert_eq!(a.truncated, b.truncated, "{ctx}: truncated");
+        assert_eq!(a.early_truncated, b.early_truncated, "{ctx}: early_truncated");
+        for (field, (va, vb)) in [
+            ("hits", (&a.hits, &b.hits)),
+            ("early_hits", (&a.early_hits, &b.early_hits)),
+        ] {
+            assert_eq!(va.len(), vb.len(), "{ctx}: {field} len");
+            for (x, y) in va.iter().zip(vb.iter()) {
+                assert_eq!(x.text, y.text, "{ctx}: {field} text");
+                assert_eq!(x.score.to_bits(), y.score.to_bits(), "{ctx}: {field} score");
+                assert_eq!(
+                    x.confidence.to_bits(),
+                    y.confidence.to_bits(),
+                    "{ctx}: {field} confidence"
+                );
+                assert_eq!(x.max_rank, y.max_rank, "{ctx}: {field} max_rank");
+                assert_eq!(x.sum_rank, y.sum_rank, "{ctx}: {field} sum_rank");
+                assert_eq!(x.exact, y.exact, "{ctx}: {field} exact");
+                assert_eq!(x.word_ends, y.word_ends, "{ctx}: {field} word_ends");
+                assert_eq!(x.segmented, y.segmented, "{ctx}: {field} segmented");
+                assert_eq!(x.partial, y.partial, "{ctx}: {field} partial");
+                assert_eq!(x.implicit2, y.implicit2, "{ctx}: {field} implicit2");
+            }
+        }
+    }
+
+    #[test]
+    fn backspace_shrink_matches_fresh_full_decode() {
+        let weights =
+            SentenceWeights { beam_width: 200, candidate_limit: 10, max_raw_length: 64, ..Default::default() };
+        let eng = shrink_engine(&weights);
+        let full = "aabbccaaddeeffgghh";
+        // 追加爬坡：填充 prefix 缓存（触发情形A增量）。
+        for k in (4..=full.len()).step_by(2) {
+            eng.decode_rich(&full[..k]);
+        }
+        // 逐级退格（偶数步）+ 截半段（奇数步）：shrink 情形C。
+        for k in (4..full.len()).rev() {
+            let shrunk = &full[..k];
+            let cached = eng.decode_rich(shrunk);
+            let fresh = shrink_engine(&weights).decode_rich(shrunk);
+            assert_decode_bitwise(&cached, &fresh, &format!("shrink raw={shrunk}"));
+        }
+    }
+
+    #[test]
+    fn backspace_removing_lock_falls_back_but_stays_exact() {
+        let weights =
+            SentenceWeights { beam_width: 200, candidate_limit: 10, max_raw_length: 64, ..Default::default() };
+        let eng = shrink_engine(&weights);
+        // 爬坡到带锁后缀的 raw（;=第2名锁，情形B追加）。
+        let full = "aabbccaadd;2";
+        for k in (4..=8).step_by(2) {
+            eng.decode_rich(&full[..k]);
+        }
+        eng.decode_rich(full);
+        // 删掉锁后缀退格：守卫②识别「被删后缀含锁字符」→ 回落全量；
+        // 结果仍须与 fresh 全量逐位一致（全量是定义上的正确答案）。
+        for k in [10, 8, 6] {
+            let shrunk = &full[..k];
+            let cached = eng.decode_rich(shrunk);
+            let fresh = shrink_engine(&weights).decode_rich(shrunk);
+            assert_decode_bitwise(&cached, &fresh, &format!("lock-removal raw={shrunk}"));
+        }
+    }
+
+    #[test]
+    fn backspace_shrink_digit_mode_matches_fresh() {
+        // digit_codes 开：数字按码表延续保留为编码字符（a8=来）；退格
+        // 删数字时守卫②保守回落全量——差分仍须逐位一致。
+        let weights = SentenceWeights {
+            beam_width: 200,
+            candidate_limit: 10,
+            max_raw_length: 64,
+            digit_codes: true,
+            ..Default::default()
+        };
+        let eng = shrink_engine(&weights);
+        let full = "a8a8a8a8bbcc";
+        for k in (4..=full.len()).step_by(2) {
+            eng.decode_rich(&full[..k]);
+        }
+        for k in (4..full.len()).rev() {
+            let shrunk = &full[..k];
+            let cached = eng.decode_rich(shrunk);
+            let fresh = shrink_engine(&weights).decode_rich(shrunk);
+            assert_decode_bitwise(&cached, &fresh, &format!("digit raw={shrunk}"));
+        }
+    }
+
+    /// 【束宽分档纯函数 2026-11-09】beam_tier 与原内联公式逐位一致。
+    #[test]
+    fn beam_tier_matches_previous_inline_formula() {
+        let formula = |bw: usize, n: usize| {
+            if n <= 16 {
+                (bw * 2 / 5).max(12000).min(bw)
+            } else if n <= 24 {
+                (bw * 3 / 5).max(400).min(bw)
+            } else if n <= 32 {
+                (bw / 5).max(300).min(bw)
+            } else if n <= 48 {
+                (bw / 8).max(200).min(bw)
+            } else {
+                (bw / 16).max(100).min(bw)
+            }
+        };
+        for bw in [100usize, 200, 299, 3750, 6000, 12000, 18000, 30000] {
+            for n in 0..130 {
+                assert_eq!(beam_tier(bw, n), formula(bw, n), "bw={bw} n={n}");
+            }
+        }
+    }
+
+    /// 【is_code 截窗 2026-11-09】digit_tail_is_code 与原「全后缀枚举」
+    /// 语义逐 probe 一致（窗口外的后缀 lookup/completions 必空）。
+    #[test]
+    fn digit_tail_is_code_matches_full_suffix_scan() {
+        let mk = |code: &str, text: &str, seq: u32| DictEntry::new(code, text, seq);
+        let dict = Dict::from_entries(
+            "is-code-test",
+            vec![
+                mk("a", "的", 0),
+                mk("a8", "来", 1),
+                mk("b8", "如", 2),
+                mk("vb", "不", 3),
+                mk("vvb8", "跨", 4),
+                mk("u3", "的", 5),
+            ],
+        );
+        let eng = SentenceEngine::with_model(
+            model::tiny_model(),
+            Arc::new(dict),
+            &Supplement::default(),
+            SentenceWeights::default(),
+        );
+        for probe in [
+            "a", "a8", "xa8", "vvb8", "ab8", "zzz8", "b", "8", "vv", "vvb8a", "u3", "3", "vvb",
+        ] {
+            let cs: Vec<char> = probe.chars().collect();
+            let slow = (1..=cs.len()).any(|j| {
+                let s: String = cs[cs.len() - j..].iter().collect();
+                !eng.dict.lookup(&s).is_empty() || !eng.dict.completions(&s, 1).is_empty()
+            });
+            assert_eq!(eng.digit_tail_is_code(&cs), slow, "probe={probe}");
+        }
     }
 }
