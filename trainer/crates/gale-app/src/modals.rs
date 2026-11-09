@@ -35,9 +35,6 @@ pub enum Modal {
     Confirm,
     /// 本段按键热力图（结算后，数据 Session::last_vk_histogram）。
     Heatmap,
-    /// 【减法 2026-11-09】原 F2 载文窗退役；本地文库 + 单字表 + TXT 收拢为
-    /// 轻量「载入」面板，从「更多」进入；主工具栏位让给「在线发文」。
-    Library,
     /// Less frequent actions, kept out of the practice toolbar.
     More,
 }
@@ -72,9 +69,6 @@ pub enum Action {
     /// 【群三件套】切换「打完自动发成绩到群」（cfg.auto_send_score）。
     ToggleAutoSend,
     LoadClipboard,
-    LoadFile,
-    LoadBook(usize),
-    Practice(usize),
     Theme(String),
     Material(Material),
     Font(i32),
@@ -163,10 +157,7 @@ pub struct Model {
     pub max_code_length: usize,
     pub schema: String,
     pub schema_ver: String,
-    pub load_tab: u8,
-    pub load_editing: bool,
     pub shelf_offset: usize,
-    pub books: Vec<String>,
     pub groups: Vec<String>,
     pub bound: Option<usize>,
     pub online_status: String,
@@ -246,7 +237,6 @@ pub fn panel(m: Modal, w: f32, h: f32) -> (f32, f32, f32, f32) {
         Modal::Online => (920., 740.),
         Modal::Preferences => (960., 760.),
         Modal::Groups => (720., 520.),
-        Modal::Library => (760., 460.),
         Modal::More => (640., 460.),
         Modal::Rules => (1040., 900.),
         Modal::Confirm => (560., 300.),
@@ -255,7 +245,7 @@ pub fn panel(m: Modal, w: f32, h: f32) -> (f32, f32, f32, f32) {
     };
     let ph = if matches!(
         m,
-        Modal::Heatmap | Modal::Groups | Modal::Library | Modal::More
+        Modal::Heatmap | Modal::Groups | Modal::More
     ) {
         panel_view(ph, h)
     } else {
@@ -650,7 +640,6 @@ fn header_keycap(f: &mut Frame, x: f32, y: f32, key: &str, t: &Theme) {
 fn panel_header(f: &mut Frame, hs: &mut Vec<Hit>, m: Modal, x: f32, y: f32, pw: f32, t: &Theme) {
     let p = tokens(t);
     let (icon_name, title, desc, key) = match m {
-        Modal::Library => ("book", "载入", "本地 TXT、单字练习与剪贴板", ""),
         Modal::More => ("folder", "更多", "工具、设置与数据", ""),
         Modal::Groups => ("group", "选择群聊", "选中后读取群文或发送成绩", "F5"),
         Modal::Preferences => ("palette", "跟打器设置", "练习、成绩、配色、外观与数据", "F1"),
@@ -693,91 +682,6 @@ fn footer(f: &mut Frame, x: f32, y: f32, pw: f32, ph: f32, t: &Theme) {
     );
     line(f, x, y + ph - PANEL_FOOT, pw, p.line);
 }
-fn draw_library(
-    f: &mut Frame,
-    hs: &mut Vec<Hit>,
-    m: &Model,
-    t: &Theme,
-    x: f32,
-    y: f32,
-    pw: f32,
-    ph: f32,
-) {
-    let p = tokens(t);
-    let left = x + 24.;
-    let column = (pw - 68.) / 2.;
-    let right_col = left + column + 20.;
-    text(f, left, y + 84., FONT_HINT, "载入文章", p.text2);
-    small_btn(
-        f,
-        hs,
-        left,
-        y + 112.,
-        column,
-        "打开 TXT 文件",
-        Action::LoadFile,
-        t,
-        false,
-    );
-    small_btn(
-        f,
-        hs,
-        left,
-        y + 156.,
-        column,
-        "从剪贴板载入（Ctrl+V）",
-        Action::LoadClipboard,
-        t,
-        false,
-    );
-    text_block(
-        f,
-        left,
-        y + 206.,
-        column,
-        FONT_HINT,
-        24.,
-        2,
-        "本地文章列表已取消；TXT 与剪贴板载入后直接进入跟打区。",
-        p.muted,
-    );
-    rect(f, x + pw / 2., y + 80., 1., ph - 160., p.line);
-    text(f, right_col, y + 84., FONT_HINT, "单字与词组练习", p.text2);
-    for (i, (title, _)) in gale_core::single::builtin_tables().iter().enumerate() {
-        small_btn(
-            f,
-            hs,
-            right_col,
-            y + 118. + i as f32 * 36.,
-            column,
-            title,
-            Action::Practice(i),
-            t,
-            false,
-        );
-    }
-    footer(f, x, y, pw, ph, t);
-    text(
-        f,
-        left,
-        y + ph - 39.,
-        FONT_HINT,
-        "Ctrl+V 可直接载入文本 · 单字练习从右侧选择",
-        p.muted,
-    );
-    btn(
-        f,
-        hs,
-        x + pw - 112.,
-        y + ph - 48.,
-        88.,
-        "关闭",
-        Action::Close,
-        t,
-        false,
-    );
-}
-
 fn draw_groups(
     f: &mut Frame,
     hs: &mut Vec<Hit>,
@@ -1004,16 +908,16 @@ fn draw_more(
     let row_h = 46.;
     let mut left_items: Vec<(String, String, Action, String)> = vec![
         (
-            "载入与单字".into(),
-            "TXT、剪贴板与单字练习".into(),
-            Action::Open(Modal::Library),
-            "".into(),
+            "重打本段".into(),
+            "从头开始当前段".into(),
+            Action::Restart,
+            "F3".into(),
         ),
         (
-            "从剪贴板载入".into(),
-            "整篇文章直接进入跟打区".into(),
-            Action::LoadClipboard,
-            "Ctrl+V".into(),
+            "选择群聊".into(),
+            "绑定或取消 QQ 群".into(),
+            Action::Open(Modal::Groups),
+            "F5".into(),
         ),
     ];
     if sess.source != crate::session::SessionSource::Single
@@ -1056,9 +960,9 @@ fn draw_more(
             "".into(),
         ),
     ];
-    // 左栏：载入 + 本轮；右栏：设置。行高 46，节标题 20。
+    // 窄窗折叠到这里的群选择和重打仍可直接操作。
     let mut ly = y + 74.;
-    text(f, left, ly, FONT_HINT, "载入与发送", p.muted);
+    text(f, left, ly, FONT_HINT, "练习与发送", p.muted);
     ly += 20.;
     for (title, desc, action, key) in &left_items {
         draw_more_row(f, hs, left, ly, col_w, title, desc, action.clone(), key, t);
@@ -1763,6 +1667,7 @@ pub(crate) fn draw_analysis_dock(
             f.push(DrawCmd::PopClip);
         }
     } else {
+        let empty = sess.current_segment().text.is_empty();
         let loading = m.field("analysis_loading") == "true";
         let error = m.field("analysis_error");
         text(
@@ -1770,7 +1675,9 @@ pub(crate) fn draw_analysis_dock(
             x + 24.,
             body_y + 8.,
             15.,
-            if loading {
+            if empty {
+                "请先载入文章"
+            } else if loading {
                 "正在分析当前文章…"
             } else if error.is_empty() {
                 "当前文章尚未取得理论分析"
@@ -1780,7 +1687,9 @@ pub(crate) fn draw_analysis_dock(
             p.text2,
         );
         if !loading {
-            let detail = if error.is_empty() {
+            let detail = if empty {
+                "点击主窗口「从剪贴板载入」或按 Ctrl+V，再打开理论分析。".to_string()
+            } else if error.is_empty() {
                 "重新请求后，这里会显示全文逐词编码与理论码长。".to_string()
             } else {
                 error
@@ -1789,17 +1698,19 @@ pub(crate) fn draw_analysis_dock(
             for (i, line) in lines.iter().take(2).enumerate() {
                 text(f, x + 24., body_y + 36. + i as f32 * 19., 13., line, p.muted);
             }
-            btn(
-                f,
-                hs,
-                x + 24.,
-                body_y + body_h - 38.,
-                104.,
-                "重新分析",
-                crate::aux_marker("analysis_retry"),
-                t,
-                false,
-            );
+            if !empty {
+                btn(
+                    f,
+                    hs,
+                    x + 24.,
+                    body_y + body_h - 38.,
+                    104.,
+                    "重新分析",
+                    crate::aux_marker("analysis_retry"),
+                    t,
+                    false,
+                );
+            }
         }
     }
 }
@@ -1849,7 +1760,6 @@ pub fn draw(
             panel_header(f, hs, m.modal, x, y, pw, t);
         }
         match m.modal {
-            Modal::Library => draw_library(f, hs, m, t, x, y, pw, ph),
             Modal::More => draw_more(f, hs, m, sess, t, x, y, pw, ph),
             Modal::Groups => draw_groups(f, hs, m, sess, cfg, t, x, y, pw, ph),
             Modal::Preferences => preferences::draw(f, hs, m, sess, cfg, t, x, y, pw, ph),
@@ -2185,26 +2095,6 @@ mod tests {
             DrawCmd::TextRun { text, color, .. } if text == "2" && *color == p.text2)));
     }
     #[test]
-    fn small_library_keeps_every_practice_table_and_file_action_visible() {
-        let mut m = Model::default();
-        m.open(Modal::Library);
-        let s = Session::new(100);
-        let cfg = Config::default();
-        let t = crate::ui::theme("墨玉");
-        let mut f = Frame::new(640., 420.);
-        let mut hits = Vec::new();
-        draw(&mut f, &mut hits, &m, &s, &cfg, &t, 640., 420., 0.);
-        let close = hits.iter().find(|h| h.action == Action::Close).unwrap();
-        assert!(close.y >= 0. && close.y + close.h <= 420.);
-        for action in std::iter::once(Action::LoadFile)
-            .chain((0..gale_core::single::builtin_tables().len()).map(Action::Practice))
-        {
-            let hit = hits.iter().find(|hit| hit.action == action).unwrap();
-            assert!(hit.h == 34. && hit.x >= 0. && hit.y >= 0.);
-            assert!(hit.x + hit.w <= 640. && hit.y + hit.h <= 420.);
-        }
-    }
-    #[test]
     fn group_actions_require_a_live_target_and_fit_the_small_window() {
         let s = Session::new(100);
         let cfg = Config::default();
@@ -2256,7 +2146,8 @@ mod tests {
                 let mut hits = Vec::new();
                 draw(&mut frame, &mut hits, &m, &s, &cfg, &t, w, h, 0.);
                 for action in [
-                    Action::Open(Modal::Library),
+                    Action::Restart,
+                    Action::Open(Modal::Groups),
                     Action::Open(Modal::Preferences),
                     Action::Open(Modal::Rules),
                     Action::ToggleRace,

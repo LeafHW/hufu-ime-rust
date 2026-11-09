@@ -14,11 +14,9 @@ mod ui;
 mod uia_bridge;
 use gale_core::{
     config::Config,
-    library::Library,
     rules::{CleaningPreset, CleaningRule, TrainingMode},
     score::ScoreStore,
     segment::parse_group_text,
-    single::SingleDrillConfig,
     wenlai::{Difficulty, FetchParams, WenlaiArticle},
 };
 use gale_win::{
@@ -57,18 +55,13 @@ fn heatmap_vk(vk: u32) -> Option<u8> {
 /// 私有标记通道（整改2/5/8/13）：modals.rs（禁改域）暂无对应 Action 变体，
 /// 借用 `Action::Theme(String)` 载荷携带 `\u{e000}` 前缀命令。真实主题名
 /// 永不含 U+E000，不会与外观页主题切换冲突；modals.rs 落正式变体（如
-/// Action::OnlineRegister / ShowFullAnalysis / SingleShuffle / SingleSegStep）
+/// Action::OnlineRegister / ShowFullAnalysis）
 /// 后，把发射点换绑即可，main.rs 这边的解码可原样退役。
 const AUX_PREFIX: char = '\u{e000}';
 const AUX_REGISTER: &str = "online_register";
 const AUX_REGISTER_CODE: &str = "online_reg_code";
 const AUX_REGISTER_SUBMIT: &str = "online_reg_submit";
 const AUX_AUTO_NEXT: &str = "online_auto_next";
-const AUX_SINGLE_SHUFFLE: &str = "single_shuffle";
-const AUX_SINGLE_SEG_PLUS: &str = "single_seg+5";
-const AUX_SINGLE_SEG_MINUS: &str = "single_seg-5";
-const AUX_SINGLE_SEG_CYCLE: &str = "single_seg_cycle";
-const AUX_SINGLE_TARGET_CYCLE: &str = "single_target_cycle";
 const AUX_SHOW_FULL: &str = "show_full_analysis";
 const AUX_SHOW_HEATMAP: &str = "show_heatmap";
 
@@ -80,10 +73,6 @@ enum AuxAction {
     /// 注册卡"注册并登录"（Register，worker 内成功后自动登录）。
     OnlineRegisterSubmit,
     OnlineAutoNext,
-    SingleShuffle,
-    SingleSeg(i32),
-    SingleSegCycle,
-    SingleTargetCycle,
     ShowFullAnalysis,
     ShowHeatmap,
     AnalysisAuto4,
@@ -95,7 +84,6 @@ enum AuxAction {
     HistoryToggle,
     HistoryOpen(usize),
     HistoryStep(i32),
-    SingleTarget(i32),
 }
 
 fn aux_action(a: &Action) -> Option<AuxAction> {
@@ -108,11 +96,6 @@ fn aux_action(a: &Action) -> Option<AuxAction> {
         AUX_REGISTER_CODE => AuxAction::OnlineRegisterCode,
         AUX_REGISTER_SUBMIT => AuxAction::OnlineRegisterSubmit,
         AUX_AUTO_NEXT => AuxAction::OnlineAutoNext,
-        AUX_SINGLE_SHUFFLE => AuxAction::SingleShuffle,
-        AUX_SINGLE_SEG_PLUS => AuxAction::SingleSeg(5),
-        AUX_SINGLE_SEG_MINUS => AuxAction::SingleSeg(-5),
-        AUX_SINGLE_SEG_CYCLE => AuxAction::SingleSegCycle,
-        AUX_SINGLE_TARGET_CYCLE => AuxAction::SingleTargetCycle,
         AUX_SHOW_FULL => AuxAction::ShowFullAnalysis,
         AUX_SHOW_HEATMAP => AuxAction::ShowHeatmap,
         "analysis_auto4" => AuxAction::AnalysisAuto4,
@@ -131,9 +114,6 @@ fn aux_action(a: &Action) -> Option<AuxAction> {
         }
         _ if cmd.starts_with("history_step:") => {
             AuxAction::HistoryStep(cmd.strip_prefix("history_step:")?.parse().ok()?)
-        }
-        _ if cmd.starts_with("single_target_step:") => {
-            AuxAction::SingleTarget(cmd.strip_prefix("single_target_step:")?.parse().ok()?)
         }
         _ if cmd.starts_with("pref_") => AuxAction::Preference(cmd.to_string()),
         _ => return None,
@@ -378,8 +358,7 @@ fn wake(hwnd: isize) {
 enum Bg {
     Analyze(u64, Result<serde_json::Value, String>),
     Chats(Vec<qq_bridge::ChatWindow>),
-    Article(u64, Option<usize>, u64, Result<String, String>),
-    File(u64, u64, Result<(String, String), String>),
+    Article(Result<String, String>),
     Saved(Result<(), String>),
     ScoreSaved(Result<(), String>),
     Skin(u64, Result<gale_core::theme::Theme, String>),
@@ -487,7 +466,6 @@ struct App {
     sess: Session,
     model: Model,
     theme: gale_core::theme::Theme,
-    library: Library,
     dir: PathBuf,
     persist: mpsc::SyncSender<Persist>,
     pending_scores: VecDeque<(u64, gale_core::score::ScoreRecord)>,
@@ -500,7 +478,6 @@ struct App {
     layout_key: (u64, u32, u32),
     layout: Vec<(usize, String, Vec<f32>)>,
     edits: BTreeMap<String, NativeEdit>,
-    draft_revision: u64,
     edit_epoch: u64,
     hits: Vec<modals::Hit>,
     /// 最近一次鼠标位置（逻辑坐标），用于悬停高亮。
@@ -549,14 +526,10 @@ struct App {
     font_save_due: Option<u64>,
     /// 整改7：QQ 会话列表上次扫描时刻（屏开期间每 10s 刷新）
     qq_scan_at: u64,
-    /// 整改8：单字练习配置（single.json：乱序 + 段长）
-    single_cfg: SingleDrillConfig,
     /// Last successful analysis key: text, source mode, schema and auto4 option.
     full_fetch_hash: Option<String>,
     full_analyzing: bool,
     full_retry_at: u64,
-    /// 当前单字练习使用的内置表索引（配置变更后原表重开）。
-    single_table: usize,
     /// 云同步的晴账号（profile.json，随虎符云同步走）。
     sync_online_user: String,
     sync_online_password: String,
@@ -636,16 +609,8 @@ fn run() -> Result<(), String> {
     let host_ctf_ok = host.ctf_ok();
     let mut sess = Session::restore_snapshot(&dir.join("session.jsonl"))
         .unwrap_or_else(|_| Session::new(cfg.seg_chars));
-    if sess.current_segment().text.is_empty() {
-        sess.load_book("欢迎来到静室", "天青色等烟雨，而我在等你。\n文字落下，心也安静下来。\n从「更多 → 本地载入」选文，或按 Ctrl+V 载入文字。按下第一个键开始计时。");
-    }
     if sess.frozen_rules.is_none() {
         let _ = sess.set_rules(cfg.session_rules.clone());
-    }
-    let library = Library::open(&dir.join("文库")).map_err(|e| e.to_string())?;
-    if let Some(path) = cli_value("--article") {
-        let (name, text) = read_article_file(&path)?;
-        sess.load_book(&name, &text);
     }
     let history = ScoreStore::open(&dir.join("统计"))
         .map(|store| store.load_all())
@@ -671,7 +636,6 @@ fn run() -> Result<(), String> {
     model
         .fields
         .insert("rule_test".into(), "“天青色”　……\u{feff}".into());
-    model.books = library.books().iter().map(|b| b.name.clone()).collect();
     let mut theme = ui::theme(&cfg.theme);
     for (key, value) in &cfg.color_overrides {
         if let Some(c) = gale_core::theme::Color::from_hex_no_hash(value) {
@@ -690,7 +654,6 @@ fn run() -> Result<(), String> {
         sess,
         model,
         theme,
-        library,
         dir: dir.clone(),
         persist,
         pending_scores: VecDeque::new(),
@@ -703,7 +666,6 @@ fn run() -> Result<(), String> {
         layout_key: (0, 0, 0),
         layout: Vec::new(),
         edits: BTreeMap::new(),
-        draft_revision: 0,
         edit_epoch: u64::MAX,
         hits: Vec::new(),
         hover: None,
@@ -738,11 +700,9 @@ fn run() -> Result<(), String> {
         online_article_current: false,
         font_save_due: None,
         qq_scan_at: 0,
-        single_cfg: SingleDrillConfig::load(&dir.join("single.json")),
         full_fetch_hash: None,
         full_analyzing: false,
         full_retry_at: 0,
-        single_table: 0,
         sync_online_user: sync_online_user.clone(),
         sync_online_password: sync_online_password.clone(),
         pending_login_password: None,
@@ -753,7 +713,6 @@ fn run() -> Result<(), String> {
     app.model
         .fields
         .insert("online_auto_next".into(), app.online_auto_next.to_string());
-    app.sync_single_fields();
     app.sync_preferences(true);
     app.sync_rule_model();
     if let Some(warning) = startup_warning { app.toast(warning); }
@@ -924,15 +883,12 @@ fn run() -> Result<(), String> {
                 CommandKey::F1 => Some(Action::Open(Modal::Preferences)),
                 CommandKey::F7 => Some(Action::OpenAppearanceSettings),
                 CommandKey::F10 => Some(Action::ToggleAnalysis),
-                // 【2026-11-09 减法定稿】F2 载文窗整体退役（剪贴板走 Ctrl+V、
-                // 群文走 F4、在线走 F8、本地文库/单字走主界面「文库」按钮）；
-                // F5 = 选群（原 F6），F6 不再绑定。
                 CommandKey::F3 => Some(Action::Restart),
                 CommandKey::F4 => Some(Action::ReadGroup),
                 CommandKey::F5 => Some(Action::Open(Modal::Groups)),
                 CommandKey::F8 => Some(Action::Open(Modal::Online)),
                 CommandKey::F9 => Some(Action::Open(Modal::Rules)),
-                // 【减法定稿】F2/F6 不再绑定；F2=载文窗、F6=旧选群位均已退役。
+                // F2 发送当前文章；本地载入只保留剪贴板，F6 不绑定功能。
                 CommandKey::F2 => Some(Action::PostArticle),
                 CommandKey::F6 | CommandKey::RetryResult => None,
                 CommandKey::LoadClipboard | CommandKey::AltE => Some(Action::LoadClipboard),
@@ -968,14 +924,6 @@ fn run() -> Result<(), String> {
                     }
                 } else {
                     app.toast("本段已记录 · Enter 下一段 / F3 重打");
-                }
-                if app.sess.source == SessionSource::Single {
-                    let passed =
-                        record.strokes_per_sec >= app.single_cfg.target_keystroke_x10 as f64 / 10.;
-                    app.model.fields.insert(
-                        "single_target_status".into(),
-                        if passed { "已达标" } else { "未达标" }.into(),
-                    );
                 }
                 // 【群三件套 2026-11-09】单段结算弹窗退役；绑定群且开自动发
                 // 成绩时，打完一段把晴兼容成绩单直接发到群。
@@ -1114,7 +1062,7 @@ fn run() -> Result<(), String> {
                     let max = (ph - lh + 48.).max(0.);
                     let has_list = matches!(
                         app.model.modal,
-                        Modal::Rules | Modal::Groups | Modal::Library
+                        Modal::Rules | Modal::Groups
                     );
                     if app.model.modal != Modal::None
                         && max > 0.
@@ -1128,7 +1076,6 @@ fn run() -> Result<(), String> {
                         let cap = match app.model.modal {
                             Modal::Groups => app.model.groups.len().saturating_sub(7),
                             Modal::Rules => app.model.rules.len().saturating_sub(6),
-                            Modal::Library => app.model.books.len().saturating_sub(5),
                             _ => 0,
                         };
                         app.model.scroll =
@@ -1373,20 +1320,6 @@ impl App {
         if self.model.bound.is_some() {
             self.act(Action::PostArticle, false);
         }
-    }
-    /// 整改8：单字配置同步到 model.fields（modals.rs 侧控件读这里显示状态）
-    fn sync_single_fields(&mut self) {
-        self.model
-            .fields
-            .insert("single_shuffle".into(), self.single_cfg.shuffle.to_string());
-        self.model.fields.insert(
-            "single_seg".into(),
-            self.single_cfg.segment_chars.to_string(),
-        );
-        self.model.fields.insert(
-            "single_target_keystroke".into(),
-            format!("{:.1}", self.single_cfg.target_keystroke_x10 as f64 / 10.),
-        );
     }
     fn sync_preferences(&mut self, editors: bool) {
         for (key, value) in [
@@ -1764,11 +1697,6 @@ impl App {
             AuxAction::HistoryOpen(index) => {
                 self.select_history(index);
             }
-            AuxAction::SingleTarget(delta) => {
-                self.single_cfg.target_keystroke_x10 =
-                    (self.single_cfg.target_keystroke_x10 as i32 + delta).clamp(10, 120) as u16;
-                self.save_single_cfg();
-            }
             AuxAction::OnlineRegister => {
                 // 登录卡 ↔ 注册卡切换（原整改2c开站点入口退役：晴站注册
                 // API 已实装 /api/auth/register*，见 wenlai.rs 与 online.rs）。
@@ -1842,43 +1770,6 @@ impl App {
                     self.auto_next_at = None;
                 }
             }
-            AuxAction::SingleShuffle => {
-                self.single_cfg.shuffle = !self.single_cfg.shuffle;
-                self.save_single_cfg();
-                self.sync_single_fields();
-                if self.sess.source == SessionSource::Single {
-                    self.toast("乱序设置将在下一组练习生效");
-                }
-            }
-            AuxAction::SingleSeg(d) => {
-                let c = self.single_cfg.clamped();
-                self.single_cfg.segment_chars = (c.segment_chars as i32 + d).clamp(
-                    gale_core::single::SINGLE_SEGMENT_MIN as i32,
-                    gale_core::single::SINGLE_SEGMENT_MAX as i32,
-                ) as u16;
-                self.save_single_cfg();
-                self.reload_single_after_config();
-            }
-            // 练习屏一键循环：+5 超过上限回绕到下限（一键可减，无需 − 按钮）
-            AuxAction::SingleSegCycle => {
-                let c = self.single_cfg.clamped();
-                let next = c.segment_chars as i32 + 5;
-                self.single_cfg.segment_chars =
-                    if next > gale_core::single::SINGLE_SEGMENT_MAX as i32 {
-                        gale_core::single::SINGLE_SEGMENT_MIN
-                    } else {
-                        next as u16
-                    };
-                self.save_single_cfg();
-                self.reload_single_after_config();
-            }
-            AuxAction::SingleTargetCycle => {
-                let c = self.single_cfg.clamped();
-                let next = c.target_keystroke_x10 as i32 + 5; // +0.5 击/秒
-                self.single_cfg.target_keystroke_x10 = if next > 120 { 10 } else { next as u16 };
-                self.save_single_cfg();
-                self.sync_single_fields();
-            }
             AuxAction::ShowFullAnalysis => self.toggle_analysis_dock(),
             AuxAction::ShowHeatmap => self.show_heatmap(),
             AuxAction::AnalysisAuto4 => {
@@ -1929,52 +1820,6 @@ impl App {
             }
         }
     }
-    /// 打开一张内置单字表（练单入口）。配置变更后会重走这里，保证
-    /// 「每组 N 字」chip 与当前会话段长永远一致。
-    fn start_single_table(&mut self, i: usize) {
-        let Some((title, body)) = gale_core::single::builtin_tables().get(i).copied() else {
-            return;
-        };
-        self.single_table = i;
-        self.sess.jump(self.sess.index);
-        let mut rules = self.sess.rules.clone();
-        rules.mode = TrainingMode::Practice;
-        rules.word_hints = true;
-        let _ = self.sess.set_rules(rules);
-        // 乱序开时种子取时钟毫秒——每次进入练习都是新排列（重打本组
-        // 由 SingleSession.seed 固定复现）；关时 seed=0 保持原序。
-        let seed = if self.single_cfg.shuffle {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64
-        } else {
-            0
-        };
-        self.sess.load_single(self.single_cfg.build_session(
-            title,
-            body,
-            if i == 4 { 2 } else { 1 },
-            seed,
-        ));
-        self.online_article_current = false;
-        self.model.race = false;
-        self.model.hints = true;
-        self.sync_single_fields();
-        self.reset_host();
-        self.open(Modal::None);
-        self.snapshot();
-        gale_win::window::request_frame();
-    }
-
-    fn reload_single_after_config(&mut self) {
-        self.sync_single_fields();
-        if self.sess.source == SessionSource::Single {
-            self.start_single_table(self.single_table);
-            self.toast("已按新的每组字数重新开始本组");
-        }
-    }
-
     /// 发文/发成绩会激活 QQ；发送结束（成功或失败）都切回跟打器。
     fn focus_trainer(&mut self) {
         unsafe {
@@ -2008,12 +1853,6 @@ impl App {
         });
     }
 
-    fn save_single_cfg(&mut self) {
-        if let Err(e) = self.single_cfg.save(&self.dir.join("single.json")) {
-            self.toast(format!("单字配置保存失败：{e}"));
-        }
-        self.sync_single_fields();
-    }
     fn apply_style(&mut self) {
         let bg = ui::rgba(self.theme.get("窗体背景色"));
         let fg = ui::rgba(self.theme.get("窗体字体色"));
@@ -2046,9 +1885,6 @@ impl App {
             let text = e.text();
             if self.model.field(k) != text {
                 changed = true;
-                if k == "load_text" {
-                    self.draft_revision = self.draft_revision.wrapping_add(1);
-                }
                 self.model.fields.insert(k.clone(), text);
             }
         }
@@ -2522,7 +2358,7 @@ impl App {
                     self.analyze();
                     gale_win::window::request_frame();
                 }
-                Bg::Article(_g, _bound, _revision, r) => {
+                Bg::Article(r) => {
                     self.capture_fields();
                     self.qq_busy = false;
                     match r {
@@ -2530,24 +2366,6 @@ impl App {
                             // F4 读到就立刻载入，不再做待读草稿二次确认。
                             self.model.fields.insert("load_text".into(), t);
                             self.load_text();
-                        }
-                        Err(e) => self.toast(e),
-                    }
-                }
-                Bg::File(g, revision, r) => {
-                    self.capture_fields();
-                    match r {
-                        Ok((name, t)) => {
-                            let _ = (g, revision);
-                            self.model.fields.insert("load_text".into(), t);
-                            self.load_text();
-                            if self.sess.title == "自定义文字"
-                                || self.sess.title == "群文"
-                                || self.sess.title.is_empty()
-                            {
-                                self.sess.title = name;
-                                self.snapshot();
-                            }
                         }
                         Err(e) => self.toast(e),
                     }
@@ -2998,9 +2816,6 @@ impl App {
                     | Action::Next
                     | Action::ToggleRace
                     | Action::LoadClipboard
-                    | Action::LoadFile
-                    | Action::LoadBook(_)
-                    | Action::Practice(_)
                     | Action::OnlineLoadOnly
                     | Action::OnlineLoad
                     | Action::ReadGroup
@@ -3010,9 +2825,9 @@ impl App {
             return;
         }
         // 整改5：F1-F4 跳段/取文不再弹"是否中断打文"确认——直接执行。
-        // 打字中触发载文件/读群文时，先把未完成段按中断处理（jump 复位本段），
+        // 打字中读群文时，先把未完成段按中断处理（jump 复位本段），
         // 与原确认后路径的语义一致；Esc 停表语义不变（主循环 Escape 分支）。
-        if self.sess.phase == Phase::Typing && matches!(a, Action::LoadFile | Action::ReadGroup) {
+        if self.sess.phase == Phase::Typing && a == Action::ReadGroup {
             self.sess.jump(self.sess.index);
             self.reset_host();
         }
@@ -3124,7 +2939,6 @@ impl App {
                     Err(e) => self.toast(e),
                 }
             }
-            Action::Practice(i) => self.start_single_table(i),
             Action::Accent(value) => {
                 if let Some(color) = gale_core::theme::Color::from_hex_no_hash(&value) {
                     self.cfg.color_overrides.insert("光标色".into(), value);
@@ -3268,30 +3082,6 @@ impl App {
                 }
                 None => self.toast("剪贴板为空或不可用"),
             },
-            Action::LoadBook(i) => {
-                if let Some(b) = self.library.books().get(i) {
-                    let name = b.name.clone();
-                    let text = b.raw_text.clone();
-                    self.sess.load_book(&name, &text);
-                    self.online_article_current = false;
-                    self.reset_host();
-                    self.open(Modal::None);
-                    self.snapshot();
-                }
-            }
-            Action::LoadFile => {
-                if let Some(p) = file_dialog(self.win.hwnd, false, "txt") {
-                    let tx = self.tx.clone();
-                    let hwnd = self.win.hwnd;
-                    let g = self.generation;
-                    let revision = self.draft_revision;
-                    std::thread::spawn(move || {
-                        let r = read_article_file(&p);
-                        let _ = tx.send(Bg::File(g, revision, r));
-                        wake(hwnd);
-                    });
-                }
-            }
             Action::Theme(n) => {
                 self.theme_generation += 1;
                 self.cfg.theme = n.clone();
@@ -3357,12 +3147,18 @@ impl App {
                 }
             }
             Action::CopyRace => {
-                let s = self.race_text();
-                self.copy(&s);
+                if self.sess.aggregate().segments == 0 {
+                    self.toast("当前没有可复制的赛报");
+                } else {
+                    let s = self.race_text();
+                    self.copy(&s);
+                }
             }
             Action::SendScore => {
                 if let Some(s) = self.score_text() {
                     self.copy(&s);
+                } else {
+                    self.toast("当前没有可发送的成绩");
                 }
             }
             Action::ToggleAutoSend => {
@@ -3390,6 +3186,10 @@ impl App {
                 }
             }
             Action::PostArticle => {
+                if self.sess.current_segment().text.trim().is_empty() {
+                    self.toast("请先载入文章，再发送到群");
+                    return;
+                }
                 match self.model.bound.and_then(|i| self.chats.get(i).cloned()) {
                     Some(chat) => {
                         let seg = self.sess.current_segment();
@@ -3468,10 +3268,7 @@ impl App {
                     // Same apartment rule as ScanGroups: Chromium's UIA tree is
                     // only complete for the UI STA thread, not for an MTA worker.
                     let r = uia_bridge::read_current_article(c.hwnd, &c.title);
-                    let g = self.generation;
-                    let bound = self.model.bound;
-                    let revision = self.draft_revision;
-                    let _ = self.tx.send(Bg::Article(g, bound, revision, r));
+                    let _ = self.tx.send(Bg::Article(r));
                     gale_win::window::request_frame();
                 } else {
                     // 【减法 2026-11-09】没绑群就直接弹选群面板（用户拍板：
@@ -3740,34 +3537,6 @@ impl App {
         gale_win::window::request_frame();
     }
 }
-fn read_article_file(p: &Path) -> Result<(String, String), String> {
-    let meta = std::fs::metadata(p).map_err(|e| e.to_string())?;
-    if meta.len() > 2_000_000 {
-        return Err("文本文件超过 2 MB".into());
-    }
-    let b = std::fs::read(p).map_err(|e| e.to_string())?;
-    let s = if b.starts_with(&[0xFF, 0xFE]) {
-        if b.len() % 2 != 0 {
-            return Err("UTF-16文本字节长度无效".into());
-        }
-        String::from_utf16(
-            &b[2..]
-                .chunks_exact(2)
-                .map(|v| u16::from_le_bytes([v[0], v[1]]))
-                .collect::<Vec<_>>(),
-        )
-        .map_err(|_| "UTF-16 文本无效")?
-    } else {
-        String::from_utf8(b).map_err(|_| "请将文本另存为 UTF-8 或 UTF-16 LE 编码")?
-    };
-    Ok((
-        p.file_stem()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .into_owned(),
-        s.trim_start_matches('\u{feff}').to_string(),
-    ))
-}
 fn file_dialog(hwnd: isize, save: bool, ext: &str) -> Option<PathBuf> {
     use windows::Win32::UI::Controls::Dialogs::*;
     unsafe {
@@ -3880,7 +3649,7 @@ mod persistence_tests {
             Modal::Online,
             Modal::Rules,
             Modal::Confirm,
-            Modal::Library,
+            Modal::More,
         ];
         for panel in panels {
             for key in [CommandKey::Enter, CommandKey::Space] {

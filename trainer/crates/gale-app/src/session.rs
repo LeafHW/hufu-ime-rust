@@ -296,7 +296,7 @@ impl Session {
         }
     }
     pub fn is_segment_done(&self) -> bool {
-        self.comparer.is_done()
+        !self.current_segment().text.is_empty() && self.comparer.is_done()
     }
     pub fn segment_recorded(&self) -> bool {
         self.recorded
@@ -373,7 +373,10 @@ impl Session {
         self.comparer.started_at = Some(now);
     }
     pub fn feed_input(&mut self, ev: InputEvent, now_ms: u64) {
-        if self.phase == Phase::Done || self.paused_at.is_some() {
+        if self.current_segment().text.is_empty()
+            || self.phase == Phase::Done
+            || self.paused_at.is_some()
+        {
             return;
         }
         let now = self.clock(now_ms);
@@ -410,7 +413,11 @@ impl Session {
         }
     }
     pub fn on_key(&mut self, vk: u32, now_ms: u64) {
-        if self.phase == Phase::Done || self.paused_at.is_some() || !StatsEngine::is_stat_key(vk) {
+        if self.current_segment().text.is_empty()
+            || self.phase == Phase::Done
+            || self.paused_at.is_some()
+            || !StatsEngine::is_stat_key(vk)
+        {
             return;
         }
         let now = self.clock(now_ms);
@@ -459,7 +466,9 @@ impl Session {
         self.bs_router.0.on_backspace_up();
     }
     pub fn set_preedit(&mut self, p: String) {
-        self.preedit = p;
+        if !self.current_segment().text.is_empty() {
+            self.preedit = p;
+        }
     }
     pub fn set_composing(&mut self, c: bool) {
         self.set_composing_from_host(c, false);
@@ -468,6 +477,9 @@ impl Session {
     /// 出现时 batch_has_commit=true——提交清空不置 protect；只有 Composing(false)
     /// （退格删空/Esc 取消）才置 protect（下一次退格仍归 IME）。
     pub fn set_composing_from_host(&mut self, c: bool, batch_has_commit: bool) {
+        if self.current_segment().text.is_empty() {
+            return;
+        }
         if c && !self.composing {
             self.stats.begin_composition();
         }
@@ -489,6 +501,9 @@ impl Session {
         self.preedit.clear();
     }
     pub fn feed_paste(&mut self, text: &str, now_ms: u64) -> Result<(), String> {
+        if self.current_segment().text.is_empty() {
+            return Err("请先从剪贴板载入文章".into());
+        }
         let rules = self.frozen_rules.as_ref().unwrap_or(&self.rules);
         if rules.mode == TrainingMode::Race || !rules.allow_paste {
             return Err("本轮禁止粘贴输入".into());
@@ -870,6 +885,32 @@ pub struct LiveStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn empty_startup_ignores_input_and_can_restart_without_recording() {
+        let mut s = Session::new(100);
+        assert!(!s.is_segment_done());
+        s.set_preedit("a".into());
+        s.set_composing(true);
+        s.on_key(0x41, 100);
+        s.feed_input(
+            InputEvent::Commit {
+                chars: "甲".into(),
+            },
+            200,
+        );
+        s.feed_input(InputEvent::Backspace, 300);
+        assert!(s.feed_paste("乙", 400).is_err());
+        s.stop_at(500);
+        s.jump(0);
+        assert!(s.title.is_empty());
+        assert!(s.current_segment().text.is_empty());
+        assert_eq!(s.phase, Phase::Idle);
+        assert_eq!(s.stats.keys, 0);
+        assert!(s.started_ms.is_none());
+        assert!(s.preedit.is_empty() && !s.composing);
+        assert!(s.finalize_current_at(600, 1).is_none());
+        assert!(s.snapshot_bytes_bounded().is_ok());
+    }
     fn session() -> Session {
         let mut s = Session::new(100);
         // 5 字段保证结算记录过 <5 硬门，可进整场聚合（2 字用例见 validity_gate_*）

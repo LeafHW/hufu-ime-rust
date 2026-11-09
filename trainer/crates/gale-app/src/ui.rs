@@ -454,7 +454,17 @@ fn chip(
 // The chrome uses the resolved theme, including user overrides.
 fn toolbar_width(label: &str, key: &str) -> f32 {
     let text_w = ui_text_width(label, FONT_HINT);
-    (text_w + if key.is_empty() { 0. } else { 34. } + 24.).max(72.)
+    (text_w
+        + if key.is_empty() {
+            0.
+        } else {
+            toolbar_key_width(key) + 6.
+        }
+        + 24.)
+        .max(72.)
+}
+fn toolbar_key_width(key: &str) -> f32 {
+    (ui_text_width(key, 12.) + 8.).max(28.)
 }
 #[allow(clippy::too_many_arguments)]
 fn toolbar_button(
@@ -470,6 +480,7 @@ fn toolbar_button(
 ) -> f32 {
     let p = tokens(t);
     let w = toolbar_width(label, key);
+    let key_w = toolbar_key_width(key);
     round(
         f,
         x,
@@ -483,7 +494,7 @@ fn toolbar_button(
     f.push(DrawCmd::PushClip {
         x: x + 12.,
         y: y + 8.,
-        w: (w - if key.is_empty() { 24. } else { 52. }).max(8.),
+        w: (w - if key.is_empty() { 24. } else { key_w + 24. }).max(8.),
         h: 20.,
     });
     text(
@@ -498,15 +509,15 @@ fn toolbar_button(
     if !key.is_empty() {
         round(
             f,
-            x + w - 38.,
+            x + w - key_w - 10.,
             y + 7.,
-            28.,
+            key_w,
             18.,
             4.,
             p.bg2,
             Some(alpha(p.line2, 0.8)),
         );
-        text(f, x + w - 34., y + 8., 12., key, p.muted);
+        text(f, x + w - key_w - 6., y + 8., 12., key, p.muted);
     }
     hs.push(Hit {
         x,
@@ -568,10 +579,17 @@ fn draw_chrome(
             action,
         });
     }
-    // 常用操作栏：文库退出主工具栏，让位给「在线发文」；理论分析回到窗口内。
+    // 本地载入直接执行剪贴板动作；设置紧邻理论分析，不再经过载入面板。
     let y = 60.;
     let wide = w >= 960.;
+    let compact = w < 800.;
     let left = [
+        (
+            "从剪贴板载入",
+            if wide { "Ctrl+V" } else { "" },
+            Action::LoadClipboard,
+            false,
+        ),
         (
             "在线发文",
             if wide { "F8" } else { "" },
@@ -594,21 +612,37 @@ fn draw_chrome(
     ];
     let mut xx = 24.;
     for (label, key, action, selected) in left {
+        if compact && matches!(action, Action::Open(Modal::Groups) | Action::Restart) {
+            continue;
+        }
         xx = toolbar_button(f, hs, xx, y, label, key, action, t, selected) + 8.;
     }
     let more_w = toolbar_width("更多", "");
-    let analysis_w = toolbar_width("理论分析", if wide { "F10" } else { "" });
-    let analysis_x = w - 24. - more_w - 8. - analysis_w;
+    let settings_w = toolbar_width("设置", "F1");
+    let analysis_w = toolbar_width("理论分析", "F10");
+    let settings_x = w - 24. - more_w - 8. - settings_w;
+    let analysis_x = settings_x - 8. - analysis_w;
     toolbar_button(
         f,
         hs,
         analysis_x,
         y,
         "理论分析",
-        if wide { "F10" } else { "" },
+        "F10",
         Action::ToggleAnalysis,
         t,
         m.analysis_dock,
+    );
+    toolbar_button(
+        f,
+        hs,
+        settings_x,
+        y,
+        "设置",
+        "F1",
+        Action::Open(Modal::Preferences),
+        t,
+        m.modal == Modal::Preferences,
     );
     toolbar_button(
         f,
@@ -663,7 +697,9 @@ fn draw_chrome(
         w - 24.,
         h - STATUS_H + 7.,
         FONT_HINT,
-        if m.paused {
+        if sess.current_segment().text.is_empty() {
+            "等待载入文章"
+        } else if m.paused {
             "已暂停"
         } else if sess.phase == crate::session::Phase::Done {
             "本段完成"
@@ -702,6 +738,22 @@ pub fn build(
     hs.clear();
     draw_chrome(&mut f, hs, sess, cfg, m, t, w, h);
     let p = tokens(t);
+    if sess.current_segment().text.is_empty() {
+        text(&mut f, 32., 136., 20., "载入文章后开始跟打", p.text);
+        text(
+            &mut f,
+            32.,
+            172.,
+            FONT_HINT,
+            "点击「从剪贴板载入」或按 Ctrl+V，也可在线取文、读取群文。",
+            p.muted,
+        );
+        crate::history::draw(&mut f, hs, sess, cfg, m, t, w, h);
+        if m.analysis_dock && m.modal == Modal::None {
+            crate::modals::draw_analysis_dock(&mut f, hs, m, sess, t, w, h);
+        }
+        return f;
+    }
     let single = sess.source == SessionSource::Single;
     let hints_visible = single
         && gale_core::rules::hints_effective(m.hints, m.race)
@@ -781,43 +833,11 @@ pub fn build(
         p.accent,
     );
     if single {
-        let shuffle = m.field("single_shuffle") == "true";
-        let seg = m.field("single_seg").parse::<u16>().unwrap_or(20);
-        let target = m.field("single_target_keystroke");
-        let target = if target.is_empty() { "3.0" } else { &target };
-        let mut xx = x;
-        for (label, ww, action, on) in [
-            (
-                if shuffle {
-                    "乱序 · 开".to_string()
-                } else {
-                    "乱序 · 关".to_string()
-                },
-                92.,
-                crate::aux_marker("single_shuffle"),
-                shuffle,
-            ),
-            (
-                format!("每组 {seg} 字 ↻"),
-                118.,
-                crate::aux_marker("single_seg_cycle"),
-                false,
-            ),
-            (
-                format!("达标 {target} 键/秒 ↻"),
-                162.,
-                crate::aux_marker("single_target_cycle"),
-                false,
-            ),
-        ] {
-            chip(&mut f, hs, xx, 199., ww, &label, action, &p, on);
-            xx += ww + 8.;
-        }
         if !m.race {
             chip(
                 &mut f,
                 hs,
-                xx,
+                x,
                 199.,
                 98.,
                 if m.hints {
@@ -830,7 +850,7 @@ pub fn build(
                 m.hints,
             );
         } else {
-            text(&mut f, xx, 203., FONT_HINT, "赛制关闭字提", p.muted);
+            text(&mut f, x, 203., FONT_HINT, "赛制关闭字提", p.muted);
         }
     }
     let active = lines.iter().rposition(|l| l.0 <= pos).unwrap_or(0);
@@ -1137,12 +1157,66 @@ mod tests {
                     480.,
                 );
                 let buttons: Vec<_> = hits.iter().filter(|h| h.y == 60.).collect();
+                assert!(buttons.iter().any(|h| h.action == Action::LoadClipboard));
+                assert!(buttons
+                    .iter()
+                    .any(|h| h.action == Action::Open(Modal::Online)));
+                assert!(buttons.iter().any(|h| h.action == Action::ReadGroup));
+                let analysis = buttons
+                    .iter()
+                    .find(|h| h.action == Action::ToggleAnalysis)
+                    .unwrap();
+                let settings = buttons
+                    .iter()
+                    .find(|h| h.action == Action::Open(Modal::Preferences))
+                    .unwrap();
+                assert!((analysis.x + analysis.w + 8. - settings.x).abs() < 0.01);
                 for (i, a) in buttons.iter().enumerate() {
                     assert!(a.x >= 0. && a.x + a.w <= width);
                     for b in buttons.iter().skip(i + 1) {
                         assert!(a.x + a.w <= b.x || b.x + b.w <= a.x);
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn empty_startup_and_analysis_show_guidance_without_sample_article() {
+        let sess = Session::new(100);
+        let cfg = Config::default();
+        for (w, h) in [(640., 420.), (800., 600.)] {
+            for analysis_dock in [false, true] {
+                let model = Model {
+                    analysis_dock,
+                    ..Default::default()
+                };
+                let mut hits = Vec::new();
+                let frame = build(
+                    &sess,
+                    &cfg,
+                    &theme("墨玉"),
+                    &model,
+                    w,
+                    h,
+                    0,
+                    0.,
+                    &mut Animation::default(),
+                    &mut hits,
+                    &[],
+                );
+                assert!(hits.iter().any(|h| h.action == Action::LoadClipboard));
+                assert!(!frame
+                    .cmds
+                    .iter()
+                    .any(|cmd| matches!(cmd, DrawCmd::StyledLine { .. })));
+                assert!(frame.cmds.iter().any(|cmd| matches!(cmd,
+                    DrawCmd::TextRun { text, .. } if text == "载入文章后开始跟打")));
+                assert_eq!(
+                    frame.cmds.iter().any(|cmd| matches!(cmd,
+                        DrawCmd::TextRun { text, .. } if text == "请先载入文章")),
+                    analysis_dock
+                );
             }
         }
     }

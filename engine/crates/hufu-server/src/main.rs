@@ -365,7 +365,7 @@ fn log_startup(msg: &str) {
 }
 
 /// 构建标记：同版本号重打包时用来区分新旧包（/api/about 与设置页日志都会带）。
-const BUILD_TAG: &str = "2026-11-10-v1.9.9.4";
+const BUILD_TAG: &str = "2026-11-10-v1.9.9.4-r2";
 
 fn main() {
     #[cfg(all(windows, not(feature = "console")))]

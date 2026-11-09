@@ -279,17 +279,6 @@ fn model() -> Model {
         .map(str::to_string)
         .collect();
     m.bound = Some(0);
-    m.books = [
-        "岳阳楼记",
-        "滕王阁序",
-        "逍遥游",
-        "核舟记",
-        "醉翁亭记",
-        "兰亭集序",
-    ]
-    .into_iter()
-    .map(str::to_string)
-    .collect();
     m
 }
 
@@ -617,12 +606,14 @@ fn main() -> Result<(), Box<dyn Error>> {
                 "02-single-practice-light.bmp"
             }
             3 | 16 => {
-                m.open(Modal::Library);
+                sess = Session::new(cfg.seg_chars);
+                m = Model::default();
+                cfg.today_chars = 0;
                 if screen == 16 {
                     theme_name = "宣纸";
-                    "16-library-light.bmp"
+                    "16-clipboard-empty-light.bmp"
                 } else {
-                    "03-library-dark.bmp"
+                    "03-clipboard-empty-dark.bmp"
                 }
             }
             4 => {
@@ -744,9 +735,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
             }
             31 => {
-                m.open(Modal::Library);
-                m.books.clear();
-                "31-library-empty-dark.bmp"
+                sess = Session::new(cfg.seg_chars);
+                m = Model::default();
+                cfg.today_chars = 0;
+                "31-clipboard-empty-dark.bmp"
             }
             32 | 33 | 37 => {
                 full_analysis_fixture(&mut sess);
@@ -775,11 +767,13 @@ fn main() -> Result<(), Box<dyn Error>> {
                 "36-rules-small-640x420.bmp"
             }
             38 | 39 => {
-                m.open(Modal::Library);
+                sess = Session::new(cfg.seg_chars);
+                m = Model::default();
+                cfg.today_chars = 0;
                 if screen == 39 {
-                    "39-library-small-800x600.bmp"
+                    "39-clipboard-small-800x600.bmp"
                 } else {
-                    "38-library-small-640x420.bmp"
+                    "38-clipboard-small-640x420.bmp"
                 }
             }
             40 => {
