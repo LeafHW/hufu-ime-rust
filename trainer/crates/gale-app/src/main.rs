@@ -190,6 +190,7 @@ fn configured_template(cfg: &Config) -> String {
     let parts: Vec<_> = cfg
         .score_fields
         .split(',')
+        .filter(|key| key.trim() != "character_accuracy")
         .filter_map(|key| {
             let label = SCORE_FIELD_LABELS
                 .iter()

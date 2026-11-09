@@ -775,7 +775,7 @@ fn score_page(f: &mut Frame, hs: &mut Vec<Hit>, m: &Model, t: &Theme, x: f32, y:
         x,
         ey + eh + 10.,
         w,
-        "占位符：{speed} 速度 · {key_accuracy} 键准 · {character_accuracy} 字准 · {strokes} 击键",
+        "占位符：{speed} 速度 · {key_accuracy} 键准 · {strokes} 击键 · {word_rate} 打词率",
         p.muted,
     );
 

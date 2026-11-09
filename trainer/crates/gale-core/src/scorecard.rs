@@ -18,12 +18,12 @@ pub const SCORE_PRESETS: &[ScorePreset] = &[
     ScorePreset {
         id: "detailed",
         name: "完整成绩",
-        template: "{segment}  速度{speed}  击键{strokes}  字准{character_accuracy}%  键准{key_accuracy}%  字数{chars}  打词率{word_rate}  {retype_label}  码长{code_len}  总键数{keys}  回改{corrections}  退格{backspaces}  废码{waste_codes}  选重{select_count}  标顶{ding_count}  用时{time}  错字{wrong}  {race}  {signature}",
+        template: "{segment}  速度{speed}  击键{strokes}  键准{key_accuracy}%  字数{chars}  打词率{word_rate}  {retype_label}  码长{code_len}  总键数{keys}  回改{corrections}  退格{backspaces}  废码{waste_codes}  选重{select_count}  标顶{ding_count}  用时{time}  错字{wrong}  {race}  {signature}",
     },
     ScorePreset {
         id: "compact",
         name: "简洁成绩",
-        template: "{segment}  速度{speed}  字准{character_accuracy}%  键准{key_accuracy}%  码长{code_len}  {retype_label}  {signature}",
+        template: "{segment}  速度{speed}  键准{key_accuracy}%  码长{code_len}  {retype_label}  {signature}",
     },
 ];
 
@@ -64,6 +64,29 @@ pub fn preset(id: &str) -> &'static ScorePreset {
         .iter()
         .find(|p| p.id == id)
         .unwrap_or(&SCORE_PRESETS[0])
+}
+
+/// 用户要求成绩单不再出现「字准」。清掉历史模板/字段配置里的字准 token，
+/// 并压掉留下的多余空格；自定义模板若显式写 `{character_accuracy}` 也会被移除。
+pub fn strip_character_accuracy(template: &str) -> String {
+    let mut out = template.to_string();
+    for token in [
+        "字准{character_accuracy}%",
+        "字准{character_accuracy}",
+        "{character_accuracy}%",
+        "{character_accuracy}",
+        "{字准}%",
+        "{字准}",
+    ] {
+        out = out.replace(token, "");
+    }
+    out.lines()
+        .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+        .collect::<Vec<_>>()
+        .join("
+")
+        .trim()
+        .to_string()
 }
 
 /// Expands known `{field}` tokens wherever they occur. Unknown tokens are retained
@@ -251,6 +274,23 @@ mod tests {
         }))
         .unwrap()
     }
+    #[test]
+    fn character_accuracy_is_stripped_from_legacy_templates() {
+        assert_eq!(
+            strip_character_accuracy(
+                "{segment}  速度{speed}  字准{character_accuracy}%  键准{key_accuracy}%"
+            ),
+            "{segment} 速度{speed} 键准{key_accuracy}%"
+        );
+        assert_eq!(strip_character_accuracy("{字准}%"), "");
+        assert!(!SCORE_PRESETS.iter().any(|p| {
+            p.template.contains("字准") || p.template.contains("character_accuracy")
+        }));
+        assert!(!crate::config::Config::default()
+            .score_fields
+            .contains("character_accuracy"));
+    }
+
     #[test]
     fn templates_keep_legacy_and_distinguish_accuracy_and_optional_data() {
         let mut r = record();

@@ -126,7 +126,7 @@ fn hint_font_default() -> f32 {
     14.
 }
 fn score_fields_default() -> String {
-    "segment,speed,character_accuracy,key_accuracy,code_len,word_rate,select_count,retype_count,chars,time,keys,backspaces,wrong,signature".into()
+    "segment,speed,key_accuracy,code_len,word_rate,select_count,retype_count,chars,time,keys,backspaces,wrong,signature".into()
 }
 
 fn default_motion_level() -> u8 {
@@ -313,6 +313,15 @@ impl Config {
             ))
             .map_err(crate::GaleError::Format)?,
         };
+        // 用户要求：成绩单不再出现「字准」。清掉旧配置里已保存的字准 token/字段。
+        cfg.score_template = crate::scorecard::strip_character_accuracy(&cfg.score_template);
+        cfg.score_fields = cfg
+            .score_fields
+            .split(',')
+            .map(str::trim)
+            .filter(|key| !key.is_empty() && *key != "character_accuracy")
+            .collect::<Vec<_>>()
+            .join(",");
         // Migrate only the uncustomized appearance defaults of the first preview.
         if !map.contains_key("design_version")
             && cfg.win_w == 1100
