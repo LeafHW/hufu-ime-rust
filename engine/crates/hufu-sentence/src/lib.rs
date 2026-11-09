@@ -1381,17 +1381,26 @@ impl SentenceEngine {
                 // 分桶注释）——截断到新 base 长即精确复用，零重算。
                 // 三道守卫（任一不满足即回落全量，结果仍正确）：
                 // ①新 base 长 ≥ INC_MIN_PREFIX；
-                // ②被删后缀不含锁类字符（;、'、数字——digit 模式数字
-                //   也可能是编码字符，保守一律判锁）：被删锁的锁位可能
-                //   ≤ 新 base 长，其段名次过滤仍烙在冻结桶里，而 fresh
-                //   解已无此锁——不守卫则结果≠全量；
+                // ②被删后缀首字符不是锁类字符（;、'、数字——digit 模式
+                //   数字也可能是编码字符，保守一律判锁）。锁字符的锁位
+                //   = 其前 base 字符数；后缀内锁位 ∈ [new_base_len,
+                //   old_base_len]：首字符为锁时锁位恰 == new_base_len，
+                //   约束 end==n 的段，fresh 解无此锁 → 必须拒绝；首字符
+                //   为编码字符时后缀内所有锁位 > new_base_len，其约束的
+                //   段终点全部 > n，截断后被丢弃，与 fresh 一致 → 放行。
+                //   （数字键选重链 2026-11-09 实测：on_rank_key 先以含锁
+                //   probe raw 解码缓存，再对去尾前缀取文本——旧「后缀
+                //   含锁即拒」在此形态误杀回落全量 ≈15-18ms；首字符
+                //   精确判后走 shrink ≈1.5ms。）
                 // ③新旧 base 长同 beam 档（beam_tier 按 n 取档）：跨档
                 //   时冻结桶束宽 ≠ 全量档束宽。虎整句 beam=200 在
                 //   n≤48 各档同值，仅 >48 档（100）会触发回落。
                 shrink = p_raw.starts_with(raw)
                     && new_base_len >= INC_MIN_PREFIX
-                    && !p_raw[raw.len()..]
-                        .contains(|c| matches!(c, ';' | '\'' | '0'..='9'))
+                    && !matches!(
+                        p_raw[raw.len()..].chars().next(),
+                        Some(';' | '\'' | '0'..='9')
+                    )
                     && beam_tier(self.weights.beam_width, old_base_len)
                         == beam_tier(self.weights.beam_width, new_base_len);
                 shrink
@@ -2015,6 +2024,36 @@ mod tests {
             let fresh = shrink_engine(&weights).decode_rich(shrunk);
             assert_decode_bitwise(&cached, &fresh, &format!("lock-removal raw={shrunk}"));
         }
+    }
+
+    /// 【数字键选重链 shrink 放行 2026-11-09】on_rank_key 形态：先解码
+    /// 含尾锁 probe raw（…base+'1'）入缓存，再取去尾前缀文本。被删后缀
+    /// = "尾段+'1"：首字符为编码字符 → 后缀内锁位 > new_base_len，截断
+    /// 无害，shrink 放行；首字符为数字锁（恰好删到锁前）→ 拒绝回落全量。
+    /// 两形态差分都必须与 fresh 全量逐位一致。
+    #[test]
+    fn rank_probe_shrink_with_trailing_digit_lock_matches_fresh() {
+        let weights =
+            SentenceWeights { beam_width: 200, candidate_limit: 10, max_raw_length: 64, ..Default::default() };
+        let eng = shrink_engine(&weights);
+        // 爬坡到长 base，再以尾锁 '1' 解码（on_rank_key probe 形态）。
+        let base = "aabbccaabbccaabb";
+        for k in (4..base.len()).step_by(2) {
+            eng.decode_rich(&base[..k]);
+        }
+        let probe = format!("{base}1");
+        eng.decode_rich(&probe);
+        // 放行形态：删除 "b1"（首字符编码）→ shrink 复用冻结桶。
+        let shrunk = &base[..base.len() - 1];
+        let cached = eng.decode_rich(shrunk);
+        let fresh = shrink_engine(&weights).decode_rich(shrunk);
+        assert_decode_bitwise(&cached, &fresh, "probe-tail digit lock shrink");
+        // 拒绝形态：从含锁 raw 恰好删到锁（后缀首字符 '1'）→ 回落全量。
+        let locked = eng.decode_rich(&probe); // 重入含锁态
+        let _ = locked;
+        let to_base = eng.decode_rich(base);
+        let fresh2 = shrink_engine(&weights).decode_rich(base);
+        assert_decode_bitwise(&to_base, &fresh2, "digit-lock-leading removal");
     }
 
     #[test]
