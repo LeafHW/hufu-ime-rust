@@ -1773,7 +1773,7 @@ fn exe_dir() -> PathBuf {
 // 超时，总预算 2s（正常情况首个候选几毫秒命中）。探测在创建窗口之前
 // 完成（此时还没进消息循环），最坏多花约 2s 启动时间。
 /// 构建标记：同版本号重打包时用来区分新旧包（与 server 的 /api/about 同值）。
-const BUILD_TAG: &str = "2026-11-05f";
+const BUILD_TAG: &str = "2026-11-10-v1.9.9.4";
 
 const DEFAULT_PORT: u16 = 4390;
 const PROBE_PORTS: [u16; 7] = [4390, 17890, 17891, 17892, 17893, 17894, 27890];

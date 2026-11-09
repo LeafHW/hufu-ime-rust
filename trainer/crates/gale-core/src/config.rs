@@ -47,6 +47,9 @@ pub struct Config {
     pub win_y: i32,
     pub win_w: i32,
     pub win_h: i32,
+    /// 新版位置用屏幕物理坐标；旧配置仍按逻辑坐标迁移。
+    #[serde(default)]
+    pub win_position_physical: bool,
     /// 字号（跟打区，DIP）
     pub font_size: f32,
     #[serde(default)]
@@ -142,6 +145,7 @@ impl Default for Config {
             win_y: 200,
             win_w: 1280,
             win_h: 800,
+            win_position_physical: false,
             font_size: 36.0,
             hint_style: 0,
             motion_level: 2,
@@ -233,6 +237,7 @@ impl Config {
             win_h: get("win_h", &d.win_h.to_string())
                 .parse()
                 .unwrap_or(d.win_h),
+            win_position_physical: get("win_position_physical", "false") == "true",
             font_size: get("font_size", &d.font_size.to_string())
                 .parse()
                 .unwrap_or(d.font_size),
@@ -365,6 +370,7 @@ impl Config {
         m.insert("win_y".into(), self.win_y.to_string());
         m.insert("win_w".into(), self.win_w.to_string());
         m.insert("win_h".into(), self.win_h.to_string());
+        m.insert("win_position_physical".into(), self.win_position_physical.to_string());
         m.insert("font_size".into(), self.font_size.to_string());
         m.insert("hint_style".into(), self.hint_style.to_string());
         m.insert("motion_level".into(), self.motion_level.to_string());
@@ -623,3 +629,11 @@ mod tests {
         );
     }
 }
+    #[test]
+    fn physical_window_position_roundtrips_and_legacy_config_keeps_old_coordinate_mode() {
+        let old = Config::from_toml_text("win_x = -1000\nwin_y = 40").unwrap();
+        assert!(!old.win_position_physical);
+        let mut cfg = old; cfg.win_position_physical = true; cfg.win_w = 960;
+        let restored = Config::from_toml_text(&cfg.to_toml_text()).unwrap();
+        assert!(restored.win_position_physical); assert_eq!(restored.win_x, -1000); assert_eq!(restored.win_w, 960);
+    }

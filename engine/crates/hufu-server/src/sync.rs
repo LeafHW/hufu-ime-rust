@@ -46,6 +46,7 @@ const MF_PATH: &str = "hufu-sync/manifest.json";
 const FILES_DIR: &str = "hufu-sync/files";
 /// 单文件上限（码表 MB 级；防异常巨物打爆坚果云配额）
 const MAX_FILE: u64 = 32 * 1024 * 1024;
+const MAX_TRAINER_PROFILE: u64 = 1024 * 1024;
 /// manifest 上限
 const MAX_MF: usize = 512 * 1024;
 /// 周期同步间隔【2min 2026-10-30 用户定案，原 5min】
@@ -1088,7 +1089,9 @@ fn do_sync(s: &SyncSettings) -> Result<String, String> {
     // 跟打器用户配置（config.toml + 晴账号）作为独立 profile 文件面同步：
     // 不走方案目录，避免出现在云同步方案列表里；云端明文（与本项目
     // 「云同步明文」口径一致，凭据只经用户自己的 WebDAV）。
-    let _ = sync_trainer_profile(&agent, s, &mut mf);
+    let (trainer_up, trainer_down) = sync_trainer_profile(&agent, s, &mut mf)?;
+    uploaded += trainer_up;
+    downloaded += trainer_down;
 
     // 设备表 + 落盘 manifest
     prune_manifest(&mut mf, s);
@@ -1957,32 +1960,122 @@ fn sync_trainer_profile(
     let Some(path) = trainer_profile_path() else {
         return Ok((0, 0));
     };
+    sync_trainer_profile_at(agent, s, mf, &path)
+}
+
+fn validate_trainer_profile(raw: &[u8]) -> Result<(), String> {
+    if raw.len() as u64 > MAX_TRAINER_PROFILE { return Err("跟打器配置超过 1 MiB".into()); }
+    let v: Value = serde_json::from_slice(raw).map_err(|_| "跟打器配置 JSON 损坏".to_string())?;
+    let config = v.get("config_toml").and_then(Value::as_str).unwrap_or("");
+    if v.get("version").and_then(Value::as_u64) != Some(1)
+        || config.trim().is_empty() || config.len() > 256 * 1024 || !config.contains('=')
+        || v.get("updated_at").and_then(Value::as_u64).is_none()
+        || v.get("online_user").is_some_and(|v| !v.is_string())
+        || v.get("online_password").is_some_and(|v| !v.is_string())
+        || v.get("online_account").is_some_and(|v| !v.is_null() && !v.is_object())
+    {
+        return Err("跟打器配置格式无效，已保留本机配置".into());
+    }
+    Ok(())
+}
+
+fn trainer_profile_local_wins(lmt: u64, hash: &str, remote: Option<&Value>) -> bool {
+    let Some(remote) = remote else { return true; };
+    let rmt = remote["mt"].as_u64().unwrap_or(0);
+    // Equal mtimes can occur on two devices. A stable tie break converges instead
+    // of each device repeatedly overwriting the other with its own local copy.
+    lmt > rmt || (lmt == rmt && hash >= remote["h"].as_str().unwrap_or(""))
+}
+
+fn install_trainer_profile(path: &Path, body: &[u8], expected: Option<&[u8]>, rmt: u64) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::windows::fs::OpenOptionsExt;
+    validate_trainer_profile(body)?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("建跟打器目录失败：{e}"))?;
+    }
+    // The trainer takes the same short file lock when saving. No lock spans HTTP.
+    let _lock = std::fs::OpenOptions::new().read(true).write(true).create(true).share_mode(0)
+        .open(path.with_extension("lock"))
+        .map_err(|e| format!("跟打器正在保存配置，本轮稍后重试：{e}"))?;
+    let current = match std::fs::read(path) {
+        Ok(raw) => Some(raw),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(format!("读跟打器配置失败：{e}")),
+    };
+    if current.as_deref() != expected {
+        return Err("同步期间跟打器配置已修改，已保留本机配置；下轮重试".into());
+    }
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let tmp = path.with_extension(format!("sync-{}-{}.tmp", std::process::id(), NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)
+            .map_err(|e| format!("建立跟打器配置临时文件失败：{e}"))?;
+        file.write_all(body).and_then(|_| file.sync_all()).map_err(|e| format!("写入跟打器配置失败：{e}"))?;
+        drop(file);
+        // Recheck after disk I/O so an app save while downloading never gets erased.
+        if std::fs::read(path).ok().as_deref() != expected {
+            return Err("同步期间跟打器配置已修改，已保留本机配置；下轮重试".into());
+        }
+        if current.is_some() { backup_file_before_write(path); }
+        std::fs::rename(&tmp, path).map_err(|e| format!("替换跟打器配置失败：{e}"))?;
+        set_mtime(path, rmt);
+        Ok(())
+    })();
+    let _ = std::fs::remove_file(&tmp);
+    result
+}
+
+fn sync_trainer_profile_at(
+    agent: &ureq::Agent,
+    s: &SyncSettings,
+    mf: &mut Value,
+    path: &Path,
+) -> Result<(usize, usize), String> {
     let remote = mf.get("trainer_profile").cloned();
-    let exists = path.is_file();
-    if !exists && remote.is_none() {
+    let local = match std::fs::read(path) {
+        Ok(raw) => { validate_trainer_profile(&raw)?; Some(raw) },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(format!("读跟打器配置失败：{e}")),
+    };
+    if local.is_none() && remote.is_none() {
         return Ok((0, 0));
     }
-    let lmt = file_mtime_ms(&path).unwrap_or(0);
+    if let Some(rv) = &remote {
+        let valid_hex = |key: &str, len: usize| key.len() == len && key.bytes().all(|b| b.is_ascii_hexdigit());
+        if !rv.get("key").and_then(Value::as_str).is_some_and(|k| valid_hex(k, 32))
+            // Existing manifest hashes use the first 16 SHA256 bytes (32 hex),
+            // the same representation as hash_bytes and all file entries.
+            || !rv.get("h").and_then(Value::as_str).is_some_and(|h| valid_hex(h, 32))
+            || !rv.get("sz").and_then(Value::as_u64).is_some_and(|n| n > 0 && n <= MAX_TRAINER_PROFILE)
+            || rv.get("mt").and_then(Value::as_u64).is_none()
+        { return Err("云端跟打器配置清单损坏，已保留本机配置".into()); }
+    }
+    let lmt = if local.is_some() { file_mtime_ms(path)? } else { 0 };
     let rmt = remote
         .as_ref()
         .and_then(|v| v.get("mt"))
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
-    let key = file_key("trainer-profile", "profile.json");
     let mut uploaded = 0;
     let mut downloaded = 0;
-    if exists && (remote.is_none() || lmt >= rmt) {
-        let raw = std::fs::read(&path).map_err(|e| format!("读跟打器配置失败：{e}"))?;
+    if let Some(raw) = local.as_ref().filter(|raw| trainer_profile_local_wins(lmt, &hash_bytes(raw), remote.as_ref())) {
         if raw.len() as u64 > MAX_FILE {
             return Err("跟打器配置超过 32 MB，已跳过".into());
         }
         let hash = hash_bytes(&raw);
+        // Content-addressed blobs keep simultaneous uploads from changing the
+        // bytes referenced by another device's manifest.
+        let key = file_key("trainer-profile", &hash);
         let same = remote
             .as_ref()
             .and_then(|v| v.get("h"))
             .and_then(|v| v.as_str())
             .map(|h| h == hash)
             .unwrap_or(false);
+        let key = if same {
+            remote.as_ref().and_then(|rv| rv["key"].as_str()).expect("validated key").to_owned()
+        } else { key };
         if !same {
             let url = url_join(&s.url, &format!("{FILES_DIR}/{key}"));
             match auth_req(
@@ -2011,27 +2104,28 @@ fn sync_trainer_profile(
             "mt": lmt.max(rmt), "sz": raw.len(), "h": hash, "key": key,
         });
     } else if let Some(rv) = remote {
-        let rkey = rv.get("key").and_then(|v| v.as_str()).unwrap_or(&key);
+        let rkey = rv["key"].as_str().expect("validated key");
+        if local.as_ref().is_some_and(|raw| hash_bytes(raw) == rv["h"].as_str().unwrap_or("")) {
+            return Ok((0, 0));
+        }
         let url = url_join(&s.url, &format!("{FILES_DIR}/{rkey}"));
         let mut body = Vec::new();
         match auth_req(agent.request("GET", &url), &s.user, &s.pass).call() {
             Ok(r) => {
                 r.into_reader()
-                    .take(MAX_FILE)
+                    .take(MAX_TRAINER_PROFILE + 1)
                     .read_to_end(&mut body)
                     .map_err(|e| format!("下载跟打器配置失败：{e}"))?;
             }
-            Err(ureq::Error::Status(404, _)) => return Ok((0, 0)),
+            Err(ureq::Error::Status(404, _)) => return Err("云端跟打器配置文件缺失，已保留本机配置".into()),
             Err(e) => return Err(format!("下载跟打器配置失败：{e}")),
         }
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| format!("建跟打器目录失败：{e}"))?;
+        if body.len() as u64 != rv["sz"].as_u64().unwrap_or(0)
+            || body.len() as u64 > MAX_TRAINER_PROFILE
+            || hash_bytes(&body) != rv["h"].as_str().unwrap_or("") {
+            return Err("云端跟打器配置大小或 SHA256 不符，已保留本机配置".into());
         }
-        if path.is_file() {
-            backup_file_before_write(&path);
-        }
-        std::fs::write(&path, &body).map_err(|e| format!("写入跟打器配置失败：{e}"))?;
-        set_mtime(&path, rmt);
+        install_trainer_profile(path, &body, local.as_deref(), rmt)?;
         downloaded = body.len();
     }
     Ok((uploaded, downloaded))
@@ -2042,6 +2136,84 @@ fn sync_trainer_profile(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn trainer_test_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("hufu-profile-sync-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&dir).unwrap(); dir
+    }
+    fn trainer_profile_bytes(size: u32) -> Vec<u8> {
+        json!({"version":1, "updated_at":1, "config_toml":format!("font_size = {size}"),
+            "online_user":"", "online_password":"", "online_account":null}).to_string().into_bytes()
+    }
+    #[test]
+    fn trainer_profile_equal_timestamps_have_a_stable_winner() {
+        let a = "aaa"; let b = "bbb";
+        assert!(!trainer_profile_local_wins(1, a, Some(&json!({"mt":1,"h":b}))));
+        assert!(trainer_profile_local_wins(1, b, Some(&json!({"mt":1,"h":a}))));
+        assert!(trainer_profile_local_wins(2, a, Some(&json!({"mt":1,"h":b}))));
+    }
+    #[test]
+    fn trainer_profile_rejects_malformed_hash_and_blob_path_before_network() {
+        let dir = trainer_test_dir(); let path = dir.join("profile.json");
+        let body = trainer_profile_bytes(24); std::fs::write(&path, &body).unwrap();
+        let good = json!({"mt":1,"sz":body.len(),"h":hash_bytes(&body),"key":file_key("trainer-profile", "profile.json")});
+        let agent = ureq::AgentBuilder::new().build(); let settings = SyncSettings::default();
+        for (field, value) in [("key", "../profile.json"), ("h", "not-a-sha256-prefix")] {
+            let mut entry = good.clone(); entry[field] = json!(value);
+            let mut mf = json!({"trainer_profile":entry});
+            assert!(sync_trainer_profile_at(&agent, &settings, &mut mf, &path).unwrap_err().contains("清单损坏"));
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    #[test]
+    fn trainer_profile_atomic_install_preserves_local_edits_and_rejects_invalid_data() {
+        let dir = trainer_test_dir(); let path = dir.join("profile.json");
+        let old = trainer_profile_bytes(24); let new = trainer_profile_bytes(30);
+        std::fs::write(&path, &old).unwrap();
+        assert!(install_trainer_profile(&path, b"truncated", Some(&old), 1000).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), old);
+        std::fs::write(&path, &new).unwrap();
+        assert!(install_trainer_profile(&path, &old, Some(&old), 1000).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), new);
+        install_trainer_profile(&path, &old, Some(&new), 1000).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), old);
+        assert_eq!(file_mtime_ms(&path).unwrap(), 1000);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    #[test]
+    fn trainer_profile_identical_legacy_blob_keeps_existing_key_without_upload() {
+        let dir = trainer_test_dir(); let path = dir.join("profile.json");
+        let body = trainer_profile_bytes(24); std::fs::write(&path, &body).unwrap();
+        let key = file_key("trainer-profile", "profile.json");
+        let mut mf = json!({"trainer_profile":{"mt":1,"sz":body.len(),"h":hash_bytes(&body),"key":key}});
+        let settings = SyncSettings::default();
+        assert_eq!(sync_trainer_profile_at(&ureq::AgentBuilder::new().build(), &settings, &mut mf, &path).unwrap(), (0,0));
+        assert_eq!(mf["trainer_profile"]["key"], key);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    #[test]
+    fn trainer_profile_corrupt_remote_body_never_replaces_local_file() {
+        use std::io::Write;
+        let dir = trainer_test_dir(); let path = dir.join("profile.json");
+        let old = trainer_profile_bytes(24); std::fs::write(&path, &old).unwrap();
+        set_mtime(&path, 1000);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut buf = [0u8; 4096]; let _ = stream.read(&mut buf).unwrap();
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\ncorrupt").unwrap();
+        });
+        let good = trainer_profile_bytes(36);
+        let mut mf = json!({"trainer_profile":{"mt":2000,"sz":good.len(),"h":hash_bytes(&good),"key":file_key("trainer-profile", "x")}});
+        let settings = SyncSettings { url:format!("http://{address}"), ..Default::default() };
+        let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(5)).build();
+        assert!(sync_trainer_profile_at(&agent, &settings, &mut mf, &path).unwrap_err().contains("SHA256"));
+        server.join().unwrap(); assert_eq!(std::fs::read(&path).unwrap(), old);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     /// 文件 key：稳定、纯 ASCII、同方案不同文件不同 key。
     #[test]

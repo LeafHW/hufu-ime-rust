@@ -1,4 +1,4 @@
-//! F1 跟打器设置：左侧五页导航 + 右侧内容区（练习/成绩单/颜色/外观/数据）。
+//! F1 跟打器设置：左侧四页导航 + 右侧内容区（练习/成绩单/外观与颜色/数据）。
 //!
 //! 面板几何由 `modals` 提供（960×752，与 1280×800 视口等高，内容区
 //! `y+62 .. y+ph-62`，左侧导航 208）；
@@ -851,7 +851,7 @@ fn data_page(f: &mut Frame, hs: &mut Vec<Hit>, t: &Theme, x: f32, y: f32, w: f32
         x + 16.,
         c2 + 36.,
         T_LABEL,
-        format!("虎符跟打器 {}", env!("CARGO_PKG_VERSION")),
+        format!("虎符跟打器 {}", release_version()),
         p.text,
     );
     note(
@@ -862,6 +862,19 @@ fn data_page(f: &mut Frame, hs: &mut Vec<Hit>, t: &Theme, x: f32, y: f32, w: f32
         "设置只影响跟打器，不改变输入法皮肤与候选窗。",
         p.muted,
     );
+}
+
+fn release_version() -> &'static str {
+    static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    VERSION.get_or_init(|| {
+        std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|dir| dir.join("version.txt")))
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .map(|version| version.trim().to_owned())
+            .filter(|version| !version.is_empty())
+            .unwrap_or_else(|| "开发版".to_owned())
+    })
 }
 
 // ---------------------------------------------------------------------- 页脚

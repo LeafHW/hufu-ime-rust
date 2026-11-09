@@ -137,6 +137,48 @@ pub fn phys_to_logical(v: i32) -> f32 {
     v as f32 / dpi_scale()
 }
 
+// Native WM_CLOSE destroys the HWND before the app exits its loop. Capture the
+// normal rectangle first, also when closing a minimized/maximized window.
+static NORMAL_BOUNDS: Mutex<Option<(i32, i32, i32, i32)>> = Mutex::new(None);
+
+unsafe fn normal_window_bounds(hwnd: HWND) -> Option<(i32, i32, i32, i32)> {
+    use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST};
+    use windows::Win32::UI::WindowsAndMessaging::{GetWindowPlacement, WINDOWPLACEMENT};
+    let mut p = WINDOWPLACEMENT { length: std::mem::size_of::<WINDOWPLACEMENT>() as u32, ..Default::default() };
+    GetWindowPlacement(hwnd, &mut p).ok()?;
+    let r = p.rcNormalPosition;
+    let mut monitor = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+    let handle = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    if !GetMonitorInfoW(handle, &mut monitor).as_bool() { return None; }
+    // WINDOWPLACEMENT uses workspace coordinates for normal application windows.
+    let x = r.left + monitor.rcWork.left - monitor.rcMonitor.left;
+    let y = r.top + monitor.rcWork.top - monitor.rcMonitor.top;
+    let (w, h) = (r.right - r.left, r.bottom - r.top);
+    (w > 0 && h > 0).then_some((x, y, w, h))
+}
+
+fn clamp_restored_bounds(x: i32, y: i32, w: i32, h: i32, work: (i32, i32, i32, i32)) -> (i32, i32, i32, i32) {
+    let (left, top, right, bottom) = work;
+    let w = w.max(1).min((right - left).max(1));
+    let h = h.max(1).min((bottom - top).max(1));
+    (x.clamp(left, right.saturating_sub(w).max(left)), y.clamp(top, bottom.saturating_sub(h).max(top)), w, h)
+}
+
+#[cfg(test)]
+mod placement_tests {
+    use super::*;
+    #[test]
+    fn secondary_monitor_keeps_negative_coordinates_and_fits_its_work_area() {
+        assert_eq!(clamp_restored_bounds(-1800, 70, 1280, 800, (-1920, 40, 0, 1080)), (-1800,70,1280,800));
+        assert_eq!(clamp_restored_bounds(2500, 90, 1600, 1000, (1920, 0, 3840, 1440)), (2240,90,1600,1000));
+    }
+    #[test]
+    fn removed_monitor_and_small_screen_keep_whole_restored_window_visible() {
+        assert_eq!(clamp_restored_bounds(-1800, -32000, 1280, 800, (0, 40, 1024, 768)), (0,40,1024,728));
+        assert_eq!(clamp_restored_bounds(9000, 9000, 960, 630, (0, 0, 1920, 1080)), (960,450,960,630));
+    }
+}
+
 // ── 鼠标事件队列（界面组消费；与 input_host::CMD_QUEUE 同款静态队列）──
 
 /// 主窗口客户区鼠标事件（物理像素；Wheel 的 x/y 为光标位置）
@@ -693,6 +735,9 @@ fn wndproc_min() -> bool {
 /// 输入层固定为 RichEdit 宿主（input_host）；自建 HIMC 的 ime_imm 后端
 /// 已删除（probe-imm REPORT 证伪：CUAS 桥拆不掉、自建上下文挂不稳）。
 unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    if msg == windows::Win32::UI::WindowsAndMessaging::WM_CLOSE {
+        *NORMAL_BOUNDS.lock().unwrap_or_else(|e| e.into_inner()) = normal_window_bounds(hwnd);
+    }
     // ★ 诊断开关 GALE_WNDPROC_MIN=1（2026-10-06 "打不了字"二分定位）：
     //   除 WM_DESTROY/WM_TIMER 外全部直落 DefWindowProc——绕开所有
     //   自定义消息臂（NCHITTEST/NCCALCSIZE/DPICHANGED/GETMINMAXINFO/
@@ -1104,11 +1149,38 @@ impl MainWindow {
     /// 当前窗口外框（屏幕物理像素）：用户调好的位置/大小落盘用。
     pub fn window_rect(&self) -> Option<(i32, i32, i32, i32)> {
         unsafe {
-            let mut r = windows::Win32::Foundation::RECT::default();
-            if windows::Win32::UI::WindowsAndMessaging::GetWindowRect(self.hwnd(), &mut r).is_err() {
-                return None;
+            if let Some(bounds) = normal_window_bounds(self.hwnd()) {
+                *NORMAL_BOUNDS.lock().unwrap_or_else(|e| e.into_inner()) = Some(bounds);
+                return Some(bounds);
             }
-            Some((r.left, r.top, r.right - r.left, r.bottom - r.top))
+            *NORMAL_BOUNDS.lock().unwrap_or_else(|e| e.into_inner())
+        }
+    }
+
+    /// Restore on the saved monitor, at that monitor's DPI. A removed monitor
+    /// falls back to the nearest surviving work area with the whole window visible.
+    pub fn restore_bounds(&self, x: i32, y: i32, w: i32, h: i32, physical_position: bool) {
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromRect, MONITORINFO, MONITOR_DEFAULTTONEAREST};
+        use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
+        use windows::Win32::UI::WindowsAndMessaging::{SetWindowPos, SWP_NOACTIVATE, SWP_NOZORDER};
+        unsafe {
+            let old_scale = dpi_scale();
+            let (x, y) = if physical_position { (x, y) } else { ((x as f32 * old_scale).round() as i32, (y as f32 * old_scale).round() as i32) };
+            let rect = RECT { left: x, top: y, right: x.saturating_add(1), bottom: y.saturating_add(1) };
+            let monitor = MonitorFromRect(&rect, MONITOR_DEFAULTTONEAREST);
+            let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+            if !GetMonitorInfoW(monitor, &mut info).as_bool() { return; }
+            let (mut dx, mut dy) = (96, 96);
+            let _ = GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dx, &mut dy);
+            let scale = dx.max(96) as f32 / 96.;
+            let (x, y, w, h) = clamp_restored_bounds(x, y, (w.max(640) as f32 * scale).round() as i32, (h.max(420) as f32 * scale).round() as i32,
+                (info.rcWork.left, info.rcWork.top, info.rcWork.right, info.rcWork.bottom));
+            // Complete the cross-monitor DPI transition while still hidden,
+            // then set the final size so WM_DPICHANGED cannot replace it.
+            let _ = SetWindowPos(self.hwnd(), None, x, y, 0, 0, SWP_NOZORDER | SWP_NOACTIVATE | windows::Win32::UI::WindowsAndMessaging::SWP_NOSIZE);
+            refresh_window_dpi(self.hwnd());
+            let _ = SetWindowPos(self.hwnd(), None, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
         }
     }
 

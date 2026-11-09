@@ -44,7 +44,13 @@ pub struct FivegramModel {
     /// 各阶量化参数（下标 order-2：quant[0]=unigram … quant[4]=5 阶）
     quant: [Quant; 5],
     /// 码点 → 词表 id（单字 token；BOS/EOS 特判 0x02/0x03）
-    cp2id: HashMap<u32, u16>,
+    /// 【id 查询直表 2026-11-09】step_prob 每事件 id_of×5（4 历史+目标），
+    /// 原单表 HashMap（SipHash 键）是解码内层最热的查询之一；BMP 拆
+    /// 65536 槽直表（Option<u16>，miss=None），非 BMP（增补平面字，
+    /// 词表极少）留小 HashMap。两源内容与原单表逐条相同、miss 同走
+    /// unknown_id，映射语义零变化。
+    cp2id_bmp: Vec<Option<u16>>,
+    cp2id_rest: HashMap<u32, u16>,
     /// 码点 → 字频名次（1 起，按 unigram 概率降序；未收录 usize::MAX）
     freq_rank: HashMap<u32, usize>,
     unigram_p: Vec<f64>,
@@ -181,7 +187,8 @@ impl FivegramModel {
         }
         // 词表：id 顺序 { len:u16, token:u8[len], p:q, b:q }；token 为 UTF-8。
         let vb = &d[vocab_offset..vocab_end];
-        let mut cp2id = HashMap::with_capacity(vocab_count);
+        let mut cp2id_bmp: Vec<Option<u16>> = vec![None; 0x1_0000];
+        let mut cp2id_rest: HashMap<u32, u16> = HashMap::new();
         let mut id2cp: Vec<Option<u32>> = Vec::with_capacity(vocab_count);
         let mut unigram_p = Vec::with_capacity(vocab_count);
         let mut pos = 0usize;
@@ -208,7 +215,11 @@ impl FivegramModel {
                 }
             }
             if let Some(cp) = one {
-                cp2id.insert(cp, id as u16);
+                if (cp as usize) < 0x1_0000 {
+                    cp2id_bmp[cp as usize] = Some(id as u16);
+                } else {
+                    cp2id_rest.insert(cp, id as u16);
+                }
             }
             id2cp.push(one);
         }
@@ -234,7 +245,8 @@ impl FivegramModel {
             qbytes,
             dirs,
             quant,
-            cp2id,
+            cp2id_bmp,
+            cp2id_rest,
             freq_rank,
             unigram_p,
             #[cfg(test)]
@@ -252,7 +264,16 @@ impl FivegramModel {
         match cp {
             0x02 => self.bos_id,
             0x03 => self.eos_id,
-            _ => self.cp2id.get(&cp).copied().unwrap_or(self.unknown_id),
+            // 【id 查询直表 2026-11-09】BMP 走直表下标，非 BMP 走残留
+            // 小表；两路 miss 都落 unknown_id——与原单表 HashMap 语义
+            // 逐位一致（0x02/0x03 是控制字符，不进词表，特判恒先命中）。
+            _ => {
+                if (cp as usize) < 0x1_0000 {
+                    self.cp2id_bmp[cp as usize].unwrap_or(self.unknown_id)
+                } else {
+                    self.cp2id_rest.get(&cp).copied().unwrap_or(self.unknown_id)
+                }
+            }
         }
     }
 
@@ -661,5 +682,32 @@ mod tests {
         let m = from_bytes(&d).unwrap();
         assert!(m.lookup(2, &[1], 2).is_none());
         assert!((m.step_prob(&['甲' as u32], '乙' as u32) - 0.1).abs() < 1e-10);
+    }
+
+    /// 【id 查询直表 2026-11-09】直表+残留小表的 id_of 与「单表 HashMap」
+    /// 原实现逐 cp 一致：BMP 全域扫描 + 增补平面采样（fixture 含 𠀀）
+    /// + BOS/EOS 特判 + unknown 兜底。
+    #[test]
+    fn id_of_direct_table_matches_flat_map() {
+        let m = probability_cache_test_model();
+        let mut flat: HashMap<u32, u16> = HashMap::new();
+        for (cp, v) in m.cp2id_bmp.iter().enumerate() {
+            if let Some(id) = v {
+                flat.insert(cp as u32, *id);
+            }
+        }
+        flat.extend(m.cp2id_rest.iter().map(|(&k, &v)| (k, v)));
+        let reference = |cp: u32| match cp {
+            0x02 => m.bos_id,
+            0x03 => m.eos_id,
+            _ => flat.get(&cp).copied().unwrap_or(m.unknown_id),
+        };
+        for cp in 0u32..0x1_1000 {
+            assert_eq!(m.id_of(cp), reference(cp), "cp={cp:#x}");
+        }
+        for cp in [0x1_1000u32, 0x2_0000, 0x2_0001, 0x1F_600, 0x10_FFFF] {
+            assert_eq!(m.id_of(cp), reference(cp), "cp={cp:#x}");
+        }
+        assert!(flat.len() >= 1, "fixture 至少含一个词表字");
     }
 }

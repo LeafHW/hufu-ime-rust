@@ -825,10 +825,27 @@ pub fn store_account(path: &Path, account: &WenlaiAccount) -> Result<(), String>
 }
 
 /// 读本机 DPAPI 登录态，供 profile.json 带上会话（跨机免重输密码）。
-pub fn export_account(data_dir: &Path, server: &str) -> Option<WenlaiAccount> {
+pub fn export_account(data_dir: &Path, server: &str, explicitly_cleared: bool) -> Option<WenlaiAccount> {
+    if explicitly_cleared { return None; }
     load_account(&data_dir.join("online-auth.dpapi"), server)
         .ok()
         .flatten()
+}
+
+/// Import only a newer profile for the active server. A durable local logout
+/// marker always wins, including when a locked credential file still exists.
+pub fn import_synced_account(data_dir: &Path, server: &str, account: &WenlaiAccount) -> Result<(), String> {
+    let path = data_dir.join("online-auth.dpapi");
+    if signed_out_marker(&path).try_exists().map_err(|e| format!("无法核实本机退出状态：{e}"))? {
+        return Ok(());
+    }
+    if wenlai::normalize_base_url(&account.domain)? != wenlai::normalize_base_url(server)? {
+        return Ok(());
+    }
+    let remote_time = std::fs::metadata(data_dir.join("profile.json")).and_then(|m| m.modified()).ok();
+    let local_time = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+    if local_time.is_some() && remote_time <= local_time { return Ok(()); }
+    store_account(&path, account)
 }
 
 fn save_account_impl(
@@ -936,6 +953,29 @@ fn invalidate_saved_account(path: &Path) -> Result<Option<String>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn explicit_session_clear_wins_even_before_worker_removes_old_dpapi_file() {
+        let dir = test_dir("profile-clear");
+        let account = WenlaiAccount { domain:DEFAULT_SERVER.into(), username:"old-user".into(), display_name:"old-user".into(), user_id:7, jwt_token:"old-test-token".into() };
+        store_account(&dir.join("online-auth.dpapi"), &account).unwrap();
+        assert!(export_account(&dir, DEFAULT_SERVER, false).is_some());
+        assert!(export_account(&dir, DEFAULT_SERVER, true).is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    #[test]
+    fn synchronized_account_never_overrides_explicit_local_logout_or_other_domain() {
+        let dir = test_dir("profile-import"); std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("online-auth.dpapi");
+        let account = WenlaiAccount { domain:DEFAULT_SERVER.into(), username:"profile-user".into(), display_name:"profile-user".into(), user_id:7, jwt_token:"test-profile-token".into() };
+        std::fs::write(dir.join("profile.json"), b"profile").unwrap();
+        std::fs::write(signed_out_marker(&path), b"signed-out").unwrap();
+        import_synced_account(&dir, DEFAULT_SERVER, &account).unwrap(); assert!(!path.exists());
+        std::fs::remove_file(signed_out_marker(&path)).unwrap();
+        import_synced_account(&dir, "https://example.com", &account).unwrap(); assert!(!path.exists());
+        import_synced_account(&dir, DEFAULT_SERVER, &account).unwrap();
+        assert_eq!(load_account(&path, DEFAULT_SERVER).unwrap().unwrap().username, "profile-user");
+        let _ = std::fs::remove_dir_all(dir);
+    }
     fn test_dir(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "hufu-online-{label}-{}-{}",

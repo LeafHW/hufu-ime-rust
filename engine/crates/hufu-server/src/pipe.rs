@@ -43,6 +43,9 @@ pub fn dispatch(
         "ping" => serde_json::json!({"ok": true, "server": "hufu"}),
         "key" => match parse_key(req) {
             Some(k) => {
+                // 【批2-F 2026-11-09】首键到达：ngram 页缓存暖走让路
+                // 推进代际，后续模型重载不能重新激活已取消的旧预热。
+                crate::NGRAM_WARM_EPOCH.advance();
                 let schema_before = host.engine.config.schema.current.clone();
                 host.session.line_end_hint = req
                     .get("line_end")

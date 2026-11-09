@@ -136,7 +136,8 @@ fn probability_cache_preserves_full_decode_bits_and_partial_tails() {
 fn probability_cache_reuses_queries_but_keeps_short_decode_bypass() {
     let engine = standard_engine();
     let model = five(&engine);
-    for raw in ["aabbccddeeffgghh", "aabbccddeeffgghhb", "aaabbccddeeffgghhiijj"] {
+    // 【C② 2026-11-09】门槛 16→8：8 键旁路，9 键起缓存命中。
+    for raw in ["aabbccdd", "aabbccdde", "aabbccddeeffgghhb", "aaabbccddeeffgghhiijj"] {
         model.reset_test_queries();
         engine.decode_internal::<false>(raw, None, false);
         let original = model.test_queries();
@@ -144,7 +145,7 @@ fn probability_cache_reuses_queries_but_keeps_short_decode_bypass() {
         engine.decode_internal::<true>(raw, None, false);
         let cached = model.test_queries();
         assert!(original > 0);
-        if raw.len() <= 16 {
+        if raw.len() <= 8 {
             assert_eq!(cached, original, "short decode must bypass hash-map work");
         } else {
             assert!(cached < original, "real cache hits expected: {raw}: {cached} / {original}");

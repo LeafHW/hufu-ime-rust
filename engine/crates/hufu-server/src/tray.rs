@@ -475,26 +475,24 @@ fn hotkey_display(s: &str) -> String {
 unsafe fn apply_trainer_shortcut(hwnd: isize) {
     let _ = UnregisterHotKey(hwnd, HOTKEY_ID_TRAINER);
     TRAINER_HOTKEY_FAILED.store(false, Ordering::SeqCst);
-    let cached = || TRAINER_HOTKEY_CACHED.lock().unwrap_or_else(|p| p.into_inner()).clone();
-    if !trainer_enabled() {
-        *TRAINER_HOTKEY_CACHED.lock().unwrap_or_else(|p| p.into_inner()) = String::new();
-        return;
-    }
     // 配置热键串：这里只在启动/配置变化时走，不在 WM_HOTKEY 高频路径，
     // 必须阻塞等锁读到**新配置**；此前 try_lock 失败回退缓存旧值，设置页
     // 改键时正好撞上保存高峰 → 永远重新注册旧的 Ctrl+Alt+G。
-    let hotkey = match SHARED.get() {
-        Some(shared) => shared
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .engine
-            .config
-            .trainer
-            .hotkey
-            .trim()
-            .to_string(),
-        None => cached(),
+    let (enabled, hotkey) = match SHARED.get() {
+        Some(shared) => {
+            let host = shared.lock().unwrap_or_else(|p| p.into_inner());
+            (host.engine.config.trainer.enabled, host.engine.config.trainer.hotkey.trim().to_string())
+        }
+        None => (
+            TRAINER_ENABLED_CACHED.load(Ordering::SeqCst),
+            TRAINER_HOTKEY_CACHED.lock().unwrap_or_else(|p| p.into_inner()).clone(),
+        ),
     };
+    TRAINER_ENABLED_CACHED.store(enabled, Ordering::SeqCst);
+    if !enabled {
+        *TRAINER_HOTKEY_CACHED.lock().unwrap_or_else(|p| p.into_inner()) = String::new();
+        return;
+    }
     *TRAINER_HOTKEY_CACHED.lock().unwrap_or_else(|p| p.into_inner()) = hotkey.clone();
     match crate::trainer::parse_hotkey(&hotkey) {
         Some((mods, vk)) => {

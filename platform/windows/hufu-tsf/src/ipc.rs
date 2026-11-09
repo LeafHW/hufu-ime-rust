@@ -273,6 +273,48 @@ fn process_is_appcontainer() -> bool {
     }
 }
 
+/// 开发态覆盖也只能指定 server，避免任意程序进入运行时自愈启动链。
+fn valid_dev_server_path(exe: &str) -> bool {
+    let path = std::path::Path::new(exe);
+    path.is_absolute()
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case("hufu-server.exe"))
+}
+
+#[cfg(test)]
+mod dev_server_path_tests {
+    use super::valid_dev_server_path;
+
+    #[test]
+    fn accepts_absolute_server_paths() {
+        for path in [
+            r"E:\开发目录\hufu-server.exe",
+            r"C:\HuFu\HUFU-SERVER.EXE",
+            r"\\localhost\HuFu\hufu-server.exe",
+        ] {
+            assert!(valid_dev_server_path(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn rejects_relative_paths_and_other_targets() {
+        for path in [
+            "",
+            "hufu-server.exe",
+            r".\hufu-server.exe",
+            r"C:hufu-server.exe",
+            r"\HuFu\hufu-server.exe",
+            r"C:\HuFu",
+            r"C:\HuFu\other.exe",
+            r"C:\HuFu\hufu-server.exe.bat",
+        ] {
+            assert!(!valid_dev_server_path(path), "{path}");
+        }
+    }
+}
+
 fn ensure_server() -> bool {
     // 【2026-11 安全阀】提权宿主不拉起 server（详见 process_is_elevated）：
     // 宁可在提权进程里打字失败，也不留一个普通权限杀不掉的常驻 server。
@@ -337,8 +379,12 @@ fn ensure_server() -> bool {
     // 发行 DLL 内置开发路径会在卸载窗口期拉起 dev 版 server（旧数据
     // 串场、提权宿主还会锁管道 ACL）——10 轮净室实测教训。
     if let Ok(dev_exe) = std::env::var("HUFU_DEV_SERVER") {
-        if !dev_exe.is_empty() {
+        if valid_dev_server_path(&dev_exe) {
             candidates.push(dev_exe);
+        } else {
+            crate::tsf::trace(
+                "ipc: HUFU_DEV_SERVER 无效：必须是文件名为 hufu-server.exe 的绝对路径，已跳过",
+            );
         }
     }
     for exe in candidates {

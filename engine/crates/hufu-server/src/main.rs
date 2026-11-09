@@ -365,7 +365,7 @@ fn log_startup(msg: &str) {
 }
 
 /// 构建标记：同版本号重打包时用来区分新旧包（/api/about 与设置页日志都会带）。
-const BUILD_TAG: &str = "2026-11-07b";
+const BUILD_TAG: &str = "2026-11-10-v1.9.9.4";
 
 fn main() {
     #[cfg(all(windows, not(feature = "console")))]
@@ -1171,6 +1171,80 @@ pub fn reload_sentence_bg(teardown_old: bool, resupplement: bool) {
 static NGRAM_LOAD_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static NGRAM_LOAD_PENDING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+/// 装载与按键都推进代际，旧预热不会被下一轮装载重新激活。
+pub(crate) struct NgramWarmEpoch(std::sync::atomic::AtomicU64);
+impl NgramWarmEpoch {
+    pub(crate) fn advance(&self) -> u64 {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed).wrapping_add(1)
+    }
+    fn is_current(&self, epoch: u64) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Relaxed) == epoch
+    }
+}
+pub(crate) static NGRAM_WARM_EPOCH: NgramWarmEpoch =
+    NgramWarmEpoch(std::sync::atomic::AtomicU64::new(0));
+
+fn warm_model_pages(reader: &mut impl std::io::Read, active: impl Fn() -> bool) -> std::io::Result<bool> {
+    if !active() { return Ok(false); }
+    let mut buf = vec![0u8; 4 << 20];
+    loop {
+        // 先让路再读，已取消的预热不再额外发起一笔 4 MiB I/O。
+        if !active() { return Ok(false); }
+        if reader.read(&mut buf)? == 0 { return Ok(true); }
+    }
+}
+
+#[cfg(test)]
+mod ngram_warm_tests {
+    use super::*;
+    #[test]
+    fn next_reload_never_revives_a_cancelled_warmup() {
+        let epochs = NgramWarmEpoch(std::sync::atomic::AtomicU64::new(0));
+        let old = epochs.advance();
+        assert!(epochs.is_current(old));
+        epochs.advance(); // first key cancels
+        assert!(!epochs.is_current(old));
+        let new = epochs.advance(); // another model load starts
+        assert!(epochs.is_current(new));
+        assert!(!epochs.is_current(old));
+    }
+    #[test]
+    fn cancelled_warmup_reads_no_more_chunks() {
+        struct Reader<'a>(&'a std::cell::Cell<usize>);
+        impl std::io::Read for Reader<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.0.set(self.0.get() + 1);
+                buf[0] = 1;
+                Ok(1)
+            }
+        }
+        let reads = std::cell::Cell::new(0);
+        assert!(!warm_model_pages(&mut Reader(&reads), || false).unwrap());
+        assert_eq!(reads.get(), 0);
+        assert!(!warm_model_pages(&mut Reader(&reads), || reads.get() == 0).unwrap());
+        assert_eq!(reads.get(), 1);
+    }
+}
+
+/// 【批2-F 2026-11-09】暖走线程降权：进后台调度模式（CPU+I/O 双降权）。
+/// 失败（含已在后台模式）静默保持原级。
+/// 线程退出时系统自动恢复默认优先级，无需显式退出后台模式。
+#[cfg(windows)]
+fn warm_thread_background_mode() {
+    use windows::Win32::System::Threading::{
+        SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN, THREAD_PRIORITY,
+    };
+    unsafe {
+        // GetCurrentThread() 伪句柄——本线程自身。
+        let h = windows::Win32::System::Threading::GetCurrentThread();
+        let _ = SetThreadPriority(
+            h,
+            THREAD_PRIORITY(THREAD_MODE_BACKGROUND_BEGIN.0 as i32),
+        );
+    }
+}
+#[cfg(not(windows))]
+fn warm_thread_background_mode() {}
 
 fn spawn_sentence_reload(shared: std::sync::Arc<std::sync::Mutex<Host>>, resupplement: bool) {
     use std::sync::atomic::Ordering;
@@ -1198,6 +1272,7 @@ fn spawn_sentence_reload(shared: std::sync::Arc<std::sync::Mutex<Host>>, resuppl
             let body = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
             let mut first = true;
             loop {
+                let warm_epoch = NGRAM_WARM_EPOCH.advance();
                 let resupplement = if first { resupplement } else { true };
                 first = false;
                 let t0 = std::time::Instant::now();
@@ -1225,6 +1300,12 @@ fn spawn_sentence_reload(shared: std::sync::Arc<std::sync::Mutex<Host>>, resuppl
                 // 【性能】mmap 页缓存预热：v5 模型 546MB 惰性映射，首查
                 // 缺页逐条读盘。冷启动时并行顺序读整文件填 page cache；
                 // 重载时页缓存已热，顺序读很快返回。
+                // 【批2-F 2026-11-09】暖走线程不扰前台：进后台调度模式
+                // （THREAD_MODE_BACKGROUND_BEGIN——CPU+I/O 双降权）；
+                // 首个按键到达即取消（键路径设置
+                // NGRAM_WARM_EPOCH，每 4MB 块检查一次——冷启动用户
+                // 开打时暖走立即让路，不再抢盘）。每次模型装载重开一个
+                // 暖走窗口（重载/换方案后页缓存可能已失效）。
                 let mut loaded_path: Option<std::path::PathBuf> = None;
                 let mut last_err: Option<std::io::Error> = None;
                 let mut dec_opt = None;
@@ -1235,13 +1316,21 @@ fn spawn_sentence_reload(shared: std::sync::Arc<std::sync::Mutex<Host>>, resuppl
                             .name("hufu-ngram-warm".into())
                             .spawn(move || {
                                 let t0 = std::time::Instant::now();
+                                warm_thread_background_mode();
                                 if let Ok(mut f) = std::fs::File::open(&p) {
-                                    use std::io::Read;
-                                    let mut buf = vec![0u8; 4 << 20];
-                                    while let Ok(n) = f.read(&mut buf) {
-                                        if n == 0 {
-                                            break;
+                                    match warm_model_pages(&mut f, || NGRAM_WARM_EPOCH.is_current(warm_epoch)) {
+                                        Ok(false) => {
+                                            eprintln!(
+                                                "ngram 页缓存预热让路于首键（{:.1}s 处）",
+                                                t0.elapsed().as_secs_f32()
+                                            );
+                                            return;
                                         }
+                                        Err(e) => {
+                                            eprintln!("ngram 页缓存预热跳过：{e}");
+                                            return;
+                                        }
+                                        Ok(true) => {}
                                     }
                                 }
                                 eprintln!("ngram 页缓存预热完成（{:.1}s）", t0.elapsed().as_secs_f32());
