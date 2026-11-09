@@ -18,8 +18,7 @@ use windows::Win32::System::Com::{
 };
 use windows::Win32::UI::Accessibility::{
     CUIAutomation, IUIAutomation, IUIAutomation2, IUIAutomationCondition, IUIAutomationElement,
-    TreeScope_Descendants, UIA_ClassNamePropertyId, UIA_ControlTypePropertyId,
-    UIA_TextControlTypeId,
+    TreeScope_Descendants, UIA_ControlTypePropertyId, UIA_TextControlTypeId,
 };
 
 /// UIA 实例按线程各持一份（thread_local）：
@@ -101,38 +100,45 @@ fn find_class(
     None
 }
 
-/// 精确类名的服务端过滤查询：每个类名一个 ClassName PropertyCondition，
-/// Or 合并成一次 FindAll（UIA PropertyCondition 只支持精确匹配）。
-/// 结果按文档序返回、上限 10 000；任一精确类名命中即返回，全部为空返回
-/// `None`，调用方回退到带回测的 TrueCondition 扫描（Electron 类名可能带
-/// 版本后缀，如 `chat-msg-area__vlist--vkBD3`）。
+/// UIA 的 ClassName 是元素 class 属性的整串（多个类名以空格分隔），
+/// 实测 QQ 9.9.36 的会话题条目：
+///   普通   `recent-contact-item`
+///   选中   `recent-contact-item recent-contact-item--selected`
+///   置顶   `recent-contact-item recent-contact-item--top rc-pin-item--read`
+/// 所以**不能用 PropertyCondition 精确等值**（只命中普通条目，置顶/选中全漏）。
+/// 这里按空白切词后逐词判断：等于特指类名，或以「特指类名--」开头（BEM 修饰符）。
+pub(crate) fn class_matches(cls: &str, spec: &str) -> bool {
+    cls.split_whitespace().any(|tok| {
+        tok == spec
+            || tok
+                .strip_prefix(spec)
+                .map(|rest| rest.starts_with("--"))
+                .unwrap_or(false)
+    })
+}
+
+/// 类名（含状态修饰符）过滤的条目查询：空白切词后逐词匹配，结果按文档序
+/// 返回、上限 10 000；全部为空返回 `None`，调用方回退到根级前缀扫描
+/// （Electron 类名可能带版本后缀，如 `chat-msg-area__vlist--vkBD3`）。
 fn find_all_by_class(
     uia: &IUIAutomation,
     root: &IUIAutomationElement,
     exact: &[&str],
 ) -> Option<Vec<IUIAutomationElement>> {
     unsafe {
-        let mut conds: Vec<IUIAutomationCondition> = Vec::new();
-        for cls in exact {
-            if let Ok(c) = uia.CreatePropertyCondition(
-                UIA_ClassNamePropertyId,
-                &windows::core::VARIANT::from(*cls),
-            ) {
-                conds.push(c);
-            }
-        }
-        if conds.is_empty() {
-            return None;
-        }
-        let mut combined = conds.pop()?;
-        while let Some(c) = conds.pop() {
-            combined = uia.CreateOrCondition(&c, &combined).ok()?;
-        }
-        let all = root.FindAll(TreeScope_Descendants, &combined).ok()?;
+        let cond = uia.CreateTrueCondition().ok()?;
+        let all = root.FindAll(TreeScope_Descendants, &cond).ok()?;
         let n = all.Length().unwrap_or(0).min(10_000);
         let mut out = Vec::with_capacity(n as usize);
         for i in 0..n {
-            if let Ok(e) = all.GetElement(i) {
+            let Ok(e) = all.GetElement(i) else {
+                continue;
+            };
+            let Ok(cls) = e.CurrentClassName() else {
+                continue;
+            };
+            let cls = cls.to_string();
+            if exact.iter().any(|spec| class_matches(&cls, spec)) {
                 out.push(e);
             }
         }
@@ -189,8 +195,16 @@ fn child_texts_joined(uia: &IUIAutomation, el: &IUIAutomationElement) -> String 
     out
 }
 
-/// 全部会话列表容器。NTQQ 9.9.x 把会话列表拆成多个容器
-/// （置顶区 + 消息区各一个，类名带不同后缀），只取第一个会漏掉置顶会话。
+/// 类名里是否存在「含 needle 的词」（容器匹配用：recent-contact-list /
+/// pinned-contact-list / contact-list--pinned 都能命中 contact-list）。
+fn class_has_token_containing(cls: &str, needle: &str) -> bool {
+    cls.split_whitespace().any(|tok| tok.contains(needle))
+}
+
+/// 全部会话列表容器。NTQQ 把会话列表拆成多个容器（置顶区 + 消息区各一个，
+/// 类名带不同后缀/BEM 修饰），只取第一个会漏掉置顶会话。这里按**类名词**
+/// 含 `contact-list` 收集（覆盖 recent-contact-list / pinned-contact-list /
+/// 未来的 contact-list--pinned 等），嵌套重复容器由 list_sessions 去重。
 fn session_lists(uia: &IUIAutomation, root: &IUIAutomationElement) -> Vec<IUIAutomationElement> {
     let mut out = Vec::new();
     unsafe {
@@ -208,7 +222,7 @@ fn session_lists(uia: &IUIAutomation, root: &IUIAutomationElement) -> Vec<IUIAut
                 continue;
             };
             let cls = cls.to_string();
-            if cls == "recent-contact-list" || cls.contains("recent-contact-list") {
+            if class_has_token_containing(&cls, "contact-list") {
                 out.push(el);
             }
         }
@@ -222,39 +236,70 @@ fn message_vlist(uia: &IUIAutomation, root: &IUIAutomationElement) -> Option<IUI
         .or_else(|| find_by_class_contains(uia, root, "chat-msg-area__vlist"))
 }
 
-/// 会话项内前 limit 个 Text 子节点 Name 拼接（NTQQ 把“虎码训练♂营”拆成 3 段；
-/// 时间戳（含':'）及其后的摘要节点被跳过）。
-fn item_texts_joined(uia: &IUIAutomation, item: &IUIAutomationElement, limit: i32) -> String {
+/// 会话项文本节点 → 显示名。NTQQ 把“虎码训练♂营”拆成多段 Text，名字后面
+/// 跟时间戳（含 ':'）与摘要；置顶/公告角标可能排在最前，跳过但不截断。
+/// 名字段数不设硬上限（只受时间戳/未读标记截断），避免 4 段以上群名被砍尾。
+pub(crate) fn join_item_texts<S: AsRef<str>>(texts: &[S]) -> String {
     let mut joined = String::new();
+    for raw in texts {
+        let s = raw.as_ref().trim();
+        if s.is_empty() {
+            continue;
+        }
+        // 时间戳（21:33）或未读标记之后的节点不是名字
+        if s.contains(':') || s.contains("未读") {
+            break;
+        }
+        // 置顶项首节点可能是置顶角标文字，跳过而不截断
+        if s == "置顶" || s == "公告" || s == "免打扰" {
+            continue;
+        }
+        // 只防病态超长（正常群名远低于此），不是截断名字段
+        if joined.len().saturating_add(s.len()) > 512 {
+            break;
+        }
+        joined.push_str(s);
+    }
+    joined
+}
+
+/// 会话项内 Text 子节点 Name 依次交给 `join_item_texts`（上限 16 个节点，
+/// 正常条目只有 1~3 段名字 + 时间戳 + 摘要）。
+fn item_texts_joined(uia: &IUIAutomation, item: &IUIAutomationElement) -> String {
+    let mut texts: Vec<String> = Vec::new();
     unsafe {
         let Ok(cond) = uia.CreatePropertyCondition(
             UIA_ControlTypePropertyId,
             &windows::core::VARIANT::from(UIA_TextControlTypeId.0),
         ) else {
-            return joined;
+            return String::new();
         };
-        let Ok(texts) = item.FindAll(TreeScope_Descendants, &cond) else {
-            return joined;
+        let Ok(found) = item.FindAll(TreeScope_Descendants, &cond) else {
+            return String::new();
         };
-        for i in 0..texts.Length().unwrap_or(0).min(limit) {
-            let Ok(te) = texts.GetElement(i) else {
+        for i in 0..found.Length().unwrap_or(0).min(16) {
+            let Ok(te) = found.GetElement(i) else {
                 continue;
             };
             if let Ok(s) = te.CurrentName() {
-                let s = s.to_string();
-                // 时间戳（21:33）或未读标记之后的节点不是名字
-                if s.contains(':') || s.contains("未读") {
-                    break;
-                }
-                // 置顶项首节点可能是置顶角标文字，跳过而不截断
-                if s.trim() == "置顶" || s.trim() == "公告" {
-                    continue;
-                }
-                joined.push_str(s.trim());
+                texts.push(s.to_string());
             }
         }
     }
-    joined
+    join_item_texts(&texts)
+}
+
+/// 两个 UIA 元素是否同一元素（跨容器去重用）。
+fn same_element(
+    uia: &IUIAutomation,
+    a: &IUIAutomationElement,
+    b: &IUIAutomationElement,
+) -> bool {
+    unsafe {
+        uia.CompareElements(a, b)
+            .map(|v| v.as_bool())
+            .unwrap_or(false)
+    }
 }
 
 /// Recent conversations are display names, not verified group IDs. Keep duplicates so
@@ -264,17 +309,28 @@ pub fn list_sessions(hwnd: isize) -> Vec<String> {
     let Some(root) = panel_root(&uia, hwnd) else {
         return vec![];
     };
-    // 多容器：置顶区 + 消息区分别枚举，全部并入；容器级精确过滤失败回退 TrueCondition 扫描。
+    // 多容器：置顶区 + 消息区分别枚举，全部并入（容器类名词含 contact-list）。
     let mut items: Vec<IUIAutomationElement> = Vec::new();
     let mut lists = session_lists(&uia, &root);
     if lists.is_empty() {
         std::thread::sleep(std::time::Duration::from_millis(250));
         lists = session_lists(&uia, &root);
     }
+    let multi = lists.len() > 1;
     for list in lists.iter() {
-        items.extend(find_all_by_class(&uia, list, &["recent-contact-item"]).into_iter().flatten());
+        for item in find_all_by_class(&uia, list, &["recent-contact-item"])
+            .into_iter()
+            .flatten()
+        {
+            // 嵌套容器会让同一条目被收集两次；只在多容器时去重（跨进程
+            // CompareElements 不便宜），顺序仍保持文档序。
+            if multi && items.iter().any(|seen| same_element(&uia, seen, &item)) {
+                continue;
+            }
+            items.push(item);
+        }
     }
-    // 根级兜底：容器类名改版时仍按条目类名前缀抓（≤2000，防巨树）。
+    // 根级兜底：容器类名改版时仍按条目类名（含状态修饰符）抓（≤2000，防巨树）。
     if items.is_empty() {
         unsafe {
             if let Ok(cond) = uia.CreateTrueCondition() {
@@ -284,7 +340,7 @@ pub fn list_sessions(hwnd: isize) -> Vec<String> {
                         .filter(|item| {
                             item.CurrentClassName()
                                 .ok()
-                                .map(|n| n.to_string().starts_with("recent-contact-item"))
+                                .map(|n| class_matches(&n.to_string(), "recent-contact-item"))
                                 .unwrap_or(false)
                         })
                         .collect();
@@ -294,7 +350,7 @@ pub fn list_sessions(hwnd: isize) -> Vec<String> {
     }
     let mut names = Vec::new();
     for item in items.iter().take(2000) {
-        let name = item_texts_joined(&uia, item, 3).trim().to_string();
+        let name = item_texts_joined(&uia, item).trim().to_string();
         if !name.is_empty() {
             names.push(name);
         }
@@ -419,4 +475,153 @@ pub fn read_current_article(hwnd: isize, expected_title: &str) -> Result<String,
                     .any(|line| line.trim_start().starts_with("-----第"))
         })
         .ok_or_else(|| "当前会话可见消息中没有带段标的跟打文，请复制原文后载入".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{class_has_token_containing, class_matches, join_item_texts};
+
+    // 以下类名/文本序列取自 2026-11-09 本机 NTQQ 9.9.36（pid 17388）的真实 UIA 树
+    // （会话列表容器 + 置顶条目 + 选中条目 + 普通条目），不是构造的示意值。
+
+    #[test]
+    fn class_matches_plain_item() {
+        assert!(class_matches("recent-contact-item", "recent-contact-item"));
+    }
+
+    #[test]
+    fn class_matches_pinned_item_with_state_classes() {
+        // 置顶条目真实类名：类名属性是整串，旧的 PropertyCondition 精确等值匹配会漏
+        let cls = "recent-contact-item recent-contact-item--top rc-pin-item--read";
+        assert!(class_matches(cls, "recent-contact-item"));
+    }
+
+    #[test]
+    fn class_matches_selected_item_with_state_classes() {
+        // 当前打开会话的条目真实类名
+        let cls = "recent-contact-item recent-contact-item--selected";
+        assert!(class_matches(cls, "recent-contact-item"));
+    }
+
+    #[test]
+    fn class_matches_rejects_unrelated_classes() {
+        for cls in [
+            "recent-contact-item-extra",
+            "recent-contact-items",
+            "rc-pin-item--read",
+            "q-scroll-view scroll-view--memory",
+            "",
+        ] {
+            assert!(
+                !class_matches(cls, "recent-contact-item"),
+                "不应命中: {cls:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn class_matches_container_names() {
+        // 真实容器类名（置顶区与普通区共用同一个滚动容器）
+        let real = "q-scroll-view scroll-view--memory scroll-view--show-scrollbar \
+                    recent-contact-list recent-contact-default-theme-list";
+        assert!(class_has_token_containing(real, "contact-list"));
+        // 假设的置顶独立容器类名也要能命中（通用，不做单类名特判）
+        assert!(class_has_token_containing("pinned-contact-list", "contact-list"));
+        assert!(class_has_token_containing(
+            "contact-list contact-list--pinned",
+            "contact-list"
+        ));
+        // 消息区/输入区不能误判成会话容器
+        assert!(!class_has_token_containing(
+            "ml-area v-list-area list-wrap chat-msg-area__vlist",
+            "contact-list"
+        ));
+    }
+
+    #[test]
+    fn join_pinned_item_name_stops_at_timestamp() {
+        // 置顶条目「虎码训练♂营」的 Text 节点顺序：名字 3 段 → 时间 → 摘要
+        let texts = [
+            "虎码训练",
+            "♂",
+            "营",
+            "23:38",
+            "Z-E-R-O.5梦：",
+            "@晴",
+            "我只是打这个文打熟了",
+        ];
+        assert_eq!(join_item_texts(&texts), "虎码训练♂营");
+    }
+
+    #[test]
+    fn join_selected_item_name() {
+        let texts = ["虎码新手村2群", "23:41", "芝士798：", "我现在就是中转", "19"];
+        assert_eq!(join_item_texts(&texts), "虎码新手村2群");
+    }
+
+    #[test]
+    fn join_keeps_more_than_three_name_segments() {
+        // 旧实现 limit=3 会把第 4 段名字砍掉；这里必须完整拼出
+        let texts = ["虎码训练", "♂", "营", "②群", "23:38", "某人：", "内容"];
+        assert_eq!(join_item_texts(&texts), "虎码训练♂营②群");
+    }
+
+    #[test]
+    fn join_skips_pin_badge_but_keeps_name() {
+        let texts = ["置顶", "虎码训练", "♂", "营", "23:38", "某人：", "内容"];
+        assert_eq!(join_item_texts(&texts), "虎码训练♂营");
+    }
+
+    #[test]
+    fn join_stops_at_unread_marker() {
+        // 「群助手」条目：名字后是无未读时的摘要，未读标记之后不再取
+        let texts = ["群助手", "23:41", "[", "@全体成员", "]", "18个群聊有新消息"];
+        assert_eq!(join_item_texts(&texts), "群助手");
+    }
+
+    /// 端到端语义回归：用真实条目（类名 + Text 序列）跑「类名匹配 → 名字拼接」，
+    /// 置顶群必须出现在结果里，且同名会话的重复保留语义不变。
+    #[test]
+    fn pinned_session_is_listed_and_duplicates_kept() {
+        struct Row {
+            cls: &'static str,
+            texts: &'static [&'static str],
+        }
+        let rows = [
+            Row {
+                cls: "recent-contact-item recent-contact-item--top rc-pin-item--read",
+                texts: &["虎码训练", "♂", "营", "23:38", "Z-E-R-O.5梦：", "@晴", "内容"],
+            },
+            Row {
+                cls: "recent-contact-item",
+                texts: &["群助手", "23:41", "[", "@全体成员", "]", "18个群聊有新消息"],
+            },
+            Row {
+                cls: "recent-contact-item recent-contact-item--selected",
+                texts: &["虎码新手村2群", "23:41", "芝士798：", "内容", "19"],
+            },
+            // 同名会话出现两次：必须两行都保留（选择端靠重复判定歧义，不能吞）
+            Row {
+                cls: "recent-contact-item",
+                texts: &["虎码训练", "♂", "营", "23:40", "某人：", "内容"],
+            },
+        ];
+        let names: Vec<String> = rows
+            .iter()
+            .filter(|r| class_matches(r.cls, "recent-contact-item"))
+            .map(|r| join_item_texts(r.texts))
+            .filter(|n| !n.is_empty())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "虎码训练♂营".to_string(),
+                "群助手".to_string(),
+                "虎码新手村2群".to_string(),
+                "虎码训练♂营".to_string(),
+            ]
+        );
+        // 置顶群在列表首位（文档序），且两条同名都在
+        assert_eq!(names.iter().filter(|n| n.as_str() == "虎码训练♂营").count(), 2);
+    }
 }

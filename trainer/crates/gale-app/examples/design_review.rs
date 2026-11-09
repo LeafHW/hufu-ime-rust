@@ -483,7 +483,7 @@ fn completed_fixture(m: &mut Model, mode: TrainingMode, done: usize) -> Session 
     sess
 }
 
-fn history_fixture(m: &mut Model, session_view: bool, select_older: bool) -> Session {
+fn history_fixture(m: &mut Model, _session_view: bool, select_older: bool) -> Session {
     let sess = completed_fixture(m, TrainingMode::Practice, 4);
     let mut previous = Session::new(100);
     previous.load_group(ParsedGroupText {
@@ -502,11 +502,12 @@ fn history_fixture(m: &mut Model, session_view: bool, select_older: bool) -> Ses
     old_record.input_method = "虎符".into();
     m.history.insert(0, old_record);
     m.selected_history = Some(if select_older { 0 } else { m.history.len() - 1 });
-    m.open(Modal::Report);
-    m.fields.insert(
-        "report_tab".into(),
-        if session_view { "session" } else { "history" }.into(),
-    );
+    m.ledger_open = true;
+    m.ledger_scroll = if select_older {
+        crate::history::record_offset(m, 0)
+    } else {
+        0.
+    };
     sess
 }
 
@@ -636,12 +637,13 @@ fn main() -> Result<(), Box<dyn Error>> {
                 let done = if screen == 7 { 4 } else { 2 };
                 sess = completed_fixture(&mut m, TrainingMode::Race, done);
                 if screen == 7 {
-                    m.open(Modal::Report);
-                    m.fields.insert("report_tab".into(), "session".into());
+                    m.ledger_open = true;
+                    m.selected_history = None;
+                    m.history = sess.results.iter().flatten().cloned().collect();
                 }
                 match screen {
                     6 => "06-race-completed-dark.bmp",
-                    7 => "07-race-report-dark.bmp",
+                    7 => "07-ledger-session-dark.bmp",
                     19 => {
                         theme_name = "宣纸";
                         "19-race-completed-light.bmp"
@@ -693,12 +695,15 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
             13..=15 | 25 | 28 => {
                 sess = history_fixture(&mut m, screen == 15, matches!(screen, 13 | 25 | 28));
+                if screen == 15 {
+                    m.selected_history = None;
+                }
                 match screen {
-                    13 => "13-report-history-older-dark.bmp",
-                    14 => "14-report-history-current-dark.bmp",
-                    15 => "15-report-session-dark.bmp",
-                    25 => "25-report-history-small-640x420.bmp",
-                    _ => "28-report-history-small-800x600.bmp",
+                    13 => "13-ledger-history-older-dark.bmp",
+                    14 => "14-ledger-history-current-dark.bmp",
+                    15 => "15-ledger-history-collapsed-dark.bmp",
+                    25 => "25-ledger-history-small-640x420.bmp",
+                    _ => "28-ledger-history-small-800x600.bmp",
                 }
             }
             20 | 30 => {
@@ -744,14 +749,14 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
             32 | 33 | 37 => {
                 full_analysis_fixture(&mut sess);
-                m.open(Modal::FullAnalysis);
+                m.analysis_dock = true;
                 if screen == 33 {
                     m.fields.insert("analysis_view".into(), "heatmap".into());
-                    "33-full-analysis-heatmap-dark.bmp"
+                    "33-analysis-dock-heatmap-dark.bmp"
                 } else if screen == 37 {
-                    "37-full-analysis-small-640x420.bmp"
+                    "37-analysis-dock-small-640x420.bmp"
                 } else {
-                    "32-full-analysis-dark.bmp"
+                    "32-analysis-dock-dark.bmp"
                 }
             }
             34 => {
@@ -791,13 +796,13 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
             43 | 44 => {
                 m.open(Modal::Preferences);
-                let tab = if screen == 43 { 1 } else { 0 };
+                let tab = if screen == 43 { 1 } else { 3 };
                 m.fields.insert("pref_tab".into(), tab.to_string());
                 cfg.score_template = gale_core::scorecard::preset("detailed").template.into();
                 if screen == 43 {
                     "43-preferences-scores-small-800x600.bmp"
                 } else {
-                    "44-preferences-practice-small-800x600.bmp"
+                    "44-preferences-data-small-800x600.bmp"
                 }
             }
             45 => {
@@ -882,11 +887,11 @@ fn main() -> Result<(), Box<dyn Error>> {
             59..=61 | 70 | 71 => {
                 sess = history_fixture(&mut m, matches!(screen, 60 | 61), true);
                 match screen {
-                    59 => "59-report-history-800x600.bmp",
-                    60 => "60-report-session-800x600.bmp",
-                    61 => "61-report-session-640x420.bmp",
-                    70 => "70-report-history-640x420-selected-detail.bmp",
-                    _ => "71-report-history-800x600-selected-detail.bmp",
+                    59 => "59-ledger-history-800x600.bmp",
+                    60 => "60-ledger-session-800x600.bmp",
+                    61 => "61-ledger-session-640x420.bmp",
+                    70 => "70-ledger-history-640x420-selected-detail.bmp",
+                    _ => "71-ledger-history-800x600-selected-detail.bmp",
                 }
             }
             64 => {
@@ -899,21 +904,13 @@ fn main() -> Result<(), Box<dyn Error>> {
                 sess = article(TrainingMode::Practice);
                 m.latest = None;
                 m.history.clear();
-                m.open(Modal::Report);
-                "65-report-history-empty-640x420.bmp"
+                m.ledger_open = true;
+                "65-ledger-history-empty-640x420.bmp"
             }
             _ => unreachable!(),
         };
-        if m.modal == Modal::Report
-            && !secondary_panels::session_report(&m)
-            && m.selected_history == Some(0)
-            && width < 1000.
-        {
-            m.scroll = m.history.len().saturating_sub(3) as f32;
-        }
-        if matches!(screen, 70 | 71) {
-            m.panel_scroll =
-                secondary_panels::history_detail_scroll(&m, &sess, width, height - 138.);
+        if m.ledger_open {
+            m.ledger_scroll = m.ledger_scroll.min(crate::history::scroll_max(&m, height));
         }
         cfg.theme = theme_name.into();
         let single = matches!(&sess.source, session::SessionSource::Single);
@@ -980,7 +977,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         manifest.push(serde_json::json!({
             "screen":screen,"file":name,"logical_size":[width,height],"pixel_size":[width as u32,height as u32],
             "theme":theme_name,"modal":format!("{:?}",m.modal),"phase":format!("{:?}",sess.phase),
-            "font_size":cfg.font_size,"single_character_hints":single,"report_tab":m.field("report_tab"),
+            "font_size":cfg.font_size,"single_character_hints":single,"report_tab":m.field("report_tab"),"ledger_open":m.ledger_open,"analysis_dock":m.analysis_dock,"ledger_scroll":m.ledger_scroll,"analysis_scroll":m.analysis_dock_scroll,
             "panel_scroll":m.panel_scroll,"list_scroll":m.scroll,"selected_history":m.selected_history,"history_records":m.history.len(),
             "draw_commands":frame.cmds.len(),"hit_targets":hits.len(),
             "visible_native_field_rectangles":field_manifest,"native_field_values_painted_by_d2d":true

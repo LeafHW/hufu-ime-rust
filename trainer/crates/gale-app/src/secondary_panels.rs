@@ -257,901 +257,6 @@ fn paragraph(f: &mut Frame, x: f32, y: f32, w: f32, h: f32, size: f32, lh: f32, 
     end_clip(f);
 }
 
-fn duration(ms: u64) -> String {
-    let tenths = ms / 100;
-    format!(
-        "{:02}:{:02}.{}",
-        tenths / 600,
-        (tenths / 10) % 60,
-        tenths % 10
-    )
-}
-
-fn segment_caption(index: usize, mark: &str) -> String {
-    let ordinal = index.saturating_add(1);
-    if mark.is_empty() || mark == ordinal.to_string() {
-        format!("第 {ordinal} 段")
-    } else {
-        format!("第 {ordinal} 段 · {mark}")
-    }
-}
-
-fn record_time(r: &ScoreRecord) -> String {
-    // ScoreRecord.date uses the record's own civil date. Do not mix it with a
-    // guessed local UTC offset to manufacture a wall-clock timestamp.
-    r.date.clone()
-}
-
-fn live_trace(sess: &Session, r: &ScoreRecord) -> bool {
-    sess.recorded
-        && r.para_index == sess.current_index()
-        && r.title == sess.title
-        && sess
-            .results
-            .get(r.para_index)
-            .and_then(Option::as_ref)
-            .is_some_and(|x| x.ts == r.ts)
-}
-
-/// Net committed characters in elapsed-time windows. Empty windows stay zero,
-/// and Backspace reduces the window's net output instead of adding throughput.
-fn speed_samples(events: &[TimingEvent], elapsed_ms: u64) -> (u64, Vec<f64>) {
-    if events.is_empty() || elapsed_ms == 0 {
-        return (5000, Vec::new());
-    }
-    let step = elapsed_ms
-        .saturating_add(199)
-        .checked_div(200)
-        .unwrap_or(5000)
-        .max(5000);
-    let n = elapsed_ms
-        .saturating_add(step - 1)
-        .checked_div(step)
-        .unwrap_or(1)
-        .clamp(1, 200) as usize;
-    let mut counts = vec![0i64; n];
-    let mut at = 0u64;
-    for e in events {
-        at = at.saturating_add(e.dt_ms);
-        let i = (at / step).min(n as u64 - 1) as usize;
-        counts[i] = counts[i].saturating_add(e.len_delta as i64);
-    }
-    let samples = counts
-        .into_iter()
-        .enumerate()
-        .map(|(i, chars)| {
-            let span = elapsed_ms.saturating_sub(i as u64 * step).min(step).max(1);
-            chars.max(0) as f64 * 60000. / span as f64
-        })
-        .collect();
-    (step, samples)
-}
-
-#[derive(Debug)]
-struct SlowEstimate {
-    ch: char,
-    average_ms: f64,
-    count: usize,
-    wrong: usize,
-}
-
-/// Commit groups have one timestamp, not one timestamp per character. Group time
-/// is shared evenly and explicitly labelled as an estimate in the report.
-fn slow_estimates(sess: &Session) -> Vec<SlowEstimate> {
-    let target: Vec<char> = sess.comparer.text.chars().collect();
-    let mut position = 0usize;
-    let mut groups: BTreeMap<char, (f64, usize)> = BTreeMap::new();
-    for e in &sess.comparer.timing_events {
-        if e.len_delta > 0 {
-            let n = e.len_delta as usize;
-            let each = e.dt_ms as f64 / n as f64;
-            for ch in target.iter().skip(position).take(n) {
-                if !ch.is_whitespace() && e.dt_ms > 0 {
-                    let item = groups.entry(*ch).or_default();
-                    item.0 += each;
-                    item.1 += 1;
-                }
-            }
-            position = position.saturating_add(n).min(target.len());
-        } else {
-            position = position.saturating_sub(e.len_delta.unsigned_abs() as usize);
-        }
-    }
-    let mut wrong = BTreeMap::<char, usize>::new();
-    for (i, state) in sess.comparer.states.iter().enumerate() {
-        if *state == CharState::Wrong {
-            if let Some(ch) = target.get(i) {
-                *wrong.entry(*ch).or_default() += 1;
-            }
-        }
-    }
-    let mut out: Vec<_> = groups
-        .into_iter()
-        .map(|(ch, (total, count))| SlowEstimate {
-            ch,
-            average_ms: total / count.max(1) as f64,
-            count,
-            wrong: wrong.get(&ch).copied().unwrap_or(0),
-        })
-        .collect();
-    out.sort_by(|a, b| b.average_ms.total_cmp(&a.average_ms).then(a.ch.cmp(&b.ch)));
-    out.truncate(5);
-    out
-}
-
-pub fn session_report(m: &Model) -> bool {
-    m.field("report_tab") == "session"
-}
-
-pub fn selected_report_record(m: &Model) -> Option<&ScoreRecord> {
-    m.selected_history
-        .and_then(|index| m.history.get(index))
-        .or_else(|| m.history.last())
-        .or(m.latest.as_ref())
-}
-
-fn report_columns(width: f32) -> (f32, bool, f32, usize) {
-    let cw = (width - 48.).min(980.).max(160.);
-    let wide = cw >= 720.;
-    let list_w = if !wide {
-        cw
-    } else if cw >= 900. {
-        300.
-    } else {
-        240.
-    };
-    (cw, wide, list_w, if wide { 6 } else { 3 })
-}
-
-/// Keep rendering, wheel scrolling and page buttons on the same page size.
-pub fn report_visible_rows(m: &Model, width: f32) -> usize {
-    if session_report(m) {
-        if (width - 48.).min(980.) >= 720. {
-            5
-        } else {
-            3
-        }
-    } else {
-        report_columns(width).3
-    }
-}
-
-pub fn report_scroll_cap(m: &Model, sess: &Session, width: f32) -> usize {
-    let rows = if session_report(m) {
-        sess.results.iter().flatten().count()
-    } else {
-        m.history.len()
-    };
-    rows.saturating_sub(report_visible_rows(m, width))
-}
-
-/// A narrow report stacks its detail below the list. Selecting a record should
-/// bring that actual detail into view rather than leave the selection offscreen.
-pub fn history_detail_scroll(m: &Model, sess: &Session, width: f32, viewport: f32) -> f32 {
-    let (_, wide, _, _) = report_columns(width);
-    let limit = report_visible_rows(m, width);
-    if wide {
-        return 0.;
-    }
-    let page = (m.scroll as usize).min(report_scroll_cap(m, sess, width));
-    let shown = m.history.len().saturating_sub(page).min(limit);
-    let detail_top = 80. + 34. + shown as f32 * 64. + 66.;
-    (detail_top - 16.).min((report_content_height(m, sess, width) - viewport).max(0.))
-}
-
-/// The report has a compact empty state and only scrolls when its actual content needs it.
-pub fn report_content_height(m: &Model, sess: &Session, width: f32) -> f32 {
-    if session_report(m) {
-        if sess.results.iter().all(Option::is_none) {
-            320.
-        } else {
-            1328.
-        }
-    } else if selected_report_record(m).is_none() {
-        320.
-    } else {
-        let (cw, wide, list_w, _) = report_columns(width);
-        let limit = report_visible_rows(m, width);
-        if wide {
-            let detail_h: f32 = if cw - list_w - 24. >= 480. {
-                420.
-            } else {
-                510.
-            };
-            let list_h = 34.
-                + m.history.len().min(limit) as f32 * 64.
-                + if m.history.len() > limit { 52. } else { 0. };
-            80. + detail_h.max(list_h) + 80.
-        } else {
-            let detail_h = if cw >= 480. { 420. } else { 510. };
-            80. + 34. + m.history.len().min(limit) as f32 * 64. + 66. + detail_h + 80.
-        }
-    }
-}
-
-fn main_area(
-    f: &mut Frame,
-    m: &Model,
-    sess: &Session,
-    t: &Theme,
-    x: f32,
-    y: f32,
-    pw: f32,
-    ph: f32,
-) -> (f32, f32, f32) {
-    let p = tokens(t);
-    rect(f, x, y, pw, ph, p.bg);
-    let cw = (pw - 48.).min(980.).max(160.);
-    let cx = x + (pw - cw) / 2.;
-    let height = report_content_height(m, sess, pw);
-    let maximum = (height - ph).max(0.);
-    let scroll = m.panel_scroll.clamp(0., maximum);
-    if maximum > 0. {
-        let viewport = (ph - 62.).max(1.);
-        let track = (viewport - 42.).max(1.);
-        let body = (height - 62.).max(viewport);
-        let thumb = (track * viewport / body).clamp(18f32.min(track), track);
-        round(f, x + pw - 10., y + 32., 3., track, 1.5, p.line, None);
-        round(
-            f,
-            x + pw - 10.,
-            y + 32. + scroll / maximum * (track - thumb),
-            3.,
-            thumb,
-            1.5,
-            alpha(p.accent, 0.7),
-            None,
-        );
-    }
-    clip(f, x, y, pw, (ph - 62.).max(1.));
-    (cx, y - scroll, cw)
-}
-
-fn metric(f: &mut Frame, x: f32, y: f32, w: f32, value: &str, label: &str, t: &Theme) {
-    let p = tokens(t);
-    clipped_text(f, x, y, w, 25., value, p.text);
-    clipped_text(f, x, y + 35., w, 14., label, p.muted);
-}
-
-fn result_badge(m: &Model, r: &ScoreRecord) -> &'static str {
-    let (mode, hints) = r.round.as_ref().map(|r| (r.mode, r.word_hints)).unwrap_or((
-        if m.race {
-            TrainingMode::Race
-        } else {
-            TrainingMode::Practice
-        },
-        m.hints && !m.race,
-    ));
-    race_badge(mode, hints)
-}
-
-fn draw_report(
-    f: &mut Frame,
-    hs: &mut Vec<Hit>,
-    m: &Model,
-    sess: &Session,
-    t: &Theme,
-    x: f32,
-    y: f32,
-    pw: f32,
-    ph: f32,
-) {
-    let first_hit = hs.len();
-    if session_report(m) {
-        draw_session_report(f, hs, m, sess, t, x, y, pw, ph);
-    } else {
-        draw_history_report(f, hs, m, sess, t, x, y, pw, ph);
-    }
-    // Body controls scroll with the drawing clip; clipped rows cannot intercept
-    // the toolbar or fixed report footer.
-    for hit in hs.iter_mut().skip(first_hit) {
-        let fixed_footer = matches!(
-            hit.action,
-            Action::Close | Action::CopyScore | Action::CopyRace | Action::ExportImage
-        ) || (hit.y >= y + ph - 48.
-            && hit.action == crate::aux_marker("report_history"));
-        if !fixed_footer {
-            let bottom = (hit.y + hit.h).min(y + ph - 62.);
-            hit.y = hit.y.max(y);
-            hit.h = (bottom - hit.y).max(0.);
-        }
-    }
-}
-
-fn report_heading(f: &mut Frame, hs: &mut Vec<Hit>, m: &Model, t: &Theme, x: f32, y: f32) {
-    let p = tokens(t);
-    text(f, x, y + 20., 24., "成绩", p.text);
-    chip(
-        f,
-        hs,
-        x + 100.,
-        y + 14.,
-        126.,
-        "成绩记录",
-        !session_report(m),
-        crate::aux_marker("report_history"),
-        t,
-    );
-    chip(
-        f,
-        hs,
-        x + 236.,
-        y + 14.,
-        126.,
-        "本轮汇总",
-        session_report(m),
-        crate::aux_marker("report_session"),
-        t,
-    );
-}
-
-fn draw_history_report(
-    f: &mut Frame,
-    hs: &mut Vec<Hit>,
-    m: &Model,
-    sess: &Session,
-    t: &Theme,
-    x: f32,
-    y: f32,
-    pw: f32,
-    ph: f32,
-) {
-    let p = tokens(t);
-    let (cx, by, cw) = main_area(f, m, sess, t, x, y, pw, ph);
-    report_heading(f, hs, m, t, cx, by);
-    let Some(record) = selected_report_record(m) else {
-        text(f, cx, by + 140., 21., "还没有成绩记录", p.text2);
-        text(
-            f,
-            cx,
-            by + 180.,
-            15.,
-            "完成一段后会自动保存在这里，换文后仍可查看。",
-            p.muted,
-        );
-        end_clip(f);
-        return;
-    };
-
-    let (_, wide, list_w, _) = report_columns(pw);
-    let limit = report_visible_rows(m, pw);
-    let list_y = by + 80.;
-    let page = (m.scroll as usize).min(report_scroll_cap(m, sess, pw));
-    let shown = m.history.len().saturating_sub(page).min(limit);
-    text(
-        f,
-        cx,
-        list_y,
-        16.,
-        format!("全部记录 · {} 条", m.history.len()),
-        p.text2,
-    );
-    for (row, (index, item)) in m
-        .history
-        .iter()
-        .enumerate()
-        .rev()
-        .skip(page)
-        .take(limit)
-        .enumerate()
-    {
-        let yy = list_y + 34. + row as f32 * 64.;
-        let selected = std::ptr::eq(item, record);
-        if selected {
-            round(
-                f,
-                cx,
-                yy,
-                list_w,
-                58.,
-                7.,
-                alpha(p.accent, 0.10),
-                Some(alpha(p.accent, 0.28)),
-            );
-        } else {
-            line(f, cx + 10., yy + 58., list_w - 20., p.line);
-        }
-        clipped_text(
-            f,
-            cx + 12.,
-            yy + 8.,
-            list_w - 102.,
-            15.,
-            &item.title,
-            if selected { p.accent } else { p.text2 },
-        );
-        right(
-            f,
-            cx + list_w - 12.,
-            yy + 8.,
-            16.,
-            format!("{:.1}", item.speed),
-            p.text2,
-        );
-        clipped_text(
-            f,
-            cx + 12.,
-            yy + 32.,
-            list_w - 20.,
-            14.,
-            &format!(
-                "{} · 第 {} 段 · {} 字",
-                item.date,
-                item.para_index + 1,
-                item.chars
-            ),
-            p.muted,
-        );
-        hs.push(Hit {
-            x: cx,
-            y: yy,
-            w: list_w,
-            h: 58.,
-            action: Action::SelectHistory(index),
-        });
-    }
-    let list_bottom = list_y + 34. + shown as f32 * 64.;
-    if m.history.len() > limit {
-        action(
-            f,
-            hs,
-            cx,
-            list_bottom + 8.,
-            90.,
-            "较新",
-            if page > 0 {
-                crate::aux_marker(&format!("history_step:-{limit}"))
-            } else {
-                Action::None
-            },
-            t,
-            false,
-        );
-        action(
-            f,
-            hs,
-            cx + 100.,
-            list_bottom + 8.,
-            90.,
-            "较早",
-            if page + shown < m.history.len() {
-                crate::aux_marker(&format!("history_step:{limit}"))
-            } else {
-                Action::None
-            },
-            t,
-            false,
-        );
-    }
-
-    let dx = if wide { cx + list_w + 24. } else { cx };
-    let dy = if wide { list_y } else { list_bottom + 66. };
-    let dw = if wide { cw - list_w - 24. } else { cw };
-    let cols = if dw >= 480. { 3 } else { 2 };
-    let detail_h = if cols == 3 { 420. } else { 510. };
-    card(f, dx, dy, dw, detail_h, t);
-    let tx = dx + 20.;
-    let tw = dw - 40.;
-    clipped_text(f, tx, dy + 18., tw, 20., &record.title, p.text);
-    clipped_text(
-        f,
-        tx,
-        dy + 54.,
-        tw,
-        14.,
-        &format!(
-            "{} · {} · 第 {} 段 · {} 字",
-            record_time(record),
-            record.source,
-            record.para_index + 1,
-            record.chars
-        ),
-        p.muted,
-    );
-    let values = [
-        (format!("{:.1}", record.speed), "速度 · 字/分"),
-        (format!("{:.1}%", record.accuracy), "键准·按键效率"),
-        (format!("{:.1}%", record.character_accuracy()), "字准"),
-        (format!("{:.2}", record.strokes_per_sec), "击键 / 秒"),
-        (format!("{:.2}", record.code_len), "码长"),
-        (duration(record.time_ms), "用时"),
-    ];
-    for (i, (value, label)) in values.iter().enumerate() {
-        metric(
-            f,
-            tx + (i % cols) as f32 * tw / cols as f32,
-            dy + 98. + (i / cols) as f32 * 80.,
-            tw / cols as f32 - 12.,
-            value,
-            label,
-            t,
-        );
-    }
-    let extra_y = dy + 98. + (values.len() / cols) as f32 * 80.;
-    line(f, tx, extra_y + 2., tw, p.line);
-    let word_rate = record
-        .word_rate
-        .map(|rate| format!("{rate:.1}%"))
-        .unwrap_or_else(|| "—".into());
-    paragraph(
-        f,
-        tx,
-        extra_y + 18.,
-        tw,
-        62.,
-        15.,
-        26.,
-        &format!(
-            "总键 {} · 错字 {} · 退格 {} · 选重 {}\n词率 {} · 重打 {} 次",
-            record.keys,
-            record.wrong,
-            record.backspaces,
-            record.select_count,
-            word_rate,
-            record.retype_count
-        ),
-        p.text2,
-    );
-    if live_trace(sess, record) && !sess.last_vk_histogram.is_empty() {
-        link(
-            f,
-            hs,
-            tx,
-            extra_y + 86.,
-            tw,
-            "查看本段按键热力图",
-            crate::aux_marker("show_heatmap"),
-            t,
-        );
-    } else {
-        clipped_text(
-            f,
-            tx,
-            extra_y + 96.,
-            tw,
-            14.,
-            "此记录未保存按键分布。",
-            p.muted,
-        );
-    }
-    end_clip(f);
-    let ay = y + ph - 48.;
-    action(
-        f,
-        hs,
-        cx,
-        ay,
-        142.,
-        "复制这条成绩",
-        Action::CopyScore,
-        t,
-        true,
-    );
-    action(
-        f,
-        hs,
-        cx + 154.,
-        ay,
-        126.,
-        "导出图片",
-        Action::ExportImage,
-        t,
-        false,
-    );
-    if !wide {
-        action(
-            f,
-            hs,
-            cx + cw - 142.,
-            ay,
-            142.,
-            "← 全部记录",
-            crate::aux_marker("report_history"),
-            t,
-            false,
-        );
-    }
-}
-
-fn draw_session_report(
-    f: &mut Frame,
-    hs: &mut Vec<Hit>,
-    m: &Model,
-    sess: &Session,
-    t: &Theme,
-    x: f32,
-    y: f32,
-    pw: f32,
-    ph: f32,
-) {
-    let p = tokens(t);
-    let (cx, base_y, cw) = main_area(f, m, sess, t, x, y, pw, ph);
-    report_heading(f, hs, m, t, cx, base_y);
-    let by = base_y + 16.;
-    let rows: Vec<_> = sess
-        .results
-        .iter()
-        .enumerate()
-        .filter_map(|(i, r)| r.as_ref().map(|r| (i, r)))
-        .collect();
-    if rows.is_empty() {
-        text(
-            f,
-            cx,
-            by + 90.,
-            16.,
-            "本轮还没有完成的段落。历史成绩可在「成绩记录」中查看。",
-            p.muted,
-        );
-        end_clip(f);
-        return;
-    }
-    let agg = sess.aggregate();
-    let character_accuracy = if agg.chars > 0 {
-        agg.chars.saturating_sub(agg.wrong) as f64 / agg.chars as f64 * 100.
-    } else {
-        0.
-    };
-    clipped_text(
-        f,
-        cx,
-        by + 64.,
-        cw,
-        16.,
-        &format!(
-            "{} · 已完成 {} / {} 段",
-            sess.title,
-            agg.completed_segments,
-            sess.total_segments()
-        ),
-        p.text2,
-    );
-    let newest = rows.iter().max_by_key(|(_, r)| r.ts).unwrap().1;
-    text(
-        f,
-        cx,
-        by + 96.,
-        14.,
-        format!(
-            "{} · {} · 仅统计已结算且不少于 {} 字的段落",
-            result_badge(m, newest),
-            newest.date,
-            VALID_MIN_CHARS
-        ),
-        p.muted,
-    );
-    let gated: Vec<_> = rows
-        .iter()
-        .map(|(_, r)| *r)
-        .filter(|r| r.chars >= VALID_MIN_CHARS)
-        .collect();
-    let select_total: u32 = gated.iter().map(|r| r.select_count).sum();
-    let ding_total: u32 = gated.iter().map(|r| r.ding_count).sum();
-    let summaries = [
-        (format!("{:.1}", agg.speed), "总速度 · 字/分"),
-        (format!("{:.1}", agg.effective_speed), "有效速度"),
-        (duration(agg.time_ms), "总用时"),
-        (agg.chars.to_string(), "总字数"),
-        (format!("{:.1}%", agg.accuracy), "键准·按键效率"),
-        (format!("{:.1}%", character_accuracy), "字准"),
-        (format!("{:.2}", agg.strokes_per_sec), "击键 / 秒"),
-        (format!("{:.2}", agg.code_len), "平均码长"),
-        (select_total.to_string(), "选重"),
-        (ding_total.to_string(), "标顶"),
-    ];
-    let cols = if cw >= 720. { 5 } else { 3 };
-    for (i, (value, label)) in summaries.iter().enumerate() {
-        metric(
-            f,
-            cx + (i % cols) as f32 * cw / cols as f32,
-            by + 150. + (i / cols) as f32 * 78.,
-            cw / cols as f32 - 12.,
-            value,
-            label,
-            t,
-        );
-    }
-    let chart_y = by + if cols == 5 { 326. } else { 482. };
-    card(f, cx, chart_y, cw, 176., t);
-    text(f, cx + 16., chart_y + 14., 18., "分段速度对比", p.text2);
-    text(
-        f,
-        cx + 16.,
-        chart_y + 47.,
-        14.,
-        "纵轴从 0 起算；虚线为已结算段总速度。",
-        p.muted,
-    );
-    let page = (m.scroll as usize).min(report_scroll_cap(m, sess, pw));
-    let visible = report_visible_rows(m, pw);
-    let shown: Vec<_> = rows.iter().skip(page).take(visible).collect();
-    let highest = rows.iter().map(|(_, r)| r.speed).fold(1., f64::max);
-    let max = (highest / 50.).ceil().max(1.) * 50.;
-    let plot_x = cx + 64.;
-    let plot_w = cw - 88.;
-    let plot_y = chart_y + 94.;
-    let plot_h = 60.;
-    for i in 0..=2 {
-        let yy = plot_y + plot_h - i as f32 * plot_h / 2.;
-        line(f, plot_x, yy, plot_w, p.line);
-        right(
-            f,
-            plot_x - 12.,
-            yy - 8.,
-            14.,
-            format!("{:.0}", i as f64 * max / 2.),
-            p.muted,
-        );
-    }
-    let mean_y = plot_y + plot_h - (agg.speed / max) as f32 * plot_h;
-    for i in 0..(plot_w / 8.) as usize {
-        rect(f, plot_x + i as f32 * 8., mean_y, 4., 1., p.accent);
-    }
-    // Keep the mean label at the left end so it never collides with the last
-    // bar's value label.
-    text(
-        f,
-        plot_x + 6.,
-        (mean_y - 18.).max(plot_y + 2.),
-        14.,
-        format!("均速 {:.1}", agg.speed),
-        p.accent,
-    );
-    let bw = plot_w / shown.len().max(1) as f32;
-    for (j, row) in shown.iter().enumerate() {
-        let (idx, r) = **row;
-        let xx = plot_x + (j as f32 + 0.5) * bw;
-        let bh = (r.speed / max) as f32 * plot_h;
-        rect(f, xx - 14., plot_y + plot_h - bh, 28., bh, p.accent);
-        right(
-            f,
-            xx + 23.,
-            chart_y + 72.,
-            14.,
-            format!("{:.1}", r.speed),
-            p.text2,
-        );
-        right(
-            f,
-            xx + 26.,
-            chart_y + 160.,
-            14.,
-            format!("第 {} 段", idx + 1),
-            p.muted,
-        );
-    }
-    let detail_y = chart_y + 192.;
-    text(f, cx, detail_y, 18., "逐段明细", p.text2);
-    text(
-        f,
-        cx,
-        detail_y + 34.,
-        14.,
-        "键准 / 字准分别表示按键效率 / 文本正确率。",
-        p.muted,
-    );
-    let count = report_visible_rows(m, pw);
-    for (j, (idx, r)) in rows.iter().skip(page).take(count).enumerate() {
-        let yy = detail_y + 76. + j as f32 * 68.;
-        line(f, cx, yy - 10., cw, p.line);
-        clipped_text(
-            f,
-            cx,
-            yy,
-            cw,
-            16.,
-            &format!(
-                "第 {} 段 · {} · {} 字 · 速度 {:.1} 字/分 · {}",
-                idx + 1,
-                r.mark,
-                r.chars,
-                r.speed,
-                if r.round.as_ref().is_some_and(|r| !r.complete) {
-                    "中途停止"
-                } else {
-                    "已结算"
-                }
-            ),
-            p.text2,
-        );
-        clipped_text(
-            f,
-            cx,
-            yy + 28.,
-            cw,
-            14.,
-            &format!(
-                "键/字准 {:.1}/{:.1} · 击键 {:.2} · 码长 {:.2} · 错字 {} · 回改 {} · {}",
-                r.accuracy,
-                r.character_accuracy(),
-                r.strokes_per_sec,
-                r.code_len,
-                r.wrong,
-                r.corrections,
-                duration(r.time_ms)
-            ),
-            p.muted,
-        );
-    }
-    let tail_y = detail_y + 76. + count as f32 * 68.;
-    text(f, cx, tail_y, 18., "当前段慢字估计", p.text2);
-    let estimates = slow_estimates(sess);
-    let estimate_text = if estimates.is_empty() {
-        "当前段尚无可分析的上屏时间事件。".into()
-    } else {
-        estimates
-            .iter()
-            .map(|z| {
-                format!(
-                    "「{}」{:.2} 秒（{} 次，错 {} 次）",
-                    z.ch,
-                    z.average_ms / 1000.,
-                    z.count,
-                    z.wrong
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(" · ")
-    };
-    paragraph(
-        f,
-        cx,
-        tail_y + 34.,
-        cw,
-        62.,
-        14.,
-        24.,
-        &estimate_text,
-        p.muted,
-    );
-    text(
-        f,
-        cx,
-        tail_y + 105.,
-        14.,
-        "上屏组时长按字符均摊，属于估计值；滚轮可查看更多已结算段。",
-        p.muted,
-    );
-    if sess.phase == Phase::Typing && !sess.recorded {
-        let live = sess.live_stats_now();
-        text(
-            f,
-            cx,
-            tail_y + 135.,
-            14.,
-            format!(
-                "含当前段的实时统计：{} 字 · 速度 {:.1} · 击键 {:.2} · 键准 {:.1}%",
-                live.done_chars, live.total_speed, live.keys_per_sec, live.accuracy
-            ),
-            p.accent,
-        );
-    }
-    end_clip(f);
-    let ay = y + ph - 48.;
-    action(
-        f,
-        hs,
-        cx,
-        ay,
-        174.,
-        "复制整份成绩单",
-        Action::CopyRace,
-        t,
-        true,
-    );
-    action(
-        f,
-        hs,
-        cx + 186.,
-        ay,
-        142.,
-        "导出图片",
-        Action::ExportImage,
-        t,
-        false,
-    );
-}
-
 fn overlay_header(
     f: &mut Frame,
     hs: &mut Vec<Hit>,
@@ -1185,18 +290,49 @@ fn login_visible(m: &Model) -> bool {
 }
 
 fn online_form(pw: f32) -> (f32, f32) {
-    let w = (pw - 64.).min(560.).max(120.);
+    let w = (pw - 180.).min(620.).max(220.);
     ((pw - w) / 2., w)
 }
 
 fn field_shell(f: &mut Frame, x: f32, y: f32, w: f32, label: &str, t: &Theme) {
     let p = tokens(t);
-    text(f, x, y - 24., 14., label, p.muted);
-    round(f, x - 1., y - 1., w + 2., 38., 6., p.bg2, Some(p.line2));
+    text(f, x, y - 21., 13., label, p.muted);
+    round(f, x - 1., y - 1., w + 2., 40., 7., p.bg2, Some(p.line2));
 }
 
-pub(crate) fn content_height_online(_m: &Model) -> f32 {
-    700.
+pub(crate) fn content_height_online(m: &Model) -> f32 {
+    if !m.online_authenticated && !m.online_login_expanded {
+        340.
+    } else if login_visible(m) {
+        700.
+    } else {
+        680.
+    }
+}
+
+fn online_status_strip(
+    f: &mut Frame,
+    x: f32,
+    y: f32,
+    w: f32,
+    text_value: &str,
+    t: &Theme,
+    bad: bool,
+) {
+    let p = tokens(t);
+    let color = if bad { p.red } else { p.muted };
+    round(
+        f,
+        x,
+        y,
+        w,
+        34.,
+        6.,
+        alpha(color, 0.07),
+        Some(alpha(color, 0.28)),
+    );
+    rect(f, x, y + 7., 3., 20., color);
+    clipped_text(f, x + 12., y + 9., w - 20., 13., text_value, color);
 }
 
 fn draw_online(
@@ -1226,56 +362,74 @@ fn draw_online(
     let ix = x + 24.;
     let iw = pw - 48.;
     let active = m.online_authenticated && !m.online_expired;
-    let compact_card = login_visible(m);
-    card(f, ix, y + 82., iw, if compact_card { 44. } else { 64. }, t);
-    clipped_text(
+    let login = login_visible(m);
+    // 账号条：头像 + 名称/服务 + 右侧动作；未登录且表单收起时不画，
+    // 避免和下方「未登录」提示卡重复。
+    if active || login || m.online_expired {
+    let ay = y + 78.;
+    card(f, ix, ay, iw, 54., t);
+    round(
         f,
-        ix + 16.,
-        if compact_card { y + 92. } else { y + 96. },
-        iw - 250.,
-        16.,
-        if m.online_account.is_empty() {
-            if active {
-                "已登录"
-            } else {
-                "未登录"
-            }
+        ix + 12.,
+        ay + 10.,
+        34.,
+        34.,
+        17.,
+        if active {
+            alpha(p.accent, 0.16)
         } else {
-            &m.online_account
+            p.bg2
         },
-        p.text2,
+        Some(if active { alpha(p.accent, 0.35) } else { p.line }),
     );
-    if !compact_card {
-        clipped_text(
+    let initial = m
+        .online_account
+        .chars()
+        .next()
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| if active { "已".into() } else { "?".into() });
+    text(
+        f,
+        ix + 22.,
+        ay + 17.,
+        16.,
+        initial,
+        if active { p.accent } else { p.muted },
+    );
+    let name = if m.online_account.is_empty() {
+        if active { "已登录" } else { "未登录" }
+    } else {
+        &m.online_account
+    };
+    clipped_text(f, ix + 58., ay + 9., iw - 300., 15., name, p.text);
+    let sub = if m.online_expired {
+        "登录已过期 · 当前文章已保留"
+    } else if active {
+        &cfg.wenlai_domain
+    } else {
+        "登录后可同步分类、按难度取文"
+    };
+    clipped_text(f, ix + 58., ay + 31., iw - 300., 12., sub, p.muted);
+    if m.online_expired {
+        let bw = 86.;
+        round(
             f,
-            ix + 16.,
-            y + 121.,
-            iw - 250.,
-            14.,
-            if m.online_expired {
-                "登录已过期，当前文章已保留"
-            } else {
-                &cfg.wenlai_domain
-            },
-            p.muted,
+            ix + iw - 140. - bw,
+            ay + 17.,
+            bw,
+            20.,
+            10.,
+            alpha(p.accent, 0.16),
+            Some(alpha(p.accent, 0.4)),
         );
-    } else if m.online_expired {
-        clipped_text(
-            f,
-            ix + 16.,
-            y + 113.,
-            iw - 250.,
-            14.,
-            "登录已过期，当前文章已保留",
-            p.muted,
-        );
+        text(f, ix + iw - 140. - bw + 9., ay + 19., 11., "登录已过期", p.accent);
     }
     if active {
         action(
             f,
             hs,
-            ix + iw - 132.,
-            if compact_card { y + 88. } else { y + 96. },
+            ix + iw - 128.,
+            ay + 11.,
             116.,
             "退出登录",
             Action::OnlineLogout,
@@ -1286,27 +440,36 @@ fn draw_online(
         action(
             f,
             hs,
-            ix + iw - 132.,
-            if compact_card { y + 88. } else { y + 96. },
+            ix + iw - 128.,
+            ay + 11.,
             116.,
-            if login_visible(m) {
-                "收起账号"
-            } else {
-                "登录 / 注册"
-            },
+            if login { "收起账号" } else { "登录 / 注册" },
             Action::OnlineAccount,
             t,
             false,
         );
     }
-    if login_visible(m) {
+    }
+    if login {
         let (fx, fw) = online_form(pw);
         let fx = x + fx;
-        field_shell(f, fx, y + 154., fw, "用户名", t);
-        field_shell(f, fx, y + 226., fw, "密码 · 不保存", t);
+        text(
+            f,
+            fx,
+            y + 146.,
+            16.,
+            if m.online_register_mode {
+                "注册账号"
+            } else {
+                "登录"
+            },
+            p.text,
+        );
         if m.online_register_mode {
-            field_shell(f, fx, y + 298., fw, "邮箱", t);
-            field_shell(f, fx, y + 370., fw - 152., "邮箱验证码", t);
+            field_shell(f, fx, y + 194., fw, "用户名", t);
+            field_shell(f, fx, y + 258., fw, "密码 · 不保存", t);
+            field_shell(f, fx, y + 322., fw, "邮箱", t);
+            field_shell(f, fx, y + 386., fw - 158., "邮箱验证码", t);
             let label = if m.online_code_wait > 0 {
                 format!("重发 {} 秒", m.online_code_wait)
             } else {
@@ -1315,9 +478,9 @@ fn draw_online(
             action(
                 f,
                 hs,
-                fx + fw - 140.,
-                y + 370.,
-                140.,
+                fx + fw - 148.,
+                y + 388.,
+                148.,
                 &label,
                 if m.online_code_wait > 0 {
                     Action::None
@@ -1327,11 +490,19 @@ fn draw_online(
                 t,
                 false,
             );
+            text(
+                f,
+                fx,
+                y + 436.,
+                13.,
+                "验证码 60 秒可获取一次；注册成功后自动登录。",
+                p.muted,
+            );
             action(
                 f,
                 hs,
                 fx,
-                y + 426.,
+                y + 460.,
                 180.,
                 "注册并登录",
                 crate::aux_marker("online_reg_submit"),
@@ -1341,31 +512,29 @@ fn draw_online(
             link(
                 f,
                 hs,
-                fx,
-                y + 474.,
-                160.,
+                fx + 196.,
+                y + 460.,
+                140.,
                 "‹ 返回登录",
                 crate::aux_marker("online_register"),
                 t,
             );
-            paragraph(
-                f,
-                fx,
-                y + 484.,
-                fw,
-                50.,
-                14.,
-                25.,
-                "验证码每 60 秒可获取一次。\n注册成功后自动登录，随后可取文和浏览书架。",
-                p.muted,
-            );
+            if !m.online_status.is_empty() {
+                let bad = ["失败", "错误", "频繁", "过期", "无效", "不"]
+                    .iter()
+                    .any(|word| m.online_status.contains(word));
+                online_status_strip(f, fx, y + 512., fw, &m.online_status, t, bad);
+            }
         } else {
+            field_shell(f, fx, y + 194., fw, "用户名", t);
+            field_shell(f, fx, y + 258., fw, "密码 · 不保存", t);
+            field_shell(f, fx, y + 322., fw, "服务地址 · HTTPS", t);
             action(
                 f,
                 hs,
                 fx,
-                y + 280.,
-                150.,
+                y + 374.,
+                160.,
                 "登录",
                 Action::OnlineLogin,
                 t,
@@ -1374,91 +543,42 @@ fn draw_online(
             link(
                 f,
                 hs,
-                fx + 170.,
-                y + 280.,
-                190.,
+                fx + 180.,
+                y + 374.,
+                160.,
                 "没有账号？注册",
                 crate::aux_marker("online_register"),
                 t,
             );
-            field_shell(f, fx, y + 374., fw, "服务地址 · HTTPS", t);
-            action(
-                f,
-                hs,
-                fx,
-                y + 426.,
-                176.,
-                "应用服务地址",
-                Action::OnlineServer,
-                t,
-                false,
-            );
-            paragraph(
+            text(
                 f,
                 fx,
-                y + 514.,
-                fw,
-                50.,
-                14.,
-                25.,
-                "登录后自动收起账号表单。\n切换服务地址后需要重新登录。",
+                y + 422.,
+                13.,
+                "登录后自动收起账号表单；切换服务地址后需要重新登录。",
                 p.muted,
             );
+            if !m.online_status.is_empty() {
+                let bad = ["失败", "错误", "频繁", "过期", "无效", "不"]
+                    .iter()
+                    .any(|word| m.online_status.contains(word));
+                online_status_strip(f, fx, y + 466., fw, &m.online_status, t, bad);
+            }
         }
-        paragraph(
+    } else if active {
+        // 取文页：分类 / 难度 / 字数 / 取文动作 / 当前文章。
+        let top = y + 148.;
+        text(f, ix, top, 16., "取文", p.text);
+        right(
             f,
-            fx,
-            y + 610.,
-            fw,
-            75.,
-            14.,
-            24.,
-            &m.online_status,
+            ix + iw,
+            top + 2.,
+            12.,
+            "取文后直接进入跟打区",
             p.muted,
         );
-    } else {
-        clipped_text(
-            f,
-            ix,
-            y + 164.,
-            iw,
-            20.,
-            if m.online_title.is_empty() {
-                "尚未取文"
-            } else {
-                &m.online_title
-            },
-            p.text,
-        );
-        let meta = m
-            .online_article
-            .as_ref()
-            .map(|a| {
-                let position = if a.sort_num > 0 && a.end_sort_num > a.sort_num {
-                    format!("第 {} 至 {} 段", a.sort_num, a.end_sort_num)
-                } else if a.sort_num > 0 {
-                    format!("第 {} 段", a.sort_num)
-                } else if !a.seg_mark.is_empty() {
-                    format!("段标 {}", a.seg_mark)
-                } else {
-                    "源站未提供段号".into()
-                };
-                format!(
-                    "{} 字 · 分类 {} · 难度 {} · {}",
-                    a.text.chars().count(),
-                    if a.category.is_empty() {
-                        "未提供"
-                    } else {
-                        &a.category
-                    },
-                    a.difficulty.label(),
-                    position
-                )
-            })
-            .unwrap_or_else(|| "取文后，文章会直接进入跟打区。".into());
-        clipped_text(f, ix, y + 196., iw, 14., &meta, p.muted);
-        text(f, ix, y + 232., 14., "分类", p.muted);
-        let cap = ((iw - 90.) / 104.).floor().max(1.) as usize;
+        text(f, ix, y + 182., 13., "分类", p.muted);
+        let cap = ((iw - 90.) / 132.).floor().max(1.) as usize;
         let selected = m
             .online_category
             .min(m.online_categories.len().saturating_sub(1));
@@ -1477,102 +597,66 @@ fn draw_online(
                 f,
                 hs,
                 ix + j as f32 * (bw + 8.),
-                y + 258.,
+                y + 200.,
                 bw,
                 &elide(name, (bw / 14.).floor().max(1.) as usize),
                 idx == m.online_category,
-                if active {
-                    Action::OnlineCategory(idx)
-                } else {
-                    Action::None
-                },
+                Action::OnlineCategory(idx),
                 t,
             );
         }
         if m.online_categories.is_empty() {
-            text(
-                f,
-                ix,
-                y + 267.,
-                14.,
-                if active {
-                    "分类加载中…"
-                } else {
-                    "登录后同步分类"
-                },
-                p.muted,
-            );
+            text(f, ix, y + 210., 13., "分类加载中…", p.muted);
         } else if m.online_categories.len() > cap {
             link(
                 f,
                 hs,
                 ix + iw - 74.,
-                y + 258.,
+                y + 200.,
                 74.,
                 "更多 ›",
-                if active {
-                    Action::OnlineCategory((selected + 1) % m.online_categories.len())
-                } else {
-                    Action::None
-                },
+                Action::OnlineCategory((selected + 1) % m.online_categories.len()),
                 t,
             );
         }
-        text(f, ix, y + 304., 14., "难度", p.muted);
-        let dw = ((iw - 40.) / 6.).min(100.);
+        text(f, ix, y + 252., 13., "难度", p.muted);
+        let dw = ((iw - 40.) / 6. - 8.).min(120.);
         for (i, name) in ["淼", "水", "易", "普", "难", "虐"].into_iter().enumerate() {
             chip(
                 f,
                 hs,
                 ix + i as f32 * (dw + 8.),
-                y + 330.,
+                y + 270.,
                 dw,
                 name,
                 m.online_difficulty == i,
-                if active {
-                    Action::OnlineDifficultyTo(i)
-                } else {
-                    Action::None
-                },
+                Action::OnlineDifficultyTo(i),
                 t,
             );
         }
-        field_shell(f, ix, y + 400., 100., "取文字数", t);
-        if !active {
-            text(
-                f,
-                ix + 10.,
-                y + 410.,
-                14.,
-                cfg.seg_chars.to_string(),
-                p.muted,
-            );
-        }
+        text(f, ix, y + 322., 13., "取文字数", p.muted);
+        round(f, ix - 1., y + 342., 112., 40., 7., p.bg2, Some(p.line2));
         toggle(
             f,
             hs,
-            ix + 130.,
-            y + 410.,
+            ix + 136.,
+            y + 354.,
             m.online_strict,
-            if active {
-                Action::OnlineStrict
-            } else {
-                Action::None
-            },
+            Action::OnlineStrict,
             t,
         );
-        text(f, ix + 168., y + 410., 14., "精确字数", p.muted);
+        text(f, ix + 172., y + 352., 13., "精确字数", p.muted);
         toggle(
             f,
             hs,
-            ix + 300.,
-            y + 410.,
+            ix + 286.,
+            y + 354.,
             m.field("online_auto_next") != "false",
             crate::aux_marker("online_auto_next"),
             t,
         );
-        text(f, ix + 338., y + 410., 14., "自动下一段", p.muted);
-        let aw = ((iw - 24.) / 3.).min(190.);
+        text(f, ix + 322., y + 352., 13., "自动下一段", p.muted);
+        let aw = ((iw - 24.) / 3.).min(180.);
         for (i, (name, dir)) in [("上一段", -1), ("随机取文", 0), ("下一段", 1)]
             .into_iter()
             .enumerate()
@@ -1581,142 +665,115 @@ fn draw_online(
                 f,
                 hs,
                 ix + i as f32 * (aw + 12.),
-                y + 458.,
+                y + 396.,
                 aw,
                 name,
-                if active {
-                    Action::OnlineFetch(dir)
-                } else {
-                    Action::None
-                },
+                Action::OnlineFetch(dir),
                 t,
                 dir == 0,
+            );
+        }
+        // 当前文章卡（替代原在线书架空卡）。
+        let cy = y + 450.;
+        card(f, ix, cy, iw, 96., t);
+        if let Some(article) = &m.online_article {
+            text(f, ix + 16., cy + 12., 12., "当前文章", p.muted);
+            f.push(DrawCmd::PushClip {
+                x: ix + 16.,
+                y: cy + 30.,
+                w: iw - 32.,
+                h: 22.,
+            });
+            text(f, ix + 16., cy + 31., 16., elide(&article.title, 40), p.text);
+            f.push(DrawCmd::PopClip);
+            let meta = format!(
+                "{} 字 · 分类 {} · 难度 {} · {}",
+                article.text.chars().count(),
+                if article.category.is_empty() {
+                    "未提供"
+                } else {
+                    &article.category
+                },
+                article.difficulty.label(),
+                if article.sort_num > 0 {
+                    format!("第 {} 段", article.sort_num)
+                } else {
+                    "未提供段号".into()
+                }
+            );
+            clipped_text(f, ix + 16., cy + 64., iw - 32., 12., &meta, p.muted);
+        } else {
+            text(f, ix + 16., cy + 14., 15., "尚未取文", p.text2);
+            text(
+                f,
+                ix + 16.,
+                cy + 40.,
+                13.,
+                "选择分类与难度后点「随机取文」，文章会直接进入跟打区。",
+                p.muted,
             );
         }
         let status_text = if m.online_busy {
             "正在取文，当前文章已保留…"
         } else if !m.online_status.is_empty() {
             &m.online_status
-        } else if active {
-            "自动下一段开启后，结算 1.5 秒后接续；赛制除外。"
         } else {
-            "登录后可取文和浏览书架。"
+            "按「随机取文」开始；已登录身份会用于同步分类与书架。"
         };
-        let status_color = if m.online_status.contains("失败")
+        let bad = m.online_status.contains("失败")
             || m.online_status.contains("过期")
             || m.online_status.contains("错误")
-        {
-            p.red
-        } else {
-            p.muted
-        };
-        clipped_text(f, ix, y + 512., iw, 14., status_text, status_color);
-        // Shelf as a compact 3-up grid: the old vertical rows pushed the
-        // second/third book under the fixed footer at 1280x800.
-        card(f, ix, y + 548., iw, 108., t);
+            || m.online_status.contains("频繁");
+        round(f, ix + 4., y + 566., 4., 4., 2., if bad { p.red } else { p.muted }, None);
+        clipped_text(
+            f,
+            ix + 14.,
+            y + 560.,
+            iw - 20.,
+            13.,
+            status_text,
+            if bad { p.red } else { p.muted },
+        );
+    } else {
+        // 未登录且表单收起：一屏一处说明 + 登录入口，不再重复账号条。
+        let cy = y + 104.;
+        card(f, ix, cy, iw, 150., t);
+        text(f, ix + 22., cy + 20., 18., "登录后在线取文", p.text);
         text(
             f,
-            ix + 16.,
-            y + 562.,
-            18.,
-            format!("在线书架 · {} 本", m.online_shelf.len()),
-            p.text2,
+            ix + 22.,
+            cy + 52.,
+            13.,
+            "登录后可同步分类、按难度取文；令牌只保存在本机，不保存密码。",
+            p.muted,
         );
-        link(
+        action(
             f,
             hs,
-            ix + iw - 176.,
-            y + 552.,
-            70.,
-            "刷新",
-            if active {
-                Action::OnlineBooks
-            } else {
-                Action::None
-            },
+            ix + 22.,
+            cy + 86.,
+            168.,
+            "登录 / 注册",
+            Action::OnlineAccount,
             t,
+            true,
         );
-        if m.online_shelf.len() > 3 {
-            link(
-                f,
-                hs,
-                ix + iw - 94.,
-                y + 552.,
-                80.,
-                "下一页 ›",
-                Action::ShelfPage,
-                t,
-            );
-        }
-        if m.online_shelf.is_empty() {
-            text(
-                f,
-                ix + 16.,
-                y + 604.,
-                14.,
-                if active {
-                    "书架为空，可先随机取文。"
-                } else {
-                    "登录后显示书架。"
-                },
-                p.muted,
-            );
-        } else {
-            let offset = m.shelf_offset.min(m.online_shelf.len().saturating_sub(1));
-            let book_w = ((iw - 48.) / 3.).max(120.);
-            for (j, (idx, name)) in m
-                .online_shelf
-                .iter()
-                .enumerate()
-                .skip(offset)
-                .take(3)
-                .enumerate()
-            {
-                chip(
-                    f,
-                    hs,
-                    ix + 16. + j as f32 * (book_w + 8.),
-                    y + 596.,
-                    book_w,
-                    &elide(name, ((book_w - 16.) / 15.).max(4.) as usize),
-                    false,
-                    if active {
-                        Action::OnlineShelf(idx)
-                    } else {
-                        Action::None
-                    },
-                    t,
-                );
-            }
-        }
     }
     line(f, x + 16., y + ph - 62., pw - 32., p.line);
-    link(
+    text(
         f,
-        hs,
         ix,
-        y + ph - 49.,
-        110.,
-        "理论分析",
-        crate::aux_marker("show_full_analysis"),
-        t,
-    );
-    link(
-        f,
-        hs,
-        ix + 128.,
-        y + ph - 49.,
-        110.,
-        "键盘热力图",
-        crate::aux_marker("show_heatmap"),
-        t,
+        y + ph - 39.,
+        13.,
+        "取文后直接进入跟打区 · 登录不保存密码",
+        p.muted,
     );
     action(
         f,
         hs,
-        x + pw - 132.,
-        y + ph - 49.,
-        108.,
+        x + pw - 136.,
+        y + ph - 52.,
+        112.,
         "返回跟打",
         Action::Close,
         t,
@@ -2190,17 +1247,17 @@ pub fn fields(m: &Model, x: f32, y: f32, pw: f32, ph: f32) -> Vec<FieldSpec> {
         Modal::Online if login_visible(m) => {
             let (fx, fw) = online_form(pw);
             let fx = x + fx;
-            add("username", fx, y + 154., fw, 36., false, false);
-            add("password", fx, y + 226., fw, 36., false, true);
+            add("username", fx, y + 196., fw, 38., false, false);
+            add("password", fx, y + 260., fw, 38., false, true);
             if m.online_register_mode {
-                add("reg_email", fx, y + 298., fw, 36., false, false);
-                add("reg_code", fx, y + 370., fw - 152., 36., false, false);
+                add("reg_email", fx, y + 324., fw, 38., false, false);
+                add("reg_code", fx, y + 388., fw - 158., 38., false, false);
             } else {
-                add("server", fx, y + 374., fw, 36., false, false);
+                add("server", fx, y + 324., fw, 38., false, false);
             }
         }
         Modal::Online if m.online_authenticated && !m.online_expired => {
-            add("online_chars", x + 24., y + 400., 100., 36., false, false);
+            add("online_chars", x + 24., y + 344., 108., 36., false, false);
         }
         Modal::Rules => {
             let (side, rw, _, test_y, test_h, cw) = rules_geometry(pw, ph);
@@ -2230,7 +1287,7 @@ pub fn draw(
     f: &mut Frame,
     hs: &mut Vec<Hit>,
     m: &Model,
-    sess: &Session,
+    _sess: &Session,
     cfg: &Config,
     t: &Theme,
     x: f32,
@@ -2239,7 +1296,6 @@ pub fn draw(
     ph: f32,
 ) {
     match m.modal {
-        Modal::Report => draw_report(f, hs, m, sess, t, x, y, pw, ph),
         Modal::Online => draw_online(f, hs, m, cfg, t, x, y, pw, ph),
         Modal::Rules => draw_rules(f, hs, m, cfg, t, x, y, pw, ph),
         _ => {}
@@ -2249,39 +1305,6 @@ pub fn draw(
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn timeline_uses_elapsed_windows_and_subtracts_backspace() {
-        let events = [
-            TimingEvent {
-                len_delta: 10,
-                dt_ms: 1000,
-            },
-            TimingEvent {
-                len_delta: -2,
-                dt_ms: 1000,
-            },
-            TimingEvent {
-                len_delta: 5,
-                dt_ms: 4000,
-            },
-        ];
-        let (step, samples) = speed_samples(&events, 10000);
-        assert_eq!(step, 5000);
-        assert_eq!(samples, vec![96., 60.]);
-        assert_eq!(speed_samples(&events, 0).1.len(), 0);
-    }
-    #[test]
-    fn long_timeline_is_bounded_and_keeps_idle_windows() {
-        let (_, samples) = speed_samples(
-            &[TimingEvent {
-                len_delta: 1,
-                dt_ms: 1,
-            }],
-            86_400_000,
-        );
-        assert!(samples.len() <= 200);
-        assert_eq!(samples.iter().filter(|s| **s > 0.).count(), 1);
-    }
     #[test]
     fn cleaning_fields_fit_both_comparison_columns() {
         for pw in [640., 880., 1040.] {
@@ -2449,7 +1472,7 @@ mod tests {
                 }
                 assert!(hs.iter().all(|hit| hit.h >= 34.));
                 let primary_label = if modal == Modal::Online {
-                    "随机取文"
+                    "登录 / 注册"
                 } else {
                     "应用到当前文"
                 };
@@ -2459,349 +1482,5 @@ mod tests {
                 )));
             }
         }
-    }
-    #[test]
-    fn slow_estimates_share_commit_time_and_follow_backspace_position() {
-        let mut sess = Session::new(100);
-        sess.comparer = gale_core::compare::Comparer::new("甲乙丙");
-        sess.comparer.timing_events = vec![
-            TimingEvent {
-                len_delta: 2,
-                dt_ms: 2000,
-            },
-            TimingEvent {
-                len_delta: -1,
-                dt_ms: 1000,
-            },
-            TimingEvent {
-                len_delta: 1,
-                dt_ms: 3000,
-            },
-            TimingEvent {
-                len_delta: 1,
-                dt_ms: 1000,
-            },
-        ];
-        let slow = slow_estimates(&sess);
-        assert_eq!(slow[0].ch, '乙');
-        assert_eq!(slow[0].count, 2);
-        assert_eq!(slow[0].average_ms, 2000.);
-        assert_eq!(
-            slow.iter().find(|z| z.ch == '甲').unwrap().average_ms,
-            1000.
-        );
-    }
-
-    #[test]
-    fn two_wrong_characters_show_text_accuracy_separately_from_pro_key_efficiency() {
-        let mut sess = Session::new(100);
-        sess.load_book("测试", "你好");
-        sess.on_key(0x4A, 1000);
-        sess.feed_input(
-            gale_core::compare::InputEvent::Commit { chars: "j".into() },
-            1001,
-        );
-        sess.on_key(0x4A, 2000);
-        sess.feed_input(
-            gale_core::compare::InputEvent::Commit { chars: "j".into() },
-            2001,
-        );
-        let result = sess.finalize_current_at(2002, 1).unwrap();
-        assert_eq!(result.keys, 2);
-        assert_eq!(result.wrong, 2);
-        assert_eq!(result.accuracy, 100.);
-        assert_eq!(result.character_accuracy(), 0.);
-        assert_eq!(result.effective_speed, 0.);
-        let mut m = Model::default();
-        m.latest = Some(result);
-        // Older records have no word-rate provenance; preserve that absence
-        // while still showing the stored numeric retry count.
-        let legacy = m.latest.as_mut().unwrap();
-        legacy.word_rate = None;
-        legacy.retype_count = 2;
-        let mut f = Frame::new(1280., 800.);
-        draw_report(
-            &mut f,
-            &mut Vec::new(),
-            &m,
-            &sess,
-            &crate::ui::theme("墨玉"),
-            0.,
-            55.,
-            1280.,
-            708.,
-        );
-        let text: Vec<_> = f
-            .cmds
-            .iter()
-            .filter_map(|c| match c {
-                DrawCmd::TextRun { text, .. } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert!(f
-            .cmds
-            .iter()
-            .all(|cmd| !matches!(cmd, DrawCmd::TextRun { h, .. } if *h < 14.)));
-        assert!(text.iter().any(|s| s.contains("字准")));
-        assert!(text.iter().any(|s| s.contains("键准")));
-        assert_eq!(m.latest.as_ref().unwrap().accuracy, 100.);
-        m.fields.insert("report_tab".into(), "session".into());
-        let mut report = Frame::new(1280., 800.);
-        draw_report(
-            &mut report,
-            &mut Vec::new(),
-            &m,
-            &sess,
-            &crate::ui::theme("墨玉"),
-            0.,
-            55.,
-            1280.,
-            708.,
-        );
-        let report_text: Vec<_> = report
-            .cmds
-            .iter()
-            .filter_map(|c| match c {
-                DrawCmd::TextRun { text, .. } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert!(report
-            .cmds
-            .iter()
-            .all(|cmd| !matches!(cmd, DrawCmd::TextRun { h, .. } if *h < 14.)));
-        assert!(report_text.contains(&"字准"));
-        assert!(report_text.contains(&"键准·按键效率"));
-        assert!(report_text.iter().any(|s| s.contains("100.0/0.0")));
-        assert_eq!(sess.aggregate().accuracy, 100.);
-    }
-
-    #[test]
-    fn historical_detail_uses_the_selected_record_and_never_current_key_distribution() {
-        let mut sess = Session::new(100);
-        sess.load_book("当前文章", "甲");
-        sess.on_key(65, 10);
-        // Production separately drains the host's physical-key queue into this
-        // histogram; on_key only updates the score's statistical key counters.
-        *sess.vk_histogram.entry(0x41).or_insert(0) += 1;
-        sess.feed_input(
-            gale_core::compare::InputEvent::Commit {
-                chars: "甲".into()
-            },
-            20,
-        );
-        let current = sess.finalize_current_at(30, 2).unwrap();
-        assert!(!sess.last_vk_histogram.is_empty());
-        let mut older = current.clone();
-        older.title = "历史文章".into();
-        older.ts = 1;
-        older.speed = 123.4;
-        let mut m = Model::default();
-        m.modal = Modal::Report;
-        m.history = vec![older, current.clone()];
-        m.latest = Some(current);
-        m.selected_history = Some(0);
-        let mut f = Frame::new(1280., 800.);
-        let mut hits = Vec::new();
-        draw_report(
-            &mut f,
-            &mut hits,
-            &m,
-            &sess,
-            &crate::ui::theme("墨玉"),
-            0.,
-            108.,
-            1280.,
-            662.,
-        );
-        assert_eq!(selected_report_record(&m).unwrap().title, "历史文章");
-        let detail_titles: Vec<_> = f
-            .cmds
-            .iter()
-            .filter_map(|cmd| match cmd {
-                DrawCmd::TextRun { x, text, .. } if *x > 478. => Some(text.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert!(detail_titles.contains(&"历史文章"));
-        assert!(!detail_titles.contains(&"当前文章"));
-        assert!(!hits
-            .iter()
-            .any(|hit| hit.action == crate::aux_marker("show_heatmap")));
-        assert_eq!(m.latest.as_ref().unwrap().title, "当前文章");
-        for width in [800., 640.] {
-            let viewport = 462.;
-            m.panel_scroll = history_detail_scroll(&m, &sess, width, viewport);
-            let mut frame = Frame::new(width, 600.);
-            let mut hits = Vec::new();
-            draw_report(
-                &mut frame,
-                &mut hits,
-                &m,
-                &sess,
-                &crate::ui::theme("墨玉"),
-                0.,
-                108.,
-                width,
-                viewport,
-            );
-            let detail_title = frame
-                .cmds
-                .iter()
-                .find_map(|cmd| match cmd {
-                    DrawCmd::TextRun { text, x, y, h, .. }
-                        if text == "历史文章" && *h >= 20. && (width < 768. || *x > 300.) =>
-                    {
-                        Some(*y)
-                    }
-                    _ => None,
-                })
-                .unwrap();
-            assert!(
-                detail_title >= 108. && detail_title < 108. + viewport - 62.,
-                "selected detail should be visible at width {width}"
-            );
-            if width == 800. {
-                assert_eq!(
-                    m.panel_scroll, 0.,
-                    "800px report keeps history beside detail"
-                );
-            } else {
-                assert!(m.panel_scroll > 0.);
-                assert!(hits
-                    .iter()
-                    .any(|hit| hit.action == crate::aux_marker("report_history")
-                        && hit.y > 108. + viewport - 62.
-                        && hit.h > 0.));
-            }
-        }
-    }
-
-    #[test]
-    fn empty_report_is_compact_and_has_no_disabled_score_actions() {
-        let mut m = Model::default();
-        m.modal = Modal::Report;
-        let sess = Session::new(100);
-        assert!(report_content_height(&m, &sess, 1280.) < 400.);
-        let mut f = Frame::new(1280., 800.);
-        let mut hits = Vec::new();
-        draw_report(
-            &mut f,
-            &mut hits,
-            &m,
-            &sess,
-            &crate::ui::theme("墨玉"),
-            0.,
-            108.,
-            1280.,
-            662.,
-        );
-        assert!(!hits
-            .iter()
-            .any(|hit| matches!(hit.action, Action::CopyScore | Action::ExportImage)));
-        assert!(f
-            .cmds
-            .iter()
-            .any(|cmd| matches!(cmd, DrawCmd::TextRun { text, .. } if text == "还没有成绩记录")));
-    }
-
-    fn pagination_record() -> ScoreRecord {
-        let mut sess = Session::new(100);
-        sess.load_book("分页测试", "甲");
-        sess.on_key(0x41, 10);
-        sess.feed_input(
-            gale_core::compare::InputEvent::Commit {
-                chars: "甲".into()
-            },
-            20,
-        );
-        sess.finalize_current_at(30, 1).unwrap()
-    }
-
-    #[test]
-    fn report_history_last_page_reaches_the_oldest_record_at_each_width() {
-        let sess = Session::new(100);
-        let record = pagination_record();
-        for (width, total, visible, cap) in [(640., 4, 3, 1), (1280., 14, 6, 8)] {
-            let mut m = Model::default();
-            m.modal = Modal::Report;
-            m.history = (0..total)
-                .map(|i| {
-                    let mut item = record.clone();
-                    item.title = format!("历史记录 {i}");
-                    item.ts = i as u64;
-                    item
-                })
-                .collect();
-            assert_eq!(report_visible_rows(&m, width), visible);
-            assert_eq!(report_scroll_cap(&m, &sess, width), cap);
-            m.scroll = cap as f32;
-            let mut frame = Frame::new(width, 1038.);
-            let mut hits = Vec::new();
-            draw_report(
-                &mut frame,
-                &mut hits,
-                &m,
-                &sess,
-                &crate::ui::theme("墨玉"),
-                0.,
-                108.,
-                width,
-                900.,
-            );
-            let visible_records: Vec<_> = hits
-                .iter()
-                .filter_map(|hit| match hit.action {
-                    Action::SelectHistory(index) if hit.h > 0. => Some(index),
-                    _ => None,
-                })
-                .collect();
-            assert_eq!(visible_records, (0..visible).rev().collect::<Vec<_>>());
-        }
-    }
-
-    #[test]
-    fn report_summary_paginates_completed_records_instead_of_unfinished_segments() {
-        let record = pagination_record();
-        let mut sess = Session::new(100);
-        sess.load_book("分页测试", "甲");
-        sess.segments = vec![sess.current_segment().clone(); 12];
-        sess.results = (0..12)
-            .map(|index| (index % 2 == 0).then(|| record.clone()))
-            .collect();
-        let mut m = Model::default();
-        m.modal = Modal::Report;
-        m.fields.insert("report_tab".into(), "session".into());
-        assert_eq!(report_visible_rows(&m, 640.), 3);
-        assert_eq!(report_scroll_cap(&m, &sess, 640.), 3);
-        assert_eq!(report_visible_rows(&m, 1280.), 5);
-        assert_eq!(report_scroll_cap(&m, &sess, 1280.), 1);
-        m.scroll = 1.;
-        let mut frame = Frame::new(1280., 1466.);
-        draw_report(
-            &mut frame,
-            &mut Vec::new(),
-            &m,
-            &sess,
-            &crate::ui::theme("墨玉"),
-            0.,
-            108.,
-            1280.,
-            1328.,
-        );
-        let details: Vec<_> = frame
-            .cmds
-            .iter()
-            .filter_map(|cmd| match cmd {
-                DrawCmd::TextRun { text, .. } if text.contains("· 已结算") => {
-                    Some(text.as_str())
-                }
-                _ => None,
-            })
-            .collect();
-        assert_eq!(details.len(), 5);
-        assert!(details.iter().any(|text| text.starts_with("第 11 段 ·")));
-        assert!(!details.iter().any(|text| text.starts_with("第 1 段 ·")));
     }
 }

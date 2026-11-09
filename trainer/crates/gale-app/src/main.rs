@@ -94,7 +94,6 @@ enum AuxAction {
     HistoryToggle,
     HistoryOpen(usize),
     HistoryStep(i32),
-    ReportTab(bool),
     SingleTarget(i32),
 }
 
@@ -126,8 +125,6 @@ fn aux_action(a: &Action) -> Option<AuxAction> {
                 .clamp(12, 36),
         ),
         "history_toggle" => AuxAction::HistoryToggle,
-        "report_history" => AuxAction::ReportTab(false),
-        "report_session" => AuxAction::ReportTab(true),
         _ if cmd.starts_with("history_open:") => {
             AuxAction::HistoryOpen(cmd.strip_prefix("history_open:")?.parse().ok()?)
         }
@@ -550,7 +547,8 @@ struct App {
     full_fetch_hash: Option<String>,
     full_analyzing: bool,
     full_retry_at: u64,
-    analysis_font_drag: bool,
+    /// 当前单字练习使用的内置表索引（配置变更后原表重开）。
+    single_table: usize,
 }
 fn main() {
     if let Err(e) = run() {
@@ -567,11 +565,19 @@ fn main() {
 }
 fn run() -> Result<(), String> {
     // P0 单实例（任务 3）：新命名互斥体主判据；旧版实例由 window.rs 兜底探测。
-    if single_instance_guard() {
-        return Ok(());
-    }
-    if gale_win::window::activate_existing_instance().is_some() {
-        return Ok(());
+    // 开发/验收时可用 HUFU_TRAINER_TEST_MUTEX=1 跳过单实例守卫（配合 --data 独立数据目录）。
+    // 仅调试构建接受该变量；发行构建恒为 false，与原来的单实例行为一致。
+    #[cfg(debug_assertions)]
+    let test_instance = std::env::var_os("HUFU_TRAINER_TEST_MUTEX").is_some();
+    #[cfg(not(debug_assertions))]
+    let test_instance = false;
+    if !test_instance {
+        if single_instance_guard() {
+            return Ok(());
+        }
+        if gale_win::window::activate_existing_instance().is_some() {
+            return Ok(());
+        }
     }
     let _com =
         gale_win::window::ComSta::new().map_err(|e| format!("无法初始化STA/TSF输入环境：{e}"))?;
@@ -614,7 +620,7 @@ fn run() -> Result<(), String> {
     let mut sess = Session::restore_snapshot(&dir.join("session.jsonl"))
         .unwrap_or_else(|_| Session::new(cfg.seg_chars));
     if sess.current_segment().text.is_empty() {
-        sess.load_book("欢迎来到静室", "天青色等烟雨，而我在等你。\n文字落下，心也安静下来。\n从文库选文，或按 Ctrl+V 载入文字。按下第一个键开始计时。");
+        sess.load_book("欢迎来到静室", "天青色等烟雨，而我在等你。\n文字落下，心也安静下来。\n从「更多 → 本地载入」选文，或按 Ctrl+V 载入文字。按下第一个键开始计时。");
     }
     if sess.frozen_rules.is_none() {
         let _ = sess.set_rules(cfg.session_rules.clone());
@@ -719,7 +725,7 @@ fn run() -> Result<(), String> {
         full_fetch_hash: None,
         full_analyzing: false,
         full_retry_at: 0,
-        analysis_font_drag: false,
+        single_table: 0,
     };
     app.model
         .fields
@@ -777,7 +783,7 @@ fn run() -> Result<(), String> {
             gale_win::window::request_frame();
         }
         app.collect_background();
-        if app.model.modal == Modal::FullAnalysis && app.sess.full_analysis.is_none() {
+        if app.model.analysis_dock && app.sess.full_analysis.is_none() {
             app.fetch_full_analysis();
         }
         app.collect_online();
@@ -785,13 +791,13 @@ fn run() -> Result<(), String> {
         let focused = unsafe { GetForegroundWindow() == app.win.hwnd() };
         if focused
             && !was_focused
-            && (app.sess.phase == Phase::Idle || app.model.modal == Modal::FullAnalysis)
+            && (app.sess.phase == Phase::Idle || app.model.analysis_dock)
         {
             app.analyzed = 0;
             app.analyze();
         }
         let accept_host =
-            app.model.modal == Modal::None && !app.compact_history() && (focused || was_focused);
+            app.model.modal == Modal::None && (focused || was_focused);
         was_focused = focused;
         app.online_pending = app.online.as_ref().map(|o| o.pending_count()).unwrap_or(0);
         app.model.online_busy = app.online_pending > 0;
@@ -847,7 +853,7 @@ fn run() -> Result<(), String> {
             app.sess.on_backspace_up();
         }
         bs_down_prev = bs_down;
-        let paused = (!focused || app.model.modal != Modal::None || app.compact_history())
+        let paused = (!focused || app.model.modal != Modal::None)
             && !app.model.race;
         app.sess.set_paused(paused, now);
         if paused != app.model.paused {
@@ -868,6 +874,10 @@ fn run() -> Result<(), String> {
                 CommandKey::Escape => {
                     if app.model.modal != Modal::None {
                         Some(Action::Close)
+                    } else if app.model.ledger_open {
+                        Some(Action::ToggleLedger)
+                    } else if app.model.analysis_dock {
+                        Some(Action::ToggleAnalysis)
                     } else {
                         app.sess.stop_at(now);
                         None
@@ -875,7 +885,7 @@ fn run() -> Result<(), String> {
                 }
                 CommandKey::F1 => Some(Action::Open(Modal::Preferences)),
                 CommandKey::F7 => Some(Action::Open(Modal::Appearance)),
-                CommandKey::F10 => Some(aux_marker(AUX_SHOW_FULL)),
+                CommandKey::F10 => Some(Action::ToggleAnalysis),
                 // 【2026-11-09 减法定稿】F2 载文窗整体退役（剪贴板走 Ctrl+V、
                 // 群文走 F4、在线走 F8、本地文库/单字走主界面「文库」按钮）；
                 // F5 = 选群（原 F6），F6 不再绑定。
@@ -887,24 +897,8 @@ fn run() -> Result<(), String> {
                 // 【减法定稿】F2/F6 不再绑定；F2=载文窗、F6=旧选群位均已退役。
                 CommandKey::F2 | CommandKey::F6 | CommandKey::RetryResult => None,
                 CommandKey::LoadClipboard | CommandKey::AltE => Some(Action::LoadClipboard),
-                CommandKey::CopyResult => Some(
-                    if app.model.modal == Modal::Report
-                        && secondary_panels::session_report(&app.model)
-                    {
-                        Action::CopyRace
-                    } else {
-                        Action::CopyScore
-                    },
-                ),
-                CommandKey::SendResult => Some(
-                    if app.model.modal == Modal::Report
-                        && secondary_panels::session_report(&app.model)
-                    {
-                        Action::CopyRace
-                    } else {
-                        Action::SendScore
-                    },
-                ),
+                CommandKey::CopyResult => Some(Action::CopyScore),
+                CommandKey::SendResult => Some(Action::SendScore),
                 CommandKey::ExportResult => Some(Action::ExportImage),
                 CommandKey::CtrlLeft => Some(Action::Previous),
                 CommandKey::CtrlRight => Some(Action::Next),
@@ -994,7 +988,8 @@ fn run() -> Result<(), String> {
         }
         gale_win::input_host::set_round_done(app.sess.phase == Phase::Done);
         gale_win::input_host::set_result_key_target(
-            (app.model.modal == Modal::Report).then_some(app.win.hwnd),
+            (app.model.ledger_open && app.model.selected_history.is_some())
+                .then_some(app.win.hwnd),
         );
         for e in gale_win::window::drain_mouse() {
             match e {
@@ -1005,8 +1000,6 @@ fn run() -> Result<(), String> {
                         if a == Action::None {
                             continue;
                         }
-                        app.analysis_font_drag =
-                            matches!(aux_action(&a), Some(AuxAction::AnalysisFont(_)));
                         app.capture_fields();
                         app.act(a, false);
                     } else if yy < 55. {
@@ -1019,15 +1012,14 @@ fn run() -> Result<(), String> {
                                 LPARAM(0),
                             );
                         }
-                    } else if app.model.modal == Modal::None && !app.compact_history() {
+                    } else if app.model.modal == Modal::None {
+                        if app.model.ledger_open || app.model.analysis_dock {
+                            app.model.ledger_open = false;
+                            app.model.analysis_dock = false;
+                            gale_win::window::request_frame();
+                        }
                         app.host.focus();
                     }
-                }
-                MouseEv::Move { x, y }
-                    if app.analysis_font_drag && app.model.modal == Modal::FullAnalysis =>
-                {
-                    app.set_analysis_font_at(x as f32);
-                    app.hover = Some((x as f32, y as f32));
                 }
                 MouseEv::Move { x, y } => {
                     let pos = Some((x as f32, y as f32));
@@ -1036,35 +1028,38 @@ fn run() -> Result<(), String> {
                         gale_win::window::request_frame();
                     }
                 }
-                MouseEv::LUp { .. } => {
-                    app.analysis_font_drag = false;
-                }
-                MouseEv::Wheel { delta, .. } => {
-                    if app.model.modal == Modal::FullAnalysis {
-                        if unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0 {
-                            let font = app
-                                .model
-                                .field("analysis_font")
-                                .parse::<i32>()
-                                .unwrap_or(20);
-                            let font = (font + delta / 120).clamp(12, 36);
-                            app.model
-                                .fields
-                                .insert("analysis_font".into(), font.to_string());
-                        } else {
-                            let sc = gale_win::window::dpi_scale();
-                            let (w, h) = app.win.client_size();
-                            let (_, _, pw, ph) =
-                                modals::panel(Modal::FullAnalysis, w as f32 / sc, h as f32 / sc);
-                            let max = modals::analysis_scroll_max(&app.sess, &app.model, pw, ph);
-                            app.model.scroll =
-                                (app.model.scroll - delta as f32 / 120. * 64.).clamp(0., max);
+                MouseEv::LUp { .. } => {}
+                MouseEv::Wheel { delta, x, y } => {
+                    let sc = gale_win::window::dpi_scale();
+                    let (cw, ch) = app.win.client_size();
+                    let (lw, lh) = (cw as f32 / sc, ch as f32 / sc);
+                    let mx = x as f32 / sc;
+                    let my = y as f32 / sc;
+                    // 理论分析停靠面板：指针在面板内时滚分析内容。
+                    if app.model.analysis_dock {
+                        let (ax, ay, aw, ah) = modals::analysis_dock_rect(lw, lh);
+                        if mx >= ax && mx <= ax + aw && my >= ay && my <= ay + ah {
+                            let max = modals::analysis_scroll_max(&app.sess, &app.model, lw, lh);
+                            app.model.analysis_dock_scroll = (app.model.analysis_dock_scroll
+                                - delta as f32 / 120. * 64.)
+                                .clamp(0., max);
+                            gale_win::window::request_frame();
+                            continue;
                         }
-                        gale_win::window::request_frame();
-                        continue;
                     }
-                    // 整改6：Ctrl+滚轮 = 实时字号（10..=60，滚轮向上放大），
-                    // 不滚面板；800ms 防抖后统一落盘（见主循环 font_save_due）。
+                    // 成绩面板：指针在面板内时滚列表。
+                    if app.model.ledger_open {
+                        let (px, py, pw, ph) = history::panel_rect_for(&app.model, lw, lh);
+                        if mx >= px && mx <= px + pw && my >= py && my <= py + ph {
+                            let max = history::scroll_max(&app.model, lh);
+                            app.model.ledger_scroll = (app.model.ledger_scroll
+                                - delta as f32 / 120. * 64.)
+                                .clamp(0., max);
+                            gale_win::window::request_frame();
+                            continue;
+                        }
+                    }
+                    // Ctrl+滚轮 = 实时字号（10..=60，滚轮向上放大），不滚面板。
                     if unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0 {
                         let step = (delta / 120).clamp(-1, 1);
                         if step != 0 {
@@ -1075,25 +1070,11 @@ fn run() -> Result<(), String> {
                         }
                         continue;
                     }
-                    let (_, _, _, ph) = modals::panel_for_model(
-                        &app.model,
-                        app.win.client_size().0 as f32 / gale_win::window::dpi_scale(),
-                        app.win.client_size().1 as f32 / gale_win::window::dpi_scale(),
-                    );
-                    let max = if app.model.modal == Modal::Report {
-                        (secondary_panels::report_content_height(
-                            &app.model,
-                            &app.sess,
-                            app.win.client_size().0 as f32 / gale_win::window::dpi_scale(),
-                        ) - ph)
-                            .max(0.)
-                    } else {
-                        (ph - app.win.client_size().1 as f32 / gale_win::window::dpi_scale() + 48.)
-                            .max(0.)
-                    };
+                    let (_, _, _, ph) = modals::panel_for_model(&app.model, lw, lh);
+                    let max = (ph - lh + 48.).max(0.);
                     let has_list = matches!(
                         app.model.modal,
-                        Modal::Rules | Modal::Groups | Modal::Report | Modal::Library
+                        Modal::Rules | Modal::Groups | Modal::Library
                     );
                     if app.model.modal != Modal::None
                         && max > 0.
@@ -1105,13 +1086,8 @@ fn run() -> Result<(), String> {
                             (app.model.panel_scroll - delta as f32 / 120. * 64.).clamp(0., max);
                     } else {
                         let cap = match app.model.modal {
-                            Modal::Groups => app.model.groups.len().saturating_sub(5),
+                            Modal::Groups => app.model.groups.len().saturating_sub(7),
                             Modal::Rules => app.model.rules.len().saturating_sub(6),
-                            Modal::Report => secondary_panels::report_scroll_cap(
-                                &app.model,
-                                &app.sess,
-                                app.win.client_size().0 as f32 / gale_win::window::dpi_scale(),
-                            ),
                             Modal::Library => app.model.books.len().saturating_sub(5),
                             _ => 0,
                         };
@@ -1127,7 +1103,7 @@ fn run() -> Result<(), String> {
             last_size = size;
             gale_win::window::request_frame();
         }
-        if (app.sess.phase == Phase::Idle || app.model.modal == Modal::FullAnalysis)
+        if (app.sess.phase == Phase::Idle || app.model.analysis_dock)
             && now - status_at >= 5000
         {
             status_at = now;
@@ -1135,7 +1111,7 @@ fn run() -> Result<(), String> {
             app.analyze();
         }
         if app.sess.phase == Phase::Typing
-            && app.model.modal != Modal::FullAnalysis
+            && !app.model.analysis_dock
             && now - status_at >= 250
         {
             status_at = now;
@@ -1354,9 +1330,6 @@ impl App {
             format!("{:.1}", self.single_cfg.target_keystroke_x10 as f64 / 10.),
         );
     }
-    fn compact_history(&self) -> bool {
-        false // History now lives in the unified report view, never over the typing area.
-    }
     fn sync_preferences(&mut self, editors: bool) {
         for (key, value) in [
             ("hint_show_code", self.cfg.hint_show_code),
@@ -1437,7 +1410,7 @@ impl App {
                 if let Ok(tab) = tab.parse::<u8>() {
                     self.model
                         .fields
-                        .insert("pref_tab".into(), tab.min(2).to_string());
+                        .insert("pref_tab".into(), tab.min(3).to_string());
                     self.model.modal_epoch += 1;
                 }
                 return;
@@ -1608,23 +1581,21 @@ impl App {
             wake(hwnd);
         });
     }
-    fn show_full_analysis(&mut self) {
-        self.open(Modal::FullAnalysis);
+    fn toggle_analysis_dock(&mut self) {
+        if self.model.analysis_dock {
+            self.model.analysis_dock = false;
+            gale_win::window::request_frame();
+            return;
+        }
+        self.model.modal = Modal::None;
+        self.model.ledger_open = false;
+        self.model.selected_history = None;
+        self.model.analysis_dock = true;
+        self.model.analysis_dock_scroll = 0.;
         self.full_retry_at = 0;
         self.analyzed = 0;
         self.analyze();
         self.fetch_full_analysis();
-    }
-
-    fn set_analysis_font_at(&mut self, cursor_x: f32) {
-        let sc = gale_win::window::dpi_scale();
-        let (w, h) = self.win.client_size();
-        let (x, _, pw, _) = modals::panel(Modal::FullAnalysis, w as f32 / sc, h as f32 / sc);
-        let width = (pw - 430.).clamp(80., 250.);
-        let size = (12. + ((cursor_x - x - 70.) / width).clamp(0., 1.) * 24.).round() as u8;
-        self.model
-            .fields
-            .insert("analysis_font".into(), size.to_string());
         gale_win::window::request_frame();
     }
 
@@ -1701,18 +1672,16 @@ impl App {
             return;
         }
         self.auto_next_at = None;
-        if self.model.modal != Modal::Report {
-            self.open(Modal::Report);
-        }
+        self.model.modal = Modal::None;
+        self.model.analysis_dock = false;
+        self.model.ledger_open = true;
         self.model.selected_history = Some(index);
-        self.model
-            .fields
-            .insert("report_tab".into(), "history".into());
         let sc = gale_win::window::dpi_scale();
-        let (w, h) = self.win.client_size();
-        let (_, _, pw, ph) = modals::panel_for_model(&self.model, w as f32 / sc, h as f32 / sc);
-        self.model.panel_scroll =
-            secondary_panels::history_detail_scroll(&self.model, &self.sess, pw, ph);
+        let (_, h) = self.win.client_size();
+        let lh = h as f32 / sc;
+        let offset = crate::history::record_offset(&self.model, index);
+        self.model.ledger_scroll = offset.min(crate::history::scroll_max(&self.model, lh));
+        gale_win::window::request_frame();
     }
 
     /// 私有标记动作执行（aux_action 解码后）
@@ -1721,26 +1690,21 @@ impl App {
             AuxAction::Preference(command) => self.preference_action(&command),
             AuxAction::HistoryToggle => {
                 self.auto_next_at = None;
-                self.open(Modal::Report);
+                self.model.analysis_dock = false;
+                self.model.ledger_open = !self.model.ledger_open;
+                if !self.model.ledger_open {
+                    self.model.selected_history = None;
+                }
             }
             AuxAction::HistoryStep(delta) => {
-                let cap = secondary_panels::report_scroll_cap(
-                    &self.model,
-                    &self.sess,
-                    self.win.client_size().0 as f32 / gale_win::window::dpi_scale(),
-                ) as f32;
-                self.model.scroll = (self.model.scroll + delta as f32).clamp(0., cap);
+                let sc = gale_win::window::dpi_scale();
+                let (_, h) = self.win.client_size();
+                let lh = h as f32 / sc;
+                let cap = crate::history::scroll_max(&self.model, lh);
+                self.model.ledger_scroll = (self.model.ledger_scroll + delta as f32).clamp(0., cap);
             }
             AuxAction::HistoryOpen(index) => {
                 self.select_history(index);
-            }
-            AuxAction::ReportTab(session) => {
-                self.model.fields.insert(
-                    "report_tab".into(),
-                    if session { "session" } else { "history" }.into(),
-                );
-                self.model.scroll = 0.;
-                self.model.panel_scroll = 0.;
             }
             AuxAction::SingleTarget(delta) => {
                 self.single_cfg.target_keystroke_x10 =
@@ -1823,6 +1787,10 @@ impl App {
             AuxAction::SingleShuffle => {
                 self.single_cfg.shuffle = !self.single_cfg.shuffle;
                 self.save_single_cfg();
+                self.sync_single_fields();
+                if self.sess.source == SessionSource::Single {
+                    self.toast("乱序设置将在下一组练习生效");
+                }
             }
             AuxAction::SingleSeg(d) => {
                 let c = self.single_cfg.clamped();
@@ -1831,6 +1799,7 @@ impl App {
                     gale_core::single::SINGLE_SEGMENT_MAX as i32,
                 ) as u16;
                 self.save_single_cfg();
+                self.reload_single_after_config();
             }
             // 练习屏一键循环：+5 超过上限回绕到下限（一键可减，无需 − 按钮）
             AuxAction::SingleSegCycle => {
@@ -1843,14 +1812,16 @@ impl App {
                         next as u16
                     };
                 self.save_single_cfg();
+                self.reload_single_after_config();
             }
             AuxAction::SingleTargetCycle => {
                 let c = self.single_cfg.clamped();
                 let next = c.target_keystroke_x10 as i32 + 5; // +0.5 击/秒
                 self.single_cfg.target_keystroke_x10 = if next > 120 { 10 } else { next as u16 };
                 self.save_single_cfg();
+                self.sync_single_fields();
             }
-            AuxAction::ShowFullAnalysis => self.show_full_analysis(),
+            AuxAction::ShowFullAnalysis => self.toggle_analysis_dock(),
             AuxAction::ShowHeatmap => self.show_heatmap(),
             AuxAction::AnalysisAuto4 => {
                 let next = !self.analysis_auto4();
@@ -1875,7 +1846,7 @@ impl App {
                 self.model
                     .fields
                     .insert("analysis_view".into(), next.into());
-                self.model.scroll = 0.;
+                self.model.analysis_dock_scroll = 0.;
             }
             AuxAction::AnalysisRetry => {
                 self.full_retry_at = 0;
@@ -1886,8 +1857,7 @@ impl App {
                 self.draw();
                 let sc = gale_win::window::dpi_scale();
                 let (w, h) = self.win.client_size();
-                let (x, y, pw, ph) =
-                    modals::panel(Modal::FullAnalysis, w as f32 / sc, h as f32 / sc);
+                let (x, y, pw, ph) = modals::analysis_dock_rect(w as f32 / sc, h as f32 / sc);
                 let crop = Some((
                     (x * sc) as u32,
                     (y * sc) as u32,
@@ -1901,6 +1871,52 @@ impl App {
             }
         }
     }
+    /// 打开一张内置单字表（练单入口）。配置变更后会重走这里，保证
+    /// 「每组 N 字」chip 与当前会话段长永远一致。
+    fn start_single_table(&mut self, i: usize) {
+        let Some((title, body)) = gale_core::single::builtin_tables().get(i).copied() else {
+            return;
+        };
+        self.single_table = i;
+        self.sess.jump(self.sess.index);
+        let mut rules = self.sess.rules.clone();
+        rules.mode = TrainingMode::Practice;
+        rules.word_hints = true;
+        let _ = self.sess.set_rules(rules);
+        // 乱序开时种子取时钟毫秒——每次进入练习都是新排列（重打本组
+        // 由 SingleSession.seed 固定复现）；关时 seed=0 保持原序。
+        let seed = if self.single_cfg.shuffle {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64
+        } else {
+            0
+        };
+        self.sess.load_single(self.single_cfg.build_session(
+            title,
+            body,
+            if i == 4 { 2 } else { 1 },
+            seed,
+        ));
+        self.online_article_current = false;
+        self.model.race = false;
+        self.model.hints = true;
+        self.sync_single_fields();
+        self.reset_host();
+        self.open(Modal::None);
+        self.snapshot();
+        gale_win::window::request_frame();
+    }
+
+    fn reload_single_after_config(&mut self) {
+        self.sync_single_fields();
+        if self.sess.source == SessionSource::Single {
+            self.start_single_table(self.single_table);
+            self.toast("已按新的每组字数重新开始本组");
+        }
+    }
+
     fn save_single_cfg(&mut self) {
         if let Err(e) = self.single_cfg.save(&self.dir.join("single.json")) {
             self.toast(format!("单字配置保存失败：{e}"));
@@ -1952,15 +1968,14 @@ impl App {
         if m == Modal::Preferences {
             self.sync_preferences(true);
         }
-        if m == Modal::Report {
-            self.model.selected_history = None;
-            self.model
-                .fields
-                .insert("report_tab".into(), "history".into());
+        if m != Modal::None {
+            self.model.ledger_open = false;
+            self.model.analysis_dock = false;
         }
         self.model.open(m);
         gale_win::input_host::set_result_key_target(
-            matches!(m, Modal::Report).then_some(self.win.hwnd),
+            (self.model.ledger_open && self.model.selected_history.is_some())
+                .then_some(self.win.hwnd),
         );
         gale_win::window::set_focus_relay(m == Modal::None);
         if m != Modal::None {
@@ -2038,14 +2053,9 @@ impl App {
         let (lw, lh) = (w as f32 / sc, h as f32 / sc);
         let now = self.clock.elapsed().as_secs_f64();
         let (_, _, _, ph) = modals::panel_for_model(&self.model, lw, lh);
-        self.model.panel_scroll = self.model.panel_scroll.clamp(
-            0.,
-            if matches!(self.model.modal, Modal::Report) {
-                (secondary_panels::report_content_height(&self.model, &self.sess, lw) - ph).max(0.)
-            } else {
-                (ph - (lh - 48.).min(ph)).max(0.)
-            },
-        );
+        self.model.panel_scroll = self.model
+            .panel_scroll
+            .clamp(0., (ph - (lh - 48.).min(ph)).max(0.));
         let (bw, fs, base_lh) = ui::body_metrics(&self.sess, &self.cfg, lw);
         let hints_visible = self.sess.source == SessionSource::Single
             && gale_core::rules::hints_effective(self.model.hints, self.model.race)
@@ -2118,7 +2128,7 @@ impl App {
         if let Err(e) = self.renderer.draw_frame(&f) {
             self.toast(format!("绘制失败：{e}"));
         }
-        if self.model.modal == Modal::None && !self.compact_history() {
+        if self.model.modal == Modal::None {
             gale_win::window::set_focus_relay(true);
             // Keep a visible, focused native TSF host at the painted caret.
             // It has a real client surface; text itself is drawn by DirectWrite.
@@ -2141,10 +2151,6 @@ impl App {
                 dpi,
             );
             self.host.show();
-        }
-        if self.model.modal == Modal::None && self.compact_history() {
-            gale_win::window::set_focus_relay(false);
-            self.host.hide();
         }
         let specs = modals::fields(&self.model, lw, lh);
         if self.edit_epoch != self.model.modal_epoch {
@@ -2776,9 +2782,14 @@ impl App {
         self.snapshot();
     }
     fn score_text(&self) -> Option<String> {
-        if self.model.modal == Modal::Report {
-            return secondary_panels::selected_report_record(&self.model)
-                .map(|record| self.format_record(record));
+        if self.model.ledger_open {
+            if let Some(record) = self
+                .model
+                .selected_history
+                .and_then(|index| self.model.history.get(index))
+            {
+                return Some(self.format_record(record));
+            }
         }
         if self.sess.phase != Phase::Done || !self.sess.recorded {
             return None;
@@ -2886,6 +2897,22 @@ impl App {
         }
         match a {
             Action::None => {}
+            Action::ToggleLedger => {
+                self.model.analysis_dock = false;
+                self.model.modal = Modal::None;
+                self.model.ledger_open = !self.model.ledger_open;
+                if self.model.ledger_open {
+                    let sc = gale_win::window::dpi_scale();
+                    let (_, h) = self.win.client_size();
+                    let lh = h as f32 / sc;
+                    let cap = crate::history::scroll_max(&self.model, lh);
+                    self.model.ledger_scroll = self.model.ledger_scroll.clamp(0., cap);
+                } else {
+                    self.model.selected_history = None;
+                }
+                gale_win::window::request_frame();
+            }
+            Action::ToggleAnalysis => self.toggle_analysis_dock(),
             Action::Open(m) => {
                 if self.model.modal == m {
                     self.open(Modal::None);
@@ -2907,7 +2934,12 @@ impl App {
                 }
             }
             Action::SelectHistory(index) => {
-                self.select_history(index);
+                if self.model.ledger_open && self.model.selected_history == Some(index) {
+                    self.model.selected_history = None;
+                    gale_win::window::request_frame();
+                } else {
+                    self.select_history(index);
+                }
             }
             Action::OnlineAccount => {
                 self.model.online_login_expanded = !self.model.online_login_expanded;
@@ -2967,38 +2999,7 @@ impl App {
                     Err(e) => self.toast(e),
                 }
             }
-            Action::Practice(i) => {
-                if let Some((title, body)) = gale_core::single::builtin_tables().get(i).copied() {
-                    self.sess.jump(self.sess.index);
-                    let mut rules = self.sess.rules.clone();
-                    rules.mode = TrainingMode::Practice;
-                    rules.word_hints = true;
-                    let _ = self.sess.set_rules(rules);
-                    // 整改8：段长/乱序走 single.json（shuffle 默认开、段长默认 20）。
-                    // 乱序开时种子取时钟毫秒——每次进入练习都是新排列（重打本组
-                    // 由 SingleSession.seed 固定复现）；关时 seed=0 保持原序。
-                    let seed = if self.single_cfg.shuffle {
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_millis() as u64
-                    } else {
-                        0
-                    };
-                    self.sess.load_single(self.single_cfg.build_session(
-                        title,
-                        body,
-                        if i == 4 { 2 } else { 1 },
-                        seed,
-                    ));
-                    self.online_article_current = false;
-                    self.model.race = false;
-                    self.model.hints = true;
-                    self.reset_host();
-                    self.open(Modal::None);
-                    self.snapshot();
-                }
-            }
+            Action::Practice(i) => self.start_single_table(i),
             Action::Accent(value) => {
                 if let Some(color) = gale_core::theme::Color::from_hex_no_hash(&value) {
                     self.cfg.color_overrides.insert("光标色".into(), value);
@@ -3082,7 +3083,11 @@ impl App {
             }
             Action::Next => {
                 if self.sess.index + 1 >= self.sess.total_segments() {
-                    self.open(Modal::Report);
+                    if self.model.history.is_empty() {
+                        self.toast("本轮已完成");
+                    } else {
+                        self.select_history(self.model.history.len() - 1);
+                    }
                 } else {
                     self.sess.next_segment();
                     self.reset_host();
@@ -3751,7 +3756,6 @@ mod persistence_tests {
             Modal::None,
             Modal::Groups,
             Modal::Appearance,
-            Modal::Report,
             Modal::Online,
             Modal::Rules,
             Modal::Confirm,

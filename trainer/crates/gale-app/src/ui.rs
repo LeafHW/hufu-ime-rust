@@ -18,6 +18,14 @@ pub const FONT_HINT: f32 = 14.0;
 pub const FONT_LABEL: f32 = 14.0;
 /// 赛制下字提行的"停手才显示"门限（毫秒，晴口径 B：赛制词提全关、字提停手 5s 显示）。
 pub const ZITI_IDLE_MS: f64 = 5000.;
+/// 底部状态行高度。
+pub const STATUS_H: f32 = 28.;
+/// 底部成绩栏高度。
+pub const LEDGER_H: f32 = 36.;
+/// 底部成绩栏的顶边 y（状态行之上，留 8px 间距）。
+pub fn ledger_bar_y(h: f32) -> f32 {
+    h - STATUS_H - 8. - LEDGER_H
+}
 
 pub fn rgba(c: Color) -> [f32; 4] {
     [
@@ -444,6 +452,72 @@ fn chip(
     });
 }
 // The chrome uses the resolved theme, including user overrides.
+fn toolbar_width(label: &str, key: &str) -> f32 {
+    let text_w = ui_text_width(label, FONT_HINT);
+    (text_w + if key.is_empty() { 0. } else { 34. } + 24.).max(72.)
+}
+#[allow(clippy::too_many_arguments)]
+fn toolbar_button(
+    f: &mut Frame,
+    hs: &mut Vec<Hit>,
+    x: f32,
+    y: f32,
+    label: &str,
+    key: &str,
+    action: Action,
+    t: &Theme,
+    selected: bool,
+) -> f32 {
+    let p = tokens(t);
+    let w = toolbar_width(label, key);
+    round(
+        f,
+        x,
+        y,
+        w,
+        32.,
+        8.,
+        if selected { alpha(p.accent, 0.12) } else { p.surface2 },
+        Some(if selected { alpha(p.accent, 0.42) } else { p.line }),
+    );
+    f.push(DrawCmd::PushClip {
+        x: x + 12.,
+        y: y + 8.,
+        w: (w - if key.is_empty() { 24. } else { 52. }).max(8.),
+        h: 20.,
+    });
+    text(
+        f,
+        x + 12.,
+        y + 8.,
+        FONT_HINT,
+        label,
+        if selected { p.accent } else { p.text2 },
+    );
+    f.push(DrawCmd::PopClip);
+    if !key.is_empty() {
+        round(
+            f,
+            x + w - 38.,
+            y + 7.,
+            28.,
+            18.,
+            4.,
+            p.bg2,
+            Some(alpha(p.line2, 0.8)),
+        );
+        text(f, x + w - 34., y + 8., 12., key, p.muted);
+    }
+    hs.push(Hit {
+        x,
+        y,
+        w,
+        h: 32.,
+        action,
+    });
+    x + w
+}
+// The chrome uses the resolved theme, including user overrides.
 fn draw_chrome(
     f: &mut Frame,
     hs: &mut Vec<Hit>,
@@ -494,70 +568,96 @@ fn draw_chrome(
             action,
         });
     }
+    // 常用操作栏：文库退出主工具栏，让位给「在线发文」；理论分析回到窗口内。
     let y = 60.;
-    if m.modal == Modal::Report {
-        button(f, hs, 24., y, 100., "返回练习", Action::Close, t, false);
-    } else {
-        let draft = !m.pending_source.is_empty();
-        let mut xx = 24.;
-        for (label, ww, action, selected) in [
-            ("文库", 78., Action::Open(Modal::Library), false),
-            ("选群  F5", 100., Action::Open(Modal::Groups), false),
-            (
-                if draft {
-                    "载入待读群文"
-                } else {
-                    "读取群文  F4"
-                },
-                138.,
-                if draft {
-                    Action::AcceptDraft
-                } else {
-                    Action::ReadGroup
-                },
-                draft,
-            ),
-            ("重打  F3", 100., Action::Restart, false),
-        ] {
-            button(f, hs, xx, y, ww, label, action, t, selected);
-            xx += ww + 8.;
-        }
+    let wide = w >= 960.;
+    let draft = !m.pending_source.is_empty();
+    let left = [
+        (
+            "在线发文",
+            if wide { "F8" } else { "" },
+            Action::Open(Modal::Online),
+            false,
+        ),
+        (
+            "选群",
+            if wide { "F5" } else { "" },
+            Action::Open(Modal::Groups),
+            false,
+        ),
+        (
+            if draft { "载入待读群文" } else { "读取群文" },
+            if wide { "F4" } else { "" },
+            if draft {
+                Action::AcceptDraft
+            } else {
+                Action::ReadGroup
+            },
+            draft,
+        ),
+        ("重打", if wide { "F3" } else { "" }, Action::Restart, false),
+    ];
+    let mut xx = 24.;
+    for (label, key, action, selected) in left {
+        xx = toolbar_button(f, hs, xx, y, label, key, action, t, selected) + 8.;
     }
-    button(
+    let more_w = toolbar_width("更多", "");
+    let analysis_w = toolbar_width("理论分析", if wide { "F10" } else { "" });
+    let analysis_x = w - 24. - more_w - 8. - analysis_w;
+    toolbar_button(
         f,
         hs,
-        w - 110.,
+        analysis_x,
         y,
-        86.,
-        "更多 ⋯",
+        "理论分析",
+        if wide { "F10" } else { "" },
+        Action::ToggleAnalysis,
+        t,
+        m.analysis_dock,
+    );
+    toolbar_button(
+        f,
+        hs,
+        w - 24. - more_w,
+        y,
+        "更多",
+        "",
         Action::Open(Modal::More),
         t,
         false,
     );
     line(f, 0., 104., w, p.line);
-    rect(f, 0., h - 30., w, 30., p.bg2);
-    line(f, 0., h - 30., w, p.line);
-    round(f, 20., h - 17., 4., 4., 2., p.muted, None);
+    // 底部状态行（成绩栏由 history.rs 绘制在它上方）。
+    rect(f, 0., h - STATUS_H, w, STATUS_H, p.bg2);
+    line(f, 0., h - STATUS_H, w, p.line);
+    round(f, 20., h - STATUS_H + 11., 4., 4., 2., p.muted, None);
     let target = m
         .bound
         .and_then(|i| m.groups.get(i))
         .map(|name| format!("目标群 · {}", elide(name, 18)))
         .unwrap_or_else(|| "未选择群聊".into());
+    let group_name = m.bound.and_then(|i| m.groups.get(i));
     let notice = if m.status.is_empty() || m.status.starts_with("就绪") {
         target
+    } else if group_name
+        .map(|name| m.status.contains(name.as_str()))
+        .unwrap_or(false)
+    {
+        // 已绑定/已切到「群名」这类状态不再和目标群前缀重复。
+        m.status.clone()
     } else {
         format!("{target} · {}", m.status)
     };
     f.push(DrawCmd::PushClip {
         x: 32.,
-        y: h - 27.,
+        y: h - STATUS_H + 4.,
         w: (w - 218.).max(100.),
-        h: 24.,
+        h: 22.,
     });
     text(
         f,
         32.,
-        h - 24.,
+        h - STATUS_H + 7.,
         FONT_HINT,
         elide_width(&notice, (w - 224.).max(100.), FONT_HINT),
         p.muted,
@@ -566,12 +666,10 @@ fn draw_chrome(
     right(
         f,
         w - 24.,
-        h - 24.,
+        h - STATUS_H + 7.,
         FONT_HINT,
         if m.paused {
             "已暂停"
-        } else if m.modal == Modal::Report {
-            "成绩记录"
         } else if sess.phase == crate::session::Phase::Done {
             "本段完成"
         } else if sess.started_ms.is_some() {
@@ -608,9 +706,6 @@ pub fn build(
     let mut f = Frame::new(w, h);
     hs.clear();
     draw_chrome(&mut f, hs, sess, cfg, m, t, w, h);
-    if m.modal == Modal::Report {
-        return f;
-    }
     let p = tokens(t);
     let single = sess.source == SessionSource::Single;
     let hints_visible = single
@@ -624,7 +719,12 @@ pub fn build(
     let count = sess.current_segment().text.chars().count();
     let elapsed = sess.elapsed_ms(now_ms) as f64 / 1000.;
     let top = if single { 236. } else { 208. };
-    let bottom = h - 90.;
+    // 理论分析停靠面板打开时正文区让位；成绩面板是浮层，不改变正文高度。
+    let bottom = if m.analysis_dock {
+        crate::modals::analysis_dock_rect(w, h).1 - 8.
+    } else {
+        ledger_bar_y(h) - 8.
+    };
     rect(
         &mut f,
         x - 12.,
@@ -635,21 +735,25 @@ pub fn build(
     );
     let speed = format!("{:.1}", live.para_speed);
     let speed_size = 30_f32.min(112. / (speed.len().max(1) as f32 * 0.6));
-    mono(&mut f, x, 117., speed_size, speed, p.accent);
-    text(&mut f, x + 116., 135., FONT_HINT, "字/分", p.muted);
+    mono(&mut f, x, 117., speed_size, speed.clone(), p.accent);
+    let speed_w = ui_text_width(&speed, speed_size);
+    text(&mut f, x + speed_w + 7., 132., 12., "字/分", p.muted);
     let duration = format!("{:02}:{:04.1}", (elapsed / 60.) as u64, elapsed % 60.);
     let mut metrics = vec![
-        ("击键 / 秒", format!("{:.2}", live.para_keys_per_sec)),
+        ("击键/秒", format!("{:.2}", live.para_keys_per_sec)),
         ("码长", format!("{:.2}", live.para_code_len)),
         ("键准", format!("{:.1}%", live.para_accuracy)),
         ("错字", sess.comparer.wrong.to_string()),
+        ("用时", duration.clone()),
     ];
-    if w >= 900. {
-        metrics.push(("用时", duration.clone()));
+    if w < 760. {
+        metrics.remove(1);
     }
-    let pitch = (bw - 156.).max(320.) / metrics.len() as f32;
+    let metrics_x = x + (speed_w + 74.).max(196.);
+    let metrics_w = (bw - (metrics_x - x)).max(300.);
+    let pitch = (metrics_w / metrics.len() as f32).max(84.);
     for (i, (label, value)) in metrics.iter().enumerate() {
-        let xx = x + 156. + i as f32 * pitch;
+        let xx = metrics_x + i as f32 * pitch;
         text(&mut f, xx, 116., FONT_HINT, *label, p.muted);
         mono(&mut f, xx, 138., 18., value, p.text2);
     }
@@ -670,9 +774,6 @@ pub fn build(
         elide_width(&progress, if w < 900. { bw - 116. } else { bw }, FONT_HINT),
         p.muted,
     );
-    if w < 900. {
-        right(&mut f, x + bw, 164., FONT_HINT, duration, p.muted);
-    }
     rect(&mut f, x, 185., bw, 2., p.line);
     rect(
         &mut f,
@@ -933,6 +1034,9 @@ pub fn build(
     }
     f.push(DrawCmd::PopClip);
     crate::history::draw(&mut f, hs, sess, cfg, m, t, w, h);
+    if m.analysis_dock && m.modal == Modal::None {
+        crate::modals::draw_analysis_dock(&mut f, hs, m, sess, t, w, h);
+    }
     f
 }
 
@@ -1021,7 +1125,7 @@ mod tests {
     #[test]
     fn toolbar_stays_inside_small_windows_without_overlap() {
         let (sess, mut model, cfg, _) = fixture();
-        for modal in [Modal::None, Modal::Report] {
+        for modal in [Modal::None, Modal::More] {
             model.modal = modal;
             for width in [640., 800., 1000., 1280.] {
                 let mut hits = Vec::new();
