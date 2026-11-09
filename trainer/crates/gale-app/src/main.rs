@@ -1405,7 +1405,7 @@ impl App {
                 if let Ok(tab) = tab.parse::<u8>() {
                     self.model
                         .fields
-                        .insert("pref_tab".into(), tab.min(4).to_string());
+                        .insert("pref_tab".into(), tab.min(3).to_string());
                     self.model.modal_epoch += 1;
                 }
                 return;
@@ -2905,7 +2905,7 @@ impl App {
             }
             Action::ToggleAnalysis => self.toggle_analysis_dock(),
             Action::OpenAppearanceSettings => {
-                self.model.fields.insert("pref_tab".into(), "3".into());
+                self.model.fields.insert("pref_tab".into(), "2".into());
                 self.open(Modal::Preferences);
             }
             Action::Open(m) => {

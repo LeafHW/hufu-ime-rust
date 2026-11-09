@@ -308,8 +308,29 @@ pub fn send_message_enhanced(chat: &ChatWindow, text: &str) -> Result<(), String
             return Err("已中止：无法校验 QQ 当前会话（UIA 读取失败），内容已留在剪贴板".into())
         }
     }
-    // 4) 粘贴 + 回车
+    // 4) 粘贴 + 回车；等 QQ 真正收下消息再返回，否则调用方立刻切回跟打器
+    //    会把 Ctrl+V / Enter 抢走，成绩和文章就发不出去。
     gale_win::keys::paste_and_enter();
+    let marker: String = text.chars().take(24).collect();
+    let mut confirmed = false;
+    for _ in 0..6 {
+        thread::sleep(Duration::from_millis(200));
+        if let Some(bodies) = crate::uia_bridge::read_message_bodies(chat.hwnd) {
+            if bodies
+                .iter()
+                .rev()
+                .take(3)
+                .any(|body| body.contains(&marker))
+            {
+                confirmed = true;
+                break;
+            }
+        }
+    }
+    if !confirmed {
+        // UIA 读不到消息区时也把粘贴链路等完；不再重复粘贴，避免发两遍。
+        thread::sleep(Duration::from_millis(600));
+    }
     Ok(())
 }
 

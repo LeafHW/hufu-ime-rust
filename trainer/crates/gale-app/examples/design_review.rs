@@ -631,7 +631,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
             5 => {
                 m.open(Modal::Preferences);
-                m.fields.insert("pref_tab".into(), "3".into());
+                m.fields.insert("pref_tab".into(), "2".into());
                 "05-preferences-appearance-dark.bmp"
             }
             6 | 7 | 19 | 29 => {
@@ -766,7 +766,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
             35 => {
                 m.open(Modal::Preferences);
-                m.fields.insert("pref_tab".into(), "3".into());
+                m.fields.insert("pref_tab".into(), "2".into());
                 "35-preferences-appearance-small-640x420.bmp"
             }
             36 => {
@@ -798,7 +798,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
             43 | 44 => {
                 m.open(Modal::Preferences);
-                let tab = if screen == 43 { 1 } else { 4 };
+                let tab = if screen == 43 { 1 } else { 3 };
                 m.fields.insert("pref_tab".into(), tab.to_string());
                 cfg.score_template = gale_core::scorecard::preset("detailed").template.into();
                 if screen == 43 {
@@ -809,7 +809,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
             45 => {
                 m.open(Modal::Preferences);
-                m.fields.insert("pref_tab".into(), "3".into());
+                m.fields.insert("pref_tab".into(), "2".into());
                 "45-preferences-appearance-small-800x600.bmp"
             }
             46 => {

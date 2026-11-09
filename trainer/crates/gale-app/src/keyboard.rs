@@ -322,13 +322,16 @@ fn draw_impl(
             [0.98, 0.98, 0.98, 1.]
         };
         round(f, kx, ky, kw, kh, 4., fill, Some(alpha(p.line, 0.8)));
-        let (label, label_size) = key_label(key.label, kw);
-        // A zero-frequency dot under every cap read as a rendering artifact.
+        let (label, mut label_size) = key_label(key.label, kw);
+        if main_only {
+            label_size = label_size.min(13.);
+        }
         // Only draw a count when there is one, and stack the label above it so
         // both lines share the same centre line on every cap.
         let show_count = (main_only || key_show_count(kh) || compact) && n > 0;
+        let count_size = if main_only { 11. } else if compact { 12. } else { 14. };
         let block = if show_count {
-            label_size + 2. + 14.
+            label_size + 1. + count_size
         } else {
             label_size
         };
@@ -344,8 +347,8 @@ fn draw_impl(
             centered(
                 f,
                 kx + kw / 2.,
-                top + label_size + 2.,
-                if compact { 12. } else { 14. },
+                top + label_size + 1.,
+                count_size,
                 n.to_string(),
                 fg,
             );

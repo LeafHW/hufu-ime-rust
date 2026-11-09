@@ -1692,12 +1692,8 @@ pub(crate) fn draw_analysis_dock(
     let body_w = (pw - 40.).max(120.);
     if let Some(fa) = &sess.full_analysis {
         if heatmap {
-            // 当前段实际按键次数（未结算用正在累计的直方图，结算后用快照）。
-            let hist = if sess.vk_histogram.is_empty() {
-                &sess.last_vk_histogram
-            } else {
-                &sess.vk_histogram
-            };
+            // 理论热力：按全文词条的编码统计每个键的理论使用次数（不是实际按键）。
+            let summary = crate::analysis::summarize(fa, auto4);
             f.push(DrawCmd::PushClip {
                 x: x + 20.,
                 y: body_y,
@@ -1705,7 +1701,7 @@ pub(crate) fn draw_analysis_dock(
                 h: body_h,
             });
             crate::keyboard::draw_main(f, t, x + 24., body_y + 2., body_w - 8., body_h - 6., |key| {
-                hist.get(&key).copied().unwrap_or(0)
+                summary.key_counts.get(&key).copied().unwrap_or(0)
             });
             f.push(DrawCmd::PopClip);
         } else {
