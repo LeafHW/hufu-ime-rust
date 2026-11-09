@@ -341,5 +341,5 @@ fn fmt_speed(r: &ScoreRecord) -> String {
 
 fn duration(ms: u64) -> String {
     let secs = ms as f64 / 1000.;
-    format!("{:02}:{:04.1}", (secs / 60.) as u64, secs % 60.)
+    format!("{}:{:04.1}", (secs / 60.) as u64, secs % 60.)
 }
