@@ -1,20 +1,20 @@
-//! F1 跟打器设置：左侧四页导航 + 右侧内容区（练习/成绩单/外观与颜色/数据）。
+//! F1 跟打器设置：左侧四页导航 + 右侧内容区（词提/成绩单/外观与颜色/数据）。
 //!
 //! 面板几何由 `modals` 提供（960×752，与 1280×800 视口等高，内容区
 //! `y+62 .. y+ph-62`，左侧导航 208）；
 //! 本模块只负责排版、绘制与原生编辑框坐标。`pref_*` 动作语义保持与 `main.rs`
 //! 一致：`pref_tab:{0..3}`、`pref_toggle:{key}`、`pref_step:hint_font_size:±1`、
 //! `pref_field:{key}`、`pref_score_preset:{id}`、`pref_save_template`、
-//! `pref_color_select:{key}`、`pref_apply_colors`，以及 `Action::Folder`。
+//! `pref_color_choose:{key}`（系统调色盘），以及 `Action::Folder`。
 use super::{hit_box, wrap, Action, FieldSpec, Hit, Model, PANEL_FOOT, PANEL_HEAD};
+use crate::session::Session;
 use crate::ui::{
     alpha, body_text, elide_width, line, mono, rect, right, round, text, tokens, ui_text_width,
     Palette,
 };
-use gale_core::scorecard::{format_score_template, SCORE_FIELDS, SCORE_PRESETS};
 use gale_core::config::Config;
+use gale_core::scorecard::{format_score_template, SCORE_FIELDS, SCORE_PRESETS};
 use gale_core::theme::Theme;
-use crate::session::Session;
 use gale_win::d2d::{Align, DrawCmd, FontFamily, Frame};
 use std::path::PathBuf;
 
@@ -42,7 +42,7 @@ const T_LABEL: f32 = 15.;
 const T_NOTE: f32 = 13.;
 
 const PAGES: [(&str, &str); 4] = [
-    ("练习", "单字提示与字号"),
+    ("词提", "提示开关、策略与配色"),
     ("成绩单", "自动复制与成绩单样式"),
     ("外观与颜色", "主题、排版、动效与配色"),
     ("数据与关于", "存储位置与版本"),
@@ -55,47 +55,69 @@ const COLORS: &[(&str, &str, &str)] = &[
     ("对打打对底色", "打对底色", "173c2b"),
     ("打错字色", "打错文字", "e36b65"),
     ("对打打错底色", "打错底色", "4b2021"),
+];
+const HINT_COLORS: &[(&str, &str, &str)] = &[
     ("词提编码色", "单字编码", "d0c9b9"),
     ("词提角标色", "选重数字", "d0c9b9"),
+    ("词提一码色", "多字一码", "ff7f9f"),
+    ("词提简码色", "简码词", "7bdbac"),
+    ("词提二字三码色", "二字三码", "a5b8ff"),
+    ("词提二字全码色", "二字全码", "ffae65"),
+    ("词提三字全码色", "三字全码", "c69bf2"),
+    ("词提四字全码色", "长词全码", "7ecbfa"),
+    ("词提下划线色", "词组连线", "58a6f5"),
+];
+const RANK_COLORS: &[(&str, &str, &str)] = &[
+    ("词提1选色", "1 选", "7bdbac"),
+    ("词提2选色", "2 选", "a5b8ff"),
+    ("词提3选色", "3 选", "ffae65"),
+    ("词提4选色", "4 选", "ff7f9f"),
+    ("词提5选色", "5 选", "c69bf2"),
+    ("词提6选色", "6 选", "7ecbfa"),
+    ("词提7选色", "7 选", "e3cd70"),
+    ("词提8选色", "8 选", "6dd7cc"),
+    ("词提9选色", "9 选", "f29bdd"),
+    ("词提10选色", "10 选", "dcaf89"),
+    ("词提编码色", "单字编码", "d0c9b9"),
+    ("词提角标色", "选重数字", "d0c9b9"),
+    ("词提下划线色", "词组连线", "58a6f5"),
 ];
 
-// 练习页
-const PRACTICE_SWITCH_Y: f32 = 48.;
-const PRACTICE_SWITCH_H: f32 = 56.;
-const PRACTICE_SWITCH_PITCH: f32 = 64.;
-const PRACTICE_SIZE_LABEL_Y: f32 = 176.;
-const PRACTICE_SIZE_Y: f32 = 196.;
-const PRACTICE_SIZE_H: f32 = 56.;
-const PRACTICE_PREVIEW_Y: f32 = 264.;
-const PRACTICE_PREVIEW_H: f32 = 150.;
+// 词提页
+const PRACTICE_SWITCH_Y: f32 = 72.;
+const PRACTICE_SWITCH_H: f32 = 44.;
+const PRACTICE_SWITCH_PITCH: f32 = 48.;
+const PRACTICE_STRATEGY_Y: f32 = 270.;
+const PRACTICE_DYNAMIC_Y: f32 = 336.;
+const PRACTICE_SIZE_LABEL_Y: f32 = 388.;
+const PRACTICE_SIZE_Y: f32 = 408.;
+const PRACTICE_SIZE_H: f32 = 48.;
+const PRACTICE_PREVIEW_Y: f32 = 468.;
+const PRACTICE_PREVIEW_H: f32 = 148.;
 
 // 成绩单页
-const SCORE_G1_LABEL_Y: f32 = 24.;
-const SCORE_G1_Y: f32 = 44.;
+const SCORE_G1_LABEL_Y: f32 = 124.;
+const SCORE_G1_Y: f32 = 144.;
 const SCORE_G1_ROW_H: f32 = 40.;
 const SCORE_G2_LABEL_Y: f32 = 132.;
 const SCORE_CHIPS_Y: f32 = 154.;
 const SCORE_CHIP_PITCH: f32 = 32.;
 const SCORE_CHIP_H: f32 = 30.;
 const SCORE_CHIP_COLUMNS: usize = 4;
-const SCORE_G3_TITLE_Y: f32 = 206.;
-const SCORE_SAVE_Y: f32 = 204.;
-const SCORE_PRESETS_Y: f32 = 158.;
+const SCORE_G3_TITLE_Y: f32 = 306.;
+const SCORE_SAVE_Y: f32 = 304.;
+const SCORE_PRESETS_Y: f32 = 258.;
 const SCORE_PRESETS_H: f32 = 30.;
-const SCORE_EDITOR_Y: f32 = 230.;
+const SCORE_EDITOR_Y: f32 = 332.;
 const SCORE_EDITOR_H: f32 = 76.;
-const SCORE_PREVIEW_Y: f32 = 352.;
-const SCORE_PREVIEW_H: f32 = 110.;
+const SCORE_PREVIEW_Y: f32 = 464.;
+const SCORE_PREVIEW_H: f32 = 134.;
 
 // 颜色页
 const COLOR_LABEL_Y: f32 = 30.;
 const COLOR_ROWS_Y: f32 = 52.;
 const COLOR_ROW_H: f32 = 34.;
 const COLOR_ROW_GAP: f32 = 6.;
-const COLOR_HEX_LABEL_Y: f32 = 468.;
-const COLOR_HEX_Y: f32 = 486.;
-const COLOR_HEX_H: f32 = 36.;
-const COLOR_HEX_W: f32 = 220.;
 const COLOR_HINT_Y: f32 = 432.;
 const COLOR_PREVIEW_Y: f32 = 456.;
 const COLOR_PREVIEW_H: f32 = 160.;
@@ -115,19 +137,56 @@ fn enabled(m: &Model, key: &str, default: bool) -> bool {
 }
 fn selected_color(m: &Model) -> &'static str {
     let value = m.field("pref_color_key");
-    COLORS
+    page_colors(m)
         .iter()
         .find(|(key, _, _)| *key == value)
         .map(|v| v.0)
-        .unwrap_or(COLORS[0].0)
+        .unwrap_or(page_colors(m)[0].0)
 }
 fn selected_color_label(m: &Model) -> &'static str {
     let value = selected_color(m);
-    COLORS
+    page_colors(m)
         .iter()
         .find(|(key, _, _)| *key == value)
         .map(|v| v.1)
-        .unwrap_or(COLORS[0].1)
+        .unwrap_or(page_colors(m)[0].1)
+}
+fn hint_colors_view(m: &Model) -> bool {
+    tab(m) == 0 && m.field("pref_hint_view") == "colors"
+}
+fn page_colors(m: &Model) -> &'static [(&'static str, &'static str, &'static str)] {
+    if tab(m) == 0 {
+        if enabled(m, "hint_rank_colors", false) {
+            RANK_COLORS
+        } else {
+            HINT_COLORS
+        }
+    } else {
+        COLORS
+    }
+}
+pub(crate) fn color_allowed(m: &Model, key: &str) -> bool {
+    (tab(m) == 2 || hint_colors_view(m)) && page_colors(m).iter().any(|c| c.0 == key)
+}
+/// Remember a color from the visible group for the palette and preview.
+pub(crate) fn sync_color_editor(m: &mut Model) {
+    let key = selected_color(m);
+    let hex = m.field(&format!("color_{key}"));
+    m.fields.insert("pref_color_key".into(), key.into());
+    m.fields.insert("pref_color_hex".into(), hex);
+}
+pub(crate) fn select_page(m: &mut Model, page: u8) {
+    m.fields.insert("pref_tab".into(), page.min(3).to_string());
+    refresh_page(m);
+}
+pub(crate) fn select_hint_view(m: &mut Model, view: &str) {
+    m.fields.insert("pref_hint_view".into(), view.into());
+    refresh_page(m);
+}
+fn refresh_page(m: &mut Model) {
+    sync_color_editor(m);
+    m.panel_scroll = 0.;
+    m.modal_epoch += 1;
 }
 fn color_hex(m: &Model, key: &str, fallback: &str) -> String {
     m.fields
@@ -213,10 +272,6 @@ fn body_y(y: f32) -> f32 {
 fn score_editor_rect(bx: f32, by: f32, bw: f32) -> (f32, f32, f32, f32) {
     (bx, by + SCORE_EDITOR_Y, bw, SCORE_EDITOR_H)
 }
-/// 颜色值输入框（内容区坐标；绘制与原生 FieldSpec 共用同一组常量）。
-fn color_field_rect(bx: f32, by: f32) -> (f32, f32, f32, f32) {
-    (bx, by + COLOR_HEX_Y, COLOR_HEX_W, COLOR_HEX_H)
-}
 fn score_chip_rect(x: f32, y: f32, w: f32, index: usize) -> (f32, f32, f32) {
     let gap = 8.;
     let cw = (w - (SCORE_CHIP_COLUMNS - 1) as f32 * gap) / SCORE_CHIP_COLUMNS as f32;
@@ -250,7 +305,16 @@ fn centered(f: &mut Frame, cx: f32, y: f32, size: f32, s: &str, c: [f32; 4]) {
 fn note(f: &mut Frame, x: f32, y: f32, w: f32, s: &str, c: [f32; 4]) {
     text(f, x, y, T_NOTE, elide_width(s, w.max(8.), T_NOTE), c);
 }
-fn primary(f: &mut Frame, hs: &mut Vec<Hit>, x: f32, y: f32, w: f32, label: &str, a: Action, t: &Theme) {
+fn primary(
+    f: &mut Frame,
+    hs: &mut Vec<Hit>,
+    x: f32,
+    y: f32,
+    w: f32,
+    label: &str,
+    a: Action,
+    t: &Theme,
+) {
     let p = tokens(t);
     round(f, x, y, w, 36., 8., p.accent, Some(alpha(p.text, 0.18)));
     centered(f, x + w / 2., y + 10., 15., label, [0.13, 0.09, 0.035, 1.]);
@@ -271,7 +335,15 @@ fn outline_button(
     centered(f, x + w / 2., y + 8., 15., label, p.text2);
     hit_box(hs, x, y, w, 32., a);
 }
-fn step_button(f: &mut Frame, hs: &mut Vec<Hit>, x: f32, y: f32, label: &str, a: Action, t: &Theme) {
+fn step_button(
+    f: &mut Frame,
+    hs: &mut Vec<Hit>,
+    x: f32,
+    y: f32,
+    label: &str,
+    a: Action,
+    t: &Theme,
+) {
     let p = tokens(t);
     round(f, x, y, 32., 32., 8., p.bg2, Some(p.line2));
     centered(f, x + 16., y + 7., 18., label, p.text2);
@@ -324,7 +396,14 @@ fn toggle_row(
 ) {
     let p = tokens(t);
     text(f, x + 16., y + title_dy, T_LABEL, title, p.text);
-    note(f, x + 16., y + desc_dy, w - 16. - 16. - 44. - 12., desc, p.muted);
+    note(
+        f,
+        x + 16.,
+        y + desc_dy,
+        w - 16. - 16. - 44. - 12.,
+        desc,
+        p.muted,
+    );
     switch(
         f,
         hs,
@@ -466,16 +545,7 @@ fn nav(f: &mut Frame, hs: &mut Vec<Hit>, m: &Model, t: &Theme, x: f32, y: f32) {
         let on = tab(m) == i as u8;
         if on {
             round(f, ix, iy, iw, NAV_ITEM_H, 8., alpha(p.accent, 0.08), None);
-            round(
-                f,
-                ix,
-                iy + 8.,
-                3.,
-                NAV_ITEM_H - 16.,
-                1.5,
-                p.accent,
-                None,
-            );
+            round(f, ix, iy + 8., 3., NAV_ITEM_H - 16., 1.5, p.accent, None);
         }
         text(
             f,
@@ -501,42 +571,86 @@ fn nav(f: &mut Frame, hs: &mut Vec<Hit>, m: &Model, t: &Theme, x: f32, y: f32) {
 
 fn practice_page(f: &mut Frame, hs: &mut Vec<Hit>, m: &Model, t: &Theme, x: f32, y: f32, w: f32) {
     let p = tokens(t);
-    page_title(
+    page_title(f, x, y, w, "词提", "正文与 F10 按当前码表分析", &p);
+    let choice_w = (w - 8.) / 2.;
+    for (i, (id, label)) in [("settings", "提示设置"), ("colors", "词提配色")]
+        .iter()
+        .enumerate()
+    {
+        seg_button(
+            f,
+            hs,
+            x + i as f32 * (choice_w + 8.),
+            y + 30.,
+            choice_w,
+            30.,
+            label,
+            hint_colors_view(m) == (*id == "colors"),
+            crate::aux_marker(&format!("pref_hint_view:{id}")),
+            &p,
+        );
+    }
+    if hint_colors_view(m) {
+        round(f, x, y + 72., w, 44., 8., p.surface2, Some(p.line));
+        toggle_row(
+            f,
+            hs,
+            m,
+            t,
+            x,
+            y + 72.,
+            w,
+            44.,
+            "hint_rank_colors",
+            "选重颜色模式",
+            "默认关闭；开启后只按候选序号为词组着色",
+            false,
+            5.,
+            25.,
+        );
+        color_controls(f, hs, m, t, x, y, w);
+        hint_color_preview(f, m, t, x, y + 372., w);
+        return;
+    }
+    // The main switch uses session rules; the other three are display choices.
+    let cy = y + PRACTICE_SWITCH_Y;
+    round(f, x, cy, w, PRACTICE_SWITCH_H, 8., p.surface2, Some(p.line));
+    text(f, x + 16., cy + 5., T_LABEL, "启用词提", p.text);
+    note(
         f,
-        x,
-        y,
-        w,
-        "单字练习提示",
-        "编码与选重只出现在单字练习",
+        x + 16.,
+        cy + 25.,
+        w - 88.,
+        "按当前虎符码表识别正文词组",
+        p.muted,
+    );
+    switch(
+        f,
+        hs,
+        x + w - 60.,
+        cy + (PRACTICE_SWITCH_H - 24.) / 2.,
+        m.hints,
+        Action::ToggleHints,
         &p,
     );
-    section_label(f, x, y + 30., "提示开关", &p);
     for (i, (key, title, desc)) in [
-        (
-            "hint_show_code",
-            "显示单字编码",
-            "在练习字下方显示当前码表编码",
-        ),
+        ("hint_show_code", "显示编码", "在字词下方显示当前码表编码"),
         (
             "hint_show_rank",
             "显示选重数字",
-            "显示候选位次，辅助练习选重",
+            "首选不标数字，从第二候选起显示",
+        ),
+        (
+            "hint_color_words",
+            "词组着色",
+            "仅词组着色，单字与标点保持普通字色",
         ),
     ]
     .iter()
     .enumerate()
     {
-        let cy = y + PRACTICE_SWITCH_Y + i as f32 * PRACTICE_SWITCH_PITCH;
-        round(
-            f,
-            x,
-            cy,
-            w,
-            PRACTICE_SWITCH_H,
-            8.,
-            p.surface2,
-            Some(p.line),
-        );
+        let cy = y + PRACTICE_SWITCH_Y + (i + 1) as f32 * PRACTICE_SWITCH_PITCH;
+        round(f, x, cy, w, PRACTICE_SWITCH_H, 8., p.surface2, Some(p.line));
         toggle_row(
             f,
             hs,
@@ -550,9 +664,79 @@ fn practice_page(f: &mut Frame, hs: &mut Vec<Hit>, m: &Model, t: &Theme, x: f32,
             title,
             desc,
             true,
-            8.,
-            31.,
+            5.,
+            25.,
         );
+    }
+    let locked = m.field("hint_settings_locked") == "true";
+    let strategy_y = y + PRACTICE_STRATEGY_Y;
+    section_label(f, x, strategy_y, "路由策略", &p);
+    note(
+        f,
+        x + 100.,
+        strategy_y,
+        w - 100.,
+        if locked {
+            "本轮已锁定，重打后可修改"
+        } else {
+            "先比较实际键数，再按策略取舍"
+        },
+        p.muted,
+    );
+    let route_hits = hs.len();
+    let choice_w = (w - 8.) / 2.;
+    for (i, (id, label)) in [("shortest", "最短编码"), ("phrases", "词组优先")]
+        .iter()
+        .enumerate()
+    {
+        seg_button(
+            f,
+            hs,
+            x + i as f32 * (choice_w + 8.),
+            strategy_y + 22.,
+            choice_w,
+            30.,
+            label,
+            if *id == "shortest" {
+                m.field("hint_strategy") != "phrases"
+            } else {
+                m.field("hint_strategy") == "phrases"
+            },
+            crate::aux_marker(&format!("pref_strategy:{id}")),
+            &p,
+        );
+    }
+    let dynamic_y = y + PRACTICE_DYNAMIC_Y;
+    round(
+        f,
+        x,
+        dynamic_y,
+        w,
+        PRACTICE_SWITCH_H,
+        8.,
+        p.surface2,
+        Some(p.line),
+    );
+    toggle_row(
+        f,
+        hs,
+        m,
+        t,
+        x,
+        dynamic_y,
+        w,
+        PRACTICE_SWITCH_H,
+        "hint_dynamic",
+        "动态词提",
+        "按正确进度重算后续词提",
+        false,
+        5.,
+        25.,
+    );
+    if locked {
+        hs.truncate(route_hits);
+        rect(f, x, strategy_y + 22., w, 30., alpha(p.bg, 0.35));
+        rect(f, x, dynamic_y, w, PRACTICE_SWITCH_H, alpha(p.bg, 0.35));
     }
     // 字号步进：数值 + − / + 一组 32 高按钮。
     section_label(f, x, y + PRACTICE_SIZE_LABEL_Y, "提示字号", &p);
@@ -567,7 +751,14 @@ fn practice_page(f: &mut Frame, hs: &mut Vec<Hit>, m: &Model, t: &Theme, x: f32,
         "范围 14–28，默认 14",
         p.muted,
     );
-    right(f, x + w - 16. - 84., sy + 15., 20., format!("{:.0}", hint_size(m)), p.accent);
+    right(
+        f,
+        x + w - 16. - 84.,
+        sy + 15.,
+        20.,
+        format!("{:.0}", hint_size(m)),
+        p.accent,
+    );
     step_button(
         f,
         hs,
@@ -586,8 +777,11 @@ fn practice_page(f: &mut Frame, hs: &mut Vec<Hit>, m: &Model, t: &Theme, x: f32,
         crate::aux_marker("pref_step:hint_font_size:1"),
         t,
     );
-    // 预览卡：字 / 编码 / 选重三例，脚注收进卡内。
-    let py = y + PRACTICE_PREVIEW_Y;
+    hint_preview(f, m, t, x, y + PRACTICE_PREVIEW_Y, w);
+}
+
+fn hint_preview(f: &mut Frame, m: &Model, t: &Theme, x: f32, py: f32, w: f32) {
+    let p = tokens(t);
     round(
         f,
         x,
@@ -599,27 +793,66 @@ fn practice_page(f: &mut Frame, hs: &mut Vec<Hit>, m: &Model, t: &Theme, x: f32,
         Some(p.line),
     );
     text(f, x + 16., py + 12., T_LABEL, "提示预览", p.text);
-    note(f, x + w - 16. - 160., py + 14., 160., "仅单字练习显示", p.muted);
-    let show_code = enabled(m, "hint_show_code", true);
-    let show_rank = enabled(m, "hint_show_rank", true);
-    let size = hint_size(m);
-    let cell = (w - 32.) / 3.;
-    for (i, (code, caption)) in [("a", "单码"), ("ab", "两码"), ("abc", "三码")]
-        .iter()
-        .enumerate()
-    {
+    note(f, x + w - 16. - 80., py + 14., 80., "规则示例", p.muted);
+    let show_code = m.hints && enabled(m, "hint_show_code", true);
+    let show_rank = m.hints && enabled(m, "hint_show_rank", true);
+    let color_words = m.hints && enabled(m, "hint_color_words", true);
+    let max_len = if m.max_code_length == 0 {
+        4
+    } else {
+        m.max_code_length
+    };
+    let rank_mode = enabled(m, "hint_rank_colors", false);
+    let rank_examples = [
+        ("词组", "abcd", 1, "1 选"),
+        ("词组", "abcd", 2, "2 选"),
+        ("词组", "abcd", 3, "3 选"),
+        ("词组", "abcd", 4, "4 选"),
+    ];
+    let class_examples = [
+        ("的", "u", 1, "单字 · 首选"),
+        ("简明", "a", 1, "一码词 · 首选"),
+        ("来来来", "aaah", 2, "三字词 · 选重"),
+    ];
+    let examples: &[(&str, &str, usize, &str)] = if rank_mode {
+        &rank_examples
+    } else {
+        &class_examples
+    };
+    let cell = (w - 32.) / examples.len() as f32;
+    let size = hint_size(m).min((cell - 10.) / 3.);
+    for (i, (word, code, rank, caption)) in examples.iter().enumerate() {
         let sx = x + 16. + i as f32 * cell;
-        body_text(f, sx, py + 42., 24., "字", p.text);
-        if show_code {
-            mono(f, sx, py + 72., size, *code, p.hint_code);
+        let tint = color_words
+            .then(|| crate::ui::hint_word_tint_for_rank(&p, word, code, *rank, max_len, rank_mode))
+            .flatten();
+        body_text(f, sx, py + 42., 24., *word, tint.unwrap_or(p.text2));
+        if m.hints && word.chars().count() > 1 {
+            line(
+                f,
+                sx,
+                py + 68.,
+                word.chars().count() as f32 * 24.,
+                tint.unwrap_or(p.hint_underline),
+            );
         }
-        if show_rank {
+        if show_code {
+            mono(f, sx, py + 72., size, *code, tint.unwrap_or(p.hint_code));
+        }
+        if show_rank && *rank > 1 {
             let code_w = if show_code {
                 code.chars().count() as f32 * size * 0.6
             } else {
                 0.
             };
-            mono(f, sx + code_w + 2., py + 68., size, "2", p.hint_badge);
+            mono(
+                f,
+                sx + code_w + 2.,
+                py + 68.,
+                size,
+                rank.to_string(),
+                tint.unwrap_or(p.hint_badge),
+            );
         }
         note(f, sx, py + 100., cell - 8., caption, p.muted);
     }
@@ -628,7 +861,11 @@ fn practice_page(f: &mut Frame, hs: &mut Vec<Hit>, m: &Model, t: &Theme, x: f32,
         x + 16.,
         py + 122.,
         w - 32.,
-        "文章练习不显示编码与选重提示。",
+        if rank_mode {
+            "相同候选序号同色；单字、标点不着色。"
+        } else {
+            "正文与 F10 共用词类配色；单字、标点不着色。"
+        },
         p.muted,
     );
 }
@@ -676,6 +913,48 @@ fn score_preview_text(m: &Model) -> String {
 fn score_page(f: &mut Frame, hs: &mut Vec<Hit>, m: &Model, t: &Theme, x: f32, y: f32, w: f32) {
     let p = tokens(t);
     page_title(f, x, y, w, "成绩单", "自动行为、样式与最近一次预览", &p);
+    section_label(f, x, y + 30., "核心数据 · 标准与简洁均保留", &p);
+    let core_w = (w - 24.) / 4.;
+    for (i, (label, token)) in [
+        ("速度", "{speed}"),
+        ("键准 %", "{key_accuracy}"),
+        ("击键", "{strokes}"),
+        ("码长", "{code_len}"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let cx = x + i as f32 * (core_w + 8.);
+        round(f, cx, y + 50., core_w, 60., 7., p.surface2, Some(p.line));
+        text(f, cx + 8., y + 58., T_NOTE, *label, p.muted);
+        let value = m
+            .latest
+            .as_ref()
+            .map(|r| format_score_template(r, token, ""))
+            .unwrap_or_else(|| "—".into());
+        let size = if core_w < 100. { 16. } else { 20. };
+        let available = core_w - 16.;
+        if value.chars().count() as f32 * size * 0.6 > available && value.contains('/') {
+            let (penalized, raw) = value.split_once('/').unwrap();
+            for (line, value) in [penalized.to_string(), format!("/{raw}")]
+                .iter()
+                .enumerate()
+            {
+                let fit = 14f32.min(available / (value.chars().count().max(1) as f32 * 0.6));
+                mono(
+                    f,
+                    cx + 8.,
+                    y + 78. + line as f32 * 16.,
+                    fit,
+                    value,
+                    p.accent,
+                );
+            }
+        } else {
+            let fit = size.min(available / (value.chars().count().max(1) as f32 * 0.6));
+            mono(f, cx + 8., y + 80., fit, value, p.accent);
+        }
+    }
 
     section_label(f, x, y + SCORE_G1_LABEL_Y, "自动行为", &p);
     let g1 = y + SCORE_G1_Y;
@@ -723,7 +1002,7 @@ fn score_page(f: &mut Frame, hs: &mut Vec<Hit>, m: &Model, t: &Theme, x: f32, y:
         21.,
     );
 
-    section_label(f, x, y + 136., "成绩单样式", &p);
+    section_label(f, x, y + 236., "成绩单样式", &p);
     let preset = m.field("score_preset");
     let presets = [
         ("standard", "标准"),
@@ -749,13 +1028,13 @@ fn score_page(f: &mut Frame, hs: &mut Vec<Hit>, m: &Model, t: &Theme, x: f32, y:
         );
     }
 
-    text(f, x, y + SCORE_G3_TITLE_Y, T_TITLE, "自定义模板", p.text);
+    text(f, x, y + SCORE_G3_TITLE_Y, T_TITLE, "成绩单模板", p.text);
     note(
         f,
         x + 96.,
         y + SCORE_G3_TITLE_Y + 3.,
         w - 220.,
-        "可留空；填写后优先于上方样式",
+        "自由编辑后点击保存",
         p.muted,
     );
     outline_button(
@@ -775,21 +1054,20 @@ fn score_page(f: &mut Frame, hs: &mut Vec<Hit>, m: &Model, t: &Theme, x: f32, y:
         x,
         ey + eh + 10.,
         w,
-        "占位符：{speed} 速度 · {key_accuracy} 键准 · {strokes} 击键 · {word_rate} 打词率",
+        "速度 {speed} · 键准 {key_accuracy}",
+        p.muted,
+    );
+    note(
+        f,
+        x,
+        ey + eh + 30.,
+        w,
+        "击键 {strokes} · 码长 {code_len}",
         p.muted,
     );
 
     let py = y + SCORE_PREVIEW_Y;
-    round(
-        f,
-        x,
-        py,
-        w,
-        SCORE_PREVIEW_H,
-        8.,
-        p.surface2,
-        Some(p.line),
-    );
+    round(f, x, py, w, SCORE_PREVIEW_H, 8., p.surface2, Some(p.line));
     text(f, x + 16., py + 9., T_NOTE, "最近一次成绩预览", p.text);
     let per_line = (((w - 32.) / T_NOTE) as usize).max(8);
     let lines = wrap(&score_preview_text(m), per_line);
@@ -798,7 +1076,9 @@ fn score_page(f: &mut Frame, hs: &mut Vec<Hit>, m: &Model, t: &Theme, x: f32, y:
         let row = if total > 3 && i == 2 {
             format!(
                 "{}…",
-                row.chars().take(per_line.saturating_sub(1)).collect::<String>()
+                row.chars()
+                    .take(per_line.saturating_sub(1))
+                    .collect::<String>()
             )
         } else {
             row
@@ -885,12 +1165,21 @@ fn footer(f: &mut Frame, hs: &mut Vec<Hit>, t: &Theme, x: f32, y: f32, pw: f32, 
     rect(f, x + 1., top, pw - 2., PANEL_FOOT - 1., alpha(p.bg2, 0.6));
     line(f, x, top, pw, p.line);
     text(f, x + PAD, top + 24., T_NOTE, "更改即时保存", p.muted);
-    primary(f, hs, x + pw - PAD - 96., top + 13., 96., "完成", Action::Close, t);
+    primary(
+        f,
+        hs,
+        x + pw - PAD - 96.,
+        top + 13.,
+        96.,
+        "完成",
+        Action::Close,
+        t,
+    );
 }
 
 // ---------------------------------------------------------------- 对外接口
 
-/// 原生编辑框：成绩单模板与颜色值输入。坐标与 `draw` 共用同一组常量。
+/// 原生编辑框仅用于成绩单模板；颜色由系统调色盘处理。
 pub(super) fn fields(m: &Model, x: f32, y: f32, pw: f32, _ph: f32) -> Vec<FieldSpec> {
     let (bx, by, bw) = (body_x(x), body_y(y), body_w(pw));
     match tab(m) {
@@ -903,18 +1192,6 @@ pub(super) fn fields(m: &Model, x: f32, y: f32, pw: f32, _ph: f32) -> Vec<FieldS
                 w: fw,
                 h: fh,
                 multi: true,
-                password: false,
-            }]
-        }
-        2 => {
-            let (fx, fy, fw, fh) = color_field_rect(bx, by);
-            vec![FieldSpec {
-                id: "pref_color_hex",
-                x: fx,
-                y: fy,
-                w: fw,
-                h: fh,
-                multi: false,
                 password: false,
             }]
         }
@@ -964,7 +1241,15 @@ fn appearance_page(
     w: f32,
 ) {
     let p = tokens(t);
-    page_title(f, x, y, w, "外观与颜色", "主题、排版、动效与三态配色", &p);
+    page_title(
+        f,
+        x,
+        y,
+        w - 120.,
+        "外观与颜色",
+        "主题、排版、动效与三态配色",
+        &p,
+    );
     outline_button(
         f,
         hs,
@@ -992,7 +1277,14 @@ fn appearance_page(
             Some(if selected { p.accent } else { p.line2 }),
         );
         centered(f, bx + theme_w / 2., y + 58., T_LABEL, name, pt.text);
-        hit_box(hs, bx, y + 50., theme_w, 34., Action::Theme(name.to_string()));
+        hit_box(
+            hs,
+            bx,
+            y + 50.,
+            theme_w,
+            34.,
+            Action::Theme(name.to_string()),
+        );
     }
     let follow = cfg.theme == "跟随虎符";
     text(f, x, y + 96., T_LABEL, "跟随虎符皮肤", p.text2);
@@ -1015,9 +1307,49 @@ fn appearance_page(
         t,
     );
     line(f, x, y + 134., w, p.line);
+    text(f, x, y + 150., T_LABEL, "字体", p.text2);
+    let font_name = if cfg.font_family.is_empty() {
+        format!("默认 · {}", gale_win::d2d::detected_cjk_family())
+    } else {
+        let actual = gale_win::d2d::resolved_cjk_family(&cfg.font_family);
+        if actual == cfg.font_family {
+            actual
+        } else {
+            format!("{}（已回退 {}）", cfg.font_family, actual)
+        }
+    };
+    text(
+        f,
+        x + 44.,
+        y + 150.,
+        T_NOTE,
+        elide_width(&font_name, (w - 292.).max(40.), T_NOTE),
+        p.text,
+    );
+    outline_button(
+        f,
+        hs,
+        x + w - 238.,
+        y + 142.,
+        108.,
+        "默认霞鹜",
+        Action::FontDefault,
+        t,
+    );
+    outline_button(
+        f,
+        hs,
+        x + w - 120.,
+        y + 142.,
+        120.,
+        "选择系统字体",
+        Action::FontChoose,
+        t,
+    );
+    let typography_w = (w - 24.) / 2.;
     for (row, (name, value, minus, plus)) in [
         (
-            "字号",
+            "字号 10–100",
             format!("{:.0} px", cfg.font_size),
             Action::Font(-2),
             Action::Font(2),
@@ -1032,11 +1364,19 @@ fn appearance_page(
     .into_iter()
     .enumerate()
     {
-        let ry = y + 142. + row as f32 * 36.;
-        text(f, x, ry + 8., T_LABEL, name, p.text2);
-        mono(f, x + w - 168., ry + 8., 14., value, p.text);
-        step_button(f, hs, x + w - 120., ry, "−", minus, t);
-        step_button(f, hs, x + w - 80., ry, "+", plus, t);
+        let rx = x + row as f32 * (typography_w + 24.);
+        let ry = y + 178.;
+        if typography_w < 220. {
+            // At 640px the column is 156px wide: stack label and value in
+            // its left 76px, leaving the two buttons their full width.
+            text(f, rx, ry, T_NOTE, name, p.text2);
+            mono(f, rx, ry + 17., 14., value, p.text);
+        } else {
+            text(f, rx, ry + 8., T_NOTE, name, p.text2);
+            mono(f, rx + typography_w - 132., ry + 8., 14., value, p.text);
+        }
+        step_button(f, hs, rx + typography_w - 76., ry, "−", minus, t);
+        step_button(f, hs, rx + typography_w - 36., ry, "+", plus, t);
     }
     section_label(f, x, y + 216., "动效强度", &p);
     let motion_w = (w - 3. * 8.) / 4.;
@@ -1055,107 +1395,12 @@ fn appearance_page(
         );
     }
     line(f, x, y + 278., w, p.line);
-    section_label(f, x, y + 290., "跟打区配色", &p);
-    let selected = selected_color(m);
-    let col_w = (w - 12.) / 2.;
-    for (i, (key, label, fallback)) in COLORS.iter().enumerate() {
-        let col = i % 2;
-        let row = i / 2;
-        let rx = x + col as f32 * (col_w + 12.);
-        let ry = y + 312. + row as f32 * 38.;
-        let on = selected == *key;
-        round(
-            f,
-            rx,
-            ry,
-            col_w,
-            34.,
-            7.,
-            if on {
-                alpha(p.accent, 0.08)
-            } else {
-                p.surface2
-            },
-            Some(if on { p.accent } else { p.line }),
-        );
-        let hex = color_hex(m, key, fallback);
-        round(
-            f,
-            rx + 8.,
-            ry + 8.,
-            18.,
-            18.,
-            4.,
-            parse_color(&hex).unwrap_or(p.text2),
-            Some(p.line2),
-        );
-        text(
-            f,
-            rx + 34.,
-            ry + 8.,
-            T_LABEL,
-            *label,
-            if on { p.accent } else { p.text },
-        );
-        right(
-            f,
-            rx + col_w - 8.,
-            ry + 9.,
-            T_NOTE,
-            format!("#{}", hex.to_uppercase()),
-            if on { p.text2 } else { p.muted },
-        );
-        hit_box(
-            hs,
-            rx,
-            ry,
-            col_w,
-            34.,
-            crate::aux_marker(&format!("pref_color_select:{key}")),
-        );
-    }
-    // 自定义颜色值 + 应用
-    let input = m.field("pref_color_hex");
-    let (fx, fy, fw, fh) = color_field_rect(x, y);
-    section_label(f, x, y + COLOR_HEX_LABEL_Y, "颜色值（#RRGGBB）", &p);
-    note(
-        f,
-        x + 200.,
-        y + COLOR_HEX_LABEL_Y,
-        w - 360.,
-        &format!("正在编辑：{}", selected_color_label(m)),
-        p.muted,
-    );
-    round(f, fx, fy, fw, fh, 6., p.bg, Some(p.line2));
-    let swatch = parse_color(&input).unwrap_or(p.surface2);
-    round(f, fx + fw + 10., fy, 34., fh, 6., swatch, Some(p.line2));
-    let bw = 104.;
-    primary(
-        f,
-        hs,
-        x + w - bw,
-        fy,
-        bw,
-        "应用颜色",
-        crate::aux_marker("pref_apply_colors"),
-        t,
-    );
-    note(
-        f,
-        x,
-        y + 528.,
-        w,
-        if parse_color(&input).is_some() {
-            "格式有效 · 应用后即时生效并保存"
-        } else {
-            "请输入六位十六进制，例如 63C08D；可带 # 前缀"
-        },
-        p.muted,
-    );
+    section_label(f, x, y + 290., "跟打区背景与三态配色", &p);
+    color_controls(f, hs, m, t, x, y, w);
     // 三态预览（紧凑）
-    let py = y + 548.;
-    round(f, x, py, w, 68., 8., p.article_bg, Some(p.line));
-    text(f, x + 12., py + 7., T_NOTE, "跟打区三态预览", p.text2);
+    let py = y + 568.;
+    round(f, x, py, w, 48., 8., p.article_bg, Some(p.line));
+    text(f, x + 12., py + 5., T_NOTE, "跟打区三态预览", p.text2);
     for (i, (label, color, bg)) in [
         ("未打", p.text, p.bg_pending),
         ("打对", p.correct, p.bg_done),
@@ -1164,21 +1409,350 @@ fn appearance_page(
     .iter()
     .enumerate()
     {
-        let sx = x + 12. + i as f32 * 150.;
-        text(f, sx, py + 28., 11., *label, p.muted);
-        round(f, sx, py + 42., 34., 20., 4., *bg, None);
-        body_text(f, sx + 4., py + 41., 14., "字", *color);
+        let sx = x + 12. + i as f32 * (w - 24.) / 3.;
+        text(f, sx, py + 27., T_NOTE, *label, p.muted);
+        round(f, sx + 34., py + 24., 24., 20., 4., *bg, None);
+        body_text(f, sx + 39., py + 24., 14., "字", *color);
+    }
+}
+
+fn color_controls(f: &mut Frame, hs: &mut Vec<Hit>, m: &Model, t: &Theme, x: f32, y: f32, w: f32) {
+    if hint_colors_view(m) {
+        hint_color_controls(f, hs, m, t, x, y, w);
+        return;
+    }
+    let p = tokens(t);
+    let selected = selected_color(m);
+    let col_w = (w - 12.) / 2.;
+    for (i, (key, label, fallback)) in page_colors(m).iter().enumerate() {
+        let rx = x + (i % 2) as f32 * (col_w + 12.);
+        let ry = y + 312. + (i / 2) as f32 * 30.;
+        let on = selected == *key;
+        round(
+            f,
+            rx,
+            ry,
+            col_w,
+            26.,
+            6.,
+            p.surface2,
+            Some(if on { p.accent } else { p.line }),
+        );
+        let hex = color_hex(m, key, fallback);
+        round(
+            f,
+            rx + 8.,
+            ry + 5.,
+            24.,
+            16.,
+            4.,
+            parse_color(&hex).unwrap_or(p.text2),
+            Some(p.line2),
+        );
+        text(
+            f,
+            rx + 42.,
+            ry + 6.,
+            T_NOTE,
+            elide_width(label, col_w - 76., T_NOTE),
+            if on { p.accent } else { p.text },
+        );
+        right(f, rx + col_w - 10., ry + 6., T_NOTE, "›", p.muted);
+        hit_box(
+            hs,
+            rx,
+            ry,
+            col_w,
+            26.,
+            crate::aux_marker(&format!("pref_color_choose:{key}")),
+        );
     }
     note(
         f,
-        x + 470.,
-        py + 44.,
-        w - 482.,
-        "三态颜色同时作用于正文与单字编码/选重提示。",
+        x,
+        y + 416.,
+        w,
+        "点击色块打开调色盘，选好后即时生效并保存。",
         p.muted,
     );
 }
 
+fn hint_word_color_key(key: &str) -> bool {
+    matches!(
+        key,
+        "词提一码色"
+            | "词提简码色"
+            | "词提二字三码色"
+            | "词提二字全码色"
+            | "词提三字全码色"
+            | "词提四字全码色"
+    )
+}
+
+/// Word-class colors and generic annotation colors form two visual groups. The
+/// flat two-column list made the six classes and the three helper colors look
+/// equally important; the groups also keep the rank palette compact enough to
+/// fit beside its preview on the narrow page.
+fn hint_color_controls(
+    f: &mut Frame,
+    hs: &mut Vec<Hit>,
+    m: &Model,
+    t: &Theme,
+    x: f32,
+    y: f32,
+    w: f32,
+) {
+    let p = tokens(t);
+    note(
+        f,
+        x + w - 156.,
+        y + 130.,
+        156.,
+        "点击色块打开调色盘",
+        p.muted,
+    );
+    let mut cy = y + 152.;
+    if enabled(m, "hint_rank_colors", false) {
+        // Ten ranks fit as two clean rows at the normal panel width; the
+        // narrow page keeps four columns so the labels never truncate.
+        let rank_cols = if w >= 600. { 5 } else { 4 };
+        cy = color_group(
+            f,
+            hs,
+            m,
+            t,
+            x,
+            cy,
+            w,
+            "候选序号配色",
+            &RANK_COLORS[..10],
+            rank_cols,
+        );
+        cy += 6.;
+        color_group(f, hs, m, t, x, cy, w, "通用提示色", &RANK_COLORS[10..], 3);
+    } else {
+        let words: Vec<_> = HINT_COLORS
+            .iter()
+            .copied()
+            .filter(|(key, _, _)| hint_word_color_key(key))
+            .collect();
+        let meta: Vec<_> = HINT_COLORS
+            .iter()
+            .copied()
+            .filter(|(key, _, _)| !hint_word_color_key(key))
+            .collect();
+        cy = color_group(f, hs, m, t, x, cy, w, "六档词色", &words, 3);
+        cy += 6.;
+        color_group(f, hs, m, t, x, cy, w, "通用提示色", &meta, 3);
+    }
+    note(f, x, y + 344., w, "选好颜色后即时生效并保存。", p.muted);
+}
+
+fn color_group(
+    f: &mut Frame,
+    hs: &mut Vec<Hit>,
+    m: &Model,
+    t: &Theme,
+    x: f32,
+    mut y: f32,
+    w: f32,
+    title: &str,
+    items: &[(&str, &str, &str)],
+    cols: usize,
+) -> f32 {
+    let p = tokens(t);
+    let cols = cols.max(1);
+    rect(f, x, y + 2., 2., 11., alpha(p.accent, 0.72));
+    text(f, x + 9., y, T_NOTE, title, p.text2);
+    y += 20.;
+    let gap = 8.;
+    let col_w = (w - (cols - 1) as f32 * gap) / cols as f32;
+    let selected = selected_color(m);
+    for (i, (key, label, fallback)) in items.iter().enumerate() {
+        let rx = x + (i % cols) as f32 * (col_w + gap);
+        let ry = y + (i / cols) as f32 * 34.;
+        let on = selected == *key;
+        round(
+            f,
+            rx,
+            ry,
+            col_w,
+            30.,
+            6.,
+            if on {
+                alpha(p.accent, 0.05)
+            } else {
+                p.surface2
+            },
+            Some(if on { alpha(p.accent, 0.8) } else { p.line }),
+        );
+        let hex = color_hex(m, key, fallback);
+        round(
+            f,
+            rx + 8.,
+            ry + 6.,
+            22.,
+            18.,
+            4.,
+            parse_color(&hex).unwrap_or(p.text2),
+            Some(alpha(p.line2, 0.9)),
+        );
+        let show_hex = col_w >= 168.;
+        let label_w = col_w - 38. - if show_hex { 64. } else { 6. };
+        text(
+            f,
+            rx + 38.,
+            ry + 8.,
+            T_NOTE,
+            elide_width(label, label_w.max(24.), T_NOTE),
+            if on { p.accent } else { p.text },
+        );
+        if show_hex {
+            let hex_w = hex.chars().count() as f32 * 11. * 0.6;
+            mono(
+                f,
+                rx + col_w - 8. - hex_w,
+                ry + 9.,
+                11.,
+                hex,
+                if on { alpha(p.accent, 0.85) } else { p.muted },
+            );
+        }
+        hit_box(
+            hs,
+            rx,
+            ry,
+            col_w,
+            30.,
+            crate::aux_marker(&format!("pref_color_choose:{key}")),
+        );
+    }
+    y + ((items.len().max(1) + cols - 1) / cols) as f32 * 34.
+}
+
+/// Full color preview for the palette page: six word classes, or all ten
+/// candidate ranks. Unlike the compact hint-toggle preview this intentionally
+/// shows the configured colors even while word hints are switched off, because
+/// this page is the color editor.
+fn hint_color_preview(f: &mut Frame, m: &Model, t: &Theme, x: f32, py: f32, w: f32) {
+    let p = tokens(t);
+    let rank_mode = enabled(m, "hint_rank_colors", false);
+    let one_row = if rank_mode { w >= 680. } else { w >= 600. };
+    let h = if one_row { 140. } else { 200. };
+    round(f, x, py, w, h, 8., p.surface2, Some(p.line));
+    text(f, x + 16., py + 12., T_LABEL, "配色预览", p.text);
+    note(
+        f,
+        x + w - 16. - 110.,
+        py + 14.,
+        110.,
+        "正文与 F10 同步",
+        p.muted,
+    );
+    let show_code = enabled(m, "hint_show_code", true);
+    let show_rank = enabled(m, "hint_show_rank", true);
+    let max_len = if m.max_code_length == 0 {
+        4
+    } else {
+        m.max_code_length
+    };
+    let class_examples = [
+        ("一码词", "a", 1, "一简词"),
+        ("简码", "ab", 1, "简码"),
+        ("三码", "abc", 1, "二字三码"),
+        ("全码", "abcd", 1, "二字全码"),
+        ("三字词", "abcd", 1, "三字全码"),
+        ("四字词语", "abcd", 1, "长词全码"),
+    ];
+    let rank_examples: [(&str, &str, usize, String); 10] = std::array::from_fn(|i| {
+        let rank = i + 1;
+        ("词组", "abcd", rank, format!("{rank} 选"))
+    });
+    let examples: Vec<(&str, &str, usize, String)> = if rank_mode {
+        rank_examples.to_vec()
+    } else {
+        class_examples
+            .iter()
+            .map(|(word, code, rank, caption)| (*word, *code, *rank, (*caption).to_string()))
+            .collect()
+    };
+    let cols = if one_row {
+        examples.len()
+    } else if rank_mode {
+        5
+    } else {
+        3
+    };
+    let cell = (w - 32.) / cols as f32;
+    let row_h = 66.;
+    let size = 22.;
+    let code_size = hint_size(m).min(16.);
+    for (i, (word, code, rank, caption)) in examples.into_iter().enumerate() {
+        let sx = x + 16. + (i % cols) as f32 * cell;
+        let sy = py + 36. + (i / cols) as f32 * row_h;
+        let caption_w = ui_text_width(&caption, 11.);
+        text(
+            f,
+            sx + (cell - caption_w).max(0.) / 2.,
+            sy,
+            11.,
+            &caption,
+            if rank_mode { p.text2 } else { p.muted },
+        );
+        let word_y = sy + 15.;
+        let tint = crate::ui::hint_word_tint_for_rank(&p, word, code, rank, max_len, rank_mode);
+        let word_w = ui_text_width(word, size);
+        let wx = sx + (cell - word_w).max(0.) / 2.;
+        body_text(f, wx, word_y, size, word, tint.unwrap_or(p.text2));
+        if crate::analysis::is_multi_word(word) {
+            let underline = tint
+                .map(|color| alpha(color, 0.62))
+                .unwrap_or(p.hint_underline);
+            rect(f, wx, word_y + size + 3., word_w.max(0.), 2., underline);
+        }
+        let code_w = if show_code {
+            code.chars().count() as f32 * code_size * 0.6
+        } else {
+            0.
+        };
+        let rank_size = code_size * 0.78;
+        let rank_w = if show_rank && rank > 1 {
+            rank.to_string().chars().count() as f32 * rank_size * 0.6
+        } else {
+            0.
+        };
+        let gap = if code_w > 0. && rank_w > 0. { 2. } else { 0. };
+        let hx = sx + (cell - code_w - gap - rank_w).max(0.) / 2.;
+        if show_code {
+            mono(
+                f,
+                hx,
+                word_y + size + 8.,
+                code_size,
+                code,
+                alpha(tint.unwrap_or(p.hint_code), 0.92),
+            );
+        }
+        if show_rank && rank > 1 {
+            mono(
+                f,
+                hx + code_w + gap,
+                word_y + size + 4.,
+                rank_size,
+                rank.to_string(),
+                alpha(tint.unwrap_or(p.hint_badge), 0.95),
+            );
+        }
+    }
+    note(
+        f,
+        x + 16.,
+        py + h - 20.,
+        w - 32.,
+        "配色作用于词组；单字与标点保持普通字色。",
+        p.muted,
+    );
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1253,22 +1827,20 @@ mod tests {
         assert!(v[0].multi);
         m.fields.insert("pref_tab".into(), "2".into());
         let (x, y, pw, ph) = panel_for_model(&m, 1280., 800.);
-        let v = fields(&m, x, y, pw, ph);
-        assert_eq!(v[0].id, "pref_color_hex");
-        assert!(!v[0].multi);
+        assert!(fields(&m, x, y, pw, ph).is_empty());
         m.fields.insert("pref_tab".into(), "3".into());
         let (x, y, pw, ph) = panel_for_model(&m, 1280., 800.);
+        assert!(fields(&m, x, y, pw, ph).is_empty());
+        select_page(&mut m, 0);
+        select_hint_view(&mut m, "colors");
+        assert!(fields(&m, x, y, pw, ph).is_empty());
+        select_hint_view(&mut m, "settings");
         assert!(fields(&m, x, y, pw, ph).is_empty());
     }
 
     #[test]
     fn native_editor_rectangles_match_the_drawn_boxes() {
-        for (w, h, tab) in [
-            (1280., 800., 1u8),
-            (800., 600., 1),
-            (1280., 800., 2),
-            (800., 600., 2),
-        ] {
+        for (w, h, tab) in [(1280., 800., 1u8), (800., 600., 1)] {
             let m = preference_model(tab);
             let (x, y, pw, ph) = panel_for_model(&m, w, h);
             let t = crate::ui::theme("墨玉");
@@ -1326,15 +1898,15 @@ mod tests {
     fn every_page_fits_the_first_screen_at_1280x800() {
         // 最底部的两页留出 ≥12px 呼吸空间，避免卡片下沿压在页脚分割线上。
         assert!(SCORE_PREVIEW_Y + SCORE_PREVIEW_H <= BODY_VISIBLE_800 - 12.);
-        // 外观与颜色页末端：三态预览 548+68，留 12px。
-        assert!(548. + 68. <= BODY_VISIBLE_800 - 12.);
+        // 外观与颜色页末端：三态预览 568+48，留 12px。
+        assert!(568. + 48. <= BODY_VISIBLE_800 - 12.);
         assert!(PRACTICE_PREVIEW_Y + PRACTICE_PREVIEW_H <= BODY_VISIBLE_800);
         assert!(DATA_CARD2_Y + DATA_CARD_H <= BODY_VISIBLE_800);
         // 800×600 靠滚动可达：任何一页都不超过滚动上限。
         for end in [
             PRACTICE_PREVIEW_Y + PRACTICE_PREVIEW_H,
             SCORE_PREVIEW_Y + SCORE_PREVIEW_H,
-            548. + 68.,
+            568. + 48.,
             DATA_CARD2_Y + DATA_CARD_H,
         ] {
             assert!(end <= BODY_BUDGET);
@@ -1351,7 +1923,8 @@ mod tests {
             let visible_end = y + view - PANEL_FOOT;
             let hs = hit_targets(&m, 800., 600.);
             let inside = |hs: &[Hit], a: &Action| {
-                hs.iter().any(|h| &h.action == a && h.y >= y && h.y + h.h <= visible_end)
+                hs.iter()
+                    .any(|h| &h.action == a && h.y >= y && h.y + h.h <= visible_end)
             };
             for i in 0..4 {
                 assert!(
@@ -1361,9 +1934,13 @@ mod tests {
             }
             let anchors: Vec<Action> = match tab {
                 0 => vec![
+                    Action::ToggleHints,
                     crate::aux_marker("pref_toggle:hint_show_code"),
                     crate::aux_marker("pref_toggle:hint_show_rank"),
-                    crate::aux_marker("pref_step:hint_font_size:1"),
+                    crate::aux_marker("pref_toggle:hint_color_words"),
+                    crate::aux_marker("pref_strategy:shortest"),
+                    crate::aux_marker("pref_strategy:phrases"),
+                    crate::aux_marker("pref_toggle:hint_dynamic"),
                 ],
                 1 => vec![
                     crate::aux_marker("pref_toggle:score_auto_copy"),
@@ -1374,15 +1951,12 @@ mod tests {
                     Action::Theme("宣纸".into()),
                     Action::Font(2),
                     Action::MotionLevel(2),
-                    crate::aux_marker(&format!("pref_color_select:{}", COLORS[0].0)),
+                    crate::aux_marker(&format!("pref_color_choose:{}", COLORS[0].0)),
                 ],
                 _ => vec![Action::Folder],
             };
             for a in anchors {
-                assert!(
-                    inside(&hs, &a),
-                    "800×600 tab={tab}: 主控件 {a:?} 不在首屏"
-                );
+                assert!(inside(&hs, &a), "800×600 tab={tab}: 主控件 {a:?} 不在首屏");
             }
             let _ = (x, pw);
         }
@@ -1402,15 +1976,21 @@ mod tests {
         }
         // 练习
         let hs = hit_targets(&preference_model(0), 1280., 800.);
-        for key in ["hint_show_code", "hint_show_rank"] {
+        assert!(hs.iter().any(|h| h.action == Action::ToggleHints));
+        for key in [
+            "hint_show_code",
+            "hint_show_rank",
+            "hint_color_words",
+            "hint_dynamic",
+        ] {
             assert!(hs
                 .iter()
                 .any(|h| h.action == crate::aux_marker(&format!("pref_toggle:{key}"))));
         }
         for delta in ["-1", "1"] {
-            assert!(hs
-                .iter()
-                .any(|h| h.action == crate::aux_marker(&format!("pref_step:hint_font_size:{delta}"))));
+            assert!(hs.iter().any(
+                |h| h.action == crate::aux_marker(&format!("pref_step:hint_font_size:{delta}"))
+            ));
         }
         // 成绩单：两行开关、全部字段 chip、5 个预设、保存。
         let hs = hit_targets(&preference_model(1), 1280., 800.);
@@ -1435,11 +2015,13 @@ mod tests {
         assert!(hs
             .iter()
             .any(|h| h.action == crate::aux_marker("pref_save_template")));
-        // 外观与颜色页：主题、字号、动效、8 个颜色行、应用、恢复默认。
+        // 外观与颜色页：主题、字号、动效与跟打区三态。
         let hs = hit_targets(&preference_model(2), 1280., 800.);
         for a in [
             Action::Theme("宣纸".into()),
             Action::Font(2),
+            Action::FontChoose,
+            Action::FontDefault,
             Action::MotionLevel(2),
             Action::AppearanceReset,
         ] {
@@ -1448,17 +2030,251 @@ mod tests {
         for (key, _, _) in COLORS {
             assert!(hs
                 .iter()
-                .any(|h| h.action == crate::aux_marker(&format!("pref_color_select:{key}"))));
+                .any(|h| h.action == crate::aux_marker(&format!("pref_color_choose:{key}"))));
         }
         assert_eq!(
             hs.iter()
                 .filter(|h| h.action == crate::aux_marker("pref_apply_colors"))
                 .count(),
-            1
+            0
         );
         // 数据页：打开目录。
         let hs = hit_targets(&preference_model(3), 1280., 800.);
         assert!(hs.iter().any(|h| h.action == Action::Folder));
+    }
+
+    #[test]
+    fn active_round_locks_strategy_and_dynamic_without_hiding_display_controls() {
+        let mut m = preference_model(0);
+        let actions = [
+            crate::aux_marker("pref_strategy:shortest"),
+            crate::aux_marker("pref_strategy:phrases"),
+            crate::aux_marker("pref_toggle:hint_dynamic"),
+        ];
+        let hs = hit_targets(&m, 640., 600.);
+        assert!(actions
+            .iter()
+            .all(|action| hs.iter().any(|hit| &hit.action == action)));
+        m.fields
+            .insert("hint_settings_locked".into(), "true".into());
+        let hs = hit_targets(&m, 640., 600.);
+        assert!(actions
+            .iter()
+            .all(|action| hs.iter().all(|hit| &hit.action != action)));
+        assert!(hs
+            .iter()
+            .any(|hit| hit.action == crate::aux_marker("pref_toggle:hint_show_code")));
+    }
+
+    #[test]
+    fn word_colors_open_the_palette_and_fit_both_modes_on_the_narrow_page() {
+        let mut m = preference_model(0);
+        select_hint_view(&mut m, "colors");
+        let w = 336.;
+        for rank_mode in [false, true] {
+            m.fields
+                .insert("hint_rank_colors".into(), rank_mode.to_string());
+            let mut f = Frame::new(w, BODY_BUDGET);
+            let mut hs = Vec::new();
+            practice_page(&mut f, &mut hs, &m, &crate::ui::theme("墨玉"), 0., 0., w);
+            for (key, _, _) in page_colors(&m) {
+                let hit = hs
+                    .iter()
+                    .find(|hit| {
+                        hit.action == crate::aux_marker(&format!("pref_color_choose:{key}"))
+                    })
+                    .unwrap();
+                assert!(hit.x >= 0. && hit.x + hit.w <= w);
+                assert!(hit.y >= 152. && hit.y + hit.h <= 380.);
+            }
+            assert!(fields(&m, 0., 0., 640., CONTENT_HEIGHT).is_empty());
+            assert!(f.cmds.iter().all(|cmd| !matches!(cmd, DrawCmd::TextRun {text, ..} if text.contains("RRGGBB") || text.starts_with('#'))));
+        }
+    }
+
+    #[test]
+    fn switching_color_pages_rebinds_the_editor_and_keeps_colors_in_their_page() {
+        let mut m = preference_model(2);
+        m.fields
+            .insert("color_跟打区背景色".into(), "123456".into());
+        m.fields.insert("color_词提编码色".into(), "654321".into());
+        sync_color_editor(&mut m);
+        assert_eq!(m.field("pref_color_key"), "跟打区背景色");
+        assert_eq!(m.field("pref_color_hex"), "123456");
+        let epoch = m.modal_epoch;
+        m.panel_scroll = 200.;
+        select_page(&mut m, 0);
+        select_hint_view(&mut m, "colors");
+        assert_eq!(m.field("pref_color_key"), "词提编码色");
+        assert_eq!(m.field("pref_color_hex"), "654321");
+        assert_eq!(m.panel_scroll, 0.);
+        assert_eq!(m.modal_epoch, epoch + 2);
+        let hints = hit_targets(&m, 1280., 800.);
+        let appearance = hit_targets(&preference_model(2), 1280., 800.);
+        for (colors, own, other) in [
+            (HINT_COLORS, &hints, &appearance),
+            (COLORS, &appearance, &hints),
+        ] {
+            for (key, _, _) in colors {
+                let action = crate::aux_marker(&format!("pref_color_choose:{key}"));
+                assert!(own.iter().any(|hit| hit.action == action));
+                assert!(other.iter().all(|hit| hit.action != action));
+            }
+        }
+        assert!(color_allowed(&m, "词提下划线色"));
+        assert!(!color_allowed(&m, "跟打区背景色"));
+        select_page(&mut m, 2);
+        assert_eq!(m.field("pref_color_key"), "跟打区背景色");
+        assert_eq!(m.field("pref_color_hex"), "123456");
+        assert!(!color_allowed(&m, "词提一码色"));
+    }
+
+    #[test]
+    fn practice_preview_matches_word_colors_and_candidate_rank_rules() {
+        let t = crate::ui::theme("墨玉");
+        let p = tokens(&t);
+        let mut m = preference_model(0);
+        m.hints = true;
+        m.max_code_length = 4;
+        let render = |m: &Model| {
+            let mut f = Frame::new(640., 600.);
+            practice_page(&mut f, &mut Vec::new(), m, &t, 0., 0., 336.);
+            f
+        };
+        let body_color = |f: &Frame, word: &str| {
+            f.cmds
+                .iter()
+                .find_map(|cmd| match cmd {
+                    DrawCmd::TextRun {
+                        text,
+                        color,
+                        font: FontFamily::Lxgw,
+                        ..
+                    } if text == word => Some(*color),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        let mono_texts = |f: &Frame| {
+            f.cmds
+                .iter()
+                .filter_map(|cmd| match cmd {
+                    DrawCmd::TextRun {
+                        text,
+                        font: FontFamily::Mono,
+                        ..
+                    } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let f = render(&m);
+        assert_eq!(body_color(&f, "的"), p.text2);
+        assert_eq!(
+            body_color(&f, "简明"),
+            crate::ui::hint_word_tint(&p, "简明", "a", 4).unwrap()
+        );
+        assert_eq!(
+            body_color(&f, "来来来"),
+            crate::ui::hint_word_tint(&p, "来来来", "aaah", 4).unwrap()
+        );
+        assert_eq!(mono_texts(&f), ["u", "a", "aaah", "2"]);
+        m.fields.insert("hint_show_code".into(), "false".into());
+        assert_eq!(mono_texts(&render(&m)), ["2"]);
+        m.fields.insert("hint_show_rank".into(), "false".into());
+        m.fields.insert("hint_color_words".into(), "false".into());
+        let f = render(&m);
+        assert!(mono_texts(&f).is_empty());
+        assert_eq!(body_color(&f, "简明"), p.text2);
+        m.fields.clear();
+        m.hints = false;
+        let f = render(&m);
+        assert!(mono_texts(&f).is_empty());
+        assert_eq!(body_color(&f, "来来来"), p.text2);
+    }
+
+    #[test]
+    fn narrow_practice_page_keeps_four_switches_and_size_controls_reachable() {
+        let m = preference_model(0);
+        let hs = hit_targets(&m, 640., 600.);
+        for action in [
+            Action::ToggleHints,
+            crate::aux_marker("pref_toggle:hint_show_code"),
+            crate::aux_marker("pref_toggle:hint_show_rank"),
+            crate::aux_marker("pref_toggle:hint_color_words"),
+            crate::aux_marker("pref_step:hint_font_size:-1"),
+            crate::aux_marker("pref_step:hint_font_size:1"),
+        ] {
+            let hit = hs.iter().find(|h| h.action == action).unwrap();
+            assert!(hit.x >= 0. && hit.x + hit.w <= 640.);
+        }
+        assert!(PRACTICE_PREVIEW_Y + PRACTICE_PREVIEW_H <= BODY_BUDGET);
+    }
+
+    #[test]
+    fn typography_labels_values_and_buttons_do_not_overlap_in_narrow_columns() {
+        let m = preference_model(2);
+        let t = crate::ui::theme("墨玉");
+        let mut cfg = Config::default();
+        cfg.font_size = 100.;
+        cfg.line_gap = 2.2;
+        for width in [336., 704.] {
+            let mut f = Frame::new(width, 752.);
+            let mut hs = Vec::new();
+            appearance_page(
+                &mut f,
+                &mut hs,
+                &m,
+                &Session::new(100),
+                &cfg,
+                &t,
+                0.,
+                0.,
+                width,
+            );
+            let text_box = |label: &str| {
+                f.cmds
+                    .iter()
+                    .find_map(|cmd| match cmd {
+                        DrawCmd::TextRun { x, y, h, text, .. } if text == label => {
+                            Some((*x, *y, ui_text_width(text, *h), *h))
+                        }
+                        _ => None,
+                    })
+                    .unwrap()
+            };
+            let intersects = |a: (f32, f32, f32, f32), b: (f32, f32, f32, f32)| {
+                a.0 < b.0 + b.2 && b.0 < a.0 + a.2 && a.1 < b.1 + b.3 && b.1 < a.1 + a.3
+            };
+            for (label, value, minus, plus) in [
+                ("字号 10–100", "100 px", Action::Font(-2), Action::Font(2)),
+                (
+                    "行距",
+                    "3.20",
+                    Action::LineHeight(-1),
+                    Action::LineHeight(1),
+                ),
+            ] {
+                let label_box = text_box(label);
+                let value_box = text_box(value);
+                assert!(
+                    !intersects(label_box, value_box),
+                    "width={width}: {label}/{value}"
+                );
+                for action in [minus, plus] {
+                    let hit = hs.iter().find(|hit| hit.action == action).unwrap();
+                    let button = (hit.x, hit.y, hit.w, hit.h);
+                    assert!(
+                        !intersects(label_box, button),
+                        "width={width}: {label}/{action:?}"
+                    );
+                    assert!(
+                        !intersects(value_box, button),
+                        "width={width}: {value}/{action:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

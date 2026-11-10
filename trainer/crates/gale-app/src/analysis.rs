@@ -2,11 +2,39 @@
 use std::collections::BTreeMap;
 
 pub fn is_multi_word(text: &str) -> bool {
-    text.chars()
-        .filter(|ch| ch.is_alphanumeric())
-        .take(2)
-        .count()
-        == 2
+    text.chars().take(2).count() == 2 && text.chars().all(char::is_alphanumeric)
+}
+
+/// The six prompt colors describe word length and base-code length, without
+/// selection keys or commit tails. Both the article and F10 use this classifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WordColorClass {
+    Short = 0,
+    Two3 = 1,
+    Two4 = 2,
+    Three = 3,
+    Long = 4,
+    One = 5,
+}
+pub fn word_color_class(text: &str, code: &str) -> Option<WordColorClass> {
+    if code.is_empty() || !is_multi_word(text) {
+        return None;
+    }
+    let chars = text.chars().count();
+    let keys = code.chars().count();
+    Some(if keys == 1 {
+        WordColorClass::One
+    } else if keys <= 2 || (chars >= 3 && keys == 3) {
+        WordColorClass::Short
+    } else if chars == 2 && keys == 3 {
+        WordColorClass::Two3
+    } else if chars == 2 {
+        WordColorClass::Two4
+    } else if chars == 3 {
+        WordColorClass::Three
+    } else {
+        WordColorClass::Long
+    })
 }
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
@@ -81,6 +109,9 @@ fn literal_keys(text: &str) -> Option<String> {
                 '【' => "[".into(),
                 '】' => "]".into(),
                 '￥' => "$".into(),
+                '…' => "^".into(),
+                '—' => "_".into(),
+                '·' => "~".into(),
                 c if c.is_ascii() && !c.is_control() => c.to_string(),
                 _ => return None,
             })
@@ -89,20 +120,13 @@ fn literal_keys(text: &str) -> Option<String> {
         .map(|parts| parts.concat())
 }
 
-pub fn entry_keys(entry: &FullAnalysisEntry, auto4: bool, _max_code_length: usize) -> String {
+pub fn entry_keys(entry: &FullAnalysisEntry, _auto4: bool, _max_code_length: usize) -> String {
     let Some(code) = &entry.code else {
         return literal_keys(&entry.word).unwrap_or_default();
     };
-    let tail = if entry.rank == 1 && code.len() == 4 {
-        if auto4 {
-            ""
-        } else {
-            " "
-        }
-    } else {
-        entry.tail.as_str()
-    };
-    format!("{}{}", code, tail.replace('_', " "))
+    // The route solver knows whether following punctuation commits a pending
+    // candidate. Reconstructing tails here would change both the route and F10.
+    format!("{}{}", code, entry.tail.replace('_', " "))
 }
 
 fn physical_key(ch: char) -> Option<(u8, bool)> {
@@ -301,7 +325,55 @@ mod tests {
             (6, 1, 9, 1)
         );
         assert_eq!(a.key_counts[&0x10], 1);
-        assert_eq!(summarize(&fa, false).known_keys, 10);
+        assert_eq!(summarize(&fa, false).known_keys, 9);
+        let mut explicit_confirm = fa.clone();
+        explicit_confirm.entries[0].tail = "_".into();
+        assert_eq!(summarize(&explicit_confirm, false).known_keys, 10);
+    }
+    #[test]
+    fn executable_recipe_preserves_server_pending_and_confirmation_tails() {
+        for (code, rank, tail, keys) in [
+            ("ab", 1, "", "ab"),
+            ("abcd", 1, "", "abcd"),
+            ("abcd", 1, "_", "abcd "),
+            ("abcde", 1, "_", "abcde "),
+            ("abc", 2, ";", "abc;"),
+        ] {
+            let entry = FullAnalysisEntry {
+                word: "词组".into(),
+                code: Some(code.into()),
+                rank,
+                tail: tail.into(),
+                ..Default::default()
+            };
+            for auto4 in [false, true] {
+                assert_eq!(entry_keys(&entry, auto4, 4), keys);
+            }
+        }
+    }
+    #[test]
+    fn prompt_word_colors_use_the_six_extracted_classes() {
+        use WordColorClass::*;
+        for (word, code, expected) in [
+            ("词组", "a", Some(One)),
+            ("更长的词", "a", Some(One)),
+            ("𠮷甲", "a", Some(One)),
+            ("词组", "ab", Some(Short)),
+            ("三字词", "abc", Some(Short)),
+            ("更长的词", "abc", Some(Short)),
+            ("词组", "abc", Some(Two3)),
+            ("词组", "abcd", Some(Two4)),
+            ("三字词", "abcd", Some(Three)),
+            ("四字词语", "abcd", Some(Long)),
+            ("𠮷甲", "abc", Some(Two3)),
+            ("甲", "a", None),
+            ("……", "a", None),
+            ("……", "abc", None),
+            ("词，词", "abc", None),
+            ("词组", "", None),
+        ] {
+            assert_eq!(word_color_class(word, code), expected, "{word}/{code}");
+        }
     }
     #[test]
     fn malformed_or_incomplete_recipe_is_rejected() {
@@ -335,6 +407,25 @@ mod tests {
                 summary.known_keys
             ),
             (7, 0, 8)
+        );
+        let singles = FullAnalysis {
+            entries: ["…", "—", "·"]
+                .into_iter()
+                .map(|word| FullAnalysisEntry {
+                    word: word.into(),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let summary = summarize(&singles, true);
+        assert_eq!(
+            (
+                summary.char_count,
+                summary.missing_chars,
+                summary.known_keys
+            ),
+            (3, 0, 6)
         );
     }
 }

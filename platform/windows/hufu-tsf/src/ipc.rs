@@ -699,8 +699,7 @@ fn call_on(
                 // 失败的 400ms：挂死可能自愈，且本次已付全价等待）。
                 CONN_DOWN_UNTIL_MS.store(
                     now_ms() + 200,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
+                    std::sync::atomic::Ordering::Relaxed);
                 *file = None;
                 return None;
             }
@@ -711,8 +710,7 @@ fn call_on(
                 // 400ms 正常退避，两值取后写者，无冲突）。
                 CONN_DOWN_UNTIL_MS.store(
                     now_ms() + 200,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
+                    std::sync::atomic::Ordering::Relaxed);
                 *file = None;
                 return None;
             }
@@ -738,6 +736,120 @@ fn call_on(
             return serde_json::from_slice(buf).ok();
         }
         None
+    }
+}
+
+/// Forward numerical outcomes only to a same-thread opt-in input control.
+/// Synchronous delivery queues the event before the corresponding commit can
+/// finish a training segment; it never calls TSF or shares input text.
+fn publish_trainer_outcome(outcome: &Value, key: &str) {
+    use windows::core::w;
+    use windows::Win32::Foundation::{LPARAM, WPARAM};
+    use windows::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId};
+    use windows::Win32::UI::Input::KeyboardAndMouse::GetFocus;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetPropW, GetWindowThreadProcessId, RegisterWindowMessageW, SendMessageW,
+    };
+    let rank = match outcome.get("selection") {
+        Some(Value::Null) => 0,
+        Some(value) => match value.as_u64().filter(|rank| (1..=10).contains(rank)) {
+            Some(rank) => rank as usize,
+            None => return,
+        },
+        None => return, // An older server has no authoritative selection data.
+    };
+    unsafe {
+        let focus = GetFocus();
+        if focus.0.is_null() {
+            return;
+        }
+        let mut process = 0;
+        let thread = GetWindowThreadProcessId(focus, Some(&mut process));
+        if process != GetCurrentProcessId()
+            || thread != GetCurrentThreadId()
+            || GetPropW(focus, w!("HuFu.Trainer.InputOutcome.v1")).0 as usize != 1
+        {
+            return;
+        }
+        static MESSAGE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        let message =
+            *MESSAGE.get_or_init(|| RegisterWindowMessageW(w!("HuFu.Trainer.InputOutcome.v1")));
+        if message != 0 {
+            SendMessageW(
+                focus,
+                message,
+                WPARAM(rank),
+                LPARAM(trainer_key_vk(key) as isize),
+            );
+        }
+    }
+}
+
+fn trainer_key_vk(key: &str) -> u32 {
+    match key {
+        "space" => 0x20,
+        "enter" => 0x0D,
+        "tab" => 0x09,
+        "backspace" => 0x08,
+        "delete" => 0x2E,
+        "escape" => 0x1B,
+        "home" => 0x24,
+        "end" => 0x23,
+        "pageup" => 0x21,
+        "pagedown" => 0x22,
+        "left" => 0x25,
+        "right" => 0x27,
+        "up" => 0x26,
+        "down" => 0x28,
+        "capslock" => 0x14,
+        "shiftleft" => 0xA0,
+        "shiftright" => 0xA1,
+        "ctrlleft" => 0xA2,
+        "ctrlright" => 0xA3,
+        "altleft" => 0xA4,
+        "altright" => 0xA5,
+        "numadd" => 0x6B,
+        "numsub" => 0x6D,
+        "nummul" => 0x6A,
+        "numdiv" => 0x6F,
+        "numdot" => 0x6E,
+        "numenter" => 0x0E,
+        _ => {
+            if let Some(n) = key.strip_prefix('f').and_then(|n| n.parse::<u32>().ok()) {
+                if (1..=12).contains(&n) {
+                    return 0x6F + n;
+                }
+            }
+            if let Some(n) = key.strip_prefix("num").and_then(|n| n.parse::<u32>().ok()) {
+                if n <= 9 {
+                    return 0x60 + n;
+                }
+            }
+            let mut chars = key.chars();
+            let Some(ch) = chars.next() else {
+                return 0;
+            };
+            if chars.next().is_some() {
+                return 0;
+            }
+            match ch {
+                'a'..='z' | 'A'..='Z' => ch.to_ascii_uppercase() as u32,
+                '0'..='9' => ch as u32,
+                ' ' => 0x20,
+                ';' => 0xBA,
+                '=' => 0xBB,
+                ',' => 0xBC,
+                '-' => 0xBD,
+                '.' => 0xBE,
+                '/' => 0xBF,
+                '`' => 0xC0,
+                '[' => 0xDB,
+                '\\' => 0xDC,
+                ']' => 0xDD,
+                '\'' => 0xDE,
+                _ => 0,
+            }
+        }
     }
 }
 
@@ -818,6 +930,13 @@ pub fn key_request(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+    if sound.is_some() {
+        crate::sound::set_settings(true, sound_vol, &sound_pack);
+    } else if consumed {
+        // Every consumed key carries a sound tag when the switch is enabled.
+        crate::sound::set_enabled(false);
+    }
+    publish_trainer_outcome(outcome, key);
     Some((consumed, commit, back, state, sound, sound_vol, sound_pack))
 }
 
@@ -826,7 +945,8 @@ pub fn key_request(
 /// 轮询用：拉当前会话态（不产生按键副作用）。供候选窗停顿期刷新
 /// （异步重排到达后主动换序，用户不必按键即可看到新首选）。
 pub fn state_request() -> Option<Value> {
-    let mut resp = match call(&serde_json::json!({"op": "state", "candidate_ui": crate::candidate_ui::request()})) {Some(r)=>r,None=>{crate::candidate_ui::reset();return None;}};
+    let mut resp = match call(&serde_json::json!({"op": "state", "candidate_ui": crate::candidate_ui::request()}),
+    ) {Some(r)=>r,None=>{crate::candidate_ui::reset();return None;}};
     // 【2026-11 UI-less 异步刷新】轮询响应里带回了最新候选页（含后台重排/
     // 云候选到达后的结果）。这里无条件 publish 一次：宿主自绘（UI-less）
     // 时我们的候选窗被隐藏，渲染路径不一定走到 update_ui，靠这一行保证
@@ -851,5 +971,156 @@ pub fn clipboard_request(exe: &str) -> Option<String> {
     match resp.get("text") {
         Some(Value::String(s)) => Some(s.clone()),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod trainer_outcome_tests {
+    use super::*;
+    use std::sync::{
+        atomic::{AtomicU32, Ordering},
+        Mutex,
+    };
+    use windows::core::w;
+    use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, WPARAM};
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW, RegisterWindowMessageW,
+        RemovePropW, SetPropW, UnregisterClassW, WINDOW_EX_STYLE, WNDCLASSW, WS_CHILD,
+        WS_OVERLAPPEDWINDOW,
+    };
+
+    static MESSAGE: AtomicU32 = AtomicU32::new(0);
+    static RECEIVED: Mutex<Vec<(usize, isize)>> = Mutex::new(Vec::new());
+
+    unsafe extern "system" fn probe_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+        if msg == MESSAGE.load(Ordering::Relaxed) && msg != 0 {
+            RECEIVED.lock().unwrap().push((wp.0, lp.0));
+            return LRESULT(0);
+        }
+        DefWindowProcW(hwnd, msg, wp, lp)
+    }
+
+    struct Fixture {
+        parent: HWND,
+        child: HWND,
+        old_focus: HWND,
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = RemovePropW(self.child, w!("HuFu.Trainer.InputOutcome.v1"));
+                let _ = SetFocus(self.old_focus);
+                let _ = DestroyWindow(self.parent);
+                let _ = UnregisterClassW(
+                    w!("HuFuTrainerOutcomeProbe"),
+                    GetModuleHandleW(None).unwrap(),
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a Windows desktop; creates only a hidden private test window"]
+    fn native_trainer_outcomes_require_opt_in_focus_and_preserve_protocol() {
+        unsafe {
+            let instance = GetModuleHandleW(None).unwrap();
+            let class = WNDCLASSW {
+                lpfnWndProc: Some(probe_proc),
+                hInstance: instance.into(),
+                lpszClassName: w!("HuFuTrainerOutcomeProbe"),
+                ..Default::default()
+            };
+            assert_ne!(RegisterClassW(&class), 0);
+            let parent = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                class.lpszClassName,
+                None,
+                WS_OVERLAPPEDWINDOW,
+                0,
+                0,
+                100,
+                100,
+                None,
+                None,
+                instance,
+                None,
+            )
+            .unwrap();
+            let child = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                class.lpszClassName,
+                None,
+                WS_CHILD,
+                0,
+                0,
+                10,
+                10,
+                parent,
+                None,
+                instance,
+                None,
+            )
+            .unwrap();
+            let fixture = Fixture {
+                parent,
+                child,
+                old_focus: GetFocus(),
+            };
+            MESSAGE.store(
+                RegisterWindowMessageW(w!("HuFu.Trainer.InputOutcome.v1")),
+                Ordering::Relaxed,
+            );
+            RECEIVED.lock().unwrap().clear();
+            let _ = SetFocus(child);
+            assert_eq!(GetFocus(), child);
+
+            publish_trainer_outcome(&serde_json::json!({"selection":2}), ";");
+            assert!(
+                RECEIVED.lock().unwrap().is_empty(),
+                "unrelated controls do not receive outcomes"
+            );
+            SetPropW(
+                child,
+                w!("HuFu.Trainer.InputOutcome.v1"),
+                HANDLE(1usize as _),
+            )
+            .unwrap();
+            publish_trainer_outcome(&serde_json::json!({"selection":2}), ";");
+            assert_eq!(
+                *RECEIVED.lock().unwrap(),
+                vec![(2, 0xBA)],
+                "delivery is synchronous"
+            );
+            publish_trainer_outcome(&serde_json::json!({"selection":null}), "space");
+            publish_trainer_outcome(&serde_json::json!({"selection":3}), "shiftleft");
+            assert_eq!(
+                *RECEIVED.lock().unwrap(),
+                vec![(2, 0xBA), (0, 0x20), (3, 0xA0)]
+            );
+            for invalid in [
+                serde_json::json!({}),
+                serde_json::json!({"selection":11}),
+                serde_json::json!({"selection":-1}),
+                serde_json::json!({"selection":"2"}),
+            ] {
+                publish_trainer_outcome(&invalid, "2");
+            }
+            assert_eq!(
+                RECEIVED.lock().unwrap().len(),
+                3,
+                "old or malformed responses convey no authority"
+            );
+            let _ = SetFocus(parent);
+            assert_eq!(GetFocus(), parent);
+            publish_trainer_outcome(&serde_json::json!({"selection":2}), "2");
+            assert_eq!(
+                RECEIVED.lock().unwrap().len(),
+                3,
+                "opt-in belongs to the exact focused control"
+            );
+            drop(fixture);
+        }
     }
 }

@@ -1123,6 +1123,12 @@ static HOST_HANDLE: std::sync::OnceLock<std::sync::Arc<std::sync::Mutex<Host>>> 
 /// 时客户端带 1 与服务端一致，不会误报冲突。
 static CONFIG_REV: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
+/// 【2026-11-11 并行测试互踩修复】CONFIG_REV 与词提码表缓存（trainer::sources::SOURCES）
+/// 均为进程级全局：并行的路由测试（config CAS / trainer 词提）互推 rev、互切来源，
+/// 会让对方观察到设计外的 409/503。触碰这两个全局的测试共持此锁串行。
+#[cfg(test)]
+pub(crate) static GLOBALS_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn config_rev() -> u64 {
     CONFIG_REV.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -5837,7 +5843,7 @@ mod config_route_tests {
     use std::sync::{Arc, Barrier};
     use std::time::Duration;
 
-    static ROUTE_TEST_MUTEX: Mutex<()> = Mutex::new(());
+    use crate::GLOBALS_TEST_MUTEX as ROUTE_TEST_MUTEX;
 
     fn call(addr: &str, method: &str, path: &str, value: &serde_json::Value) -> (u16, serde_json::Value) {
         let body = if method == "GET" { Vec::new() } else { serde_json::to_vec(value).unwrap() };

@@ -176,6 +176,78 @@ fn key_pool_tags() -> Vec<String> {
 /// 【音效包 2026-10-30】空串 = 根目录平铺（旧模式）。langbar 5s 快照
 /// 比对兜底（覆盖 config.json 手改/云同步拉取等不经键响应的变更）。
 static CURRENT_PACK: Mutex<String> = Mutex::new(String::new());
+static CONFIG_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static CONFIG_VOLUME: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(70);
+
+/// Pass-through keys may never reach OnKeyDown. Reuse the existing background
+/// sound-state snapshot rather than adding IPC to OnTestKeyDown.
+pub fn set_settings(enabled: bool, volume: u8, pack: &str) {
+    set_enabled(enabled);
+    CONFIG_VOLUME.store(volume.min(100), std::sync::atomic::Ordering::Relaxed);
+    set_pack(pack);
+}
+
+pub fn set_enabled(enabled: bool) {
+    if CONFIG_ENABLED.swap(enabled, std::sync::atomic::Ordering::Relaxed) != enabled {
+        invalidate();
+    }
+}
+
+pub fn configured_key_sound() -> Option<(u8, String)> {
+    CONFIG_ENABLED
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .then(|| {
+            (
+                CONFIG_VOLUME.load(std::sync::atomic::Ordering::Relaxed),
+                CURRENT_PACK
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .clone(),
+            )
+        })
+}
+
+/// Only the requested typing keys. Navigation and shortcut chords stay silent.
+pub fn additional_typing_key(vk: usize, ctrl: bool, alt: bool, meta: bool) -> bool {
+    !ctrl && !alt && !meta && matches!(vk, 0x08 | 0x20 | 0x30..=0x39 | 0x60..=0x69)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct KeySoundStamp(usize, usize, i32);
+
+/// A TSF test callback is a query and can be repeated for one queued key message.
+/// Its real callback uses the same message timestamp/scan data. This gate only
+/// deduplicates sound; it never changes whether the key is eaten or forwarded.
+#[derive(Default)]
+pub struct InputSoundGate {
+    test: Option<KeySoundStamp>,
+    real: Option<KeySoundStamp>,
+}
+
+impl InputSoundGate {
+    pub fn test(&mut self, vk: usize, lparam: usize, message_time: i32) -> bool {
+        let stamp = KeySoundStamp(vk, lparam, message_time);
+        let fresh = self.test != Some(stamp) && self.real != Some(stamp);
+        self.test = Some(stamp);
+        fresh
+    }
+
+    pub fn real(&mut self, vk: usize, lparam: usize, message_time: i32) -> bool {
+        let stamp = KeySoundStamp(vk, lparam, message_time);
+        let fresh = self.test != Some(stamp) && self.real != Some(stamp);
+        self.real = Some(stamp);
+        fresh
+    }
+
+    pub fn release(&mut self, vk: usize) {
+        if self.test.is_some_and(|stamp| stamp.0 == vk) {
+            self.test = None;
+        }
+        if self.real.is_some_and(|stamp| stamp.0 == vk) {
+            self.real = None;
+        }
+    }
+}
 
 /// 包名变更检测：不同→invalidate()+记新值；相同→no-op（零成本）。
 pub fn set_pack(pack: &str) {
@@ -583,6 +655,48 @@ pub(crate) fn base64_decode(s: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typing_sound_coverage_excludes_navigation_and_shortcuts() {
+        for vk in [0x08, 0x20, 0x30, 0x39, 0x60, 0x69] {
+            assert!(additional_typing_key(vk, false, false, false));
+            assert!(!additional_typing_key(vk, true, false, false));
+            assert!(!additional_typing_key(vk, false, true, false));
+            assert!(!additional_typing_key(vk, false, false, true));
+        }
+        for vk in [0x09, 0x0d, 0x10, 0x11, 0x12, 0x25, 0x2e, 0x41, 0x6a, 0x70] {
+            assert!(!additional_typing_key(vk, false, false, false));
+        }
+    }
+
+    #[test]
+    fn repeated_test_queries_and_real_callback_sound_only_once() {
+        let mut gate = InputSoundGate::default();
+        let lp = 0x0002_0001;
+        assert!(gate.test(0x31, lp, 100));
+        assert!(!gate.test(0x31, lp, 100));
+        assert!(!gate.real(0x31, lp, 100));
+        assert!(!gate.real(0x31, lp, 100));
+        gate.release(0x31);
+        assert!(gate.test(0x31, lp, 200));
+        assert!(!gate.real(0x31, lp, 200));
+    }
+
+    #[test]
+    fn test_only_and_real_only_hosts_keep_every_new_press_and_repeat() {
+        let mut gate = InputSoundGate::default();
+        let lp = 0x000e_0001;
+        assert!(gate.test(0x08, lp, 100));
+        assert!(gate.test(0x08, lp | 0x4000_0000, 133));
+        assert!(gate.test(0x08, lp | 0x4000_0000, 166));
+        // A lost up or a host without real callbacks cannot suppress the next key.
+        assert!(gate.test(0x08, lp, 300));
+        assert!(gate.real(0x20, 0x0039_0001, 400));
+        assert!(!gate.real(0x20, 0x0039_0001, 400));
+        assert!(gate.real(0x20, 0x4039_0001, 433));
+        gate.release(0x20);
+        assert!(gate.real(0x20, 0x0039_0001, 433));
+    }
 
     #[test]
     fn long_playback_keeps_its_handle_until_released() {

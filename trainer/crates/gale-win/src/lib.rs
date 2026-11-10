@@ -13,6 +13,7 @@ pub mod color_picker;
 pub mod d2d;
 pub mod edit;
 pub mod fx;
+pub mod font_picker;
 pub mod input_host;
 pub mod keys;
 pub mod window;

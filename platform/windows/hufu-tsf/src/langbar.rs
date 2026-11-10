@@ -4,23 +4,28 @@
 //! - 左键 → 管道 op "toggle_lang" 切换中英（与 Shift 单击同语义）
 //! - 右键 → 管道 op "settings" 打开设置页（与托盘双击同通道）
 //! - 生命周期跟随输入法：Activate 挂载、Deactivate 移除
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
+use std::sync::Mutex;
+use windows::core::{implement, Interface, Result, GUID, PCWSTR, VARIANT};
 use windows::Win32::Foundation::{BOOL, COLORREF, E_INVALIDARG, RECT, SIZE};
 use windows::Win32::UI::Input::KeyboardAndMouse::GetFocus;
 use windows::Win32::UI::TextServices::{
+    ITfCompartment, ITfCompartmentEventSink, ITfCompartmentEventSink_Impl, ITfCompartmentMgr,
+    ITfLangBarItem, ITfLangBarItemButton, ITfLangBarItemButton_Impl, ITfLangBarItemMgr,
+    ITfLangBarItemSink, ITfLangBarItem_Impl, ITfSource, ITfSource_Impl, ITfThreadMgr,
     GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION, GUID_COMPARTMENT_KEYBOARD_OPENCLOSE,
-    GUID_LBI_INPUTMODE, ITfCompartment, ITfCompartmentEventSink, ITfCompartmentEventSink_Impl,
-    ITfCompartmentMgr, ITfLangBarItem, ITfLangBarItem_Impl, ITfLangBarItemButton,
-    ITfLangBarItemButton_Impl, ITfLangBarItemMgr, ITfLangBarItemSink, ITfSource, ITfSource_Impl,
-    ITfThreadMgr, TF_CONVERSIONMODE_ALPHANUMERIC, TF_CONVERSIONMODE_NATIVE, TF_LANGBARITEMINFO,
+    GUID_LBI_INPUTMODE, TF_CONVERSIONMODE_ALPHANUMERIC, TF_CONVERSIONMODE_NATIVE,
+    TF_LANGBARITEMINFO,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     // 【2026-11-07 回滚】DestroyIcon 随 GetIcon 双槽回滚移除（不再使用）。
-    CreateIconIndirect, CreateWindowExW, DefWindowProcW, DestroyWindow, HICON, HWND_MESSAGE,
-    ICONINFO, RegisterClassExW, SetForegroundWindow, WNDCLASSEXW,
+    CreateIconIndirect, CreateWindowExW, DefWindowProcW, DestroyWindow,
+    RegisterClassExW,
+    SetForegroundWindow,
+    HICON, HWND_MESSAGE,
+    ICONINFO,
+    WNDCLASSEXW,
 };
-use windows::core::{GUID, Interface, PCWSTR, Result, VARIANT, implement};
 
 /// COM 指针跨线程搬运套（sink 由 msctf 线程 Advise、模式切换线程通知：
 /// 实际调用仍是 COM 默认自由线程封送语义，这里只解除 Rust 的静态限制）
@@ -639,16 +644,19 @@ fn refresh_schemas_cache_inner(force: bool) {
         .and_then(|r| {
             let enabled = r.get("enabled").and_then(|v| v.as_bool());
             let pack = r.get("pack").and_then(|v| v.as_str()).map(|s| s.to_string());
-            enabled.map(|e| (e, pack))
+        let volume = r
+            .get("volume")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(70)
+            .min(100) as u8;
+        enabled.map(|e| (e, volume, pack))
         });
-    if let Some((on, pack)) = snd {
-        let was = SND_ON.swap(on, Ordering::Relaxed);
+    if let Some((on, volume, pack)) = snd {
+        SND_ON.store(on, Ordering::Relaxed);
         // 【B6 修复 2026-09-13 三十四修】开关状态翻转时清本进程音效
         // 缓存——invalidate() 原本零调用，wav/开关变更后旧缓存永不
         // 失效（换音效文件+重开开关也放旧音）。
-        if was != on {
-            crate::sound::invalidate();
-        }
+        crate::sound::set_settings(on, volume, pack.as_deref().unwrap_or(""));
         // 【音效包 2026-10-30】包名变更兜底失效（键响应随行为主通道；
         // 此处 5s 快照覆盖 config.json 手改/云同步拉取等不经键响应的
         // 变更）。set_pack 内部含变更检测与 invalidate。
@@ -853,6 +861,7 @@ unsafe fn popup_menu(pt: &windows::Win32::Foundation::POINT) {
         } else if sel == 4 {
             // 按键音效开关：server 侧取反+落盘（热生效）
             SND_ON.store(!snd_on, Ordering::Relaxed);
+            crate::sound::set_enabled(!snd_on);
             pipe_async(serde_json::json!({"op": "sound_toggle"}));
         } else if sel >= 100 {
             let idx = (sel - 100) as usize;

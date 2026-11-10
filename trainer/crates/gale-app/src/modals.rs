@@ -9,7 +9,7 @@ use gale_win::d2d::{DrawCmd, Frame};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 #[path = "preferences.rs"]
-mod preferences;
+pub(crate) mod preferences;
 // Modal text always remains legible at the actual window size. Decorative
 // geometry and the training article's configured size are independent.
 fn text(f: &mut Frame, x: f32, y: f32, size: f32, s: impl Into<String>, c: [f32; 4]) {
@@ -72,6 +72,8 @@ pub enum Action {
     Theme(String),
     Material(Material),
     Font(i32),
+    FontChoose,
+    FontDefault,
     Motion,
     Accent(String),
     LineHeight(i32),
@@ -243,10 +245,7 @@ pub fn panel(m: Modal, w: f32, h: f32) -> (f32, f32, f32, f32) {
         Modal::Heatmap => (1040., 620.),
         _ => (880., 596.),
     };
-    let ph = if matches!(
-        m,
-        Modal::Heatmap | Modal::Groups | Modal::More
-    ) {
+    let ph = if matches!(m, Modal::Heatmap | Modal::Groups | Modal::More) {
         panel_view(ph, h)
     } else {
         ph
@@ -642,7 +641,12 @@ fn panel_header(f: &mut Frame, hs: &mut Vec<Hit>, m: Modal, x: f32, y: f32, pw: 
     let (icon_name, title, desc, key) = match m {
         Modal::More => ("folder", "更多", "工具、设置与数据", ""),
         Modal::Groups => ("group", "选择群聊", "选中后读取群文或发送成绩", "F5"),
-        Modal::Preferences => ("palette", "跟打器设置", "练习、成绩、配色、外观与数据", "F1"),
+        Modal::Preferences => (
+            "palette",
+            "跟打器设置",
+            "练习、成绩、配色、外观与数据",
+            "F1",
+        ),
         Modal::Heatmap => (
             "keyboard",
             "本段按键热力图",
@@ -943,7 +947,7 @@ fn draw_more(
     let right_items: Vec<(String, String, Action, String)> = vec![
         (
             "跟打器设置".into(),
-            "单字提示、成绩单与配色".into(),
+            "词提、成绩单与配色".into(),
             Action::Open(Modal::Preferences),
             "F1".into(),
         ),
@@ -1030,7 +1034,16 @@ fn draw_more_row(
     f.push(DrawCmd::PopClip);
     if !key.is_empty() {
         let kw = (ui_text_width(key, 12.) + 16.).max(38.);
-        round(f, x + w - kw, y + 10., kw, 22., 5., p.surface2, Some(p.line2));
+        round(
+            f,
+            x + w - kw,
+            y + 10.,
+            kw,
+            22.,
+            5.,
+            p.surface2,
+            Some(p.line2),
+        );
         text(f, x + w - kw + 8., y + 13., 12., key, p.muted);
     } else {
         text(f, x + w - 16., y + 12., 15., "›", p.muted);
@@ -1077,8 +1090,7 @@ pub(super) fn appearance_preview(
     }
     let fs = (cfg.font_size / 2.).clamp(14., 32.);
     let hint_fs = cfg.hint_font_size.max(14.);
-    let hints_visible = sess.source == crate::session::SessionSource::Single
-        && gale_core::rules::hints_effective(m.hints, m.race);
+    let hints_visible = gale_core::rules::hints_effective(m.hints, m.race);
     let lh = if hints_visible {
         (fs * (1. + cfg.line_gap) + 9.).max(fs + hint_fs + 11.)
     } else {
@@ -1091,15 +1103,17 @@ pub(super) fn appearance_preview(
             (hints_visible && cfg.hint_color_words)
                 .then(|| {
                     word.code.as_deref().and_then(|code| {
-                        crate::ui::hint_word_tint(
+                        crate::ui::hint_word_tint_for_rank(
                             &p,
                             &word.text,
                             code,
+                            word.rank,
                             if m.max_code_length == 0 {
                                 4
                             } else {
                                 m.max_code_length
                             },
+                            cfg.hint_rank_colors,
                         )
                     })
                 })
@@ -1164,7 +1178,7 @@ pub(super) fn appearance_preview(
                 .filter(|word| word.start <= char_at)
                 .and_then(|_| word_colors[word_at]);
             let color = match sess.comparer.states.get(char_at) {
-                Some(gale_core::compare::CharState::Correct) => tint.unwrap_or(p.text),
+                Some(gale_core::compare::CharState::Correct) => p.correct,
                 Some(gale_core::compare::CharState::Wrong) => p.red,
                 _ => tint.unwrap_or(p.text2),
             };
@@ -1355,67 +1369,147 @@ struct AnalysisBlock {
     words: Vec<String>,
     keys: Vec<String>,
     missing: bool,
+    punctuation: bool,
+    rank: u64,
 }
-fn analysis_blocks(fa: &crate::FullAnalysis, m: &Model, width: f32) -> (Vec<AnalysisBlock>, f32) {
+
+/// Shared rhythm for both the measured layout and the draw pass. Keeping these
+/// numbers in one place prevents the code row from drifting away from the word
+/// when only one of the two call sites is adjusted.
+fn analysis_metrics(m: &Model) -> (f32, f32, f32, f32, f32) {
     let fs = analysis_font(m);
-    let ks = (fs * 0.68).max(14.);
+    let ks = (fs * 0.62).max(13.);
+    let line_h = fs * 1.34;
+    let key_gap = (fs * 0.18).max(4.);
+    let key_line_h = ks * 1.35;
+    (fs, ks, line_h, key_gap, key_line_h)
+}
+
+/// Punctuation stays in the article color and carries no code row. Grouping it
+/// with the preceding word for line breaking keeps a comma or full stop from
+/// being stranded at the start of an analysis line.
+fn analysis_punctuation(word: &str) -> bool {
+    !word.is_empty()
+        && word
+            .chars()
+            .all(|ch| !ch.is_alphanumeric() && !ch.is_whitespace())
+}
+
+fn analysis_blocks(fa: &crate::FullAnalysis, m: &Model, width: f32) -> (Vec<AnalysisBlock>, f32) {
+    let (fs, ks, line_h, key_gap, key_line_h) = analysis_metrics(m);
     let available = width.max(fs * 2.);
-    let gap = (fs * 0.56).max(9.);
+    let word_gap = (fs * 0.38).max(8.);
+    let row_gap = (fs * 0.50).max(10.);
     let mut x = 0.;
     let mut y = 0.;
     let mut row_height: f32 = 0.;
-    let mut out = Vec::new();
+    let mut row_start = 0usize;
+    let mut out: Vec<AnalysisBlock> = Vec::new();
     for (source_index, entry) in fa.entries.iter().enumerate() {
         if entry.word == "\n" || entry.word == "\r\n" {
             y += row_height.max(fs * 2.7);
             x = 0.;
             row_height = 0.;
+            row_start = out.len();
             continue;
         }
+        let punctuation = analysis_punctuation(&entry.word);
         let recipe = crate::analysis::entry_keys(entry, analysis_auto4(m), fa.max_code_length);
-        let missing = entry.code.is_none()
+        let missing = !punctuation
+            && entry.code.is_none()
             && recipe.is_empty()
             && entry.word.chars().any(|c| !c.is_whitespace());
-        let keys = if missing {
-            "缺字".into()
-        } else if entry.rank > 1 && entry.code.is_some() {
-            format!(
-                "{}{}",
-                crate::analysis::display_keys(entry.code.as_deref().unwrap()),
-                entry.rank
-            )
+        let rank = if !punctuation && !missing && entry.rank > 1 && entry.code.is_some() {
+            entry.rank
+        } else {
+            0
+        };
+        let keys = if punctuation {
+            String::new()
+        } else if missing {
+            "缺字".to_string()
+        } else if rank > 0 {
+            crate::analysis::display_keys(entry.code.as_deref().unwrap())
         } else {
             crate::analysis::display_keys(&recipe)
         };
-        let key_label = if keys.is_empty() { "—" } else { &keys };
         let word_width = analysis_text_width(&entry.word, fs, false);
-        let key_width = analysis_text_width(key_label, ks, true);
-        let block_width = word_width.max(key_width).max(fs * 0.7).min(available);
-        if x > 0. && x + block_width > available {
-            y += row_height;
+        let key_width = if keys.is_empty() {
+            0.
+        } else {
+            analysis_text_width(&keys, ks, true)
+        };
+        // The selection digit is a superscript after the recipe; reserve its
+        // width here or a short word with a four-letter code clips it.
+        let rank_width = if rank > 1 {
+            rank.to_string().chars().count() as f32 * ks * 0.78 * 0.6 + 2.
+        } else {
+            0.
+        };
+        let block_width = word_width
+            .max(key_width + rank_width)
+            .max(fs * 0.7)
+            .min(available);
+        let words = analysis_wrap(&entry.word, block_width, fs, false);
+        let keys = if keys.is_empty() {
+            Vec::new()
+        } else {
+            analysis_wrap(&keys, block_width, ks, true)
+        };
+        let block_height = words.len() as f32 * line_h
+            + if keys.is_empty() {
+                0.
+            } else {
+                key_gap + keys.len() as f32 * key_line_h
+            };
+        let mut gap = if x <= 0. {
+            0.
+        } else if punctuation {
+            0.
+        } else {
+            word_gap
+        };
+        let mut wrap = x > 0. && x + gap + block_width > available;
+        // Carry the word and its trailing punctuation to the next line as one
+        // cluster instead of letting the punctuation break by itself.
+        if wrap && punctuation && out.len() > row_start && !out[out.len() - 1].punctuation {
+            let mut previous = out.pop().unwrap();
+            let kept_from = row_start.min(out.len());
+            row_height = out[kept_from..]
+                .iter()
+                .map(|block| block.h)
+                .fold(0f32, f32::max);
+            y += row_height + row_gap;
+            row_start = out.len();
+            previous.x = 0.;
+            previous.y = y;
+            row_height = previous.h;
+            x = previous.w;
+            out.push(previous);
+            gap = 0.;
+            wrap = x + block_width > available;
+        }
+        if wrap {
+            y += row_height + row_gap;
             x = 0.;
             row_height = 0.;
+            row_start = out.len();
+            gap = 0.;
         }
-        let words = analysis_wrap(&entry.word, block_width, fs, false);
-        let keys = analysis_wrap(key_label, block_width, ks, true);
-        let block_height = words.len() as f32 * fs * 1.4 + keys.len() as f32 * ks * 1.4 + gap;
         out.push(AnalysisBlock {
             source_index,
-            x,
+            x: x + gap,
             y,
             w: block_width,
             h: block_height,
             words,
             keys,
             missing,
+            punctuation,
+            rank,
         });
+        x += gap + block_width;
         row_height = row_height.max(block_height);
-        x += block_width + gap;
-        if entry.word.contains('\n') {
-            y += row_height;
-            x = 0.;
-            row_height = 0.;
-        }
     }
     (out, y + row_height)
 }
@@ -1432,11 +1526,16 @@ pub fn analysis_scroll_max(sess: &Session, m: &Model, w: f32, h: f32) -> f32 {
 }
 /// 主窗口底部「理论分析」停靠面板的几何：紧贴成绩栏上方，宽 = 窗口 - 48。
 pub fn analysis_dock_height(h: f32) -> f32 {
-    (h * 0.36).clamp(216., 300.)
+    // Leave one full 100-DIP article row above the dock in short windows.
+    (h * 0.36).clamp(120., 300.).min((h - 300.).max(120.))
 }
 pub fn analysis_dock_rect(w: f32, h: f32) -> (f32, f32, f32, f32) {
     let dh = analysis_dock_height(h);
-    let bottom = crate::ui::ledger_bar_y(h) - 8.;
+    let bottom = if h < 520. {
+        h - crate::ui::STATUS_H - 8.
+    } else {
+        crate::ui::ledger_bar_y(h) - 8.
+    };
     (24., bottom - dh, (w - 48.).max(220.), dh)
 }
 fn analysis_chip(
@@ -1458,7 +1557,11 @@ fn analysis_chip(
         w,
         26.,
         6.,
-        if on { alpha(p.accent, 0.12) } else { p.surface2 },
+        if on {
+            alpha(p.accent, 0.12)
+        } else {
+            p.surface2
+        },
         Some(if on { alpha(p.accent, 0.5) } else { p.line }),
     );
     text(
@@ -1514,23 +1617,35 @@ pub(crate) fn draw_analysis_dock(
     let auto4 = analysis_auto4(m);
     let heatmap = analysis_is_heatmap(m);
     let fs = analysis_font(m);
+    let close_x = x + pw - 44.;
+    let view_w = 74.;
+    let view_x = close_x - 8. - view_w;
+    let auto_w = 92.;
+    let auto_x = view_x - 10. - auto_w;
+    let plus_x = auto_x - 10. - 26.;
+    let minus_x = plus_x - 4. - 30. - 26.;
     text(f, x + 20., y + 13., 16., "理论码长分析", p.text);
-    let mut cx = x + 20. + 118.;
+    let cx = x + 20. + 118.;
     if let Some(fa) = &sess.full_analysis {
+        let schema_w = (minus_x - cx - 10.).max(0.);
         f.push(DrawCmd::PushClip {
             x: cx,
             y: y + 15.,
-            w: (pw - 360.).max(60.),
+            w: schema_w,
             h: 20.,
         });
-        text(f, cx, y + 15., 12., &fa.schema, p.muted);
+        text(
+            f,
+            cx,
+            y + 15.,
+            12.,
+            elide_width(&fa.schema, schema_w, 15.),
+            p.muted,
+        );
         f.push(DrawCmd::PopClip);
     }
     // 右侧控制：字号 − n + · 四码首选 · 视图 · 关闭
-    let close_x = x + pw - 44.;
     analysis_icon_button(f, hs, close_x, y + 8., 26., "×", Action::ToggleAnalysis, t);
-    let view_w = 74.;
-    let view_x = close_x - 8. - view_w;
     analysis_chip(
         f,
         hs,
@@ -1542,8 +1657,6 @@ pub(crate) fn draw_analysis_dock(
         t,
         heatmap,
     );
-    let auto_w = 92.;
-    let auto_x = view_x - 10. - auto_w;
     analysis_chip(
         f,
         hs,
@@ -1555,8 +1668,6 @@ pub(crate) fn draw_analysis_dock(
         t,
         auto4,
     );
-    let plus_x = auto_x - 10. - 26.;
-    let minus_x = plus_x - 4. - 30. - 26.;
     let minus = crate::aux_marker(&format!("analysis_font:{}", (fs as i32 - 1).clamp(12, 36)));
     let plus = crate::aux_marker(&format!("analysis_font:{}", (fs as i32 + 1).clamp(12, 36)));
     analysis_icon_button(f, hs, minus_x, y + 8., 26., "−", minus, t);
@@ -1570,15 +1681,18 @@ pub(crate) fn draw_analysis_dock(
             ("字数", summary.char_count.to_string()),
             ("选重", summary.select_count.to_string()),
             ("缺字", summary.missing_chars.to_string()),
-            ("已知键", summary.known_keys.to_string()),
+            ("理论键", summary.known_keys.to_string()),
         ];
         let step = ((pw - 40.) / 5.).max(96.);
         for (i, (label, value)) in items.iter().enumerate() {
             let sx = x + 20. + i as f32 * step;
             text(f, sx, y + 46., 12., *label, p.muted);
+            // Keep a clear gutter between the caption and its number; the old
+            // fixed +46 offset collided once a four-character label was used.
+            let value_x = sx + crate::ui::ui_text_width(label, 12.).max(26.) + 12.;
             mono(
                 f,
-                sx + 46.,
+                value_x,
                 y + 42.,
                 16.,
                 value,
@@ -1604,14 +1718,20 @@ pub(crate) fn draw_analysis_dock(
                 w: body_w,
                 h: body_h,
             });
-            crate::keyboard::draw_main(f, t, x + 24., body_y + 2., body_w - 8., body_h - 6., |key| {
-                summary.key_counts.get(&key).copied().unwrap_or(0)
-            });
+            crate::keyboard::draw_main(
+                f,
+                t,
+                x + 24.,
+                body_y + 2.,
+                body_w - 8.,
+                body_h - 6.,
+                |key| summary.key_counts.get(&key).copied().unwrap_or(0),
+            );
             f.push(DrawCmd::PopClip);
         } else {
             let (blocks, total_h) = analysis_blocks(fa, m, body_w);
             let scroll = m.analysis_dock_scroll.clamp(0., (total_h - body_h).max(0.));
-            let ks = (fs * 0.68).max(14.);
+            let (_, ks, line_h, key_gap, key_line_h) = analysis_metrics(m);
             f.push(DrawCmd::PushClip {
                 x: x + 20.,
                 y: body_y,
@@ -1625,17 +1745,27 @@ pub(crate) fn draw_analysis_dock(
                 let bx = x + 20. + block.x;
                 let by = body_y + block.y - scroll;
                 let entry = &fa.entries[block.source_index];
-                let color = if block.missing {
+                let color = entry
+                    .code
+                    .as_deref()
+                    .filter(|_| m.field("hint_color_words") != "false")
+                    .and_then(|code| {
+                        crate::ui::hint_word_tint_for_rank(
+                            &p,
+                            &entry.word,
+                            code,
+                            usize::try_from(entry.rank).unwrap_or(0),
+                            fa.max_code_length,
+                            m.field("hint_rank_colors") == "true",
+                        )
+                    })
+                    .unwrap_or(p.text);
+                // The code is supporting information: keep the word at full
+                // strength and let the recipe sit back in the same hue.
+                let key_color = if block.missing {
                     p.red
                 } else {
-                    let code = entry.code.as_deref().unwrap_or("");
-                    if entry.word.chars().filter(|c| c.is_alphanumeric()).count() <= 1 {
-                        let n = code.chars().count().max(1);
-                        p.word_colors[(n - 1).min(p.word_colors.len() - 1)]
-                    } else {
-                        crate::ui::hint_word_tint(&p, &entry.word, code, fa.max_code_length)
-                            .unwrap_or(p.text)
-                    }
+                    alpha(color, 0.78)
                 };
                 f.push(DrawCmd::PushClip {
                     x: bx,
@@ -1644,11 +1774,36 @@ pub(crate) fn draw_analysis_dock(
                     h: block.h,
                 });
                 for (i, word) in block.words.iter().enumerate() {
-                    crate::ui::body_text(f, bx, by + i as f32 * fs * 1.4, fs, word, color);
+                    let word_w = analysis_text_width(word, fs, false);
+                    let ox = (block.w - word_w).max(0.) / 2.;
+                    crate::ui::body_text(f, bx + ox, by + i as f32 * line_h, fs, word, color);
                 }
-                let key_y = by + block.words.len() as f32 * fs * 1.4;
-                for (i, keys) in block.keys.iter().enumerate() {
-                    mono(f, bx, key_y + i as f32 * ks * 1.4, ks, keys, color);
+                if !block.punctuation {
+                    let key_y = by + block.words.len() as f32 * line_h + key_gap;
+                    for (i, keys) in block.keys.iter().enumerate() {
+                        let rank = if i == 0 && block.rank > 1 {
+                            block.rank.to_string()
+                        } else {
+                            String::new()
+                        };
+                        let key_w = analysis_text_width(keys, ks, true);
+                        let rank_size = ks * 0.78;
+                        let rank_w = rank.chars().count() as f32 * rank_size * 0.6;
+                        let rank_gap = if key_w > 0. && rank_w > 0. { 2. } else { 0. };
+                        let ox = (block.w - key_w - rank_gap - rank_w).max(0.) / 2.;
+                        let row_y = key_y + i as f32 * key_line_h;
+                        mono(f, bx + ox, row_y, ks, keys, key_color);
+                        if !rank.is_empty() {
+                            mono(
+                                f,
+                                bx + ox + key_w + rank_gap,
+                                row_y - 3.,
+                                rank_size,
+                                rank,
+                                alpha(color, 0.9),
+                            );
+                        }
+                    }
                 }
                 f.push(DrawCmd::PopClip);
             }
@@ -1696,7 +1851,14 @@ pub(crate) fn draw_analysis_dock(
             };
             let lines = analysis_wrap(&detail, body_w, 13., false);
             for (i, line) in lines.iter().take(2).enumerate() {
-                text(f, x + 24., body_y + 36. + i as f32 * 19., 13., line, p.muted);
+                text(
+                    f,
+                    x + 24.,
+                    body_y + 36. + i as f32 * 19.,
+                    13.,
+                    line,
+                    p.muted,
+                );
             }
             if !empty {
                 btn(
@@ -1988,6 +2150,59 @@ mod tests {
         assert!(blocks[0].w <= 250. && height > 100.);
     }
     #[test]
+    fn analysis_keeps_punctuation_on_its_word_row() {
+        let mut entries = Vec::new();
+        for _ in 0..12 {
+            entries.push(crate::FullAnalysisEntry {
+                word: "词组".into(),
+                code: Some("ab".into()),
+                rank: 1,
+                ..Default::default()
+            });
+            entries.push(crate::FullAnalysisEntry {
+                word: "，".into(),
+                ..Default::default()
+            });
+        }
+        let fa = crate::FullAnalysis {
+            entries,
+            max_code_length: 4,
+            ..Default::default()
+        };
+        let (blocks, _) = analysis_blocks(&fa, &Model::default(), 220.);
+        let mut previous_y = None;
+        for block in &blocks {
+            if block.punctuation {
+                assert_eq!(
+                    Some(block.y),
+                    previous_y,
+                    "punctuation must not break onto an empty row"
+                );
+            }
+            previous_y = Some(block.y);
+        }
+    }
+
+    #[test]
+    fn analysis_reserves_width_for_the_selection_superscript() {
+        let fa = crate::FullAnalysis {
+            entries: vec![crate::FullAnalysisEntry {
+                word: "甲乙".into(),
+                code: Some("abcd".into()),
+                rank: 2,
+                ..Default::default()
+            }],
+            max_code_length: 4,
+            ..Default::default()
+        };
+        let (blocks, _) = analysis_blocks(&fa, &Model::default(), 900.);
+        let (_, ks, ..) = analysis_metrics(&Model::default());
+        let key_w = analysis_text_width(&blocks[0].keys.concat(), ks, true);
+        let rank_w = ks * 0.78 * 0.6 + 2.;
+        assert!(blocks[0].w >= key_w + rank_w - 0.01);
+    }
+
+    #[test]
     fn analysis_colors_only_words_and_shows_selection_rank_without_changing_key_counts() {
         let entry = |word: &str, code: Option<&str>, rank, tail: &str| crate::FullAnalysisEntry {
             word: word.into(),
@@ -2034,17 +2249,364 @@ mod tests {
             ]
         );
         assert_eq!(blocks[0].keys.concat(), "a_");
-        assert_eq!(blocks[1].keys.concat(), "ab2");
-        assert_eq!(blocks[3].keys.concat(), "cd3");
+        assert_eq!(blocks[1].keys.concat(), "ab");
+        assert_eq!(blocks[1].rank, 2);
+        assert_eq!(blocks[3].keys.concat(), "cd");
+        assert_eq!(blocks[3].rank, 3);
         assert!(blocks[4].missing);
         let summary = crate::analysis::summarize(&fa, true);
         assert_eq!(summary.key_counts.get(&0xba), Some(&1));
         assert_eq!(summary.key_counts.get(&0xde), Some(&1));
         assert!(!summary.key_counts.contains_key(&b'2'));
         assert!(!summary.key_counts.contains_key(&b'3'));
+
+        // Exercise the actual dock renderer: a separate single-character branch
+        // used to color these by code length despite the shared tint helper.
+        let mut session = Session::new(100);
+        session.load_book("着色回归", "甲词组，另一词缺字乙最后词");
+        session.full_analysis = Some(fa);
+        let mut model = Model::default();
+        model.analysis_dock = true;
+        let mut frame = Frame::new(1280., 800.);
+        draw_analysis_dock(
+            &mut frame,
+            &mut Vec::new(),
+            &model,
+            &session,
+            &crate::ui::theme("墨玉"),
+            1280.,
+            800.,
+        );
+        for surface in ["甲", "，", "乙", "缺字"] {
+            assert!(
+                frame.cmds.iter().any(|cmd| matches!(cmd,
+                    DrawCmd::TextRun { text, color, font: gale_win::d2d::FontFamily::Lxgw, .. } if text == surface && *color == p.text
+                )),
+                "{surface} should keep the neutral text color"
+            );
+        }
+        assert!(frame.cmds.iter().any(|cmd| matches!(cmd,
+            DrawCmd::TextRun { text, color, .. } if text == "词组" && *color == short
+        )));
+        assert!(frame.cmds.iter().any(|cmd| matches!(cmd,
+            DrawCmd::TextRun { text, color, font: gale_win::d2d::FontFamily::Mono, .. } if text == "缺字" && *color == p.red
+        )), "missing-code diagnosis remains red below the neutral article text");
     }
     #[test]
-    fn appearance_preview_keeps_hints_only_for_single_practice() {
+    fn article_and_f10_render_all_six_word_classes_with_the_same_palette() {
+        let cases = [
+            ("简词", Some("ab")),
+            ("二三", Some("abc")),
+            ("二四", Some("abcd")),
+            ("三字词", Some("abcd")),
+            ("四字词语", Some("abcd")),
+            ("一码", Some("a")),
+            ("单", Some("a")),
+            ("，", None),
+            ("……", Some("a")),
+            ("缺词", None),
+        ];
+        let article: String = cases.iter().map(|(word, _)| *word).collect();
+        let mut sess = Session::new(100);
+        sess.load_book("六档词色", &article);
+        let mut start = 0;
+        let words: Vec<_> = cases
+            .iter()
+            .map(|(word, code)| {
+                let len = word.chars().count();
+                let hint = HintWord {
+                    text: (*word).into(),
+                    code: code.map(str::to_owned),
+                    start,
+                    len,
+                    rank: 1,
+                    tail: "_".into(),
+                };
+                start += len;
+                hint
+            })
+            .collect();
+        let cfg = Config {
+            font_size: 36.,
+            focus_dim: false,
+            ..Default::default()
+        };
+        let model = Model {
+            hints: true,
+            words: words.clone(),
+            max_code_length: 4,
+            ..Default::default()
+        };
+        let lines = vec![(
+            0,
+            article.clone(),
+            (0..=start).map(|i| i as f32 * 36.).collect(),
+        )];
+        let theme = crate::ui::theme("墨玉");
+        let p = tokens(&theme);
+        let frame = crate::ui::build(
+            &sess,
+            &cfg,
+            &theme,
+            &model,
+            1280.,
+            800.,
+            0,
+            0.,
+            &mut crate::ui::Animation::default(),
+            &mut Vec::new(),
+            &lines,
+        );
+        let spans = frame
+            .cmds
+            .iter()
+            .find_map(|cmd| match cmd {
+                DrawCmd::StyledLine { text, spans, .. } if text == &article => Some(spans),
+                _ => None,
+            })
+            .unwrap();
+        for (i, word) in words.iter().enumerate() {
+            let expected = if i < 6 { p.word_colors[i] } else { p.text2 };
+            assert_eq!(spans[word.start].2, expected, "article {}", word.text);
+        }
+        sess.full_analysis = Some(crate::FullAnalysis {
+            entries: words
+                .iter()
+                .map(|word| crate::FullAnalysisEntry {
+                    word: word.text.clone(),
+                    code: word.code.clone(),
+                    rank: 1,
+                    tail: word.tail.clone(),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        });
+        let mut frame = Frame::new(1280., 800.);
+        draw_analysis_dock(
+            &mut frame,
+            &mut Vec::new(),
+            &Model::default(),
+            &sess,
+            &theme,
+            1280.,
+            800.,
+        );
+        for (i, word) in words.iter().take(6).enumerate() {
+            assert!(frame.cmds.iter().any(|cmd| matches!(cmd,
+                DrawCmd::TextRun { text, color, font: gale_win::d2d::FontFamily::Lxgw, .. } if text == &word.text && *color == p.word_colors[i]
+            )), "F10 {}", word.text);
+        }
+        for word in words.iter().skip(6) {
+            assert!(frame.cmds.iter().any(|cmd| matches!(cmd,
+                DrawCmd::TextRun { text, color, font: gale_win::d2d::FontFamily::Lxgw, .. } if text == &word.text && *color == p.text
+            )), "F10 nonword {} stays neutral", word.text);
+        }
+    }
+    #[test]
+    fn candidate_rank_colors_match_article_hints_preview_and_f10_for_all_ten_choices() {
+        let surfaces = [
+            "甲词", "乙词", "丙词", "丁词", "戊词", "己词", "庚词", "辛词", "壬词", "癸词", "单",
+            "，", "缺词",
+        ];
+        let codes = [
+            Some("a"),
+            Some("bb"),
+            Some("ccc"),
+            Some("dddd"),
+            Some("e"),
+            Some("ff"),
+            Some("ggg"),
+            Some("hhhh"),
+            Some("i"),
+            Some("jj"),
+            Some("a"),
+            Some("b"),
+            None,
+        ];
+        let article = surfaces.concat();
+        let mut sess = Session::new(100);
+        sess.load_book("选重配色", &article);
+        let mut start = 0;
+        let words: Vec<_> = surfaces
+            .iter()
+            .zip(codes)
+            .enumerate()
+            .map(|(i, (surface, code))| {
+                let len = surface.chars().count();
+                let word = HintWord {
+                    start,
+                    len,
+                    text: (*surface).into(),
+                    code: code.map(str::to_owned),
+                    rank: if i < 10 { i + 1 } else { 3 },
+                    tail: "_".into(),
+                };
+                start += len;
+                word
+            })
+            .collect();
+        let cfg = Config {
+            font_size: 36.,
+            focus_dim: false,
+            hint_rank_colors: true,
+            ..Default::default()
+        };
+        let mut model = Model {
+            hints: true,
+            words: words.clone(),
+            max_code_length: 4,
+            ..Default::default()
+        };
+        model
+            .fields
+            .insert("hint_rank_colors".into(), "true".into());
+        let lines = vec![(
+            0,
+            article.clone(),
+            (0..=start).map(|i| i as f32 * 36.).collect(),
+        )];
+        sess.full_analysis = Some(crate::FullAnalysis {
+            entries: words
+                .iter()
+                .map(|word| crate::FullAnalysisEntry {
+                    word: word.text.clone(),
+                    code: word.code.clone(),
+                    rank: word.rank as u64,
+                    tail: word.tail.clone(),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        });
+        for name in ["墨玉", "宣纸"] {
+            let t = crate::ui::theme(name);
+            let p = tokens(&t);
+            let frame = crate::ui::build(
+                &sess,
+                &cfg,
+                &t,
+                &model,
+                1280.,
+                800.,
+                0,
+                0.,
+                &mut crate::ui::Animation::default(),
+                &mut Vec::new(),
+                &lines,
+            );
+            let spans = frame
+                .cmds
+                .iter()
+                .find_map(|cmd| match cmd {
+                    DrawCmd::StyledLine { text, spans, .. } if text == &article => Some(spans),
+                    _ => None,
+                })
+                .unwrap();
+            for (i, word) in words.iter().enumerate() {
+                let expected = if i < 10 {
+                    p.hint_rank_colors[i]
+                } else {
+                    p.text2
+                };
+                assert_eq!(
+                    spans[word.start].2, expected,
+                    "{name} article {}",
+                    word.text
+                );
+                if i < 10 {
+                    assert!(frame.cmds.iter().any(|cmd| matches!(cmd,
+                        DrawCmd::TextRun { text, color, font: gale_win::d2d::FontFamily::Mono, .. } if Some(text.as_str()) == word.code.as_deref() && *color == expected
+                    )), "{name} code {}", word.text);
+                    if word.rank > 1 {
+                        assert!(frame.cmds.iter().any(|cmd| matches!(cmd,
+                            DrawCmd::TextRun { text, color, font: gale_win::d2d::FontFamily::Mono, .. } if text == &word.rank.to_string() && *color == expected
+                        )), "{name} rank {}", word.rank);
+                    }
+                }
+            }
+            let mut preview = Frame::new(1280., 400.);
+            appearance_preview(&mut preview, &sess, &model, &cfg, &t, 0., 0., 1200., 300.);
+            let spans = preview
+                .cmds
+                .iter()
+                .find_map(|cmd| match cmd {
+                    DrawCmd::StyledLine { spans, .. } => Some(spans),
+                    _ => None,
+                })
+                .unwrap();
+            for (i, word) in words.iter().enumerate() {
+                assert_eq!(
+                    spans[word.start].2,
+                    if i < 10 {
+                        p.hint_rank_colors[i]
+                    } else {
+                        p.text2
+                    }
+                );
+            }
+            let mut dock = Frame::new(1280., 800.);
+            draw_analysis_dock(&mut dock, &mut Vec::new(), &model, &sess, &t, 1280., 800.);
+            for (i, word) in words.iter().enumerate() {
+                let expected = if i < 10 {
+                    p.hint_rank_colors[i]
+                } else {
+                    p.text
+                };
+                assert!(dock.cmds.iter().any(|cmd| matches!(cmd,
+                    DrawCmd::TextRun { text, color, font: gale_win::d2d::FontFamily::Lxgw, .. } if text == &word.text && *color == expected
+                )), "{name} F10 {}", word.text);
+            }
+            model
+                .fields
+                .insert("hint_color_words".into(), "false".into());
+            let mut neutral_dock = Frame::new(1280., 800.);
+            draw_analysis_dock(
+                &mut neutral_dock,
+                &mut Vec::new(),
+                &model,
+                &sess,
+                &t,
+                1280.,
+                800.,
+            );
+            for word in &words {
+                assert!(neutral_dock.cmds.iter().any(|cmd| matches!(cmd,
+                    DrawCmd::TextRun { text, color, font: gale_win::d2d::FontFamily::Lxgw, .. } if text == &word.text && *color == p.text
+                )), "{name} F10 color switch off {}", word.text);
+            }
+            model.fields.remove("hint_color_words");
+            let mut typed = sess.clone();
+            typed.comparer.states[0] = gale_core::compare::CharState::Correct;
+            typed.comparer.states[1] = gale_core::compare::CharState::Wrong;
+            let frame = crate::ui::build(
+                &typed,
+                &cfg,
+                &t,
+                &model,
+                1280.,
+                800.,
+                0,
+                0.,
+                &mut crate::ui::Animation::default(),
+                &mut Vec::new(),
+                &lines,
+            );
+            let spans = frame
+                .cmds
+                .iter()
+                .find_map(|cmd| match cmd {
+                    DrawCmd::StyledLine { text, spans, .. } if text == &article => Some(spans),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(spans[0].2, p.correct);
+            assert_eq!(spans[1].2, p.red);
+        }
+    }
+
+    #[test]
+    fn appearance_preview_supports_article_hints_and_neutral_single_characters() {
         let mut s = Session::new(100);
         s.load_book("预览", "甲乙丙丁戊己庚辛壬癸");
         let mut m = Model::default();
@@ -2066,8 +2628,15 @@ mod tests {
         let p = tokens(&t);
         let mut frame = Frame::new(800., 300.);
         appearance_preview(&mut frame, &s, &m, &cfg, &t, 0., 0., 700., 250.);
-        assert!(!frame.cmds.iter().any(|cmd| matches!(cmd,
-            DrawCmd::TextRun { text, .. } if text.starts_with('a'))));
+        assert_eq!(
+            frame
+                .cmds
+                .iter()
+                .filter(|cmd| matches!(cmd,
+            DrawCmd::TextRun { text, .. } if text.starts_with('a')))
+                .count(),
+            5
+        );
         s.source = crate::session::SessionSource::Single;
         let mut frame = Frame::new(800., 300.);
         appearance_preview(&mut frame, &s, &m, &cfg, &t, 0., 0., 700., 250.);

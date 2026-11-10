@@ -13,10 +13,9 @@ mod skin;
 mod ui;
 mod uia_bridge;
 use gale_core::{
-    config::Config,
+    config::{Config, HintStrategy},
     rules::{CleaningPreset, CleaningRule, TrainingMode},
     score::ScoreStore,
-    segment::parse_group_text,
     wenlai::{Difficulty, FetchParams, WenlaiArticle},
 };
 use gale_win::{
@@ -132,6 +131,13 @@ const PREFERENCE_COLORS: &[&str] = &[
     "对打打错底色",
     "词提编码色",
     "词提角标色",
+    "词提一码色",
+    "词提简码色",
+    "词提二字三码色",
+    "词提二字全码色",
+    "词提三字全码色",
+    "词提四字全码色",
+    "词提下划线色",
 ];
 const SCORE_FIELD_LABELS: &[(&str, &str)] = &[
     ("segment", ""),
@@ -162,14 +168,17 @@ fn canonical_score_fields(fields: &str) -> String {
             unique.push(key);
         }
     }
-    unique.join(",")
+    gale_core::scorecard::upgrade_standard_fields(&unique.join(","))
 }
 fn configured_template(cfg: &Config) -> String {
     if !cfg.score_template.trim().is_empty() {
-        return cfg.score_template.clone();
+        return gale_core::scorecard::upgrade_builtin_template(&cfg.score_template);
     }
-    let parts: Vec<_> = cfg
-        .score_fields
+    let fields = canonical_score_fields(&cfg.score_fields);
+    if fields == gale_core::scorecard::STANDARD_SCORE_FIELDS {
+        return gale_core::scorecard::preset("standard").template.into();
+    }
+    let parts: Vec<_> = fields
         .split(',')
         .filter(|key| key.trim() != "character_accuracy")
         .filter_map(|key| {
@@ -194,7 +203,7 @@ fn configured_template(cfg: &Config) -> String {
         })
         .collect();
     if parts.is_empty() {
-        "{segment} 速度{speed}".into()
+        gale_core::scorecard::preset("standard").template.into()
     } else {
         parts.join("  ")
     }
@@ -206,22 +215,15 @@ fn configured_template(cfg: &Config) -> String {
 fn current_score_preset(cfg: &Config) -> &'static str {
     let template = cfg.score_template.trim();
     if template.is_empty() {
-        return if cfg.score_fields == Config::default().score_fields {
+        return if canonical_score_fields(&cfg.score_fields)
+            == gale_core::scorecard::STANDARD_SCORE_FIELDS
+        {
             "standard"
         } else {
-            ""
+            "custom"
         };
     }
-    for id in ["compact", "classic", "detailed"] {
-        if gale_core::scorecard::preset(id).template.trim() == template {
-            return match id {
-                "compact" => "compact",
-                "classic" => "classic",
-                _ => "detailed",
-            };
-        }
-    }
-    "custom"
+    gale_core::scorecard::builtin_preset_id(template).unwrap_or("custom")
 }
 
 pub fn data_dir() -> PathBuf {
@@ -249,7 +251,76 @@ fn unix_secs() -> u64 {
         .unwrap_or_default()
         .as_secs()
 }
-fn fetch_theory(text: &str, single: bool, auto4: bool) -> Result<FullAnalysis, String> {
+/// Every analysis request uses the same scalar offsets for round boundaries.
+/// Empty segments do not add duplicate or out-of-range breaks.
+fn segment_analysis_breaks(segments: &[gale_core::segment::Segment]) -> Vec<usize> {
+    let total: usize = segments
+        .iter()
+        .map(|segment| segment.text.chars().count())
+        .sum();
+    let (mut offset, mut breaks) = (0, Vec::new());
+    for segment in segments.iter().take(segments.len().saturating_sub(1)) {
+        offset += segment.text.chars().count();
+        if offset > 0 && offset < total && breaks.last().copied() != Some(offset) {
+            breaks.push(offset);
+        }
+    }
+    breaks
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct RequiredSpan {
+    start: usize,
+    len: usize,
+}
+
+fn analysis_request_key(
+    text: &str,
+    breaks: &[usize],
+    single: bool,
+    schema_ver: &str,
+    auto4: bool,
+    strategy: HintStrategy,
+    required_spans: &[RequiredSpan],
+    dynamic_boundary: Option<usize>,
+    route_mode: &str,
+) -> String {
+    format!(
+        "{}:{breaks:?}:{single}:{schema_ver}:{auto4}:{}:{required_spans:?}:{dynamic_boundary:?}:{route_mode}",
+        gale_core::rules::fingerprint(text.as_bytes()), strategy.as_str(),
+    )
+}
+
+fn validate_route_response(
+    value: &serde_json::Value,
+    strategy: HintStrategy,
+    required_spans: &[RequiredSpan],
+    dynamic_boundary: Option<usize>,
+    route_mode: &str,
+) -> Result<(), String> {
+    let echoed: Vec<RequiredSpan> = serde_json::from_value(value["required_spans"].clone())
+        .map_err(|_| "当前虎符服务不支持新词提规则，请更新服务后重试".to_string())?;
+    if value["route_rules"].as_str() != Some("quiettype-v1")
+        || value["strategy"].as_str() != Some(strategy.as_str())
+        || value["route_mode"].as_str() != Some(route_mode)
+        || echoed != required_spans
+        || match dynamic_boundary {
+            Some(boundary) => value["dynamic_boundary"].as_u64() != Some(boundary as u64),
+            None => !value["dynamic_boundary"].is_null(),
+        }
+    {
+        return Err("词提路由规则与请求不一致，请更新虎符服务后重试".into());
+    }
+    Ok(())
+}
+
+fn fetch_theory(
+    text: &str,
+    single: bool,
+    auto4: bool,
+    breaks: &[usize],
+    strategy: HintStrategy,
+) -> Result<FullAnalysis, String> {
     if text.chars().count() > 10000 {
         return Err("全文分析最多支持10000字，请载入较短文章".into());
     }
@@ -257,12 +328,23 @@ fn fetch_theory(text: &str, single: bool, auto4: bool) -> Result<FullAnalysis, S
         local_port(),
         "/api/trainer/analyze",
         Some(serde_json::json!({
-            "text": text, "single": single, "theory_auto4": auto4,
+            "text": text, "single": single, "theory_auto4": auto4, "breaks": breaks,
+            "strategy": strategy.as_str(), "required_spans": [],
+            "dynamic_boundary": null, "route_mode": "theory",
         })),
     )?;
+    validate_route_response(&value, strategy, &[], None, "theory")?;
     if value["theory_auto4"].as_bool() != Some(auto4) {
         return Err("当前虎符服务不支持理论分析，请更新服务后重试".into());
     }
+    full_analysis_from_response(text, &value, auto4)
+}
+
+fn full_analysis_from_response(
+    text: &str,
+    value: &serde_json::Value,
+    auto4: bool,
+) -> Result<FullAnalysis, String> {
     let mut fa = FullAnalysis {
         entries: analysis::response_entries(text, &value)?,
         schema: value["schema"].as_str().unwrap_or("当前词库").into(),
@@ -275,6 +357,184 @@ fn fetch_theory(text: &str, single: bool, auto4: bool) -> Result<FullAnalysis, S
     fa.avg_code_len_per_char = summary.avg_code_len;
     fa.select_count = summary.select_count;
     Ok(fa)
+}
+
+/// Match the reference's longest correct prefix, including relaxed quotes.
+/// A wrong character stops progress even when later characters match.
+fn dynamic_prefix_boundary(sess: &Session) -> usize {
+    sess.comparer
+        .typed
+        .iter()
+        .copied()
+        .zip(sess.current_segment().text.chars())
+        .take(sess.comparer.pos)
+        .take_while(|(typed, expected)| sess.comparer.quote_rules.equivalent(*typed, *expected))
+        .count()
+}
+
+/// Coalesce rapid commits into a bounded window rather than waiting for an
+/// input pause. The latest boundary replaces the pending one without moving
+/// its deadline; a response in flight is followed by analyze() on completion.
+fn dynamic_hint_refresh_due(
+    boundary: Option<usize>,
+    seen: &mut Option<usize>,
+    due: &mut Option<u64>,
+    now: u64,
+) -> bool {
+    if boundary != *seen {
+        *seen = boundary;
+        due.get_or_insert(now.saturating_add(80));
+    }
+    if due.is_some_and(|at| now >= at) {
+        *due = None;
+        true
+    } else {
+        false
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct SchemaRevision {
+    epoch: u64,
+    version: String,
+    unavailable_reason: Option<String>,
+}
+impl SchemaRevision {
+    fn accepts(&self, dispatched: &Self, returned_version: &str) -> bool {
+        self == dispatched && self.version == returned_version
+    }
+}
+
+#[derive(Debug, Default)]
+struct RetryBackoff {
+    failures: u8,
+    retry_at: u64,
+}
+impl RetryBackoff {
+    fn ready(&self, now: u64) -> bool {
+        now >= self.retry_at
+    }
+    fn fail(&mut self, now: u64) {
+        self.failures = self.failures.saturating_add(1);
+        let delay = (400u64 << self.failures.min(4)).min(4000);
+        self.retry_at = now.saturating_add(delay);
+    }
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StatusRequest {
+    id: u64,
+    epoch: u64,
+}
+#[derive(Debug, Default)]
+struct LiveSchemaStatus {
+    revision: SchemaRevision,
+    snapshot: Option<serde_json::Value>,
+    next_poll_at: u64,
+    sequence: u64,
+    in_flight: Option<StatusRequest>,
+    retry: RetryBackoff,
+    /// A result from a different revision must wait for a fresh status sample.
+    awaiting_status: bool,
+}
+enum StatusOutcome {
+    Ignored,
+    Failed(String),
+    Ready { changed: bool },
+}
+impl LiveSchemaStatus {
+    fn begin(&mut self, now: u64) -> Option<StatusRequest> {
+        if self.in_flight.is_some() || now < self.next_poll_at {
+            return None;
+        }
+        self.sequence = self.sequence.wrapping_add(1);
+        let request = StatusRequest {
+            id: self.sequence,
+            epoch: self.revision.epoch,
+        };
+        self.in_flight = Some(request);
+        Some(request)
+    }
+    fn complete(
+        &mut self,
+        request: StatusRequest,
+        now: u64,
+        result: Result<serde_json::Value, String>,
+    ) -> StatusOutcome {
+        if self.in_flight != Some(request) {
+            return StatusOutcome::Ignored;
+        }
+        self.in_flight = None;
+        if request.epoch != self.revision.epoch {
+            self.next_poll_at = now;
+            return StatusOutcome::Ignored;
+        }
+        let result = result.and_then(|value| {
+            // Older services can return a transient Host try_lock failure as
+            // HTTP 200. It is not evidence that the dictionary disappeared.
+            if value["schema_ver"].as_str() == Some("")
+                && value["hint_unavailable_reason"].as_str() == Some("输入引擎忙，请稍后重试")
+            {
+                Err("输入引擎忙，请稍后重试".into())
+            } else if value["schema_ver"].is_string() {
+                Ok(value)
+            } else {
+                Err("虎符服务未返回词库版本，请更新服务后重试".into())
+            }
+        });
+        match result {
+            Ok(value) => {
+                let version = value["schema_ver"].as_str().unwrap().to_string();
+                let unavailable_reason = value["hint_unavailable_reason"]
+                    .as_str()
+                    .map(str::to_string);
+                let changed = self.snapshot.is_none()
+                    || version != self.revision.version
+                    || unavailable_reason != self.revision.unavailable_reason;
+                if changed {
+                    self.revision.epoch = self.revision.epoch.wrapping_add(1);
+                    self.revision.version = version;
+                    self.revision.unavailable_reason = unavailable_reason;
+                }
+                self.snapshot = Some(value);
+                self.awaiting_status = false;
+                self.retry.reset();
+                self.next_poll_at = now.saturating_add(400);
+                StatusOutcome::Ready { changed }
+            }
+            Err(error) => {
+                self.retry.fail(now);
+                self.next_poll_at = self.retry.retry_at;
+                StatusOutcome::Failed(error)
+            }
+        }
+    }
+    fn request_fresh(&mut self, now: u64) {
+        self.awaiting_status = true;
+        self.next_poll_at = self.next_poll_at.min(now);
+    }
+    fn ready(&self) -> bool {
+        self.snapshot.is_some() && !self.awaiting_status
+    }
+    fn wait_ms(&self, now: u64) -> u32 {
+        if self.in_flight.is_some() {
+            500
+        } else {
+            self.next_poll_at.saturating_sub(now).clamp(1, 500) as u32
+        }
+    }
+}
+
+/// Only derived views change when a dictionary revision changes. In particular,
+/// the active round, its input host and its frozen scoring rules stay intact.
+fn clear_live_hint_views(model: &mut Model, sess: &mut Session) {
+    model.words.clear();
+    sess.full_analysis = None;
+    model.fields.remove("analysis_error");
+    model.fields.remove("analysis_failed_key");
 }
 /// P2 今日汇总（任务 6b）：从磁盘成绩库（统计/records.jsonl；load_valid 过
 /// <5 硬门，与聚合口径一致）算今天的字数。ui.rs 的今日卡片读 cfg.today_chars
@@ -291,6 +551,26 @@ fn completed_segment_action(command: CommandKey, done: bool, modal: Modal) -> Op
     } else {
         None
     }
+}
+
+/// A network response may replace only the untouched session it was requested
+/// for. Paused practice retains Phase::Typing, so it is protected as well.
+fn accept_online_article(
+    fetch_session: Option<(u64, u64)>,
+    request_id: u64,
+    generation: u64,
+    sess: &Session,
+    pending_scores: usize,
+) -> bool {
+    fetch_session == Some((request_id, generation))
+        && sess.phase != Phase::Typing
+        && !sess.composing
+        && sess.preedit.is_empty()
+        && !(sess.phase == Phase::Done
+            && !sess.recorded
+            && sess.comparer.pos > 0
+            && sess.stats.keys > 0)
+        && pending_scores < 32
 }
 
 /// P0 单实例守卫（任务 3）：命名互斥体 `HuFu-Trainer-SingleInstance` 为主判据。
@@ -356,7 +636,13 @@ fn wake(hwnd: isize) {
     }
 }
 enum Bg {
-    Analyze(u64, Result<serde_json::Value, String>),
+    TrainerStatus(StatusRequest, Result<serde_json::Value, String>),
+    Analyze(
+        u64,
+        String,
+        SchemaRevision,
+        Result<serde_json::Value, String>,
+    ),
     Chats(Vec<qq_bridge::ChatWindow>),
     Article(Result<String, String>),
     Saved(Result<(), String>),
@@ -365,7 +651,7 @@ enum Bg {
     RuleTest(u64, Result<gale_core::rules::CleaningResult, String>),
     RuleApply(u64, u64, Result<Session, String>),
     /// Full-article theory response with an explicit, retryable error.
-    FullAnalysis(String, Result<FullAnalysis, String>),
+    FullAnalysis(String, SchemaRevision, Result<FullAnalysis, String>),
     /// QQ 发送完成（在工作线程里等确认后回传；主线程收到后才切回跟打器）。
     Sent {
         label: String,
@@ -488,6 +774,10 @@ struct App {
     clock: Instant,
     online: Option<OnlineWorker>,
     article: Option<WenlaiArticle>,
+    /// Last accepted online source; random mode must survive advancing a round.
+    article_fetch: Option<FetchParams>,
+    /// In-flight fetch id and the practice generation it may replace.
+    fetch_session: Option<(u64, u64)>,
     shelf: Vec<gale_core::wenlai::ShelfBook>,
     chats: Vec<qq_bridge::ChatWindow>,
     tx: mpsc::Sender<Bg>,
@@ -495,12 +785,25 @@ struct App {
     generation: u64,
     analyzing: bool,
     analyzed: u64,
+    analyzed_key: String,
+    live_schema: LiveSchemaStatus,
+    display_retry: RetryBackoff,
     /// 整改14：整篇文章的词提（全文坐标，一次分析缓存；换段本地切片，
     /// 不再打到哪段才请求哪段）。full_words_ver=生成它的 schema 版本；
-    /// full_words_of=生成时的全文快照（文本变化自动失效缓存）。
+    /// full_words_of/full_words_breaks=生成时的全文与段落快照（变化自动失效缓存）。
     full_words: Vec<modals::HintWord>,
     full_words_ver: String,
     full_words_of: String,
+    full_words_breaks: Vec<usize>,
+    full_words_strategy: HintStrategy,
+    full_words_required_spans: Vec<RequiredSpan>,
+    full_words_auto4: bool,
+    full_words_dynamic_boundary: Option<usize>,
+    dynamic_boundary_seen: Option<usize>,
+    dynamic_hint_due: Option<u64>,
+    /// Recent dynamic boundaries, capped at four small responses and invalidated
+    /// whenever the independent status poll observes a new schema revision.
+    route_cache: VecDeque<(String, serde_json::Value)>,
     /// 本次 analyze 是否按整篇请求（false=超长回退单段，响应为段内坐标）。
     last_analyze_whole: bool,
     theme_generation: u64,
@@ -529,7 +832,7 @@ struct App {
     /// Last successful analysis key: text, source mode, schema and auto4 option.
     full_fetch_hash: Option<String>,
     full_analyzing: bool,
-    full_retry_at: u64,
+    full_retry: RetryBackoff,
     /// 云同步的晴账号（profile.json，随虎符云同步走）。
     sync_online_user: String,
     sync_online_password: String,
@@ -591,7 +894,13 @@ fn run() -> Result<(), String> {
     cfg.material = gale_core::config::Material::Solid;
     cfg.score_fields = canonical_score_fields(&cfg.score_fields);
     let win = MainWindow::create("虎符跟打 · 静室", 800, 600).map_err(|e| e.to_string())?;
-    win.restore_bounds(cfg.win_x, cfg.win_y, cfg.win_w, cfg.win_h, cfg.win_position_physical);
+    win.restore_bounds(
+        cfg.win_x,
+        cfg.win_y,
+        cfg.win_w,
+        cfg.win_h,
+        cfg.win_position_physical,
+    );
     win.show_and_focus();
     let (cw, ch) = win.client_size();
     let renderer =
@@ -674,6 +983,8 @@ fn run() -> Result<(), String> {
         clock: Instant::now(),
         online,
         article: None,
+        article_fetch: None,
+        fetch_session: None,
         shelf: Vec::new(),
         chats: Vec::new(),
         tx,
@@ -681,9 +992,20 @@ fn run() -> Result<(), String> {
         generation: 1,
         analyzing: false,
         analyzed: 0,
+        analyzed_key: String::new(),
+        live_schema: LiveSchemaStatus::default(),
+        display_retry: RetryBackoff::default(),
         full_words: Vec::new(),
         full_words_ver: String::new(),
         full_words_of: String::new(),
+        full_words_breaks: Vec::new(),
+        full_words_strategy: HintStrategy::default(),
+        full_words_required_spans: Vec::new(),
+        full_words_auto4: true,
+        full_words_dynamic_boundary: None,
+        dynamic_boundary_seen: None,
+        dynamic_hint_due: None,
+        route_cache: VecDeque::new(),
         last_analyze_whole: false,
         theme_generation: 0,
         rule_generation: 0,
@@ -702,7 +1024,7 @@ fn run() -> Result<(), String> {
         qq_scan_at: 0,
         full_fetch_hash: None,
         full_analyzing: false,
-        full_retry_at: 0,
+        full_retry: RetryBackoff::default(),
         sync_online_user: sync_online_user.clone(),
         sync_online_password: sync_online_password.clone(),
         pending_login_password: None,
@@ -715,7 +1037,9 @@ fn run() -> Result<(), String> {
         .insert("online_auto_next".into(), app.online_auto_next.to_string());
     app.sync_preferences(true);
     app.sync_rule_model();
-    if let Some(warning) = startup_warning { app.toast(warning); }
+    if let Some(warning) = startup_warning {
+        app.toast(warning);
+    }
     if !app.sync_online_user.is_empty() {
         app.model
             .fields
@@ -755,7 +1079,7 @@ fn run() -> Result<(), String> {
     // 弹起，通知 session 清 protect 窗（帧粒度；真实退格按压远长于一帧）。
     let mut bs_down_prev = false;
     let mut last_size = (0, 0);
-    let mut status_at = 0u64;
+    let mut stats_draw_at = 0u64;
     let mut was_focused = true;
     while !app.exit {
         if !gale_win::window::pump_messages_once() {
@@ -780,21 +1104,21 @@ fn run() -> Result<(), String> {
             gale_win::window::request_frame();
         }
         app.collect_background();
+        app.poll_trainer_status(now);
+        if app.display_retry.retry_at != 0 && app.display_retry.ready(now) {
+            app.analyze();
+        }
         if app.model.analysis_dock && app.sess.full_analysis.is_none() {
             app.fetch_full_analysis();
         }
         app.collect_online();
         app.pump_persistence();
         let focused = unsafe { GetForegroundWindow() == app.win.hwnd() };
-        if focused
-            && !was_focused
-            && (app.sess.phase == Phase::Idle || app.model.analysis_dock)
-        {
+        if focused && !was_focused && (app.sess.phase == Phase::Idle || app.model.analysis_dock) {
             app.analyzed = 0;
             app.analyze();
         }
-        let accept_host =
-            app.model.modal == Modal::None && (focused || was_focused);
+        let accept_host = app.model.modal == Modal::None && (focused || was_focused);
         was_focused = focused;
         app.online_pending = app.online.as_ref().map(|o| o.pending_count()).unwrap_or(0);
         app.model.online_busy = app.online_pending > 0;
@@ -811,6 +1135,9 @@ fn run() -> Result<(), String> {
             for ev in events {
                 match ev {
                     HostEvent::Key { vk } => app.sess.on_key(vk, now),
+                    HostEvent::CandidateSelection { vk, .. } => {
+                        app.sess.on_candidate_selection(vk, now)
+                    }
                     HostEvent::Commit(s) => app
                         .sess
                         .feed_input(gale_core::compare::InputEvent::Commit { chars: s }, now),
@@ -850,8 +1177,7 @@ fn run() -> Result<(), String> {
             app.sess.on_backspace_up();
         }
         bs_down_prev = bs_down;
-        let paused = (!focused || app.model.modal != Modal::None)
-            && !app.model.race;
+        let paused = (!focused || app.model.modal != Modal::None) && !app.model.race;
         app.sess.set_paused(paused, now);
         if paused != app.model.paused {
             app.model.paused = paused;
@@ -866,6 +1192,7 @@ fn run() -> Result<(), String> {
             }
             gale_win::window::request_frame();
         }
+        app.refresh_dynamic_hints(now);
         for cmd in gale_win::input_host::drain_cmds() {
             let a = match cmd {
                 CommandKey::Escape => {
@@ -944,7 +1271,7 @@ fn run() -> Result<(), String> {
             }
         }
         // 整改2b：自动下一段到期触发。仍在成绩单上（用户未接管：未回车进赛报/
-        // 未开其他面板）才发相邻段请求；取回的正文经 collect_online 自动载入。
+        // 未开其他面板）才按当前随机/顺序来源取文；collect_online 自动载入。
         if let Some(at) = app.auto_next_at {
             if now >= at {
                 app.auto_next_at = None;
@@ -975,8 +1302,7 @@ fn run() -> Result<(), String> {
         }
         gale_win::input_host::set_round_done(app.sess.phase == Phase::Done);
         gale_win::input_host::set_result_key_target(
-            (app.model.ledger_open && app.model.selected_history.is_some())
-                .then_some(app.win.hwnd),
+            (app.model.ledger_open && app.model.selected_history.is_some()).then_some(app.win.hwnd),
         );
         for e in gale_win::window::drain_mouse() {
             match e {
@@ -1047,11 +1373,11 @@ fn run() -> Result<(), String> {
                             continue;
                         }
                     }
-                    // Ctrl+滚轮 = 实时字号（10..=60，滚轮向上放大），不滚面板。
+                    // Ctrl+滚轮 = 实时字号（10..=100，滚轮向上放大），不滚面板。
                     if unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0 {
                         let step = (delta / 120).clamp(-1, 1);
                         if step != 0 {
-                            app.cfg.font_size = (app.cfg.font_size + step as f32).clamp(10., 60.);
+                            app.cfg.font_size = (app.cfg.font_size + step as f32).clamp(10., 100.);
                             app.apply_style();
                             app.font_save_due = Some(app.ms() + 800);
                             gale_win::window::request_frame();
@@ -1060,10 +1386,7 @@ fn run() -> Result<(), String> {
                     }
                     let (_, _, _, ph) = modals::panel_for_model(&app.model, lw, lh);
                     let max = (ph - lh + 48.).max(0.);
-                    let has_list = matches!(
-                        app.model.modal,
-                        Modal::Rules | Modal::Groups
-                    );
+                    let has_list = matches!(app.model.modal, Modal::Rules | Modal::Groups);
                     if app.model.modal != Modal::None
                         && max > 0.
                         && !(has_list
@@ -1090,18 +1413,9 @@ fn run() -> Result<(), String> {
             last_size = size;
             gale_win::window::request_frame();
         }
-        if (app.sess.phase == Phase::Idle || app.model.analysis_dock)
-            && now - status_at >= 5000
+        if app.sess.phase == Phase::Typing && !app.model.analysis_dock && now - stats_draw_at >= 250
         {
-            status_at = now;
-            app.analyzed = 0;
-            app.analyze();
-        }
-        if app.sess.phase == Phase::Typing
-            && !app.model.analysis_dock
-            && now - status_at >= 250
-        {
-            status_at = now;
+            stats_draw_at = now;
             gale_win::window::request_frame();
         }
         let animate = !app.model.reduced_motion && app.anim.active(seconds);
@@ -1122,6 +1436,7 @@ fn run() -> Result<(), String> {
             || app.online_pending > 0
             || app.reg_code_until > 0
             || app.analyzing
+            || app.dynamic_hint_due.is_some()
             || app.qq_busy
             || app.font_save_due.is_some()
             || app.auto_next_at.is_some()
@@ -1141,7 +1456,8 @@ fn run() -> Result<(), String> {
             timer = false;
         }
         if !gale_win::window::has_frame_request() {
-            gale_win::window::wait_idle(if need_timer { Some(50) } else { Some(500) });
+            let wait = if need_timer { 50 } else { 500 };
+            gale_win::window::wait_idle(Some(wait.min(app.live_schema.wait_ms(now))));
         }
     }
     app.capture_fields();
@@ -1205,9 +1521,16 @@ impl App {
             self.toast(format!("保存本机跟打器设置失败：{e}"));
             return;
         }
-        let account = crate::online::export_account(&self.dir, &cfg.wenlai_domain, self.sync_account_cleared);
-        match self.sync_profile.save(&self.dir, cfg, &self.sync_online_user,
-            &self.sync_online_password, account, self.sync_identity_dirty) {
+        let account =
+            crate::online::export_account(&self.dir, &cfg.wenlai_domain, self.sync_account_cleared);
+        match self.sync_profile.save(
+            &self.dir,
+            cfg,
+            &self.sync_online_user,
+            &self.sync_online_password,
+            account,
+            self.sync_identity_dirty,
+        ) {
             Ok(()) => self.sync_identity_dirty = false,
             Err(e) => self.toast(e),
         }
@@ -1266,10 +1589,10 @@ impl App {
         self.model.words.clear();
         // Switching segments used to clear the prefetched whole-book hints and
         // wait for another service round-trip. Re-slice the cached words first;
-        // analyze() still runs to refresh schema/status in the background.
+        // The independent status poll refreshes the schema in the background.
         self.refill_from_full_words();
         self.generation = self.generation.wrapping_add(1);
-        self.full_retry_at = 0;
+        self.full_retry.reset();
         self.analyze();
         gale_win::window::request_frame();
     }
@@ -1279,6 +1602,11 @@ impl App {
         if !self.last_analyze_whole
             || self.full_words.is_empty()
             || self.full_words_of != self.analysis_text()
+            || self.full_words_breaks != self.analysis_breaks()
+            || self.full_words_strategy != self.cfg.hint_strategy
+            || self.full_words_required_spans != self.analysis_required_spans()
+            || !self.full_words_auto4
+            || self.full_words_dynamic_boundary != self.analysis_dynamic_boundary()
             || self.full_words_ver != self.model.schema_ver
         {
             return false;
@@ -1287,7 +1615,7 @@ impl App {
         true
     }
     /// 整改2a：在线文章直达跟打区（预览流程退役的唯一载入口）。
-    /// 打字中（规则已冻结）或成绩积压时降级为待读草稿，不抢正文。
+    /// Network responses are checked against their session before reaching here.
     fn load_online_article(&mut self) {
         let Some(a) = self.article.clone() else {
             self.toast("请先取文");
@@ -1313,6 +1641,8 @@ impl App {
             }],
         });
         self.online_article_current = true;
+        self.model.ledger_open = false;
+        self.model.selected_history = None;
         self.reset_host();
         self.open(Modal::None);
         self.snapshot();
@@ -1326,6 +1656,8 @@ impl App {
             ("hint_show_code", self.cfg.hint_show_code),
             ("hint_show_rank", self.cfg.hint_show_rank),
             ("hint_color_words", self.cfg.hint_color_words),
+            ("hint_rank_colors", self.cfg.hint_rank_colors),
+            ("hint_dynamic", self.cfg.hint_dynamic),
             ("hint_underline", self.cfg.hint_underline),
             ("hint_word_bg", self.cfg.hint_word_bg),
             ("score_auto_copy", self.cfg.score_auto_copy),
@@ -1333,6 +1665,14 @@ impl App {
         ] {
             self.model.fields.insert(key.into(), value.to_string());
         }
+        self.model.fields.insert(
+            "hint_strategy".into(),
+            self.cfg.hint_strategy.as_str().into(),
+        );
+        self.model.fields.insert(
+            "hint_settings_locked".into(),
+            self.sess.frozen_rules.is_some().to_string(),
+        );
         self.model.fields.insert(
             "hint_font_size".into(),
             format!("{:.0}", self.cfg.hint_font_size),
@@ -1344,7 +1684,10 @@ impl App {
             "score_preset".into(),
             current_score_preset(&self.cfg).into(),
         );
-        for key in PREFERENCE_COLORS {
+        for key in PREFERENCE_COLORS
+            .iter()
+            .chain(ui::HINT_RANK_COLOR_KEYS.iter())
+        {
             let c = ui::setting_color(&self.theme, key);
             self.model.fields.insert(
                 format!("color_{key}"),
@@ -1360,30 +1703,31 @@ impl App {
             self.model
                 .fields
                 .insert("score_template".into(), configured_template(&self.cfg));
-            let selected = self.model.field("pref_color_key");
-            let key = if PREFERENCE_COLORS.contains(&selected.as_str()) {
-                selected
-            } else {
-                PREFERENCE_COLORS[0].to_string()
-            };
-            self.model
-                .fields
-                .insert("pref_color_key".into(), key.clone());
-            self.model.fields.insert(
-                "pref_color_hex".into(),
-                self.model.field(&format!("color_{key}")),
-            );
+            modals::preferences::sync_color_editor(&mut self.model);
         }
     }
     fn preference_action(&mut self, command: &str) {
         self.cfg.score_fields = canonical_score_fields(&self.cfg.score_fields);
         let parts: Vec<_> = command.split(':').collect();
+        let route_change = matches!(
+            parts.as_slice(),
+            ["pref_strategy", _] | ["pref_toggle", "hint_dynamic"]
+        );
+        if route_change && self.sess.frozen_rules.is_some() {
+            self.toast("本轮规则已冻结，请先重打再修改词提策略");
+            return;
+        }
         match parts.as_slice() {
+            ["pref_strategy", strategy] => {
+                self.cfg.hint_strategy = HintStrategy::from_str_lossy(strategy);
+            }
             ["pref_toggle", key] => {
                 let field = match *key {
                     "hint_show_code" => &mut self.cfg.hint_show_code,
                     "hint_show_rank" => &mut self.cfg.hint_show_rank,
                     "hint_color_words" => &mut self.cfg.hint_color_words,
+                    "hint_rank_colors" => &mut self.cfg.hint_rank_colors,
+                    "hint_dynamic" => &mut self.cfg.hint_dynamic,
                     "hint_underline" => &mut self.cfg.hint_underline,
                     "hint_word_bg" => &mut self.cfg.hint_word_bg,
                     "score_auto_copy" => &mut self.cfg.score_auto_copy,
@@ -1399,56 +1743,42 @@ impl App {
             }
             ["pref_tab", tab] => {
                 if let Ok(tab) = tab.parse::<u8>() {
-                    self.model
-                        .fields
-                        .insert("pref_tab".into(), tab.min(3).to_string());
-                    self.model.modal_epoch += 1;
+                    self.sync_preferences(false);
+                    modals::preferences::select_page(&mut self.model, tab);
                 }
                 return;
             }
-            ["pref_color_select", key] if PREFERENCE_COLORS.contains(key) => {
+            ["pref_hint_view", view @ ("settings" | "colors")] => {
+                self.sync_preferences(false);
+                modals::preferences::select_hint_view(&mut self.model, view);
+                return;
+            }
+            ["pref_color_choose", key] if modals::preferences::color_allowed(&self.model, key) => {
                 self.model
                     .fields
                     .insert("pref_color_key".into(), (*key).into());
                 let c = ui::setting_color(&self.theme, key);
-                self.model.fields.insert(
-                    "pref_color_hex".into(),
-                    format!(
-                        "{:02x}{:02x}{:02x}",
-                        (c[0] * 255.).round() as u8,
-                        (c[1] * 255.).round() as u8,
-                        (c[2] * 255.).round() as u8
-                    ),
+                let current = (
+                    (c[0] * 255.).round() as u8,
+                    (c[1] * 255.).round() as u8,
+                    (c[2] * 255.).round() as u8,
                 );
-                self.model.modal_epoch += 1;
-                return;
-            }
-            ["pref_apply_colors"] => {
-                let key = self.model.field("pref_color_key");
-                if !PREFERENCE_COLORS.contains(&key.as_str()) {
+                let Some((r, g, b)) = gale_win::color_picker::choose_color(self.win.hwnd, current)
+                else {
                     return;
-                }
-                let value = self.model.field("pref_color_hex");
-                let value = value.trim().trim_start_matches('#').to_ascii_lowercase();
-                if value.len() != 6 || !value.is_ascii() {
-                    self.toast("颜色需为六位十六进制，例如 63C08D");
-                    return;
-                }
-                if let Some(color) = gale_core::theme::Color::from_hex_no_hash(&value) {
-                    self.theme.set(&key, color);
-                    self.cfg.color_overrides.insert(key, value);
-                    self.apply_style();
-                } else {
-                    self.toast("颜色格式无效");
-                    return;
-                }
+                };
+                self.theme.set(key, gale_core::theme::Color(r, g, b, 255));
+                self.cfg
+                    .color_overrides
+                    .insert((*key).into(), format!("{r:02x}{g:02x}{b:02x}"));
+                self.apply_style();
             }
             ["pref_score_preset", id] => {
                 match *id {
                     "standard" => {
                         self.cfg.score_template.clear();
-                        self.cfg.score_fields = Config::default().score_fields;
-                        self.toast("已恢复标准字段（原勾选已重置）");
+                        self.cfg.score_fields = gale_core::scorecard::STANDARD_SCORE_FIELDS.into();
+                        self.toast("已恢复标准成绩单：速度、键准、击键、码长");
                     }
                     "compact" | "classic" | "detailed" => {
                         self.cfg.score_template = gale_core::scorecard::preset(id).template.into();
@@ -1511,7 +1841,21 @@ impl App {
             }
             _ => return,
         }
+        if route_change {
+            self.generation = self.generation.wrapping_add(1);
+            self.analyzed = 0;
+            self.full_words.clear();
+            self.full_words_ver.clear();
+            self.model.words.clear();
+            self.sess.full_analysis = None;
+            self.full_fetch_hash = None;
+            self.full_retry.reset();
+            self.model.fields.remove("analysis_failed_key");
+            self.route_cache.clear();
+            self.analyze();
+        }
         self.sync_preferences(false);
+        modals::preferences::sync_color_editor(&mut self.model);
         self.save_config();
     }
     fn format_record(&self, record: &gale_core::score::ScoreRecord) -> String {
@@ -1524,22 +1868,101 @@ impl App {
     fn analysis_text(&self) -> String {
         self.sess.segments.iter().map(|s| s.text.as_str()).collect()
     }
+    fn analysis_breaks(&self) -> Vec<usize> {
+        segment_analysis_breaks(&self.sess.segments)
+    }
     fn analysis_auto4(&self) -> bool {
         self.model.field("analysis_auto4") != "false"
     }
-    fn analysis_key(&self) -> String {
-        format!(
-            "{}:{}:{}:{}",
-            gale_core::rules::fingerprint(self.analysis_text().as_bytes()),
+    fn analysis_required_spans(&self) -> Vec<RequiredSpan> {
+        Vec::new()
+    }
+    fn analysis_dynamic_boundary(&self) -> Option<usize> {
+        self.cfg.hint_dynamic.then(|| {
+            let base: usize = self.sess.segments[..self.sess.current_index()]
+                .iter()
+                .map(|segment| segment.text.chars().count())
+                .sum();
+            base + dynamic_prefix_boundary(&self.sess)
+        })
+    }
+    fn refresh_dynamic_hints(&mut self, now: u64) {
+        let boundary = self.analysis_dynamic_boundary();
+        if dynamic_hint_refresh_due(
+            boundary,
+            &mut self.dynamic_boundary_seen,
+            &mut self.dynamic_hint_due,
+            now,
+        ) {
+            self.analyze();
+        }
+    }
+    fn hint_analysis_input(&self) -> (String, Vec<usize>, Vec<RequiredSpan>, Option<usize>, bool) {
+        let text = self.analysis_text();
+        if text.chars().count() <= 9500 {
+            (
+                text,
+                self.analysis_breaks(),
+                self.analysis_required_spans(),
+                self.analysis_dynamic_boundary(),
+                true,
+            )
+        } else {
+            (
+                self.sess.current_segment().text.clone(),
+                Vec::new(),
+                Vec::new(),
+                self.cfg
+                    .hint_dynamic
+                    .then(|| dynamic_prefix_boundary(&self.sess)),
+                false,
+            )
+        }
+    }
+    fn hint_analysis_key(&self) -> String {
+        let (text, breaks, required_spans, dynamic_boundary, _) = self.hint_analysis_input();
+        analysis_request_key(
+            &text,
+            &breaks,
             self.sess.source == SessionSource::Single,
-            self.model.schema_ver,
-            self.analysis_auto4()
+            &self.model.schema_ver,
+            true, // Both recovered display wrappers use four-code first candidates.
+            self.cfg.hint_strategy,
+            &required_spans,
+            dynamic_boundary,
+            "display",
+        )
+    }
+    fn analysis_key(&self) -> String {
+        analysis_request_key(
+            &self.analysis_text(),
+            &self.analysis_breaks(),
+            self.sess.source == SessionSource::Single,
+            &self.model.schema_ver,
+            self.analysis_auto4(),
+            self.cfg.hint_strategy,
+            &[],
+            None,
+            "theory",
         )
     }
     /// Serialize with ordinary hints. Failed requests remain retryable and only
     /// a successful result is cached; generation changes alone never poison it.
     fn fetch_full_analysis(&mut self) {
-        if self.analyzing || self.full_analyzing {
+        if !self.model.analysis_dock
+            || self.analyzing
+            || self.full_analyzing
+            || !self.live_schema.ready()
+        {
+            return;
+        }
+        if let Some(reason) = &self.live_schema.revision.unavailable_reason {
+            self.model
+                .fields
+                .insert("analysis_loading".into(), "false".into());
+            self.model
+                .fields
+                .insert("analysis_error".into(), reason.clone());
             return;
         }
         let full = self.analysis_text();
@@ -1548,9 +1971,9 @@ impl App {
         }
         let key = self.analysis_key();
         if self.model.field("analysis_failed_key") != key {
-            self.full_retry_at = 0;
+            self.full_retry.reset();
         }
-        if self.ms() < self.full_retry_at {
+        if !self.full_retry.ready(self.ms()) {
             return;
         }
         if self.full_fetch_hash.as_deref() == Some(&key) && self.sess.full_analysis.is_some() {
@@ -1564,11 +1987,14 @@ impl App {
         self.model.fields.remove("analysis_error");
         let single = self.sess.source == SessionSource::Single;
         let auto4 = self.analysis_auto4();
+        let breaks = self.analysis_breaks();
+        let strategy = self.cfg.hint_strategy;
+        let revision = self.live_schema.revision.clone();
         let tx = self.tx.clone();
         let hwnd = self.win.hwnd;
         std::thread::spawn(move || {
-            let result = fetch_theory(&full, single, auto4);
-            let _ = tx.send(Bg::FullAnalysis(key, result));
+            let result = fetch_theory(&full, single, auto4, &breaks, strategy);
+            let _ = tx.send(Bg::FullAnalysis(key, revision, result));
             wake(hwnd);
         });
     }
@@ -1583,7 +2009,7 @@ impl App {
         self.model.selected_history = None;
         self.model.analysis_dock = true;
         self.model.analysis_dock_scroll = 0.;
-        self.full_retry_at = 0;
+        self.full_retry.reset();
         self.analyzed = 0;
         self.analyze();
         self.fetch_full_analysis();
@@ -1601,7 +2027,7 @@ impl App {
         self.model.modal_epoch += 1;
     }
 
-    /// 整改9收口：词提四色循环选色。白名单外键拒绝（防伪造 aux 串）；
+    /// 词提颜色循环选色。白名单外键拒绝（防伪造 aux 串）；
     /// 当前色不在色板内（主题派生色）则跳到首色。即时生效+落盘。
     fn cycle_hint_color(&mut self, key: &str) -> bool {
         const SWATCH: [&str; 12] = [
@@ -1614,6 +2040,12 @@ impl App {
                 | "词提角标色"
                 | "词提下划线色"
                 | "词提底色"
+                | "词提一码色"
+                | "词提简码色"
+                | "词提二字三码色"
+                | "词提二字全码色"
+                | "词提三字全码色"
+                | "词提四字全码色"
                 | "多字词一色"
                 | "多字词二色"
                 | "多字词三色"
@@ -1777,8 +2209,9 @@ impl App {
                 self.model
                     .fields
                     .insert("analysis_auto4".into(), next.to_string());
-                self.full_retry_at = 0;
+                self.full_retry.reset();
                 self.full_fetch_hash = None;
+                self.sess.full_analysis = None;
                 self.fetch_full_analysis();
             }
             AuxAction::AnalysisFont(size) => {
@@ -1798,7 +2231,7 @@ impl App {
                 self.model.analysis_dock_scroll = 0.;
             }
             AuxAction::AnalysisRetry => {
-                self.full_retry_at = 0;
+                self.full_retry.reset();
                 self.full_fetch_hash = None;
                 self.fetch_full_analysis();
             }
@@ -1824,8 +2257,7 @@ impl App {
     fn focus_trainer(&mut self) {
         unsafe {
             use windows::Win32::UI::WindowsAndMessaging::{BringWindowToTop, SetForegroundWindow};
-            let hwnd =
-                windows::Win32::Foundation::HWND(self.win.hwnd as *mut core::ffi::c_void);
+            let hwnd = windows::Win32::Foundation::HWND(self.win.hwnd as *mut core::ffi::c_void);
             let _ = SetForegroundWindow(hwnd);
             let _ = BringWindowToTop(hwnd);
         }
@@ -1848,7 +2280,10 @@ impl App {
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(300));
             let result = qq_bridge::send_message_enhanced(&chat, &text).map_err(|e| e.to_string());
-            let _ = tx.send(Bg::Sent { label: ok_label, result });
+            let _ = tx.send(Bg::Sent {
+                label: ok_label,
+                result,
+            });
             wake(hwnd);
         });
     }
@@ -1929,6 +2364,9 @@ impl App {
                 HostEvent::Preedit(p) => self.sess.set_preedit(p),
                 HostEvent::Cancelled => self.sess.cancel_composition(),
                 HostEvent::Key { vk } => self.sess.on_key(vk, now),
+                HostEvent::CandidateSelection { vk, .. } => {
+                    self.sess.on_candidate_selection(vk, now)
+                }
             }
         }
         gale_win::window::request_frame();
@@ -1970,6 +2408,9 @@ impl App {
         self.edit_epoch = u64::MAX;
     }
     fn draw(&mut self) {
+        if self.renderer.fonts.set_body_family(&self.cfg.font_family) {
+            self.layout_key = (u64::MAX, 0, 0);
+        }
         let (w, h) = self.win.client_size();
         if w <= 0 || h <= 0 {
             return;
@@ -1981,12 +2422,12 @@ impl App {
         let (lw, lh) = (w as f32 / sc, h as f32 / sc);
         let now = self.clock.elapsed().as_secs_f64();
         let (_, _, _, ph) = modals::panel_for_model(&self.model, lw, lh);
-        self.model.panel_scroll = self.model
+        self.model.panel_scroll = self
+            .model
             .panel_scroll
             .clamp(0., (ph - (lh - 48.).min(ph)).max(0.));
         let (bw, fs, base_lh) = ui::body_metrics(&self.sess, &self.cfg, lw);
-        let hints_visible = self.sess.source == SessionSource::Single
-            && gale_core::rules::hints_effective(self.model.hints, self.model.race)
+        let hints_visible = gale_core::rules::hints_effective(self.model.hints, self.model.race)
             && (self.cfg.hint_show_code || self.cfg.hint_show_rank);
         let lheight = ui::line_height_for_anchor(&self.cfg, fs, base_lh, hints_visible);
         let key = (self.generation, fs.to_bits(), bw.to_bits());
@@ -1995,6 +2436,19 @@ impl App {
                 .renderer
                 .wrap_text(&self.sess.current_segment().text, fs, bw);
             self.layout_key = key;
+        }
+        if gale_core::rules::hints_effective(self.model.hints, self.model.race) {
+            let boundaries: Vec<_> = self
+                .model
+                .words
+                .iter()
+                .filter(|word| word.code.is_some() && analysis::is_multi_word(&word.text))
+                .map(|word| (word.start, word.len))
+                .collect();
+            if let Some(lines) = gale_win::d2d::rewrap_words_to_width(&self.layout, &boundaries, bw)
+            {
+                self.layout = lines;
+            }
         }
         let mut f = ui::build(
             &self.sess,
@@ -2117,44 +2571,128 @@ impl App {
             }
         }
     }
+    fn poll_trainer_status(&mut self, now: u64) {
+        let Some(request) = self.live_schema.begin(now) else {
+            return;
+        };
+        let tx = self.tx.clone();
+        let hwnd = self.win.hwnd;
+        std::thread::spawn(move || {
+            let result = local_json(local_port(), "/api/trainer/status", None);
+            let _ = tx.send(Bg::TrainerStatus(request, result));
+            wake(hwnd);
+        });
+    }
+    fn invalidate_live_hints(&mut self) {
+        self.analyzed = 0;
+        self.analyzed_key.clear();
+        self.full_words.clear();
+        self.full_words_ver.clear();
+        self.full_words_of.clear();
+        self.full_words_breaks.clear();
+        self.full_words_required_spans.clear();
+        self.full_words_dynamic_boundary = None;
+        self.route_cache.clear();
+        self.full_fetch_hash = None;
+        self.display_retry.reset();
+        self.full_retry.reset();
+        clear_live_hint_views(&mut self.model, &mut self.sess);
+        self.layout_key = (u64::MAX, 0, 0);
+        // Keep both single-flight locks: old requests must finish before the
+        // latest revision is dispatched, even after several rapid switches.
+        gale_win::window::request_frame();
+    }
+    fn apply_trainer_status(&mut self) {
+        let Some(status) = self.live_schema.snapshot.as_ref() else {
+            return;
+        };
+        if let Some(keys) = status["selection_keys"].as_array() {
+            let keys: Vec<_> = keys
+                .iter()
+                .filter_map(|value| {
+                    value
+                        .as_u64()
+                        .filter(|value| *value <= 255)
+                        .map(|v| v as u32)
+                })
+                .collect();
+            gale_win::input_host::set_selection_keys(&keys);
+        }
+        self.model.schema = status["schema"].as_str().unwrap_or("").into();
+        self.model.schema_ver = self.live_schema.revision.version.clone();
+        self.model.max_code_length = status["max_code_length"].as_u64().unwrap_or(4) as usize;
+        if let Some(reason) = status["hint_unavailable_reason"].as_str() {
+            self.model.status = reason.into();
+        } else if self.model.status.starts_with("词库状态暂不可用") {
+            self.model.status = format!(
+                "{} · {}",
+                self.model.schema,
+                if self.model.words.is_empty() {
+                    "服务已连接"
+                } else {
+                    "词提已就绪"
+                },
+            );
+        }
+    }
     fn analyze(&mut self) {
-        if self.analyzing || self.full_analyzing || self.analyzed == self.generation {
+        if self.analyzing
+            || self.full_analyzing
+            || !self.live_schema.ready()
+            || !self.display_retry.ready(self.ms())
+            || (self.analyzed == self.generation && self.analyzed_key == self.hint_analysis_key())
+        {
             return;
         }
         self.analyzing = true;
         let tx = self.tx.clone();
         let hwnd = self.win.hwnd;
         let generation = self.generation;
+        let revision = self.live_schema.revision.clone();
+        let status = self.live_schema.snapshot.clone().unwrap();
         // 整改14：词提一次性分析整篇文章（全文坐标）；换段只做本地切片，
         // 不再“打到哪段才请求哪段”。段间直接拼接（无分隔符），
         // start=全文累计字符偏移。超长文（>9500 字）会撞 server 10000 字
         // 上限，退回单段请求（段内坐标，refill 不适用——清全文缓存）。
-        let full_text: String = self
-            .sess
-            .segments
+        let (text, breaks, required_spans, dynamic_boundary, whole_book) =
+            self.hint_analysis_input();
+        let strategy = self.cfg.hint_strategy;
+        // The display rule is fixed; the F10 switch changes only the theoretical
+        // four-code model and must not reroute the article during practice.
+        let auto4 = true;
+        let request_key = self.hint_analysis_key();
+        let cached_route = self
+            .route_cache
             .iter()
-            .flat_map(|s| s.text.chars())
-            .collect();
-        let whole_book = full_text.chars().count() <= 9500;
-        let text = if whole_book {
-            full_text
-        } else {
-            self.sess.current_segment().text.clone()
-        };
+            .find(|(key, _)| key == &request_key)
+            .map(|(_, value)| value.clone());
+        self.dynamic_boundary_seen = self.analysis_dynamic_boundary();
+        self.dynamic_hint_due = None;
         if !whole_book && !self.full_words.is_empty() {
             self.full_words.clear();
             self.full_words_ver.clear();
             self.full_words_of.clear();
+            self.full_words_breaks.clear();
         }
         self.last_analyze_whole = whole_book;
-        // 【减法 2026-11-09】词提（文章模式的词级提示）整体下线：只有单字
-        // 练习保留字提。文章模式一律不请求词提数据、不显示提示。
-        let hints = self.sess.source == session::SessionSource::Single
-            && gale_core::rules::hints_effective(self.sess.rules.word_hints, self.model.race);
-        let single = self.sess.source == session::SessionSource::Single || self.cfg.hint_style == 1;
+        let hints = gale_core::rules::hints_effective(self.sess.rules.word_hints, self.model.race);
+        if !hints || status["hint_unavailable_reason"].is_string() {
+            self.analyzing = false;
+            self.analyzed = generation;
+            self.analyzed_key = request_key;
+            self.display_retry.reset();
+            self.model.words.clear();
+            return;
+        }
+        let single = self.sess.source == session::SessionSource::Single;
         // 缓存仅当：有词提数据 且 schema 版本未变 且 正文未变（换书/清洗自动失效）。
         let known_version = if self.full_words.is_empty()
             || self.full_words_of != text
+            || self.full_words_breaks != breaks
+            || self.full_words_strategy != strategy
+            || self.full_words_required_spans != required_spans
+            || self.full_words_auto4 != auto4
+            || self.full_words_dynamic_boundary != dynamic_boundary
             || self.full_words_ver.is_empty()
         {
             String::new()
@@ -2163,9 +2701,13 @@ impl App {
         };
         std::thread::spawn(move || {
             let port = local_port();
-            let r = local_json(port, "/api/trainer/status", None).and_then(|status| {
-                if !hints || status["hint_unavailable_reason"].is_string() {
-                    return Ok(status);
+            let r = (|| {
+                if let Some(cached) = cached_route {
+                    if cached["schema_ver"].as_str().is_some_and(|version| {
+                        !version.is_empty() && Some(version) == status["schema_ver"].as_str()
+                    }) {
+                        return Ok(cached);
+                    }
                 }
                 if !known_version.is_empty()
                     && status["schema_ver"].as_str() == Some(&known_version)
@@ -2177,36 +2719,96 @@ impl App {
                 local_json(
                     port,
                     "/api/trainer/analyze",
-                    Some(serde_json::json!({"text":text,"single":single})),
+                    Some(serde_json::json!({
+                        "text":text,"single":single,"breaks":breaks,"theory_auto4":auto4,
+                        "strategy":strategy.as_str(),"required_spans":required_spans,
+                        "dynamic_boundary":dynamic_boundary,
+                        "route_mode":"display",
+                    })),
                 )
-            });
-            let _ = tx.send(Bg::Analyze(generation, r));
+                .and_then(|value| {
+                    validate_route_response(
+                        &value,
+                        strategy,
+                        &required_spans,
+                        dynamic_boundary,
+                        "display",
+                    )?;
+                    if value["theory_auto4"].as_bool() != Some(auto4) {
+                        return Err("当前虎符服务不支持新词提规则，请更新服务后重试".into());
+                    }
+                    analysis::response_entries(&text, &value)?;
+                    Ok(value)
+                })
+            })();
+            let _ = tx.send(Bg::Analyze(generation, request_key, revision, r));
             wake(hwnd);
         });
     }
     fn collect_background(&mut self) {
         while let Ok(r) = self.rx.try_recv() {
             match r {
-                Bg::Analyze(g, r) => {
+                Bg::TrainerStatus(request, result) => {
+                    let now = self.ms();
+                    match self.live_schema.complete(request, now, result) {
+                        StatusOutcome::Ignored => {}
+                        StatusOutcome::Failed(error) => {
+                            self.model.status = format!("词库状态暂不可用 · 将自动重试 · {error}");
+                            gale_win::window::request_frame();
+                        }
+                        StatusOutcome::Ready { changed } => {
+                            self.apply_trainer_status();
+                            if changed {
+                                self.invalidate_live_hints();
+                            }
+                            self.analyze();
+                            self.fetch_full_analysis();
+                        }
+                    }
+                }
+                Bg::Analyze(g, request_key, revision, r) => {
                     self.analyzing = false;
-                    self.analyzed = g;
-                    if g == self.generation {
+                    let current_revision =
+                        g == self.generation && revision == self.live_schema.revision;
+                    // A transport/protocol failure still applies to this
+                    // service revision after another commit changes the key.
+                    // Otherwise rapid typing could bypass failure backoff.
+                    let failure_recorded = current_revision && r.is_err();
+                    if failure_recorded {
+                        let now = self.ms();
+                        self.display_retry.fail(now);
+                    }
+                    if current_revision && request_key == self.hint_analysis_key() {
+                        let r = r.and_then(|value| {
+                            if self
+                                .live_schema
+                                .revision
+                                .accepts(&revision, value["schema_ver"].as_str().unwrap_or(""))
+                            {
+                                Ok(value)
+                            } else {
+                                let now = self.ms();
+                                self.live_schema.request_fresh(now);
+                                Err("词库版本已变化，正在重新获取词提".into())
+                            }
+                        });
                         match r {
                             Ok(v) => {
-                                if let Some(keys) = v["selection_keys"].as_array() {
-                                    let keys: Vec<_> = keys
-                                        .iter()
-                                        .filter_map(|v| {
-                                            v.as_u64().filter(|v| *v <= 255).map(|v| v as u32)
-                                        })
-                                        .collect();
-                                    gale_win::input_host::set_selection_keys(&keys);
+                                self.analyzed = g;
+                                self.analyzed_key = request_key.clone();
+                                self.display_retry.reset();
+                                if self.cfg.hint_dynamic
+                                    && v["words"].is_array()
+                                    && serde_json::to_vec(&v)
+                                        .is_ok_and(|bytes| bytes.len() <= 2_000_000)
+                                {
+                                    let key = self.hint_analysis_key();
+                                    self.route_cache.retain(|(cached, _)| cached != &key);
+                                    self.route_cache.push_back((key, v.clone()));
+                                    while self.route_cache.len() > 4 {
+                                        self.route_cache.pop_front();
+                                    }
                                 }
-                                self.model.schema = v["schema"].as_str().unwrap_or("").into();
-                                self.model.max_code_length =
-                                    v["max_code_length"].as_u64().unwrap_or(4) as usize;
-                                self.model.schema_ver =
-                                    v["schema_ver"].as_str().unwrap_or("").into();
                                 // 整改14：words 是全文坐标；缓存命中（words_unchanged）
                                 // 沿用 full_words，仅重切当前段。超长回退
                                 // （last_analyze_whole=false）时响应为段内坐标，
@@ -2258,17 +2860,24 @@ impl App {
                                         .collect();
                                     self.full_words_ver = self.model.schema_ver.clone();
                                     self.full_words_of = full.into_iter().collect();
+                                    self.full_words_breaks = self.analysis_breaks();
+                                    self.full_words_strategy = self.cfg.hint_strategy;
+                                    self.full_words_required_spans = self.analysis_required_spans();
+                                    self.full_words_auto4 = true;
+                                    self.full_words_dynamic_boundary =
+                                        self.analysis_dynamic_boundary();
                                 }
                                 if self.last_analyze_whole {
                                     self.refill_segment_words();
                                 }
+                                self.layout_key = (u64::MAX, 0, 0);
                                 self.model.status = format!(
                                     "{} · {}",
                                     self.model.schema,
                                     if self.model.words.is_empty() {
                                         "服务已连接"
                                     } else {
-                                        "单字提示已就绪"
+                                        "词提已就绪"
                                     }
                                 );
                                 if let Some(reason) = v["hint_unavailable_reason"].as_str() {
@@ -2276,14 +2885,18 @@ impl App {
                                 }
                             }
                             Err(e) => {
+                                if !failure_recorded {
+                                    let now = self.ms();
+                                    self.display_retry.fail(now);
+                                }
                                 // Keep showing the prefetched whole-book hints
                                 // when the service is temporarily unavailable.
                                 if self.refill_from_full_words() {
                                     self.model.status =
-                                        format!("单字提示请求失败 · 已用本地缓存 · {e}");
+                                        format!("词提请求失败 · 已用本地缓存 · {e}");
                                 } else {
                                     self.model.words.clear();
-                                    self.model.status = format!("单字提示暂不可用 · {e}");
+                                    self.model.status = format!("词提暂不可用 · {e}");
                                 }
                             }
                         }
@@ -2295,6 +2908,7 @@ impl App {
                     }
                     self.fetch_full_analysis();
                     self.analyze();
+                    gale_win::window::request_frame();
                 }
                 Bg::Chats(v) => {
                     self.qq_busy = false;
@@ -2330,29 +2944,41 @@ impl App {
                         Err(e) => self.toast(e),
                     }
                 }
-                Bg::FullAnalysis(key, result) => {
+                Bg::FullAnalysis(key, revision, result) => {
                     self.full_analyzing = false;
                     self.model
                         .fields
                         .insert("analysis_loading".into(), "false".into());
-                    if key == self.analysis_key() {
+                    if revision == self.live_schema.revision && key == self.analysis_key() {
+                        let result = result.and_then(|analysis| {
+                            if self
+                                .live_schema
+                                .revision
+                                .accepts(&revision, &analysis.schema_ver)
+                            {
+                                Ok(analysis)
+                            } else {
+                                let now = self.ms();
+                                self.live_schema.request_fresh(now);
+                                Err("词库版本已变化，正在重新获取理论分析".into())
+                            }
+                        });
                         match result {
                             Ok(fa) => {
-                                self.model.schema = fa.schema.clone();
-                                self.model.schema_ver = fa.schema_ver.clone();
                                 self.sess.full_analysis = Some(fa);
                                 self.full_fetch_hash = Some(self.analysis_key());
-                                self.full_retry_at = 0;
+                                self.full_retry.reset();
                                 self.model.fields.remove("analysis_error");
                             }
                             Err(error) => {
                                 self.model.fields.insert("analysis_failed_key".into(), key);
-                                self.full_retry_at = u64::MAX;
+                                let now = self.ms();
+                                self.full_retry.fail(now);
                                 self.model.fields.insert("analysis_error".into(), error);
                             }
                         }
                     } else {
-                        self.full_retry_at = 0;
+                        self.full_retry.reset();
                         self.fetch_full_analysis();
                     }
                     self.analyze();
@@ -2435,8 +3061,27 @@ impl App {
                     if g == self.theme_generation && self.cfg.theme == "跟随虎符" {
                         match r {
                             Ok(t) => {
+                                self.capture_fields();
+                                let key = self.model.field("pref_color_key");
+                                let draft = self.model.field("pref_color_hex");
+                                let pristine =
+                                    draft.trim().trim_start_matches('#').eq_ignore_ascii_case(
+                                        &self.model.field(&format!("color_{key}")),
+                                    );
                                 self.theme = t;
+                                for (key, value) in &self.cfg.color_overrides {
+                                    if let Some(color) =
+                                        gale_core::theme::Color::from_hex_no_hash(value)
+                                    {
+                                        self.theme.set(key, color);
+                                    }
+                                }
                                 self.apply_style();
+                                self.sync_preferences(false);
+                                if pristine {
+                                    modals::preferences::sync_color_editor(&mut self.model);
+                                    self.model.modal_epoch += 1;
+                                }
                             }
                             Err(e) => self.toast(e),
                         }
@@ -2484,9 +3129,12 @@ impl App {
                 | OnlineCommand::Register { .. }
         );
         let identity_password = match &c {
-            OnlineCommand::Login { password, .. } | OnlineCommand::Register { password, .. } => Some(password.clone()),
+            OnlineCommand::Login { password, .. } | OnlineCommand::Register { password, .. } => {
+                Some(password.clone())
+            }
             _ => None,
         };
+        let fetching = matches!(&c, OnlineCommand::Fetch(_));
         match self
             .online
             .as_mut()
@@ -2494,7 +3142,14 @@ impl App {
             .and_then(|w| w.submit(c))
         {
             Ok(id) => {
+                if fetching {
+                    // A manual fetch (including shelf selection) takes over the
+                    // pending automatic advance instead of queuing a second one.
+                    self.auto_next_at = None;
+                    self.fetch_session = Some((id, self.generation));
+                }
                 if identity_change {
+                    self.fetch_session = None;
                     self.pending_login_password = identity_password.map(|p| (id, p));
                     self.online_logged_in = false;
                     self.model.online_authenticated = false;
@@ -2502,6 +3157,7 @@ impl App {
                     self.model.online_login_expanded = true;
                     self.model.modal_epoch += 1;
                     self.article = None;
+                    self.article_fetch = None;
                     self.shelf.clear();
                     self.model.online_preview.clear();
                     self.model.online_shelf.clear();
@@ -2535,7 +3191,11 @@ impl App {
                 Ok(OnlinePayload::Account(Some(a))) => {
                     self.sync_account_cleared = false;
                     self.sync_online_user = a.username.clone();
-                    if let Some((_, p)) = self.pending_login_password.take().filter(|(id, _)| *id == r.id) {
+                    if let Some((_, p)) = self
+                        .pending_login_password
+                        .take()
+                        .filter(|(id, _)| *id == r.id)
+                    {
                         self.sync_online_password = p;
                     }
                     self.sync_identity_dirty = r.id != 0;
@@ -2574,7 +3234,31 @@ impl App {
                     self.model.online_shelf.clear();
                     self.model.online_status = "登录已过期，请重新登录；当前预览保留".into();
                 }
-                Ok(OnlinePayload::Article(a)) => {
+                Ok(OnlinePayload::Article(a, params)) => {
+                    let expected_session = self.fetch_session;
+                    if expected_session.is_some_and(|(id, _)| id == r.id) {
+                        self.fetch_session = None;
+                    }
+                    if !accept_online_article(
+                        expected_session,
+                        r.id,
+                        self.generation,
+                        &self.sess,
+                        self.pending_scores.len(),
+                    ) {
+                        let message = "当前练习已变化，已忽略取文结果，请重新取文";
+                        self.model.online_status = message.into();
+                        self.toast(message);
+                        continue;
+                    }
+                    // Validate before committing either the article or its
+                    // continuation source; rejection must preserve both.
+                    if a.text.chars().count() > 100000 {
+                        let message = "在线正文超过100000字，请重新取较短文段";
+                        self.model.online_status = message.into();
+                        self.toast(message);
+                        continue;
+                    }
                     self.model.online_title = a.title.clone();
                     self.model.online_preview = a.text.clone();
                     self.model.online_status = format!(
@@ -2588,9 +3272,9 @@ impl App {
                     );
                     self.model.online_article = Some(a.clone());
                     self.article = Some(a);
+                    self.article_fetch = Some(params);
                     // 整改2a：去预览——取到正文直接载入跟打区，第一段起打
                     //（成绩单期间由自动下一段触发时，载入本身就会关闭成绩单）。
-                    // 开打中（规则已冻结）或成绩积压时降级为待读草稿，不抢正文。
                     self.load_online_article();
                 }
                 Ok(OnlinePayload::Categories(c)) => {
@@ -2672,7 +3356,14 @@ impl App {
                     self.toast("验证码已发送，请查收邮箱");
                 }
                 Err(e) => {
-                    if self.pending_login_password.as_ref().is_some_and(|(id, _)| *id == r.id) {
+                    if self.fetch_session.is_some_and(|(id, _)| id == r.id) {
+                        self.fetch_session = None;
+                    }
+                    if self
+                        .pending_login_password
+                        .as_ref()
+                        .is_some_and(|(id, _)| *id == r.id)
+                    {
                         self.sync_account_cleared = true;
                         self.pending_login_password = None;
                         self.sync_online_password.clear();
@@ -2706,11 +3397,7 @@ impl App {
             self.toast("文章超过 100000 字，请分段载入");
             return;
         }
-        if text.contains("-----第") {
-            self.sess.load_group(parse_group_text(&text));
-        } else {
-            self.sess.load_book("自定义文字", &text);
-        }
+        self.sess.load_text(&text);
         self.online_article_current = false;
         self.reset_host();
         self.open(Modal::None);
@@ -2767,7 +3454,7 @@ impl App {
         self.capture_fields();
         // 私有标记通道（整改2/5/8/13）：modals.rs 暂无正式变体的动作在这里
         // 先行解码执行，不再走后面的公共分支（真实 Theme 动作不受影响）。
-        // 整改9收口：词提四色循环选色（aux 前缀带参数，不进 AuxAction 枚举）。
+        // 词提颜色循环选色（aux 前缀带参数，不进 AuxAction 枚举）。
         if let Action::Theme(s) = &a {
             if let Some(key) = s
                 .strip_prefix(AUX_PREFIX)
@@ -2970,16 +3657,26 @@ impl App {
             Action::AppearanceReset => {
                 let d = Config::default();
                 self.cfg.font_size = d.font_size;
+                self.cfg.font_family = d.font_family;
                 self.cfg.line_gap = d.line_gap;
                 self.cfg.hint_style = d.hint_style;
                 self.cfg.motion_level = d.motion_level;
                 self.cfg.theme = "墨玉".into();
-                self.cfg.color_overrides.clear();
+                self.cfg
+                    .color_overrides
+                    .retain(|key, _| key.starts_with("词提"));
                 self.cfg.smooth_caret = true;
                 self.cfg.shake_on_wrong = true;
                 self.model.reduced_motion = gale_win::edit::reduced_motion();
                 self.theme = ui::theme("墨玉");
+                for (key, value) in &self.cfg.color_overrides {
+                    if let Some(color) = gale_core::theme::Color::from_hex_no_hash(value) {
+                        self.theme.set(key, color);
+                    }
+                }
                 self.apply_style();
+                self.sync_preferences(true);
+                self.model.modal_epoch += 1;
                 self.save_config();
             }
             Action::Close => self.open(Modal::None),
@@ -3021,7 +3718,10 @@ impl App {
                 self.open(Modal::None);
             }
             Action::Next => {
-                if self.sess.index + 1 >= self.sess.total_segments() {
+                if self.online_article_current && self.article.is_some() {
+                    self.auto_next_at = None;
+                    self.act(Action::OnlineFetch(1), false);
+                } else if self.sess.index + 1 >= self.sess.total_segments() {
                     if self.model.history.is_empty() {
                         self.toast("本轮已完成");
                     } else {
@@ -3056,22 +3756,17 @@ impl App {
                 }
             }
             Action::ToggleHints => {
-                // 【减法 2026-11-09】词提已下线；本开关只服务单字练习的字提。
-                if self.sess.source != session::SessionSource::Single {
-                    self.toast("编码提示仅用于单字练习");
-                } else {
-                    let mut r = self.sess.rules.clone();
-                    r.word_hints = !r.word_hints;
-                    match self.sess.set_rules(r) {
-                        Ok(()) => {
-                            self.model.hints = self.sess.rules.word_hints;
-                            self.generation = self.generation.wrapping_add(1);
-                            self.model.words.clear();
-                            self.analyze();
-                            self.save_config();
-                        }
-                        Err(e) => self.toast(e),
+                let mut r = self.sess.rules.clone();
+                r.word_hints = !r.word_hints;
+                match self.sess.set_rules(r) {
+                    Ok(()) => {
+                        self.model.hints = self.sess.rules.word_hints;
+                        self.generation = self.generation.wrapping_add(1);
+                        self.model.words.clear();
+                        self.analyze();
+                        self.save_config();
                     }
+                    Err(e) => self.toast(e),
                 }
             }
             Action::LoadClipboard => match unsafe { gale_win::clipboard_bridge::read_text() } {
@@ -3096,6 +3791,8 @@ impl App {
                     }
                 }
                 self.apply_style();
+                self.sync_preferences(true);
+                self.model.modal_epoch += 1;
                 self.save_config();
             }
             Action::Material(mat) => {
@@ -3104,8 +3801,23 @@ impl App {
                 self.save_config();
             }
             Action::Font(d) => {
-                // 整改6：外观页字号 +/- 与 Ctrl+滚轮统一口径（10..=60）
-                self.cfg.font_size = (self.cfg.font_size + d as f32).clamp(10., 60.);
+                // 外观页字号 +/- 与 Ctrl+滚轮统一口径（10..=100）。
+                self.cfg.font_size = (self.cfg.font_size + d as f32).clamp(10., 100.);
+                self.save_config();
+            }
+            Action::FontChoose => {
+                let current = gale_win::d2d::resolved_cjk_family(&self.cfg.font_family);
+                match gale_win::font_picker::choose_font(self.win.hwnd, &current) {
+                    Ok(Some(family)) => {
+                        self.cfg.font_family = family;
+                        self.save_config();
+                    }
+                    Ok(None) => {}
+                    Err(error) => self.toast(error),
+                }
+            }
+            Action::FontDefault => {
+                self.cfg.font_family.clear();
                 self.save_config();
             }
             Action::Motion => {
@@ -3311,6 +4023,13 @@ impl App {
                 };
                 let p = if d != 0 {
                     match &self.article {
+                        Some(a) if d > 0 => self
+                            .article_fetch
+                            .as_ref()
+                            .map(|source| source.next_params(a, chars, self.model.online_strict))
+                            .unwrap_or_else(|| {
+                                a.adjacent_params(true, chars, self.model.online_strict)
+                            }),
                         Some(a) => a.adjacent_params(d > 0, chars, self.model.online_strict),
                         None => {
                             self.toast("先随机取得一段文章");
@@ -3641,6 +4360,471 @@ fn local_json(
 #[cfg(test)]
 mod persistence_tests {
     use super::*;
+
+    #[test]
+    fn saved_score_presets_keep_core_metrics_and_custom_templates_stay_free() {
+        let mut cfg = Config::default();
+        assert_eq!(current_score_preset(&cfg), "standard");
+        let record = fixture();
+        for id in ["standard", "compact"] {
+            cfg.score_template = if id == "standard" {
+                String::new()
+            } else {
+                gale_core::scorecard::preset(id).template.into()
+            };
+            let loaded = Config::from_toml_text(&cfg.to_toml_text()).unwrap();
+            assert_eq!(current_score_preset(&loaded), id);
+            let text = gale_core::scorecard::format_score_template(
+                &record,
+                &configured_template(&loaded),
+                "虎符",
+            );
+            for label in ["速度", "键准", "击键", "码长"] {
+                assert!(text.contains(label), "{id}: {text}");
+            }
+        }
+        cfg.score_fields = "segment,speed,key_accuracy,code_len,word_rate,select_count,retype_count,chars,time,keys,backspaces,wrong,signature".into();
+        cfg.score_template.clear();
+        assert_eq!(current_score_preset(&cfg), "standard");
+        assert!(configured_template(&cfg).contains("击键{strokes}"));
+        cfg.score_template = "我的成绩：  {speed}\n  {keys}".into();
+        let loaded = Config::from_toml_text(&cfg.to_toml_text()).unwrap();
+        assert_eq!(current_score_preset(&loaded), "custom");
+        assert_eq!(configured_template(&loaded), cfg.score_template);
+    }
+
+    fn live_status_value(version: &str, unavailable: Option<&str>) -> serde_json::Value {
+        let mut value = serde_json::json!({"schema_ver":version,"schema":"测试方案"});
+        if let Some(reason) = unavailable {
+            value["hint_unavailable_reason"] = reason.into();
+        }
+        value
+    }
+
+    fn accept_live_status(
+        live: &mut LiveSchemaStatus,
+        now: u64,
+        version: &str,
+        unavailable: Option<&str>,
+    ) -> bool {
+        let request = live.begin(now).expect("status request is due");
+        match live.complete(request, now, Ok(live_status_value(version, unavailable))) {
+            StatusOutcome::Ready { changed } => changed,
+            _ => panic!("valid status must be accepted"),
+        }
+    }
+
+    #[test]
+    fn live_schema_revision_rejects_old_analysis_after_a_b_a_and_coalesces_latest() {
+        let mut live = LiveSchemaStatus::default();
+        assert!(accept_live_status(&mut live, 0, "A", None));
+        let old_a_request = live.revision.clone();
+        // The analysis lane stays busy while status polling observes changes.
+        assert!(accept_live_status(&mut live, 400, "B", None));
+        assert!(accept_live_status(&mut live, 800, "C", None));
+        assert!(accept_live_status(&mut live, 1200, "A", None));
+        assert!(!live.revision.accepts(&old_a_request, "A"));
+        let latest_request = live.revision.clone();
+        assert!(live.revision.accepts(&latest_request, "A"));
+        assert!(!live.revision.accepts(&latest_request, "B"));
+        assert_eq!(
+            live.revision.version, "A",
+            "analyze replies cannot advance status"
+        );
+        assert!(!accept_live_status(&mut live, 1600, "A", None));
+        assert_eq!(
+            live.revision, latest_request,
+            "unchanged polls do not reroute static hints"
+        );
+    }
+
+    #[test]
+    fn live_schema_poll_is_single_flight_and_old_status_cannot_release_a_new_request() {
+        let mut live = LiveSchemaStatus::default();
+        let first = live.begin(0).unwrap();
+        assert!(live.begin(4000).is_none(), "slow polls never overlap");
+        assert!(matches!(
+            live.complete(first, 0, Ok(live_status_value("A", None))),
+            StatusOutcome::Ready { changed: true }
+        ));
+        assert!(live.begin(399).is_none());
+        let second = live.begin(400).unwrap();
+        assert!(matches!(
+            live.complete(first, 401, Ok(live_status_value("old", None))),
+            StatusOutcome::Ignored
+        ));
+        assert_eq!(live.in_flight, Some(second));
+        assert_eq!(live.revision.version, "A");
+        assert!(matches!(
+            live.complete(second, 402, Ok(live_status_value("B", None))),
+            StatusOutcome::Ready { changed: true }
+        ));
+        assert_eq!(live.revision.version, "B");
+    }
+
+    #[test]
+    fn live_schema_unavailable_changes_and_recovery_invalidate_even_empty_versions() {
+        let mut live = LiveSchemaStatus::default();
+        assert!(accept_live_status(&mut live, 0, "A", None));
+        let old_a = live.revision.clone();
+        assert!(accept_live_status(&mut live, 400, "", Some("源目录已删除")));
+        let deleted = live.revision.clone();
+        assert!(!live.revision.accepts(&old_a, "A"));
+        assert!(accept_live_status(&mut live, 800, "", Some("码表格式损坏")));
+        assert_ne!(
+            live.revision, deleted,
+            "same empty version still tracks the failure reason"
+        );
+        assert!(accept_live_status(&mut live, 1200, "A", None));
+        assert!(!live.revision.accepts(&old_a, "A"));
+        assert!(live.revision.unavailable_reason.is_none());
+    }
+
+    #[test]
+    fn live_schema_failures_back_off_with_a_limit_and_recover_automatically() {
+        let mut live = LiveSchemaStatus::default();
+        let mut now = 0;
+        for delay in [800, 1600, 3200, 4000, 4000, 4000] {
+            let request = live.begin(now).unwrap();
+            assert!(live.begin(now + 1).is_none());
+            assert!(matches!(
+                live.complete(request, now, Err("服务未连接".into())),
+                StatusOutcome::Failed(_)
+            ));
+            assert_eq!(live.next_poll_at, now + delay);
+            assert!(live.begin(now + delay - 1).is_none());
+            now += delay;
+        }
+        assert!(accept_live_status(&mut live, now, "recovered", None));
+        assert_eq!(live.next_poll_at, now + 400);
+        assert_eq!(live.retry.failures, 0);
+        assert!(live.ready());
+        live.request_fresh(now + 100);
+        assert!(
+            !live.ready(),
+            "mismatched analyze responses wait for authoritative status"
+        );
+        assert_eq!(live.next_poll_at, now + 100);
+        assert!(!accept_live_status(&mut live, now + 100, "recovered", None));
+        assert!(live.ready());
+    }
+
+    #[test]
+    fn live_schema_transient_busy_preserves_the_last_revision_and_cached_status() {
+        let mut live = LiveSchemaStatus::default();
+        assert!(accept_live_status(&mut live, 0, "A", None));
+        let before_revision = live.revision.clone();
+        let before_snapshot = live.snapshot.clone();
+        let request = live.begin(400).unwrap();
+        assert!(matches!(
+            live.complete(
+                request,
+                400,
+                Ok(live_status_value("", Some("输入引擎忙，请稍后重试"))),
+            ),
+            StatusOutcome::Failed(error) if error == "输入引擎忙，请稍后重试"
+        ));
+        assert_eq!(live.revision, before_revision);
+        assert_eq!(live.snapshot, before_snapshot);
+        assert!(live.ready(), "the last usable status remains available");
+        assert!(live.revision.accepts(&before_revision, "A"));
+        assert_eq!(live.next_poll_at, 1200);
+        assert!(live.begin(1199).is_none());
+        assert!(!accept_live_status(&mut live, 1200, "A", None));
+        assert_eq!(live.revision, before_revision);
+        assert_eq!(live.retry.failures, 0);
+
+        // Similar text is not a transient-status exemption. Real unavailable
+        // sources must still clear old views, including during recovery.
+        assert!(accept_live_status(
+            &mut live,
+            1600,
+            "",
+            Some("输入引擎忙，请稍后重试：码表来源损坏"),
+        ));
+        assert!(!live.revision.accepts(&before_revision, "A"));
+        assert!(accept_live_status(&mut live, 2000, "A", None));
+        assert!(live.revision.unavailable_reason.is_none());
+    }
+
+    #[test]
+    fn live_schema_view_invalidation_preserves_typing_composition_and_scores() {
+        let mut sess = Session::new(100);
+        sess.load_book("不中断练习", "甲乙丙丁戊己");
+        sess.feed_input(
+            gale_core::compare::InputEvent::Commit {
+                chars: "甲乙".into(),
+            },
+            10,
+        );
+        sess.set_composing(true);
+        sess.set_preedit("bing".into());
+        sess.done_chars = 123;
+        sess.done_keys = 456;
+        sess.full_analysis = Some(FullAnalysis::default());
+        sess.vk_histogram.insert(0x41, 3);
+        let before = serde_json::to_value(&sess).unwrap();
+        let mut model = Model::default();
+        model.words.push(modals::HintWord {
+            text: "甲乙".into(),
+            len: 2,
+            ..Default::default()
+        });
+        model
+            .fields
+            .insert("analysis_error".into(), "old error".into());
+        clear_live_hint_views(&mut model, &mut sess);
+        assert_eq!(serde_json::to_value(&sess).unwrap(), before);
+        assert_eq!(sess.vk_histogram.get(&0x41), Some(&3));
+        assert!(sess.composing);
+        assert_eq!(sess.preedit, "bing");
+        assert!(sess.full_analysis.is_none());
+        assert!(model.words.is_empty());
+        assert!(model.field("analysis_error").is_empty());
+    }
+
+    #[test]
+    fn route_capability_echo_rejects_ignored_strategy_spans_or_dynamic_boundary() {
+        let spans = vec![RequiredSpan { start: 1, len: 2 }];
+        let expected = serde_json::json!({
+            "route_rules":"quiettype-v1", "route_mode":"display", "strategy":"phrases",
+            "required_spans":[{"start":1,"len":2}], "dynamic_boundary":3,
+        });
+        assert!(validate_route_response(
+            &expected,
+            HintStrategy::Phrases,
+            &spans,
+            Some(3),
+            "display"
+        )
+        .is_ok());
+        for (field, wrong) in [
+            ("route_rules", serde_json::json!("old")),
+            ("route_mode", serde_json::json!("theory")),
+            ("strategy", serde_json::json!("shortest")),
+            ("required_spans", serde_json::json!([])),
+            ("dynamic_boundary", serde_json::json!(2)),
+        ] {
+            let mut response = expected.clone();
+            response[field] = wrong;
+            assert!(
+                validate_route_response(
+                    &response,
+                    HintStrategy::Phrases,
+                    &spans,
+                    Some(3),
+                    "display"
+                )
+                .is_err(),
+                "{field}"
+            );
+        }
+        assert!(validate_route_response(
+            &serde_json::json!({}),
+            HintStrategy::Shortest,
+            &[],
+            None,
+            "theory"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn route_cache_keys_separate_display_progress_strategy_and_theory() {
+        let key = |strategy, boundary, mode| {
+            analysis_request_key(
+                "甲😀乙",
+                &[2],
+                false,
+                "schema",
+                true,
+                strategy,
+                &[],
+                boundary,
+                mode,
+            )
+        };
+        assert_ne!(
+            key(HintStrategy::Shortest, None, "display"),
+            key(HintStrategy::Phrases, None, "display")
+        );
+        assert_ne!(
+            key(HintStrategy::Shortest, Some(1), "display"),
+            key(HintStrategy::Shortest, Some(2), "display")
+        );
+        assert_ne!(
+            key(HintStrategy::Shortest, None, "display"),
+            key(HintStrategy::Shortest, None, "theory")
+        );
+        let locked = analysis_request_key(
+            "甲😀乙",
+            &[2],
+            false,
+            "schema",
+            true,
+            HintStrategy::Shortest,
+            &[RequiredSpan { start: 0, len: 2 }],
+            None,
+            "display",
+        );
+        assert_ne!(locked, key(HintStrategy::Shortest, None, "display"));
+    }
+
+    #[test]
+    fn dynamic_refresh_keeps_a_bounded_window_during_continuous_input() {
+        let mut seen = Some(0);
+        let mut due = None;
+        let mut dispatched = Vec::new();
+        // At 16ms per commit there is never an 80ms input pause. Requests
+        // still dispatch at the latest boundary in each bounded window.
+        for step in 0..18 {
+            let boundary = Some(step + 1);
+            let now = step as u64 * 16;
+            if dynamic_hint_refresh_due(boundary, &mut seen, &mut due, now) {
+                dispatched.push((now, seen));
+            }
+        }
+        assert_eq!(
+            dispatched,
+            [(80, Some(6)), (176, Some(12)), (272, Some(18))]
+        );
+        assert!(due.is_none());
+        assert!(!dynamic_hint_refresh_due(
+            Some(18),
+            &mut seen,
+            &mut due,
+            300
+        ));
+
+        // Backspacing all input is an ordinary changed boundary, not a
+        // disabled dynamic mode. It dispatches Some(0) to restore base words.
+        assert!(!dynamic_hint_refresh_due(Some(0), &mut seen, &mut due, 320));
+        assert_eq!(due, Some(400));
+        assert!(dynamic_hint_refresh_due(Some(0), &mut seen, &mut due, 400));
+        assert_eq!(seen, Some(0));
+        assert!(due.is_none());
+    }
+
+    #[test]
+    fn dynamic_progress_uses_only_the_correct_prefix_and_recovers_on_backspace() {
+        use gale_core::compare::InputEvent;
+        let mut sess = Session::new(100);
+        sess.load_book("动态", "“甲😀乙”");
+        sess.feed_input(
+            InputEvent::Commit {
+                chars: "\"甲😀错”".into(),
+            },
+            10,
+        );
+        assert_eq!(sess.comparer.pos, 5);
+        assert_eq!(
+            dynamic_prefix_boundary(&sess),
+            3,
+            "a later matching quote cannot skip the wrong character"
+        );
+        // The comparer has reached Done; use its input stream directly to
+        // exercise the same prefix calculation during correction/recovery.
+        sess.comparer.feed(&InputEvent::Backspace, 20);
+        sess.comparer.feed(&InputEvent::Backspace, 30);
+        assert_eq!(dynamic_prefix_boundary(&sess), 3);
+        sess.comparer.feed(&InputEvent::Backspace, 40);
+        assert_eq!(dynamic_prefix_boundary(&sess), 2, "non-BMP is one scalar");
+        sess.comparer.quote_rules.enabled = false;
+        assert_eq!(
+            dynamic_prefix_boundary(&sess),
+            0,
+            "quote compatibility follows the current round"
+        );
+        sess.comparer.quote_rules.enabled = true;
+        assert_eq!(dynamic_prefix_boundary(&sess), 2);
+        sess.comparer.feed(&InputEvent::Backspace, 50);
+        sess.comparer.feed(&InputEvent::Backspace, 60);
+        assert_eq!(dynamic_prefix_boundary(&sess), 0);
+    }
+
+    #[test]
+    fn analysis_boundaries_and_keys_follow_rounds_in_unicode_scalars() {
+        let segments = |texts: &[&str]| {
+            texts
+                .iter()
+                .map(|text| gale_core::segment::Segment {
+                    mark: String::new(),
+                    text: (*text).into(),
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            segment_analysis_breaks(&segments(&["", "𠮷甲", "", "乙", ""])),
+            [2]
+        );
+        assert!(segment_analysis_breaks(&segments(&["", "", ""])).is_empty());
+        assert!(segment_analysis_breaks(&segments(&["𠮷甲乙"])).is_empty());
+        let joined = "𠮷甲乙";
+        let split_a = segment_analysis_breaks(&segments(&["𠮷", "甲乙"]));
+        let split_b = segment_analysis_breaks(&segments(&["𠮷甲", "乙"]));
+        let key = |breaks: &[usize]| {
+            analysis_request_key(
+                joined,
+                breaks,
+                false,
+                "schema",
+                true,
+                HintStrategy::Shortest,
+                &[],
+                None,
+                "theory",
+            )
+        };
+        assert_ne!(
+            key(&split_a),
+            key(&split_b),
+            "same text with different rounds needs separate theory cache"
+        );
+        assert_ne!(key(&split_a), key(&[]));
+        assert_eq!(key(&split_a), key(&[1]));
+    }
+    #[test]
+    fn online_article_requires_the_current_request_and_practice_generation() {
+        let sess = Session::new(100);
+        assert!(accept_online_article(Some((7, 3)), 7, 3, &sess, 0));
+        assert!(!accept_online_article(None, 7, 3, &sess, 0));
+        // A newer fetch supersedes the old response even in the same session.
+        assert!(!accept_online_article(Some((8, 3)), 7, 3, &sess, 0));
+        // Restarting/loading local text increments generation before return.
+        assert!(!accept_online_article(Some((7, 3)), 7, 4, &sess, 0));
+        assert!(!accept_online_article(Some((7, 3)), 7, 3, &sess, 32));
+    }
+
+    #[test]
+    fn online_article_preserves_typing_paused_composition_and_unrecorded_results() {
+        let mut sess = Session::new(100);
+        sess.load_book("当前练习", "甲乙");
+        sess.composing = true;
+        assert!(!accept_online_article(Some((7, 3)), 7, 3, &sess, 0));
+        sess.composing = false;
+        sess.preedit = "a".into();
+        assert!(!accept_online_article(Some((7, 3)), 7, 3, &sess, 0));
+        sess.preedit.clear();
+        sess.on_key(65, 10);
+        assert_eq!(sess.phase, Phase::Typing);
+        assert!(!accept_online_article(Some((7, 3)), 7, 3, &sess, 0));
+        sess.set_paused(true, 20);
+        assert_eq!(sess.phase, Phase::Typing);
+        assert!(!accept_online_article(Some((7, 3)), 7, 3, &sess, 0));
+        sess.set_paused(false, 30);
+        sess.feed_input(
+            gale_core::compare::InputEvent::Commit {
+                chars: "甲乙".into(),
+            },
+            40,
+        );
+        assert_eq!(sess.phase, Phase::Done);
+        assert!(!sess.recorded);
+        assert!(!accept_online_article(Some((7, 3)), 7, 3, &sess, 0));
+        assert!(sess.finalize_current_at(50, 1000).is_some());
+        assert!(accept_online_article(Some((7, 3)), 7, 3, &sess, 1));
+    }
+
     #[test]
     fn completed_round_continues_only_from_typing_view() {
         let panels = [

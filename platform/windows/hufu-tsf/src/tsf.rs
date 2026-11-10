@@ -122,9 +122,7 @@ fn refresh_idle_keymaps(shared: &SharedRef) {
 }
 
 fn keymap_poll_due(g: &mut Shared, now: std::time::Instant) -> bool {
-    if g.keymap_polled_at.is_some_and(|last| {
-        now.saturating_duration_since(last) < std::time::Duration::from_secs(5)
-    }) {
+    if g.keymap_polled_at.is_some_and(|last| now.saturating_duration_since(last) < std::time::Duration::from_secs(5)) {
         return false;
     }
     g.keymap_polled_at = Some(now);
@@ -446,6 +444,7 @@ pub struct Shared {
     /// 模式键（CapsLock/Ctrl+Space）Test 阶段直发后的去重标记：
     /// 规范宿主 Test→KeyDown 成对，80ms 内同键 Down 跳过防双发。
     pub modekey_last: Option<(usize, std::time::Instant)>,
+    additional_sound_gate: crate::sound::InputSoundGate,
     /// 【三十六修】模式键 down 已直发的一次性标记（vk+时刻）：对应 up
     /// 到达即吞并清空——普通宿主 up 双发防线，不限时长（按住再久不
     /// 翻回）；跟打器类宿主 down 全无、标记恒 None → TestKeyUp 放行
@@ -583,8 +582,7 @@ pub struct Shared {
     /// 【流畅度二批 2026-11-07】Arc 化：动画 tick（5-20ms 周期）取此值
     /// 的 clone 从深拷贝（候选列表逐字 String）变引用计数克隆。
     pub last_show: Option<
-        std::sync::Arc<(Vec<(String, String)>, String, usize)>,
-    >,
+        std::sync::Arc<(Vec<(String, String)>, String, usize)>>,
     /// 【选重闪帧 2026-10-09】数字选重键上屏标记（页内下标）：引擎纯选
     /// 重路径在 state 里自带闪帧；锁+提前上屏路径（uru+3=指了指）state
     /// 为空——update_ui 用 last_show 候选 + 此下标自建闪帧（高亮滑到
@@ -735,6 +733,7 @@ impl Shared {
             stale_raw: String::new(),
             stale_raw_until: None,
             modekey_last: None,
+            additional_sound_gate: crate::sound::InputSoundGate::default(),
             modekey_down_seen: None,
             modekey_up_last: None,
             space_ctrl_armed: false,
@@ -1044,7 +1043,8 @@ impl ITfTextInputProcessor_Impl for HuFuTs_Impl {
                 DEFER_ADVISE.with(|c| c.set(false));
                 DEFER_SOFT.with(|c| c.set(false));
             } else if hard_game {
-                crate::tsf::trace("activate: 硬否决(class=hard) → 完全惰性（不挂 sink/不拆链/不子类化）");
+                crate::tsf::trace("activate: 硬否决(class=hard) → 完全惰性（不挂 sink/不拆链/不子类化）",
+                );
                 // 上次若进过旧流派，对称还原（子类化/拆链/模式位）。
                 if GAME_HOST_MODE.with(|c| c.get()) {
                     crate::tsf::trace("activate: 游戏流派残留 → 对称还原（安全阀）");
@@ -1561,6 +1561,8 @@ impl ITfKeyEventSink_Impl for HuFuTs_Impl {
         lparam: LPARAM,
     ) -> Result<BOOL> {
         crate::candidate_ui::prepare(_pic);
+        // Pass-through keys often have no OnKeyUp callback in test-only hosts.
+        crate::sound::key_up();
         // 【T3-c 2026-11-07】开关前置，免急切 format!（输出不变）。
         if keys_log_enabled() {
             keys_log(&format!("testup vk={:#x}", wparam.0));
@@ -1572,8 +1574,7 @@ impl ITfKeyEventSink_Impl for HuFuTs_Impl {
         &self,
         _pic: Option<&ITfContext>,
         wparam: WPARAM,
-        lparam: LPARAM,
-    ) -> Result<BOOL> {
+        lparam: LPARAM) -> Result<BOOL> {
         crate::candidate_ui::prepare(_pic);
         // 诊断：真实按键事件（附 dispatch 结论与管道错误码）
         //（游戏宿主不挂本 sink——聊天键流在子类化 WndProc 里，见 E7）
@@ -1595,8 +1596,7 @@ impl ITfKeyEventSink_Impl for HuFuTs_Impl {
         &self,
         _pic: Option<&ITfContext>,
         wparam: WPARAM,
-        lparam: LPARAM,
-    ) -> Result<BOOL> {
+        lparam: LPARAM) -> Result<BOOL> {
         crate::candidate_ui::prepare(_pic);
         // 键音「松开即停」：截断当前正在响的键音（打字机手感）
         crate::sound::key_up();
@@ -2070,7 +2070,8 @@ fn combo_held_except(keys: &[usize], vk: usize) -> bool {
 ///（组合外修饰=别的意图——AltGr 形态/系统组合，误入模态会吃掉宿主
 /// 快捷键基座）。
 fn stray_modifier_held(freq: &[usize], del: &[usize]) -> bool {
-    for (vk, nm) in [(0x11usize, "ctrl"), (0x12, "alt"), (0x10, "shift"), (0x5B, "win")] {
+    for (vk, nm) in [(0x11usize, "ctrl"), (0x12, "alt"), (0x10, "shift"), (0x5B, "win"),
+    ] {
         if freq.contains(&vk) || del.contains(&vk) {
             continue;
         }
@@ -3102,14 +3103,14 @@ fn caps_hook_install() {
                 &mut msg,
                 None,
                 0,
-                0,
-            )
+                0)
             .as_bool()
             {
                 if msg.message == CAPS_WM_VIRT {
                     // 拦截打点在泵侧落盘（回调内禁 I/O——文件互斥+磁盘写
                     // 会阻塞全系统键路，见 LowLevelHooksTimeout 摘钩）。
-                    crate::tsf::trace("capsll: 拦物理Caps(组段在身) → 泵侧注入虚键（系统位/灯不动）");
+                    crate::tsf::trace("capsll: 拦物理Caps(组段在身) → 泵侧注入虚键（系统位/灯不动）",
+                    );
                     caps_virt_send();
                     continue; // 线程消息：不翻译不派发
                 }
@@ -3128,7 +3129,8 @@ fn caps_synth_flip() {
         keybd_event, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, VK_CAPITAL,
     };
     unsafe {
-        keybd_event(VK_CAPITAL.0 as u8, 0x3A, KEYBD_EVENT_FLAGS(0), CAPS_FIXUP_MAGIC);
+        keybd_event(VK_CAPITAL.0 as u8, 0x3A, KEYBD_EVENT_FLAGS(0), CAPS_FIXUP_MAGIC,
+        );
         keybd_event(VK_CAPITAL.0 as u8, 0x3A, KEYEVENTF_KEYUP, CAPS_FIXUP_MAGIC);
     }
 }
@@ -3195,8 +3197,7 @@ fn fg_focus_hwnd() -> windows::Win32::Foundation::HWND {
 /// 本线程记忆——跨线程 SetFocus 本就不合法，还挤掉真宿主）。
 pub fn win32_host_focus_remember() {
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetForegroundWindow, GetWindowThreadProcessId,
-    };
+        GetForegroundWindow, GetWindowThreadProcessId};
     let fg = unsafe { GetForegroundWindow() };
     if fg.0.is_null() {
         return;
@@ -3215,8 +3216,7 @@ pub fn win32_host_focus_remember() {
 /// 候选窗都在本线程，交互期前台恒为本线程）。
 pub fn foreground_is_this_thread() -> bool {
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetForegroundWindow, GetWindowThreadProcessId,
-    };
+        GetForegroundWindow, GetWindowThreadProcessId};
     let fg = unsafe { GetForegroundWindow() };
     let fg_tid = if fg.0.is_null() {
         0
@@ -3258,8 +3258,7 @@ pub fn win32_host_focus_restore() -> bool {
     let tgt_tid = unsafe {
         windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(
             target,
-            None,
-        )
+            None)
     };
     if tgt_tid != unsafe { windows::Win32::System::Threading::GetCurrentThreadId() } {
         return false;
@@ -3563,6 +3562,36 @@ fn modekey_admit(g: &mut Shared, vk: usize, up: bool) -> bool {
 }
 
 impl HuFuTs_Impl {
+    /// Sound-only fallback for a key that the host handles itself. No extra
+    /// engine request and no change to the TSF eat/forward decision.
+    fn additional_key_sound(&self, vk: usize, lparam: usize, test_only: bool) {
+        let (ctrl, alt, meta) = unsafe {
+            (
+                GetKeyState(0x11) < 0,
+                GetKeyState(0x12) < 0,
+                GetKeyState(0x5b) < 0 || GetKeyState(0x5c) < 0,
+            )
+        };
+        if !crate::sound::additional_typing_key(vk, ctrl, alt, meta) {
+            return;
+        }
+        let Some((volume, pack)) = crate::sound::configured_key_sound() else {
+            return;
+        };
+        let stamp = unsafe { windows::Win32::UI::WindowsAndMessaging::GetMessageTime() };
+        let play = {
+            let mut g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+            if test_only {
+                g.additional_sound_gate.test(vk, lparam, stamp)
+            } else {
+                g.additional_sound_gate.real(vk, lparam, stamp)
+            }
+        };
+        if play {
+            crate::sound::play("key", volume, &pack);
+        }
+    }
+
     /// 键分派：VK → 名称+修饰 → 管道引擎 → 更新组段与候选窗。
     ///
     /// 【宿主形态实测 keys-17436】虎魄跟打器只投 OnTestKeyDown/OnTestKeyUp
@@ -3636,6 +3665,13 @@ impl HuFuTs_Impl {
     }
 
     fn dispatch(&self, wparam: usize, test_only: bool, up: bool, lparam: usize) -> BOOL {
+        if up {
+            self.shared
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .additional_sound_gate
+                .release(wparam);
+        }
         // （游戏宿主不挂本 sink——dispatch 仅普通宿主可达；游戏键流在
         // 子类化 WndProc 的 game_engine_key 里，见 E7。）
         // 【小键盘 Enter 2026-11】lparam 含 KF_EXTENDED 位（bit 24）：
@@ -3974,7 +4010,12 @@ impl HuFuTs_Impl {
             } else {
                 match vk_to_name(wparam, hint, Some(&self.shared)) {
                     Some(v) => v,
-                    None => return BOOL(0),
+                    None => {
+                        if caret_editable(&self.shared) {
+                            self.additional_key_sound(wparam, lparam, true);
+                        }
+                        return BOOL(0);
+                    }
                 }
             };
             // 【Alt+修改 下线 2026-10-17】预判分支已删——Alt 组合全放行。
@@ -4132,6 +4173,9 @@ impl HuFuTs_Impl {
                 trace("gate: 非编辑焦点 → TestDown 不预吞（直通）");
             }
             let will = want && gate_ok;
+            if !will && gate_ok {
+                self.additional_key_sound(wparam, lparam, true);
+            }
             return BOOL(will as i32);
         }
         // 【T3-c 2026-11-07】每键必经：先查开关再格式化（trace 默认关，
@@ -4214,7 +4258,12 @@ impl HuFuTs_Impl {
         } else {
             match vk_to_name(wparam, hint, Some(&self.shared)) {
                 Some(v) => v,
-                None => return BOOL(0),
+                None => {
+                    if caret_editable(&self.shared) {
+                        self.additional_key_sound(wparam, lparam, false);
+                    }
+                    return BOOL(0);
+                }
             }
         };
         let (name, m_shift, m_ctrl, m_alt) = match name.as_str() {
@@ -4340,8 +4389,7 @@ impl HuFuTs_Impl {
         if name == "capslock" && consumed {
             let prev = CAPS_PREV_LOCK.swap(
                 caps_locked_now as i8,
-                std::sync::atomic::Ordering::Relaxed,
-            );
+                std::sync::atomic::Ordering::Relaxed);
             // 首拍（-1）只建档不动作；此后只在翻转沿检查对齐。
             if prev >= 0 && prev != caps_locked_now as i8 {
                 let bit_on = (unsafe { GetKeyState(VK_CAPITAL.0 as i32) } & 1) != 0;
@@ -4425,8 +4473,7 @@ impl HuFuTs_Impl {
             let raw_cur = state.get("raw").and_then(|v| v.as_str()).unwrap_or("");
             CAPS_SNAP_COMP.store(
                 !raw_cur.is_empty(),
-                std::sync::atomic::Ordering::Release,
-            );
+                std::sync::atomic::Ordering::Release);
             let caps_mapped =
                 g.keymap.contains_key("capslock") || g.keymap_idle.contains_key("capslock");
             CAPS_SNAP_MAPPED.store(caps_mapped, std::sync::atomic::Ordering::Release);
@@ -4534,6 +4581,26 @@ impl HuFuTs_Impl {
         if trace_on() {
             trace(&format!("pipe back consumed={consumed}"));
         }
+        // Play metadata before the pass-through return: an idle number, space
+        // or Backspace keeps its native editing behavior and still has sound.
+        if !test_only || mode_key {
+            if let Some(tag) = sound {
+                let meta = unsafe { GetKeyState(0x5b) < 0 || GetKeyState(0x5c) < 0 };
+                let extra = crate::sound::additional_typing_key(wparam, m_ctrl, m_alt, meta);
+                let admit = !extra || {
+                    let stamp =
+                        unsafe { windows::Win32::UI::WindowsAndMessaging::GetMessageTime() };
+                    self.shared
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .additional_sound_gate
+                        .real(wparam, lparam, stamp)
+                };
+                if admit {
+                    crate::sound::play(&tag, sound_vol, &sound_pack);
+                }
+            }
+        }
         if !consumed {
             // 【中英失同步自愈 2026-09-11】直通键也回填模式缓存：
             // server 全局会话可能被其他进程切走（QQ 切英文→切 WPS，
@@ -4560,9 +4627,6 @@ impl HuFuTs_Impl {
             // g.chinese/语言栏，否则预判用旧值、英文态错报 TRUE，
             // 宿主不产字（「caps 切换后英文打不进」）。切换响应
             // commit 为空、无组段副作用，update_ui 此时只做状态同步。
-            if let Some(tag) = sound {
-                crate::sound::play(&tag, sound_vol, &sound_pack);
-            }
             // 【七十七修·回删替换两级通道】数字后 1. 再按 . → 删半角
             // 点+提交「。」。先走 TSF 扩选删除（QQ/记事本等正常宿主）；
             // 宿主 ShiftStart 哑（WinForms/WPS/VSCode 实测 hr=ok
@@ -4763,8 +4827,9 @@ impl HuFuTs_Impl {
     /// 空态被 TestDown 放行（宿主自删）；VK_PACKET 直产字符不进 IME。
     fn inject_back_and_text(back: u8, text: &str) {
         use windows::Win32::UI::Input::KeyboardAndMouse::{
-            INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_KEYUP,
-            KEYEVENTF_UNICODE, SendInput, VIRTUAL_KEY, VK_BACK,
+            SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
+            KEYEVENTF_KEYUP,
+            KEYEVENTF_UNICODE, VIRTUAL_KEY, VK_BACK,
         };
         let kb = |vk: VIRTUAL_KEY, scan: u16, flags: KEYBD_EVENT_FLAGS| INPUT {
             r#type: INPUT_KEYBOARD,
@@ -4854,7 +4919,8 @@ pub fn test_key(vk: u32) -> i32 {
 /// vk → (基础键名, shift, ctrl, alt)。shift = GetKeyState 按下 ||
 /// hint（本 DLL 跟踪的 TestDown/KeyDown 状态——32 位宿主 KeyDown 时刻
 /// GetKeyState 偶发失准，双保险）。
-fn vk_to_name(vk: usize, hint: bool, shared: Option<&SharedRef>) -> Option<(String, bool, bool, bool)> {
+fn vk_to_name(vk: usize, hint: bool, shared: Option<&SharedRef>,
+) -> Option<(String, bool, bool, bool)> {
     let mapped = |name: &str| shared.is_some_and(|s| keymap_has(s, name));
     unsafe {
         let shift = GetKeyState(VK_SHIFT.0 as i32) < 0 || hint;
@@ -4882,20 +4948,24 @@ fn vk_to_name(vk: usize, hint: bool, shared: Option<&SharedRef>) -> Option<(Stri
             // 0x7B）。
             0x24 => {
                 let km = mapped("home");
-                if km { "home".to_string() } else { return None }
+                if km { "home".to_string() } else { return None;
+                }
             }
             0x23 => {
                 let km = mapped("end");
-                if km { "end".to_string() } else { return None }
+                if km { "end".to_string() } else { return None;
+                }
             }
             0x2E => {
                 let km = mapped("delete");
-                if km { "delete".to_string() } else { return None }
+                if km { "delete".to_string() } else { return None;
+                }
             }
             0x70..=0x7B => {
                 let n = vk - 0x6F;
                 let name = format!("f{n}");
-                if mapped(&name) { name } else { return None }
+                if mapped(&name) { name } else { return None;
+                }
             }
             // 【小键盘映射 2026-11】VK 0x60-0x69（NumLock 开启的小键盘
             // 数字）与 0x6A-0x6F（*/-+/.//Enter——NumLock 无关）：仅当
@@ -4905,13 +4975,19 @@ fn vk_to_name(vk: usize, hint: bool, shared: Option<&SharedRef>) -> Option<(Stri
             // 0x69 是方向/Home/End 群（VK 0x23/0x24/…），不走本分支。
             0x60..=0x69 => {
                 let name = format!("num{}", vk as u8 - 0x60);
-                if mapped(&name) { name } else { return None }
+                if mapped(&name) { name } else { return None;
+                }
             }
-            0x6A => { if mapped("nummul") { "nummul".to_string() } else { return None } }
-            0x6B => { if mapped("numadd") { "numadd".to_string() } else { return None } }
-            0x6D => { if mapped("numsub") { "numsub".to_string() } else { return None } }
-            0x6E => { if mapped("numdot") { "numdot".to_string() } else { return None } }
-            0x6F => { if mapped("numdiv") { "numdiv".to_string() } else { return None } }
+            0x6A => { if mapped("nummul") { "nummul".to_string() } else { return None;
+                } }
+            0x6B => { if mapped("numadd") { "numadd".to_string() } else { return None;
+                } }
+            0x6D => { if mapped("numsub") { "numsub".to_string() } else { return None;
+                } }
+            0x6E => { if mapped("numdot") { "numdot".to_string() } else { return None;
+                } }
+            0x6F => { if mapped("numdiv") { "numdiv".to_string() } else { return None;
+                } }
             // 【八十四修·Shift+字母传大写】字母键按 shift 实态保大小写：
             // 旧口径一律 |32 转小写（引擎只知道 shift=true），而引擎的
             // 大写通道（混输缓冲、大写直上屏）都认大写字符——小写+shift
@@ -8687,7 +8763,8 @@ pub(crate) fn update_ui(shared: SharedRef, commit: String, state: serde_json::Va
                 let alive = g.comp_alive();
                 if let Some(c) = g.cand2.as_mut() {
                     c.comp_alive.set(alive);
-                    c.show_with_first_unit(&cands, &raw_disp, &skin, caret.as_ref(), sel, first_show_unit);
+                    c.show_with_first_unit(&cands, &raw_disp, &skin, caret.as_ref(), sel, first_show_unit,
+                    );
                 }
             }
             // 【流畅度二批 2026-11-07】last_show Arc 化：写点包 Arc
@@ -9229,7 +9306,8 @@ pub(crate) fn update_ui(shared: SharedRef, commit: String, state: serde_json::Va
                 match g.cand2.as_mut() {
                     Some(c) => {
                         c.comp_alive.set(alive);
-                        c.show_with_first_unit(&cands, &raw_disp, &skin, caret.as_ref(), sel, first_show_unit)
+                        c.show_with_first_unit(&cands, &raw_disp, &skin, caret.as_ref(), sel, first_show_unit,
+                        )
                     }
                     None => {}
                 }
@@ -9709,7 +9787,7 @@ fn focus_is_uwp_shell() -> bool {
     }
     unsafe {
         use windows::Win32::UI::Input::KeyboardAndMouse::GetFocus;
-        use windows::Win32::UI::WindowsAndMessaging::{GA_ROOT, GetAncestor, GetClassNameW};
+        use windows::Win32::UI::WindowsAndMessaging::{GetAncestor, GetClassNameW, GA_ROOT};
         let f = GetFocus();
         if f.is_invalid() {
             return false;
@@ -10231,10 +10309,9 @@ use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, EnumChildWindows, EnumWindows, GWL_STYLE, GUITHREADINFO,
-    GetClassNameW, GetForegroundWindow, GetGUIThreadInfo, GetWindowLongW,
-    GetWindowRect, GetWindowThreadProcessId, HWND_MESSAGE, IsWindowVisible, KillTimer,
-    RegisterClassW, SetTimer, WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSW, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, EnumChildWindows, EnumWindows, GetClassNameW,
+    GetForegroundWindow, GetGUIThreadInfo, GetWindowLongW, GetWindowRect, GetWindowThreadProcessId,
+    IsWindowVisible, KillTimer, RegisterClassW, SetTimer, GUITHREADINFO, GWL_STYLE, HWND_MESSAGE, WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSW, WS_POPUP,
 };
 
 // ═══════════ 游戏键盘保护·定稿 2026-10-06（子类化流派） ═══════════
@@ -10618,7 +10695,7 @@ pub(crate) fn gui_caret_fallback() -> Option<RECT> {
         //   3) 屏幕坐标在工作区内
         let caret_valid = |gi: &GUITHREADINFO| -> Option<RECT> {
             use windows::Win32::UI::WindowsAndMessaging::{
-                GA_ROOT, GetAncestor, GetClassNameW, IsWindowVisible,
+                GetAncestor, GetClassNameW, IsWindowVisible, GA_ROOT,
             };
             if gi.hwndCaret.0.is_null() || !IsWindowVisible(gi.hwndCaret).as_bool() {
                 return None;
@@ -11130,8 +11207,7 @@ pub(crate) fn poll_arm(shared: &SharedRef) {
 /// exe 同目录。同族不当「他进程」（poll 残留兜底不收窗）。
 fn fg_exe_lower(pid: u32) -> Option<String> {
     use windows::Win32::System::Threading::{
-        OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
-        QueryFullProcessImageNameW,
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
     };
     unsafe {
         let Ok(h) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
@@ -11783,9 +11859,11 @@ pub(crate) fn candidate_window_visible(thread: u32) -> bool {
     }
     let mut local=false;
     unsafe {
-        let _=windows::Win32::UI::WindowsAndMessaging::EnumThreadWindows(thread,Some(visit),LPARAM(&mut local as *mut bool as isize));
+        let _=windows::Win32::UI::WindowsAndMessaging::EnumThreadWindows(thread,Some(visit),LPARAM(&mut local as *mut bool as isize),
+        );
         local || windows::Win32::UI::WindowsAndMessaging::FindWindowW(
-            windows::core::w!("HuFuSrvCand"), windows::core::PCWSTR::null()).ok()
+            windows::core::w!("HuFuSrvCand"), windows::core::PCWSTR::null(),
+            ).ok()
             .is_some_and(|h| windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(h).as_bool())
     }
 }
@@ -11924,7 +12002,8 @@ mod modekey_tests {
     fn stale_down_seen_expires() {
         let mut g = Shared::new();
         g.modekey_down_seen =
-            Some((CAPS, std::time::Instant::now() - std::time::Duration::from_secs(2)));
+            Some((CAPS, std::time::Instant::now() - std::time::Duration::from_secs(2),
+        ));
         g.modekey_last = None;
         assert!(modekey_admit(&mut g, CAPS, false), "陈旧挂起标记不得吞新按压");
     }

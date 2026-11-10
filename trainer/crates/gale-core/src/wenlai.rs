@@ -142,6 +142,26 @@ impl Default for FetchParams {
     }
 }
 
+impl FetchParams {
+    /// Continue the selected source: random selections stay random; a sequential
+    /// shelf or explicit adjacent selection advances the returned article cursor.
+    pub fn next_params(&self, article: &WenlaiArticle, chars: usize, strict_length: bool) -> Self {
+        if self.mode != FetchMode::Random || self.sequential {
+            return article.adjacent_params(true, chars, strict_length);
+        }
+        Self {
+            chars,
+            strict_length,
+            // Keep the selected category/shelf book, never the previous cursor.
+            sort_num: 0,
+            end_sort_num: 0,
+            end_chars: String::new(),
+            start_chars: String::new(),
+            ..self.clone()
+        }
+    }
+}
+
 impl std::fmt::Debug for WenlaiAccount {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WenlaiAccount")
@@ -1782,5 +1802,73 @@ mod tests {
         assert!(req.url.contains("/api/texts/random?"));
         assert!(req.url.contains("difficulty=4&"));
         assert!(req.url.contains("useShelf=true&sequential=true&bookId=42"));
+    }
+
+    #[test]
+    fn completed_random_rounds_keep_random_endpoint_and_selected_source() {
+        for shelf_book in ["", "42"] {
+            let t = ScriptableMockTransport::new();
+            for _ in 0..3 {
+                t.push(200, RANDOM_RESP);
+            }
+            let mut c = WenlaiHttpClient::new("https://x.com", t);
+            let mut params = FetchParams {
+                category: "selected-category".into(),
+                difficulty: Difficulty::Nan,
+                use_shelf: !shelf_book.is_empty(),
+                book_id: shelf_book.into(),
+                ..FetchParams::default()
+            };
+            for chars in [200, 250, 300] {
+                let article = c.fetch(&params).unwrap();
+                params = params.next_params(&article, chars, false);
+            }
+            let reqs = c.transport.requests();
+            assert_eq!(reqs.len(), 3);
+            for req in reqs {
+                assert!(req.url.contains("/api/texts/random?"), "{}", req.url);
+                assert!(req.url.contains("difficulty=5&"));
+                assert!(req.url.contains("category=selected-category&"));
+                assert!(req.url.contains("sequential=false"));
+                assert!(!req.url.contains("sortNum="));
+                // The response book is not a restriction on the next random draw.
+                assert!(!req.url.contains("bookId=8899"));
+                assert_eq!(req.url.contains("bookId=42"), !shelf_book.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn completed_sequential_rounds_advance_latest_cursor() {
+        let t = ScriptableMockTransport::new();
+        t.push(200, RANDOM_RESP).push(200, RANDOM_RESP);
+        let mut c = WenlaiHttpClient::new("https://x.com", t);
+        let params = FetchParams {
+            use_shelf: true,
+            sequential: true,
+            book_id: "42".into(),
+            ..FetchParams::default()
+        };
+        let mut article = c.fetch(&params).unwrap();
+        article.end_sort_num = 4;
+        article.end_chars = "段尾".into();
+        let next = params.next_params(&article, 120, false);
+        c.fetch(&next).unwrap();
+        let req = &c.transport.requests()[1];
+        assert!(req
+            .url
+            .contains("/api/texts/adjacent?bookId=8899&sortNum=2&direction=next"));
+        assert!(req.url.contains("length=120&strictLength=false"));
+        assert!(req.url.contains("endSortNum=4&endChars="));
+        article.sort_num = 5;
+        assert_eq!(next.next_params(&article, 100, true).sort_num, 5);
+        // An explicit previous selection also continues in book order.
+        assert_eq!(
+            article
+                .adjacent_params(false, 100, true)
+                .next_params(&article, 100, true)
+                .mode,
+            FetchMode::Next
+        );
     }
 }

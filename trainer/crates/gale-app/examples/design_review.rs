@@ -2,6 +2,7 @@
 //!
 //! Run from trainer/:
 //! cargo run -p gale-app --example design_review --target x86_64-pc-windows-gnu -- <output-dir>
+//! Append a screen filter such as `77..80` or `72,75,77` to render only those screens.
 //!
 //! This program creates one hidden render surface. It does not capture the desktop,
 //! create an InputHost, connect to QQ/online services, or read/write user settings.
@@ -34,7 +35,7 @@ pub use analysis::{FullAnalysis, FullAnalysisEntry};
 
 use gale_core::{
     compare::InputEvent,
-    config::Config,
+    config::{Config, HintStrategy},
     rules::{clean_body, CleaningPreset, CleaningRule, SessionRules, TrainingMode},
     score::ScoreRecord,
     segment::{ParsedGroupText, Segment},
@@ -47,7 +48,11 @@ use gale_win::{
 };
 use modals::{HintWord, Modal, Model};
 use session::Session;
-use std::{collections::BTreeMap, error::Error, path::PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    error::Error,
+    path::PathBuf,
+};
 use windows::Win32::UI::{
     HiDpi::{SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT_UNAWARE},
     WindowsAndMessaging::DestroyWindow,
@@ -308,6 +313,92 @@ fn single_hints(sess: &Session, dict: &BTreeMap<String, String>) -> Vec<HintWord
         .collect()
 }
 
+/// Hand-authored layout recipes, never a captured server analysis. Synthetic
+/// recipes cover all six prompt classes alongside neutral single characters
+/// and punctuation; they make no claim about current dictionary reachability.
+fn word_hint_fixture(m: &mut Model) -> Session {
+    let recipes = [
+        ("的", Some("u"), 1, ""),
+        ("，", None, 0, ""),
+        ("一码", Some("a"), 1, "_"),
+        ("、", None, 0, ""),
+        ("简码", Some("ab"), 1, ""),
+        ("、", None, 0, ""),
+        ("三码", Some("abc"), 1, ""),
+        ("、", None, 0, ""),
+        ("乱来", Some("aaah"), 1, ""),
+        ("、", None, 0, ""),
+        ("来来来", Some("aaah"), 2, "2"),
+        ("、", None, 0, ""),
+        ("六档词提", Some("abcd"), 1, ""),
+        ("。", None, 0, ""),
+        ("……", None, 0, ""),
+        ("缺词", None, 0, ""),
+    ];
+    *m = Model::default();
+    m.hints = true;
+    m.max_code_length = 4;
+    m.status = "人工词提布局样本 · 未连接虎符服务".into();
+    m.schema = "六档词色 · 人工布局配方".into();
+    m.schema_ver = "visual-fixture".into();
+    let mut start = 0;
+    for (text, code, rank, tail) in recipes {
+        let len = text.chars().count();
+        m.words.push(HintWord {
+            text: text.into(),
+            code: code.map(str::to_owned),
+            tail: tail.into(),
+            start,
+            len,
+            rank,
+        });
+        start += len;
+    }
+    let body = m
+        .words
+        .iter()
+        .map(|word| word.text.as_str())
+        .collect::<String>();
+    let mut sess = Session::new(100);
+    sess.set_rules(SessionRules {
+        mode: TrainingMode::Practice,
+        word_hints: true,
+        ..SessionRules::default()
+    })
+    .expect("manual word-hint fixture rules");
+    sess.load_group(ParsedGroupText {
+        title: "词提视觉样本（人工配方）".into(),
+        difficulty: None,
+        segments: vec![Segment {
+            mark: "1".into(),
+            text: body,
+        }],
+    });
+    let entries: Vec<_> = m
+        .words
+        .iter()
+        .map(|word| FullAnalysisEntry {
+            word: word.text.clone(),
+            code: word.code.clone(),
+            code_len: word.code.as_ref().map_or(0, |code| code.len() as u64),
+            rank: word.rank as u64,
+            tail: word.tail.clone(),
+        })
+        .collect();
+    let total_code_len = entries.iter().map(|entry| entry.code_len).sum::<u64>();
+    let select_count = entries.iter().filter(|entry| entry.rank > 1).count() as u64;
+    sess.full_analysis = Some(FullAnalysis {
+        entries,
+        total_code_len,
+        avg_code_len_per_char: total_code_len as f64 / start as f64,
+        select_count,
+        schema: m.schema.clone(),
+        schema_ver: m.schema_ver.clone(),
+        max_code_length: 4,
+    });
+    sess
+}
+
 fn drill_fixture() -> Session {
     let tables = builtin_tables();
     let (title, text) = tables[0];
@@ -422,6 +513,8 @@ fn seed_preferences(cfg: &Config, m: &mut Model, theme: &gale_core::theme::Theme
     for (key, value) in [
         ("hint_show_code", cfg.hint_show_code),
         ("hint_show_rank", cfg.hint_show_rank),
+        ("hint_color_words", cfg.hint_color_words),
+        ("hint_dynamic", cfg.hint_dynamic),
         ("score_auto_copy", cfg.score_auto_copy),
         ("auto_send_score", cfg.auto_send_score),
     ] {
@@ -429,6 +522,10 @@ fn seed_preferences(cfg: &Config, m: &mut Model, theme: &gale_core::theme::Theme
     }
     m.fields
         .insert("hint_font_size".into(), cfg.hint_font_size.to_string());
+    m.fields
+        .insert("hint_strategy".into(), cfg.hint_strategy.as_str().into());
+    m.fields
+        .insert("hint_rank_colors".into(), cfg.hint_rank_colors.to_string());
     m.fields
         .insert("score_fields".into(), cfg.score_fields.clone());
     m.fields
@@ -445,7 +542,17 @@ fn seed_preferences(cfg: &Config, m: &mut Model, theme: &gale_core::theme::Theme
         "对打打错底色",
         "词提编码色",
         "词提角标色",
-    ] {
+        "词提一码色",
+        "词提简码色",
+        "词提二字三码色",
+        "词提二字全码色",
+        "词提三字全码色",
+        "词提四字全码色",
+        "词提下划线色",
+    ]
+    .into_iter()
+    .chain(ui::HINT_RANK_COLOR_KEYS)
+    {
         let color = ui::setting_color(theme, key);
         m.fields.insert(
             format!("color_{key}"),
@@ -547,7 +654,32 @@ fn main() -> Result<(), Box<dyn Error>> {
     let output = std::env::args_os()
         .nth(1)
         .map(PathBuf::from)
-        .ok_or("Usage: design_review <output-directory>")?;
+        .ok_or("Usage: design_review <output-directory> [screen-filter: 77..80 or 72,75,77]")?;
+    let screens: BTreeSet<usize> = if let Some(filter) = std::env::args_os().nth(2) {
+        let filter = filter.to_string_lossy();
+        let mut selected = BTreeSet::new();
+        for part in filter.split(',') {
+            let part = part.trim();
+            let range = part
+                .split_once("..=")
+                .or_else(|| part.split_once(".."))
+                .or_else(|| part.split_once('-'));
+            let (start, end) = match range {
+                Some((start, end)) => (start.parse::<usize>()?, end.parse::<usize>()?),
+                None => {
+                    let number = part.parse::<usize>()?;
+                    (number, number)
+                }
+            };
+            if start < 1 || end > 86 || start > end {
+                return Err("screen filter must select numbers in 1..86".into());
+            }
+            selected.extend(start..=end);
+        }
+        selected
+    } else {
+        (1..=86).collect()
+    };
     std::fs::create_dir_all(&output)?;
     unsafe {
         let _ = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_UNAWARE);
@@ -567,7 +699,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut renderer = Renderer::new(window.0.hwnd, WIDTH as u32, HEIGHT as u32)?;
     let dict = dictionaries();
     let mut manifest = Vec::new();
-    for screen in 1..=71 {
+    for screen in screens {
         let (mut sess, mut m) = practice_fixture();
         let mut cfg = Config {
             font_size: 54.,
@@ -593,8 +725,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             | 63
             | 65..=67
             | 69
-            | 70 => (640., 420.),
-            26..=28 | 30 | 39 | 41..=47 | 51 | 54 | 56 | 59 | 60 | 71 => (800., 600.),
+            | 70
+            | 73
+            | 74
+            | 76
+            | 81 => (640., 420.),
+            26..=28 | 30 | 39 | 41..=47 | 51 | 54 | 56 | 59 | 60 | 71 | 82 => (800., 600.),
             _ => (WIDTH, HEIGHT),
         };
         let mut theme_name = "墨玉";
@@ -903,6 +1039,68 @@ fn main() -> Result<(), Box<dyn Error>> {
                 m.ledger_open = true;
                 "65-ledger-history-empty-640x420.bmp"
             }
+            72..=86 => {
+                sess = word_hint_fixture(&mut m);
+                cfg.font_size = if matches!(screen, 73 | 74 | 76) {
+                    100.
+                } else {
+                    36.
+                };
+                cfg.hint_show_code = true;
+                cfg.hint_show_rank = true;
+                cfg.hint_color_words = true;
+                cfg.hint_underline = true;
+                m.fields.insert("hint_color_words".into(), "true".into());
+                m.fields.insert("hint_underline".into(), "true".into());
+                m.fields.insert("analysis_auto4".into(), "true".into());
+                m.fields.insert("analysis_font".into(), "24".into());
+                if matches!(screen, 72 | 77 | 79 | 83 | 85) {
+                    theme_name = "宣纸";
+                }
+                if matches!(screen, 74 | 77 | 78 | 86) {
+                    m.analysis_dock = true;
+                }
+                if matches!(screen, 75 | 76 | 79..=84) {
+                    m.open(Modal::Preferences);
+                    m.fields.insert(
+                        "pref_tab".into(),
+                        if screen == 76 { "2" } else { "0" }.into(),
+                    );
+                    if screen >= 79 {
+                        m.fields.insert("pref_hint_view".into(), "colors".into());
+                    }
+                    if screen == 81 {
+                        m.panel_scroll = 160.;
+                    }
+                }
+                cfg.hint_rank_colors = screen >= 83;
+                if screen == 75 {
+                    cfg.hint_strategy = HintStrategy::Phrases;
+                    cfg.hint_dynamic = true;
+                    m.fields
+                        .insert("hint_settings_locked".into(), "false".into());
+                }
+                if screen == 76 {
+                    cfg.font_family = "Microsoft YaHei UI".into();
+                }
+                match screen {
+                    72 => "72-six-word-colors-36-light-1280x800.bmp",
+                    73 => "73-word-hints-100-640x420.bmp",
+                    74 => "74-word-hints-100-analysis-640x420.bmp",
+                    75 => "75-preferences-strategy-dynamic-1280x800.bmp",
+                    76 => "76-preferences-font-100-640x420.bmp",
+                    77 => "77-analysis-six-colors-neutral-single-punctuation-light-1280x800.bmp",
+                    78 => "78-analysis-six-colors-neutral-single-punctuation-dark-1280x800.bmp",
+                    79 => "79-preferences-six-colors-one-selected-light-1280x800.bmp",
+                    80 => "80-preferences-six-colors-one-selected-dark-1280x800.bmp",
+                    81 => "81-preferences-hint-colors-640x420-scrolled.bmp",
+                    82 => "82-preferences-hint-colors-800x600.bmp",
+                    83 => "83-rank-color-palette-light-1280x800.bmp",
+                    84 => "84-rank-color-palette-dark-1280x800.bmp",
+                    85 => "85-rank-colors-main-light-1280x800.bmp",
+                    _ => "86-rank-colors-analysis-dark-1280x800.bmp",
+                }
+            }
             _ => unreachable!(),
         };
         if m.ledger_open {
@@ -917,11 +1115,24 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         let theme = ui::theme(theme_name);
         seed_preferences(&cfg, &mut m, &theme);
-        m.words = if single {
-            single_hints(&sess, &dict)
-        } else {
-            Vec::new()
-        };
+        if matches!(screen, 79..=84) {
+            m.fields.insert(
+                "pref_color_key".into(),
+                if screen >= 83 {
+                    "词提3选色"
+                } else {
+                    "词提一码色"
+                }
+                .into(),
+            );
+            let hex = m.field(&format!("color_{}", m.field("pref_color_key")));
+            m.fields.insert("pref_color_hex".into(), hex);
+        }
+        if single {
+            m.words = single_hints(&sess, &dict);
+        } else if screen <= 71 {
+            m.words.clear();
+        }
         m.max_code_length = 4;
         if single {
             if let Some(word) = m.words.get_mut(4) {
@@ -930,8 +1141,21 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         }
         renderer.resize_lossy(width as u32, height as u32);
+        renderer.fonts.set_body_family(&cfg.font_family);
         let (body_w, font_size, _) = ui::body_metrics(&sess, &cfg, width);
-        let lines = renderer.wrap_text(&sess.current_segment().text, font_size, body_w);
+        let mut lines = renderer.wrap_text(&sess.current_segment().text, font_size, body_w);
+        if gale_core::rules::hints_effective(m.hints, m.race) {
+            let boundaries: Vec<_> = m
+                .words
+                .iter()
+                .filter(|word| word.code.is_some() && analysis::is_multi_word(&word.text))
+                .map(|word| (word.start, word.len))
+                .collect();
+            if let Some(wrapped) = gale_win::d2d::rewrap_words_to_width(&lines, &boundaries, body_w)
+            {
+                lines = wrapped;
+            }
+        }
         let mut animation = ui::Animation {
             wrong_at: -100.,
             correct_at: -100.,
@@ -974,6 +1198,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             "screen":screen,"file":name,"logical_size":[width,height],"pixel_size":[width as u32,height as u32],
             "theme":theme_name,"modal":format!("{:?}",m.modal),"phase":format!("{:?}",sess.phase),
             "font_size":cfg.font_size,"single_character_hints":single,"report_tab":m.field("report_tab"),"ledger_open":m.ledger_open,"analysis_dock":m.analysis_dock,"ledger_scroll":m.ledger_scroll,"analysis_scroll":m.analysis_dock_scroll,
+            "requested_font_family":cfg.font_family,"resolved_font_family":gale_win::d2d::resolved_cjk_family(&cfg.font_family),
+            "hint_strategy":cfg.hint_strategy.as_str(),"hint_dynamic":cfg.hint_dynamic,"hint_settings_locked":m.field("hint_settings_locked"),
+            "hint_recipe_source":if screen >= 72 { Some("manual-layout-recipes-not-server-analysis") } else { None },
+            "hint_spans":m.words.iter().map(|word| serde_json::json!({"text":word.text,"code":word.code,"rank":word.rank,"tail":word.tail,"start":word.start,"len":word.len,"color_class":word.code.as_deref().and_then(|code| analysis::word_color_class(&word.text,code)).map(|class|format!("{class:?}"))})).collect::<Vec<_>>(),
             "panel_scroll":m.panel_scroll,"list_scroll":m.scroll,"selected_history":m.selected_history,"history_records":m.history.len(),
             "draw_commands":frame.cmds.len(),"hit_targets":hits.len(),
             "visible_native_field_rectangles":field_manifest,"native_field_values_painted_by_d2d":true
@@ -990,6 +1218,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         }))?,
     )?;
     std::fs::write(output.join("README.txt"), format!(
-        "虎符跟打器 · 开发期布局 fixture\n\n{} 张 BMP 使用产品真实 ui::build、modals::draw、Frame 与 Direct2D Renderer，在单个隐藏窗口内生成。\n覆盖 1280×800、800×600 与 640×420，96 DPI；正文统一使用用户字号 54。\n核心场景覆盖文章、单字练习、完成与末段完成、更多菜单、选群、外观、设置三个页签，以及成绩记录/本轮汇总。\n另保留深浅主题、在线登录注册与滚动、清洗规则、完整键盘、理论码长分析与本地载文等辅助场景。\n成绩记录同时包含《岳阳楼记》《醉翁亭记》，区分所选旧记录与本轮最新成绩；小窗口额外覆盖滚动后的详情、群聊空态与失效选择。文章不创建编码提示，单字练习从真实单字码表生成提示。\nmanifest.json 逐图记录主题、尺寸、字号、模态、滚动、历史选择、绘制指令数量和原生字段矩形。\n账号、群、文章进度与成绩均为确定性样本；成绩通过真实 Session key / commit / finalize 路径生成，不读写产品成绩文件。\n原生输入字段按 FieldSpec 坐标用 D2D 绘制样本值；未创建 InputHost/RichEdit，不能替代真实 TSF、输入、焦点与滚动验证。\n没有抓取桌面、读取其他应用、访问网络或修改系统设置。\n", manifest.len()))?;
+        "虎符跟打器 · 开发期布局 fixture\n\n{} 张 BMP 使用产品真实 ui::build、modals::draw、Frame 与 Direct2D Renderer，在单个隐藏窗口内生成。\n覆盖 1280×800、800×600 与 640×420，96 DPI；S1–S71 正文字号为 54，S72–S80 使用 36 或 100。\nS72/S77/S78 以多字一码a、简码ab、二字三码abc、二字全码aaah、三字全码aaah、长词abcd覆盖六档词色，并同时展示单字与单/双标点中立色。S73/S74 验证100字号与短窗口的正文/F10布局；S75完整展示最短编码/词组优先策略和动态开关；S76验证系统字体与100字号设置；S79/S80在浅色与深色F1颜色页选中多字一码，展示默认色值与全部六档控件。\n词提与理论数据为人工布局配方，不是服务端分析结果，不声称这些配方在当前码表可达；坐标逐token按Unicode标量累加，正文与F10调用同一分类与调色函数。算法正确性由独立oracle/服务端测试验证。\n字体选择与整词换行使用产品真实Renderer路径。可传第二参数77..80只渲染六档词色及颜色设置的最小明暗场景，或72,75,77选择场景。\nmanifest.json逐图记录主题、尺寸、字号、请求/实际字体、策略、动态开关、每词颜色档位、模态、滚动、绘制指令数量和原生字段矩形。\nS1–S71仍保留历史文章、单字练习、成绩与在线/QQ/清洗界面样例；确定性成绩通过Session真实key/commit/finalize路径生成，不读写产品成绩文件。\n原生输入字段按FieldSpec坐标由D2D代绘；未创建InputHost/RichEdit，不能替代真实TSF、输入、焦点、滚动、QQ、网络、账号或持久化验证。\n没有抓取桌面、读取其他应用、访问网络或修改系统设置。\n", manifest.len()))?;
     Ok(())
 }

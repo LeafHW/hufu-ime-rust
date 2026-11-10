@@ -9,10 +9,10 @@
 // （Rime 同拍），弱切分不压词典精确匹配（框@ennw 居首，虎爪/Rime 同）。
 const SENT_PHRASE_FRONT_FLOOR: f64 = -12.0;
 
+mod assets;
 pub mod dynamic;
 pub mod punct;
 pub mod session;
-mod assets;
 
 pub use assets::{PreparedGlobalAssets, PreparedSchema};
 
@@ -372,8 +372,7 @@ const COMMIT_HISTORY_CAP: usize = 8;
 /// 调用方传入（码表前缀查询）。
 pub fn parse_rank_locks_keep_digits(
     raw: &str,
-    is_code_prefix: &dyn Fn(&str) -> bool,
-) -> RankLocks {
+    is_code_prefix: &dyn Fn(&str) -> bool) -> RankLocks {
     let chars: Vec<char> = raw.chars().collect();
     let mut base = String::new();
     let mut locks = Vec::new();
@@ -781,7 +780,8 @@ impl Engine {
     }
 
     /// Read/derive a reverse table without holding an Engine or Host lock.
-    pub fn prepare_reverse_table(path: &Path, rule: Option<hufu_dict::ShuangpinRule>) -> std::io::Result<ReverseTable> {
+    pub fn prepare_reverse_table(path: &Path, rule: Option<hufu_dict::ShuangpinRule>,
+    ) -> std::io::Result<ReverseTable> {
         match rule {
             Some(rule) => ReverseTable::load_derived(path, &rule),
             None => ReverseTable::load(path),
@@ -1122,9 +1122,7 @@ impl Engine {
                 // 【小键盘映射 2026-11】VK 0x60-0x6F → num0-9/num./num+/
                 // num-/num*/num/numEnter（键帽语义）。与主排数字分开
                 // 身份：主排 Char('5') 是选重键，小键盘可独立映射。
-                KeyCode::Numpad(c) if c.is_ascii_digit() => {
-                    return Some(format!("num{c}"))
-                }
+                KeyCode::Numpad(c) if c.is_ascii_digit() => return Some(format!("num{c}")),
                 KeyCode::Numpad('+') => "numadd",
                 KeyCode::Numpad('-') => "numsub",
                 KeyCode::Numpad('*') => "nummul",
@@ -1317,8 +1315,7 @@ impl Engine {
                 }
                 if composing && !session.candidates.is_empty() {
                     let (first, fback) = self.resolve_commit_pair(
-                        &session.candidates[0].commit_text().to_string(),
-                    );
+                        &session.candidates[0].commit_text().to_string());
                     session.clear();
                     let mut o =
                         KeyOutcome::commit(format!("{first}{t}"), self.state(session));
@@ -1365,7 +1362,15 @@ impl Engine {
         // 撤销：日志已改异步写线程（见 learn_log_send），键路不再触盘；
         // 已入队条目由写线程落盘 + Engine Drop 关通道 join 兜底，不丢。
         // 提示音标签（前端按数据目录 sounds/<tag>.wav 播放）
-        if self.config.sound.enabled && out.consumed {
+        let typing_passthrough = !key.modifiers.ctrl
+            && !key.modifiers.alt
+            && !key.modifiers.meta
+            && match key.key {
+                KeyCode::Backspace | KeyCode::Space => true,
+                KeyCode::Char(c) | KeyCode::Numpad(c) => c.is_ascii_digit(),
+                _ => false,
+            };
+        if self.config.sound.enabled && (out.consumed || typing_passthrough) {
             let tag = self.sound_hint.unwrap_or(if out.commit.is_some() {
                 "commit"
             } else {
@@ -2060,8 +2065,7 @@ impl Engine {
             // 【{撤回} 2026-11】顶屏首选走 pair 解析：{撤回}=空文本+回删
             //（back 并入 KeyOutcome），其余功能词同 resolve_dynamic。
             let (first, back) = self.resolve_commit_pair(
-                &session.candidates[idx].commit_text().to_string(),
-            );
+                &session.candidates[idx].commit_text().to_string());
             // 【引导键连动 2026-10-10】编码态同样连动「关闭反查时按引导键」
             // 选项——用户实锤：配了 ` 反查开着时编码态按 ` 仍出 ·（旧代码
             // 反查可用硬编码 ·，选项只在反查关闭时生效）。统一：配什么出
@@ -2703,9 +2707,7 @@ impl Engine {
             && session.mode == InputMode::Normal
             && !session.raw.is_empty()
             && !session.raw.starts_with([';', '/', '\\'])
-            && session.raw.chars().all(|x| {
-                x.is_ascii_lowercase() || matches!(x, ';' | '\'' | '0'..='9')
-            })
+            && session.raw.chars().all(|x| x.is_ascii_lowercase() || matches!(x, ';' | '\'' | '0'..='9'))
         {
             self.sound_hint = Some("select");
             // 名次基准 = 候选框显示序（置顶/用户词参与排序）。
@@ -2770,7 +2772,7 @@ impl Engine {
                         st.preedit = String::new();
                         let mut o = KeyOutcome::commit(text, st);
                         o.back = back;
-                        o
+                        o.with_selection(disp_rank as u8)
                     }
                     None => KeyOutcome::consumed(self.state(session)),
                 };
@@ -2813,9 +2815,7 @@ impl Engine {
                         }
                     })
                 });
-            let dec_chunk: Option<String> = dec_tail.map(|(s, e)| {
-                base_now.chars().skip(s).take(e - s).collect::<String>()
-            });
+            let dec_chunk: Option<String> = dec_tail.map(|(s, e)| base_now.chars().skip(s).take(e - s).collect::<String>());
             let dec_authoritative = dec_chunk
                 .as_ref()
                 .map(|c| !c.is_empty() && c.chars().all(|k| k.is_ascii_lowercase()))
@@ -2928,7 +2928,7 @@ impl Engine {
                             }
                             let mut o = KeyOutcome::commit(text, st);
                             o.back = back;
-                            return o;
+                            return o.with_selection(disp_rank as u8);
                         }
                         // 【多段/带锁流前缀未上屏 2026-09-06】
                         // cbae3 = cb|ae → 「不」+行 =「不行」；
@@ -2950,9 +2950,7 @@ impl Engine {
                                         self.sentence.as_ref().and_then(|d| {
                                             let pd =
                                                 d.decode_rich(&prefix_raw);
-                                            pd.hits.first().map(|h| {
-                                                h.text.clone()
-                                            })
+                                            pd.hits.first().map(|h| h.text.clone())
                                         })
                                     });
                             if let Some(pt) = prefix_text {
@@ -2976,7 +2974,7 @@ impl Engine {
                                 }
                                 let mut o = KeyOutcome::commit(format!("{}{}", pt, pk2), st);
                                 o.back = back;
-                                return o;
+                                return o.with_selection(disp_rank as u8);
                             }
                         }
                     } else {
@@ -3009,7 +3007,7 @@ impl Engine {
                         }
                         let mut o = KeyOutcome::commit(text, st);
                         o.back = back;
-                        return o;
+                        return o.with_selection(disp_rank as u8);
                     }
                 }
             }
@@ -3028,7 +3026,7 @@ impl Engine {
                     if session.pending_commit.is_some() {
                         self.refresh_candidates(session);
                     }
-                    return self.take_or_state(session);
+                    return self.take_or_state(session).with_selection(disp_rank as u8);
                 }
                 return KeyOutcome::consumed(self.state(session));
             }
@@ -3037,6 +3035,7 @@ impl Engine {
             if dec_authoritative && picked.is_none() {
                 return KeyOutcome::consumed(self.state(session));
             }
+            let selected = picked.is_some();
             session.raw.push(suffix.unwrap_or(c));
             self.refresh_candidates(session);
             // 选重后缀也是一「键」：评估提前上屏（Rime 在 push_input 后统一评估）
@@ -3046,7 +3045,12 @@ impl Engine {
                     self.refresh_candidates(session);
                 }
             }
-            return self.take_or_state(session);
+            let out = self.take_or_state(session);
+            return if selected {
+                out.with_selection(disp_rank as u8)
+            } else {
+                out
+            };
         }
         // 非整句：按名次立即选重上屏
         // 【;/' 不进调频 2026-10-09 十八】虎整句无模型态：;/' = 码表
@@ -3142,7 +3146,12 @@ impl Engine {
                 return o;
             }
         }
-        self.select_candidate_ex(session, idx, true, no_learn)
+        let out = self.select_candidate_ex(session, idx, true, no_learn);
+        if out.commit.is_some() {
+            out.with_selection((idx + 1) as u8)
+        } else {
+            out
+        }
     }
 
     /// 【可延码判定 2026-10-09】raw 之后是否还有严格更长的编码（不含
@@ -4403,7 +4412,7 @@ impl Engine {
                         session.clear();
                         let mut o = KeyOutcome::commit(text, self.state(session));
                         o.back = back;
-                        o
+                        o.with_selection(n as u8)
                     }
                     None => KeyOutcome::consumed(self.state(session)),
                 }
@@ -4457,7 +4466,7 @@ impl Engine {
                         session.clear();
                         let mut o = KeyOutcome::commit(text, self.state(session));
                         o.back = back;
-                        o
+                        o.with_selection(c.to_digit(10).unwrap_or(0) as u8)
                     }
                     None => KeyOutcome::consumed(self.state(session)),
                 }
@@ -4547,13 +4556,15 @@ impl Engine {
     /// pos 以该码**完整候选列表** 1 基度量（超出→末尾，apply 口径）；
     /// 覆盖该词既有置顶/删除行（同码同词只留最新操作）。与
     /// op_pin_candidate 同框架：源白名单 + 延迟重载 + 组段保留。
-    pub fn op_place_candidate(&mut self, session: &mut Session, idx: usize, pos: usize) -> KeyOutcome {
+    pub fn op_place_candidate(&mut self, session: &mut Session, idx: usize, pos: usize,
+    ) -> KeyOutcome {
         let start = session.page * self.config.candidates.page_size.max(1);
         self.op_place_candidate_abs(session, start + idx, pos)
     }
 
     /// 【右键菜单·全列表口径】同 op_place_candidate，idx=完整列表绝对下标。
-    pub fn op_place_candidate_abs(&mut self, session: &mut Session, abs: usize, pos: usize) -> KeyOutcome {
+    pub fn op_place_candidate_abs(&mut self, session: &mut Session, abs: usize, pos: usize,
+    ) -> KeyOutcome {
         let pick = session.candidates.get(abs).cloned();
         let Some(cand) = pick else {
             return KeyOutcome::consumed(self.state(session));
@@ -4670,7 +4681,8 @@ impl Engine {
             return false;
         }
         for (code, old, pos) in wrong {
-            let Some(newc) = Self::circled_char(pos) else { continue };
+            let Some(newc) = Self::circled_char(pos) else { continue;
+            };
             let new_word = newc.to_string();
             // 删旧号（含旧 pN 行）+ 加新号到当前位
             self.schema.adjust.remove(&code, &old);
@@ -4975,8 +4987,7 @@ impl Engine {
             let t = if cfg.to_traditional {
                 hufu_dict::OpenCc::load_dir(
                     &dir,
-                    &["STPhrases", "STCharacters", "STCharacters_Tu"],
-                )
+                    &["STPhrases", "STCharacters", "STCharacters_Tu"])
             } else {
                 hufu_dict::OpenCc::load_dir(&dir, &["TSPhrases", "TSCharacters"])
             };
@@ -5098,9 +5109,7 @@ impl Engine {
             .create(true)
             .append(true)
             .open(dir.join("opencc.log"))
-            .and_then(|mut f| {
-                writeln!(f, "转换词典缺 {need} 表（方向 {way}）：保持原字不转换")
-            });
+            .and_then(|mut f| writeln!(f, "转换词典缺 {need} 表（方向 {way}）：保持原字不转换"));
     }
 
     /// 用户学习：自动调频 + 可选调整日志（user-adjust.log，log_adjust=true 时记录）。
@@ -5288,7 +5297,9 @@ impl Engine {
             let dropped = std::sync::Arc::clone(&self.learn_log_dropped);
             let path = self.data_dir.join("user-adjust.log");
             self.learn_log_worker =
-                Some(std::thread::spawn(move || learn_log_writer(rx, path, dropped)));
+                Some(std::thread::spawn(move || {
+                learn_log_writer(rx, path, dropped)
+            }));
             self.learn_log_tx = Some(tx);
         }
         if let Some(tx) = &self.learn_log_tx {
@@ -5305,8 +5316,7 @@ impl Engine {
     /// 无整句候选或候选不足 2 时返回 None。
     pub fn rerank_request(
         &self,
-        session: &Session,
-    ) -> Option<(String, String, Vec<String>)> {
+        session: &Session) -> Option<(String, String, Vec<String>)> {
         if !self.config.sentence.rerank.enabled {
             return None;
         }
@@ -5672,8 +5682,10 @@ impl Engine {
                 .map(|e| self.entry_to_candidate(e))
                 .collect();
             if self.config.input.semicolon_guide || cands.is_empty() {
-                cands.push(Candidate::new("：".to_string(), ";".to_string(), CandidateKind::Symbol));
-                cands.push(Candidate::new("；".to_string(), ";".to_string(), CandidateKind::Symbol));
+                cands.push(Candidate::new("：".to_string(), ";".to_string(), CandidateKind::Symbol,
+                ));
+                cands.push(Candidate::new("；".to_string(), ";".to_string(), CandidateKind::Symbol,
+                ));
             }
             session.candidates = cands;
             // 【简繁收口 2026-11】; 引导窗（码表 ; 码词条 + 内置标点）
@@ -6036,7 +6048,8 @@ impl Engine {
             if let Some(t) = fallback {
                 session
                     .candidates
-                    .push(Candidate::new(t, session.raw.clone(), CandidateKind::Symbol));
+                    .push(Candidate::new(t, session.raw.clone(), CandidateKind::Symbol,
+                ));
             }
         }
     }
@@ -6442,10 +6455,12 @@ impl Engine {
             .filter_map(|c| self.display_candidate(c)).collect();
         let selected = session.selected.checked_sub(start)
             .filter(|_| session.selected < end)
-            .and_then(|i| self.display_candidate(&session.candidates[start + i]).map(|_| {
+            .and_then(|i| {
+                self.display_candidate(&session.candidates[start + i]).map(|_| {
                 session.candidates[start..start+i].iter()
                     .filter(|c| self.display_candidate(c).is_some()).count()
-            })).unwrap_or(0);
+            })
+            }).unwrap_or(0);
         SessionState {
             raw: raw_disp,
             preedit,
@@ -7031,6 +7046,7 @@ mod tests {
         // 整句模式下按 2：写入编码选重，不上屏，候选首为锁定结果
         let out = eng.process_key(&mut s, key('2'));
         assert!(out.commit.is_none(), "整句选重不应立即上屏（实际 {:?}）", out.commit);
+        assert_eq!(out.selection, Some(2), "锁词即报告选择，不等待最终上屏");
         assert!(out.consumed);
         let st = eng.state(&s);
         assert_eq!(st.candidates[0].text, "锁2+jd", "候选首 = 锁定名次2");
@@ -7042,6 +7058,7 @@ mod tests {
         assert_eq!(st.candidates[0].text, "锁2+jdt");
         // 空格才上屏
         let out = eng.process_key(&mut s, key(' '));
+        assert_eq!(out.selection, None, "空格确认不重记此前锁词");
         assert_eq!(out.commit.unwrap(), "锁2+jdt");
 
         // 分号锁第 2：名次换算后写入（此处字典序第2=什么 → 后缀 '2'）
@@ -7050,6 +7067,7 @@ mod tests {
         eng.process_key(&mut s2, key('d'));
         let out = eng.process_key(&mut s2, key(';'));
         assert!(out.commit.is_none());
+        assert_eq!(out.selection, Some(2));
         let st = eng.state(&s2);
         assert_eq!(st.candidates[0].text, "锁2+jd");
         assert_eq!(st.raw, "jd2", "分号归一为码表名次后缀");
@@ -7571,17 +7589,20 @@ mod tests {
         eng.process_key(&mut s, key('j'));
         eng.process_key(&mut s, key('d'));
         let out = eng.process_key(&mut s, key('3'));
+        assert_eq!(out.selection, Some(3));
         assert_eq!(out.commit.unwrap(), "新", "用户词选重直接上屏");
         // 按 4（加=码表第3）→ 锁式 raw=jd3，回显 jd4（显示名次还原）
         let mut s2 = Session::new(true);
         eng.process_key(&mut s2, key('j'));
         eng.process_key(&mut s2, key('d'));
         let out2 = eng.process_key(&mut s2, key('4'));
+        assert_eq!(out2.selection, Some(4), "报告显示名次，非内部码表锁值");
         assert!(out2.commit.is_none(), "码表词锁式不上屏");
         assert_eq!(s2.raw, "jd3", "内部锁值=码表名次 3");
         assert_eq!(out2.state.as_ref().unwrap().raw, "jd4", "回显还原=显示名次 4");
         // 锁态再按 3（新，用户词）→ 改选直接上屏（不堆死码）
         let out3 = eng.process_key(&mut s2, key('3'));
+        assert_eq!(out3.selection, Some(3));
         assert_eq!(out3.commit.unwrap(), "新", "锁态改选用户词直接上屏");
         // 锁态再按数字（码表词）→ 重锁（替换名次，不追加）
         let mut s3 = Session::new(true);
@@ -7589,10 +7610,12 @@ mod tests {
         eng.process_key(&mut s3, key('d'));
         eng.process_key(&mut s3, key('4')); // raw=jd3
         let out4 = eng.process_key(&mut s3, key('2')); // 到的=码表2
+        assert_eq!(out4.selection, Some(2));
         assert!(out4.commit.is_none());
         assert_eq!(s3.raw, "jd2", "锁态重锁：raw 仍单锁（码表名次2），非 jd32");
         // 连按数字不堆死码：再按 4 → 仍 jd3
         let out5 = eng.process_key(&mut s3, key('4'));
+        assert_eq!(out5.selection, Some(4));
         assert_eq!(s3.raw, "jd3", "连按数字重锁，raw 恒单锁");
         assert_eq!(out5.state.as_ref().unwrap().raw, "jd4", "回显随按键还原");
     }
@@ -7899,8 +7922,7 @@ mod tests {
         .unwrap();
         std::fs::write(
             dir.join("用户调整.txt"),
-            "{置顶}jd\t就\n",
-        )
+            "{置顶}jd\t就\n")
         .unwrap();
         eng.reload_user_data();
         let mut s = Session::new(true);
@@ -7957,32 +7979,37 @@ mod tests {
         // 中文态打 " → 左引号 “
         let o = eng.process_key(
             &mut s,
-            KeyInput { key: KeyCode::Char('"'), modifiers: Modifiers::default(), is_press: true },
+            KeyInput { key: KeyCode::Char('"'), modifiers: Modifiers::default(), is_press: true,
+            },
         );
         assert_eq!(o.commit.as_deref(), Some("“"), "第一个双引号=左引号");
         // Shift 切英文（空态内建切换，shift_switch 默认开）
         eng.process_key(
             &mut s,
-            KeyInput { key: KeyCode::ShiftLeft, modifiers: Modifiers::default(), is_press: true },
+            KeyInput { key: KeyCode::ShiftLeft, modifiers: Modifiers::default(), is_press: true,
+            },
         );
         assert!(!s.chinese, "已切英文");
         // 英文态打几个字母（直出，不碰组字）
         for c in ['a', 'b', 'c'] {
             eng.process_key(
                 &mut s,
-                KeyInput { key: KeyCode::Char(c), modifiers: Modifiers::default(), is_press: true },
+                KeyInput { key: KeyCode::Char(c), modifiers: Modifiers::default(), is_press: true,
+                },
             );
         }
         // Shift 切回中文
         eng.process_key(
             &mut s,
-            KeyInput { key: KeyCode::ShiftLeft, modifiers: Modifiers::default(), is_press: true },
+            KeyInput { key: KeyCode::ShiftLeft, modifiers: Modifiers::default(), is_press: true,
+            },
         );
         assert!(s.chinese, "已切回中文");
         // 再打 " → 必须闭合 ”
         let o = eng.process_key(
             &mut s,
-            KeyInput { key: KeyCode::Char('"'), modifiers: Modifiers::default(), is_press: true },
+            KeyInput { key: KeyCode::Char('"'), modifiers: Modifiers::default(), is_press: true,
+            },
         );
         assert_eq!(o.commit.as_deref(), Some("”"), "切英文打字再切回后引号仍配对（右引号）");
     }
@@ -8427,8 +8454,7 @@ mod tests {
         // 逆向序：{添加} 在前 {删除} 在后 → 删除赢（后操作覆盖）
         std::fs::write(
             dir.join("用户调整.txt"),
-            "{添加}jd\t新\n{删除}jd\t就\n",
-        )
+            "{添加}jd\t新\n{删除}jd\t就\n")
         .unwrap();
         eng.reload_user_data();
         let mut s2 = Session::new(true);
@@ -8684,7 +8710,8 @@ mod tests {
             .join(format!("t-shift-upper-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("main.txt"), "#hufu-dict v1 name=t\njd\t就\njd\t到的\njd\t加\n").unwrap();
+        std::fs::write(dir.join("main.txt"), "#hufu-dict v1 name=t\njd\t就\njd\t到的\njd\t加\n",
+        ).unwrap();
         let mut eng = Engine::with_schema_dir(&dir, hufu_config::Config::default()).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         let sk = |c: char| {
@@ -8762,12 +8789,14 @@ mod tests {
         // = [行,锁1+jd,到的]：数字 1=行、2=锁1+jd、越界按 4=死键
         let out = eng.process_key(&mut s, key('1'));
         assert_eq!(out.commit.as_deref(), Some("行"), "翻页后数字 1=当前页首项");
+        assert_eq!(out.selection, Some(1));
         let mut s2 = Session::new(true);
         eng.process_key(&mut s2, key('j'));
         eng.process_key(&mut s2, key('d'));
         eng.process_key(&mut s2, key('='));
         let out2 = eng.process_key(&mut s2, key('2'));
         assert_eq!(out2.commit.as_deref(), Some("锁1+jd"), "翻页后数字 2=当前页次项");
+        assert_eq!(out2.selection, Some(2));
         // 页内越界（第 2 页 3 项按 4）=死键
         let mut s3 = Session::new(true);
         eng.process_key(&mut s3, key('j'));
@@ -8775,6 +8804,7 @@ mod tests {
         eng.process_key(&mut s3, key('='));
         let out3 = eng.process_key(&mut s3, key('4'));
         assert!(out3.commit.is_none(), "页内越界=死键");
+        assert_eq!(out3.selection, None);
         assert_eq!(s3.raw, "jd", "死键不动组段");
         // 空格仍是当前页首项（既有行为）
         let mut s4 = Session::new(true);
@@ -8783,6 +8813,7 @@ mod tests {
         eng.process_key(&mut s4, key('='));
         let out4 = eng.process_key(&mut s4, key(' '));
         assert_eq!(out4.commit.as_deref(), Some("行"), "翻页后空格=当前页首项");
+        assert_eq!(out4.selection, None);
         // 【顶字页基准 2026-10-11】整句态翻页后标点顶字同样=当前页首项
         let mut s5 = Session::new(true);
         eng.process_key(&mut s5, key('j'));
@@ -8838,7 +8869,8 @@ mod tests {
             .join(format!("t-en-commit-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("main.txt"), "#hufu-dict v1 name=t\na\t啊\naa\t阿\n").unwrap();
+        std::fs::write(dir.join("main.txt"), "#hufu-dict v1 name=t\na\t啊\naa\t阿\n",
+        ).unwrap();
         let mut eng = Engine::with_schema_dir(&dir, hufu_config::Config::default()).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         let k = |code: KeyCode| KeyInput {
@@ -8869,7 +8901,9 @@ mod tests {
         eng.process_key(&mut s, key('a'));
         let mut m = Modifiers::default();
         m.ctrl = true;
-        let o = eng.process_key(&mut s, KeyInput { key: KeyCode::Char(' '), modifiers: m, is_press: true });
+        let o = eng.process_key(&mut s, KeyInput { key: KeyCode::Char(' '), modifiers: m, is_press: true,
+            },
+        );
         assert_eq!(o.commit.as_deref(), Some("a"), "Ctrl+空格切英上屏编码");
         assert!(!s.chinese && s.raw.is_empty());
 
@@ -8903,7 +8937,9 @@ mod tests {
         eng.process_key(&mut s, key('a'));
         let mut m = Modifiers::default();
         m.ctrl = true;
-        let o = eng.process_key(&mut s, KeyInput { key: KeyCode::Char(' '), modifiers: m, is_press: true });
+        let o = eng.process_key(&mut s, KeyInput { key: KeyCode::Char(' '), modifiers: m, is_press: true,
+            },
+        );
         assert!(o.consumed && o.commit.is_none(), "关：Ctrl+空格丢码只切");
         assert!(!s.chinese && s.raw.is_empty());
 
@@ -9058,14 +9094,18 @@ mod tests {
         fn decode_rich(&self, raw: &str) -> std::sync::Arc<SentenceDecode> {
             let hits = if raw == "javz" {
                 vec![
-                    SentenceHit { text: "们服".into(), score: -5.0, confidence: -5.0, max_rank: 1, sum_rank: 2, exact: true, word_ends: vec![(1,2),(2,4)], segmented: "ja vz".into(), partial: false, implicit2: false },
-                    SentenceHit { text: "舒服".into(), score: -5.5, confidence: -5.5, max_rank: 2, sum_rank: 3, exact: true, word_ends: vec![(1,2),(2,4)], segmented: "ja vz".into(), partial: false, implicit2: false },
-                    SentenceHit { text: "们改变".into(), score: -6.0, confidence: -6.0, max_rank: 1, sum_rank: 3, exact: true, word_ends: vec![(1,2),(3,4)], segmented: "ja vz".into(), partial: false, implicit2: false },
+                    SentenceHit { text: "们服".into(), score: -5.0, confidence: -5.0, max_rank: 1, sum_rank: 2, exact: true, word_ends: vec![(1,2),(2,4)], segmented: "ja vz".into(), partial: false, implicit2: false,
+                    },
+                    SentenceHit { text: "舒服".into(), score: -5.5, confidence: -5.5, max_rank: 2, sum_rank: 3, exact: true, word_ends: vec![(1,2),(2,4)], segmented: "ja vz".into(), partial: false, implicit2: false,
+                    },
+                    SentenceHit { text: "们改变".into(), score: -6.0, confidence: -6.0, max_rank: 1, sum_rank: 3, exact: true, word_ends: vec![(1,2),(3,4)], segmented: "ja vz".into(), partial: false, implicit2: false,
+                    },
                 ]
             } else {
                 Vec::new()
             };
-            std::sync::Arc::new(SentenceDecode { hits, truncated: false, early_hits: Vec::new(), early_truncated: false })
+            std::sync::Arc::new(SentenceDecode { hits, truncated: false, early_hits: Vec::new(), early_truncated: false,
+            })
         }
     }
 
@@ -9087,7 +9127,8 @@ mod tests {
         // Qwen 把「舒服」排第一（词频偏爱）
         {
             let mut cache = eng.rerank_cache.lock().unwrap();
-            cache.insert(eng.rerank_key(&s, &Engine::rerank_context(&s)), vec!["舒服".into(), "们改变".into(), "们服".into()]);
+            cache.insert(eng.rerank_key(&s, &Engine::rerank_context(&s)), vec!["舒服".into(), "们改变".into(), "们服".into()],
+            );
         }
         eng.refresh_rerank(&mut s);
         let texts: Vec<&str> = s.candidates.iter().map(|c| c.text.as_str()).collect();
@@ -9123,7 +9164,8 @@ mod tests {
         //    按 Qwen 顺序自由重排（老痒痒可居首）。
         {
             let mut cache = eng.rerank_cache.lock().unwrap();
-            cache.insert(eng.rerank_key(&s, &Engine::rerank_context(&s)), vec!["老鬼".into(), "老痒痒".into()]);
+            cache.insert(eng.rerank_key(&s, &Engine::rerank_context(&s)), vec!["老鬼".into(), "老痒痒".into()],
+            );
         }
         eng.refresh_rerank(&mut s);
         let pos_lg = s.candidates.iter().position(|c| c.text == "老鬼").unwrap();
@@ -9144,14 +9186,18 @@ mod tests {
             // ngram 初排序：甲 > 乙 > 丙（甲乙同深度 sum=2，丙 sum=3）
             let hits = if raw == "javzq" {
                 vec![
-                    SentenceHit { text: "甲".into(), score: -5.0, confidence: -5.0, max_rank: 1, sum_rank: 2, exact: true, word_ends: vec![(1,5)], segmented: "javzq".into(), partial: false, implicit2: false },
-                    SentenceHit { text: "乙".into(), score: -5.2, confidence: -5.2, max_rank: 1, sum_rank: 2, exact: true, word_ends: vec![(1,5)], segmented: "javzq".into(), partial: false, implicit2: false },
-                    SentenceHit { text: "丙".into(), score: -6.0, confidence: -6.0, max_rank: 1, sum_rank: 3, exact: true, word_ends: vec![(1,5)], segmented: "javzq".into(), partial: false, implicit2: false },
+                    SentenceHit { text: "甲".into(), score: -5.0, confidence: -5.0, max_rank: 1, sum_rank: 2, exact: true, word_ends: vec![(1,5)], segmented: "javzq".into(), partial: false, implicit2: false,
+                    },
+                    SentenceHit { text: "乙".into(), score: -5.2, confidence: -5.2, max_rank: 1, sum_rank: 2, exact: true, word_ends: vec![(1,5)], segmented: "javzq".into(), partial: false, implicit2: false,
+                    },
+                    SentenceHit { text: "丙".into(), score: -6.0, confidence: -6.0, max_rank: 1, sum_rank: 3, exact: true, word_ends: vec![(1,5)], segmented: "javzq".into(), partial: false, implicit2: false,
+                    },
                 ]
             } else {
                 Vec::new()
             };
-            std::sync::Arc::new(SentenceDecode { hits, truncated: false, early_hits: Vec::new(), early_truncated: false })
+            std::sync::Arc::new(SentenceDecode { hits, truncated: false, early_hits: Vec::new(), early_truncated: false,
+            })
         }
         // 两段式开启：提交门控走 decode_rich_full → Some
         fn decode_rich_full(&self, raw: &str) -> Option<std::sync::Arc<SentenceDecode>> {
@@ -9590,7 +9636,9 @@ mod tests {
         let mut s5 = Session::new(true);
         eng.process_key(&mut s5, key('1'));
         eng.process_key(&mut s5, key('.'));
-        let o7 = eng.process_key(&mut s5, KeyInput { key: KeyCode::Escape, modifiers: Modifiers::default(), is_press: true });
+        let o7 = eng.process_key(&mut s5, KeyInput { key: KeyCode::Escape, modifiers: Modifiers::default(), is_press: true,
+            },
+        );
         assert!(o7.consumed && o7.commit.is_none(), "Esc 取消");
         assert_eq!(s5.raw, "", "组段已清");
 
@@ -9668,9 +9716,11 @@ mod tests {
         let schema = dir.join("schema");
         std::fs::create_dir_all(&schema).unwrap();
         std::fs::create_dir_all(dir.join("转换词典")).unwrap();
-        std::fs::write(schema.join("main.txt"), "#hufu-dict v1 name=t\nh\t后\nhq\t后来\n").unwrap();
+        std::fs::write(schema.join("main.txt"), "#hufu-dict v1 name=t\nh\t后\nhq\t后来\n",
+        ).unwrap();
         std::fs::write(dir.join("转换词典").join("STPhrases.txt"), "后来\t後來\n").unwrap();
-        std::fs::write(dir.join("转换词典").join("STCharacters.txt"), "后\t後\n来\t來\n").unwrap();
+        std::fs::write(dir.join("转换词典").join("STCharacters.txt"), "后\t後\n来\t來\n",
+        ).unwrap();
         std::fs::write(dir.join("转换词典").join("emoji.txt"), "后\t后 👑\n").unwrap();
         let mut cfg = hufu_config::Config::default();
         cfg.opencc.enabled = true;
@@ -10104,8 +10154,7 @@ mod tests {
         let gen: hufu_config::GeneralSection = serde_json::from_str("{}").unwrap();
         assert_eq!(gen.export_key, "");
         let sec: hufu_config::CandidatesSection = serde_json::from_str(
-            r#"{"freq_key":"capslock","delete_key":"alt"}"#,
-        )
+            r#"{"freq_key":"capslock","delete_key":"alt"}"#)
         .unwrap();
         assert_eq!(sec.freq_key, "capslock");
         assert_eq!(sec.delete_key, "alt");
@@ -10235,19 +10284,27 @@ mod tests {
 
         // item 6：Esc 双行为（esc_undo 默认关=透传）
         let mut s5 = Session::new(true);
-        let o = eng.process_key(&mut s5, KeyInput { key: KeyCode::Escape, modifiers: Modifiers::default(), is_press: true });
+        let o = eng.process_key(&mut s5, KeyInput { key: KeyCode::Escape, modifiers: Modifiers::default(), is_press: true,
+            },
+        );
         assert!(!o.consumed && o.commit.is_none(), "esc_undo 关时空态 Esc 透传");
         // 开：空态 Esc = 撤回（空提交+back）；连按撤更早
         eng.config.general.esc_undo = true;
         let mut s6 = Session::new(true);
-        let o = eng.process_key(&mut s6, KeyInput { key: KeyCode::Escape, modifiers: Modifiers::default(), is_press: true });
+        let o = eng.process_key(&mut s6, KeyInput { key: KeyCode::Escape, modifiers: Modifiers::default(), is_press: true,
+            },
+        );
         assert!(o.consumed, "esc_undo 开空态 Esc 撤回（consumed）");
         assert_eq!(o.commit.as_deref(), Some(""));
         assert_eq!(o.back, "再次".chars().count() as u8, "Esc 撤回 back=2");
-        let o = eng.process_key(&mut s6, KeyInput { key: KeyCode::Escape, modifiers: Modifiers::default(), is_press: true });
+        let o = eng.process_key(&mut s6, KeyInput { key: KeyCode::Escape, modifiers: Modifiers::default(), is_press: true,
+            },
+        );
         assert_eq!(o.back, "重复我".chars().count() as u8, "连按 Esc 撤更早");
         // 撤光后透传
-        let o = eng.process_key(&mut s6, KeyInput { key: KeyCode::Escape, modifiers: Modifiers::default(), is_press: true });
+        let o = eng.process_key(&mut s6, KeyInput { key: KeyCode::Escape, modifiers: Modifiers::default(), is_press: true,
+            },
+        );
         assert!(!o.consumed, "撤光后 Esc 恢复透传");
         // esc_undo_ready 标记联动（DLL TestDown 用）
         assert!(!eng.state(&s6).esc_undo_ready, "撤光后 ready=false");
@@ -10442,8 +10499,7 @@ mod tests {
         // 反例：文件名含「超集」但内容是普通主码表 → 不进副表
         std::fs::write(
             dir.join("我的超集.txt"),
-            "zz\t字\nzy\t自\n",
-        )
+            "zz\t字\nzy\t自\n")
         .unwrap();
         let mut cfg = Config::default();
         cfg.reverse.enabled = false;
@@ -10530,11 +10586,13 @@ mod tests {
         eng.process_key(&mut s, key('j'));
         eng.process_key(&mut s, key('d'));
         let o = eng.process_key(&mut s, key('q'));
+        assert_eq!(o.selection, Some(1), "显式首选键也报告选择");
         assert_eq!(o.commit.as_deref(), Some("就"), "q = 第 1 选重键（首选）");
         let mut s2 = Session::new(true);
         eng.process_key(&mut s2, key('j'));
         eng.process_key(&mut s2, key('d'));
         let o = eng.process_key(&mut s2, key('w'));
+        assert_eq!(o.selection, Some(2));
         assert_eq!(o.commit.as_deref(), Some("到的"), "w = 第 2 选重键");
         // 空表：q 不是选重键（fallback：q 是编码字符进 raw 续码）
         eng.config.candidates.custom_select_keys = Vec::new();
@@ -10543,6 +10601,108 @@ mod tests {
         eng.process_key(&mut s3, key('d'));
         let o = eng.process_key(&mut s3, key('2'));
         assert_eq!(o.commit.as_deref(), Some("到的"), "空表数字默认零差异");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn selection_metadata_tracks_real_rank_actions_without_sound() {
+        let (mut eng, dir) = test_engine("selection-metadata");
+        eng.config.sound.enabled = false;
+        for (key_code, rank) in [
+            (KeyCode::Char(';'), 2),
+            (KeyCode::Char('\''), 3),
+            (KeyCode::Char('1'), 1),
+            (KeyCode::Char('2'), 2),
+            (KeyCode::CapsLock, 2),
+            (KeyCode::ShiftLeft, 3),
+        ] {
+            eng.config
+                .keymap
+                .map
+                .insert("capslock".into(), "select2".into());
+            eng.config
+                .keymap
+                .map
+                .insert("shiftleft".into(), "select3".into());
+            let mut session = Session::new(true);
+            assert_eq!(eng.process_key(&mut session, key('j')).selection, None);
+            assert_eq!(eng.process_key(&mut session, key('d')).selection, None);
+            let out = eng.process_key(
+                &mut session,
+                KeyInput {
+                    key: key_code,
+                    modifiers: Modifiers::default(),
+                    is_press: true,
+                },
+            );
+            assert!(out.commit.as_ref().is_some_and(|text| !text.is_empty()));
+            assert_eq!(
+                out.selection,
+                Some(rank),
+                "actual selection via {key_code:?}"
+            );
+            assert_eq!(
+                out.sound, None,
+                "statistics must not depend on sound.enabled"
+            );
+            assert_eq!(eng.process_key(&mut session, key(',')).selection, None);
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn selection_metadata_excludes_confirmation_literals_and_overrun() {
+        let (mut eng, dir) = test_engine("selection-nonactions");
+        for confirmation in [KeyCode::Space, KeyCode::Enter] {
+            let mut session = Session::new(true);
+            eng.process_key(&mut session, key('j'));
+            eng.process_key(&mut session, key('d'));
+            let out = eng.process_key(
+                &mut session,
+                KeyInput {
+                    key: confirmation,
+                    modifiers: Modifiers::default(),
+                    is_press: true,
+                },
+            );
+            assert_eq!(
+                out.selection, None,
+                "default confirmation is not explicit rank selection"
+            );
+        }
+        let mut idle = Session::new(true);
+        assert_eq!(
+            eng.process_key(&mut idle, key('2')).selection,
+            None,
+            "plain digit"
+        );
+        assert_eq!(
+            eng.process_key(&mut idle, key(';')).selection,
+            None,
+            "plain punctuation / guide"
+        );
+        for invalid in ['9', ';'] {
+            let mut session = Session::new(true);
+            eng.process_key(&mut session, key('a')); // only one exact candidate
+            let out = eng.process_key(&mut session, key(invalid));
+            assert!(
+                out.commit.is_some(),
+                "overrun still performs the existing top-commit fallback"
+            );
+            assert_eq!(
+                out.selection, None,
+                "no candidate was selected by {invalid}"
+            );
+        }
+        eng.config.keymap.map.insert("q".into(), "select9".into());
+        let mut missing = Session::new(true);
+        eng.process_key(&mut missing, key('j'));
+        eng.process_key(&mut missing, key('d'));
+        assert_eq!(
+            eng.process_key(&mut missing, key('q')).selection,
+            None,
+            "invalid mapped rank"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -10564,6 +10724,117 @@ mod tests {
         let mut s4 = Session::new(true);
         let o = eng.process_key(&mut s4, key('a'));
         assert_eq!(o.sound, None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn idle_typing_keys_sound_without_changing_passthrough_or_text() {
+        let (mut eng, dir) = test_engine("snd-passthrough");
+        eng.config.sound.enabled = true;
+        for chinese in [true, false] {
+            for code in [
+                KeyCode::Backspace,
+                KeyCode::Space,
+                KeyCode::Char('0'),
+                KeyCode::Char('9'),
+                KeyCode::Numpad('1'),
+                KeyCode::Numpad('9'),
+            ] {
+                let mut s = Session::new(chinese);
+                let input = KeyInput {
+                    key: code,
+                    modifiers: Modifiers::default(),
+                    is_press: true,
+                };
+                let audible = eng.process_key(&mut s, input);
+                assert!(!audible.consumed, "{chinese:?} {code:?}");
+                assert!(audible.commit.is_none());
+                assert_eq!(
+                    audible.sound.as_deref(),
+                    Some("key"),
+                    "{chinese:?} {code:?}"
+                );
+                assert!(s.raw.is_empty());
+
+                eng.config.sound.enabled = false;
+                let silent = eng.process_key(&mut Session::new(chinese), input);
+                assert_eq!(silent.consumed, audible.consumed);
+                assert_eq!(silent.commit, audible.commit);
+                assert_eq!(silent.sound, None);
+                eng.config.sound.enabled = true;
+            }
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn passthrough_shortcuts_navigation_and_keyup_do_not_gain_sound() {
+        let (mut eng, dir) = test_engine("snd-shortcuts");
+        eng.config.sound.enabled = true;
+        eng.config.general.ctrl_space_switch = false;
+        for code in [
+            KeyCode::Backspace,
+            KeyCode::Space,
+            KeyCode::Char('3'),
+            KeyCode::Numpad('3'),
+        ] {
+            for modifiers in [
+                Modifiers {
+                    ctrl: true,
+                    ..Default::default()
+                },
+                Modifiers {
+                    alt: true,
+                    ..Default::default()
+                },
+                Modifiers {
+                    meta: true,
+                    ..Default::default()
+                },
+            ] {
+                let out = eng.process_key(
+                    &mut Session::new(false),
+                    KeyInput {
+                        key: code,
+                        modifiers,
+                        is_press: true,
+                    },
+                );
+                assert!(!out.consumed);
+                assert_eq!(out.sound, None, "{code:?} {modifiers:?}");
+            }
+        }
+        for code in [
+            KeyCode::Backspace,
+            KeyCode::Space,
+            KeyCode::Char('3'),
+            KeyCode::Left,
+            KeyCode::F(1),
+        ] {
+            let input = KeyInput {
+                key: code,
+                modifiers: Modifiers::default(),
+                is_press: false,
+            };
+            assert_eq!(eng.process_key(&mut Session::new(true), input).sound, None);
+        }
+        for code in [
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Home,
+            KeyCode::Delete,
+        ] {
+            let out = eng.process_key(
+                &mut Session::new(true),
+                KeyInput {
+                    key: code,
+                    modifiers: Modifiers::default(),
+                    is_press: true,
+                },
+            );
+            assert!(!out.consumed);
+            assert_eq!(out.sound, None);
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -10799,7 +11070,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         // 无「反查」文件：schema.reverse/reverse_path 均空 = 反查不可用
-        std::fs::write(dir.join("main.txt"), "#hufu-dict v1 name=t\na\t啊\njd\t就\n").unwrap();
+        std::fs::write(dir.join("main.txt"), "#hufu-dict v1 name=t\na\t啊\njd\t就\n",
+        ).unwrap();
         let mut cfg = hufu_config::Config::default();
         cfg.reverse.scheme = String::new(); // 「（关闭反查）」
         let mut eng = Engine::with_schema_dir(&dir, cfg).unwrap();
@@ -11191,7 +11463,8 @@ mod tests {
         eng.process_key(&mut s, key('d'));
         let o = eng.process_key(
             &mut s,
-            KeyInput { key: KeyCode::CapsLock, modifiers: Modifiers::default(), is_press: true },
+            KeyInput { key: KeyCode::CapsLock, modifiers: Modifiers::default(), is_press: true,
+            },
         );
         assert_eq!(o.commit.as_deref(), Some("到的"), "capslock=select2 上屏第 2 候选");
         // 空态 capslock（无映射场景）：回退内建（切英文）——先清映射
@@ -11199,7 +11472,8 @@ mod tests {
         let mut s_idle = Session::new(true);
         let o = eng.process_key(
             &mut s_idle,
-            KeyInput { key: KeyCode::CapsLock, modifiers: Modifiers::default(), is_press: true },
+            KeyInput { key: KeyCode::CapsLock, modifiers: Modifiers::default(), is_press: true,
+            },
         );
         assert!(o.commit.is_none(), "空态无映射 capslock 走内建（不吞映射路径）");
         // 【空态解析链判定 2026-10-12 三次】三种配置形态：
@@ -11212,7 +11486,8 @@ mod tests {
         let mut s_follow = Session::new(true);
         let o = eng.process_key(
             &mut s_follow,
-            KeyInput { key: KeyCode::CapsLock, modifiers: Modifiers::default(), is_press: true },
+            KeyInput { key: KeyCode::CapsLock, modifiers: Modifiers::default(), is_press: true,
+            },
         );
         assert!(o.consumed && o.commit.is_none(), "跟随：空态静默消费");
         assert!(!s_follow.caps_lock, "跟随：绝不进锁大写");
@@ -11221,14 +11496,16 @@ mod tests {
         let mut s_cleared = Session::new(true);
         let o = eng.process_key(
             &mut s_cleared,
-            KeyInput { key: KeyCode::CapsLock, modifiers: Modifiers::default(), is_press: true },
+            KeyInput { key: KeyCode::CapsLock, modifiers: Modifiers::default(), is_press: true,
+            },
         );
         assert!(o.consumed && s_cleared.caps_lock, "清除=空串：空态照走默认锁大写");
         eng.config.keymap.map_idle.insert("capslock".into(), "select2".into());
         let mut s_idle_bound = Session::new(true);
         let o = eng.process_key(
             &mut s_idle_bound,
-            KeyInput { key: KeyCode::CapsLock, modifiers: Modifiers::default(), is_press: true },
+            KeyInput { key: KeyCode::CapsLock, modifiers: Modifiers::default(), is_press: true,
+            },
         );
         assert!(o.consumed && o.commit.is_none(), "显式空态绑定：静默消费");
         assert!(!s_idle_bound.caps_lock, "显式空态绑定绝不进锁大写");
@@ -11245,7 +11522,8 @@ mod tests {
         eng.process_key(&mut s2, key('d'));
         let o = eng.process_key(
             &mut s2,
-            KeyInput { key: KeyCode::CapsLock, modifiers: Modifiers::default(), is_press: true },
+            KeyInput { key: KeyCode::CapsLock, modifiers: Modifiers::default(), is_press: true,
+            },
         );
         assert_eq!(o.commit.as_deref(), Some("就4"), "select4 越界=首选+4 顶屏");
         assert!(o.consumed, "select4 越界顶屏 consumed");
@@ -11270,7 +11548,8 @@ mod tests {
         let mut s4 = Session::new(true);
         let o = eng.process_key(
             &mut s4,
-            KeyInput { key: KeyCode::F(1), modifiers: Modifiers::default(), is_press: true },
+            KeyInput { key: KeyCode::F(1), modifiers: Modifiers::default(), is_press: true,
+            },
         );
         assert_eq!(o.commit.as_deref(), Some(""), "F1=undo 空提交");
         assert_eq!(o.back, "再次".chars().count() as u8, "undo back=最新一条");
@@ -11280,7 +11559,8 @@ mod tests {
         let mut s5 = Session::new(true);
         let o = eng.process_key(
             &mut s5,
-            KeyInput { key: KeyCode::Home, modifiers: Modifiers::default(), is_press: true },
+            KeyInput { key: KeyCode::Home, modifiers: Modifiers::default(), is_press: true,
+            },
         );
         assert_eq!(o.commit.as_deref(), Some("重复我"), "home=repeat 回放最新历史（undo 后）");
         // repeat3 倒数第 3 条（栈：第四条→第三条→重复我）
@@ -11289,7 +11569,8 @@ mod tests {
         eng.config.keymap.map.insert("end".into(), "repeat3".into());
         let o = eng.process_key(
             &mut s5,
-            KeyInput { key: KeyCode::End, modifiers: Modifiers::default(), is_press: true },
+            KeyInput { key: KeyCode::End, modifiers: Modifiers::default(), is_press: true,
+            },
         );
         assert_eq!(o.commit.as_deref(), Some("重复我"), "end=repeat3 = 倒数第 3 条");
         // 【重复上屏×4 2026-11】repeat4 = 倒数第 4 条。注意 undo 已
@@ -11298,7 +11579,8 @@ mod tests {
         eng.config.keymap.map.insert("end".into(), "repeat4".into());
         let o = eng.process_key(
             &mut s5,
-            KeyInput { key: KeyCode::End, modifiers: Modifiers::default(), is_press: true },
+            KeyInput { key: KeyCode::End, modifiers: Modifiers::default(), is_press: true,
+            },
         );
         assert_eq!(o.commit.as_deref(), Some("重复我"), "end=repeat4 = 倒数第 4 条");
 
@@ -11307,14 +11589,16 @@ mod tests {
         let mut s6 = Session::new(true);
         let o = eng.process_key(
             &mut s6,
-            KeyInput { key: KeyCode::Tab, modifiers: Modifiers::default(), is_press: true },
+            KeyInput { key: KeyCode::Tab, modifiers: Modifiers::default(), is_press: true,
+            },
         );
         assert!(o.consumed, "tab=switch 吞键");
         assert!(!s6.chinese, "切到英文");
         // 英文态映射不触发（keymap 仅中文态）：tab 再按走内建英文路径
         let o = eng.process_key(
             &mut s6,
-            KeyInput { key: KeyCode::Tab, modifiers: Modifiers::default(), is_press: true },
+            KeyInput { key: KeyCode::Tab, modifiers: Modifiers::default(), is_press: true,
+            },
         );
         assert!(!o.consumed || o.commit.is_none(), "英文态 tab 不再触发 switch");
 
@@ -11324,7 +11608,9 @@ mod tests {
         let mut s7 = Session::new(true);
         eng.process_key(&mut s7, key('j'));
         eng.process_key(&mut s7, key('d'));
-        let o = eng.process_key(&mut s7, KeyInput { key: KeyCode::CapsLock, modifiers: m, is_press: true });
+        let o = eng.process_key(&mut s7, KeyInput { key: KeyCode::CapsLock, modifiers: m, is_press: true,
+            },
+        );
         assert_ne!(o.commit.as_deref(), Some("到的"), "Shift+capslock 不触发 select2");
 
         // —— clear：编码态清屏 ——
@@ -11334,7 +11620,8 @@ mod tests {
         eng.process_key(&mut s8, key('d'));
         let o = eng.process_key(
             &mut s8,
-            KeyInput { key: KeyCode::Delete, modifiers: Modifiers::default(), is_press: true },
+            KeyInput { key: KeyCode::Delete, modifiers: Modifiers::default(), is_press: true,
+            },
         );
         assert!(o.consumed && o.commit.is_none(), "delete=clear 清屏");
         assert!(s8.raw.is_empty(), "raw 已清");
@@ -11347,7 +11634,8 @@ mod tests {
         eng.process_key(&mut s9, key('d'));
         let o = eng.process_key(
             &mut s9,
-            KeyInput { key: KeyCode::Up, modifiers: Modifiers::default(), is_press: true },
+            KeyInput { key: KeyCode::Up, modifiers: Modifiers::default(), is_press: true,
+            },
         );
         assert!(o.consumed, "up=pageup 路径通");
 
@@ -11388,7 +11676,9 @@ mod tests {
         eng.config.keymap.map_idle.remove("[");
         eng.config.keymap.map.remove("capslock");
         eng.config.keymap.map.insert("capslock".into(), "text:甲".into());
-        let o = eng.process_key(&mut s11, KeyInput { key: KeyCode::CapsLock, modifiers: Modifiers::default(), is_press: true });
+        let o = eng.process_key(&mut s11, KeyInput { key: KeyCode::CapsLock, modifiers: Modifiers::default(), is_press: true,
+            },
+        );
         assert_eq!(o.commit.as_deref(), Some("甲"), "map-only 键空态回落 map（老行为）");
 
         // —— 【Shift 可映射 2026-11】shift 键映射优先于内建切换 ——
@@ -11396,21 +11686,25 @@ mod tests {
         let mut s12 = Session::new(true);
         let o = eng.process_key(
             &mut s12,
-            KeyInput { key: KeyCode::ShiftLeft, modifiers: Modifiers::default(), is_press: true },
+            KeyInput { key: KeyCode::ShiftLeft, modifiers: Modifiers::default(), is_press: true,
+            },
         );
         assert_eq!(o.commit.as_deref(), Some("乙"), "shift 映射直出（不切英文）");
         assert!(s12.chinese, "shift 映射生效时不切换中英");
         // Shift+其他键仍是组合（不触发映射）：Shift+j 非映射形态
         let mut m2 = Modifiers::default();
         m2.shift = true;
-        let o = eng.process_key(&mut s12, KeyInput { key: KeyCode::Char('j'), modifiers: m2, is_press: true });
+        let o = eng.process_key(&mut s12, KeyInput { key: KeyCode::Char('j'), modifiers: m2, is_press: true,
+            },
+        );
         assert_ne!(o.commit.as_deref(), Some("乙"), "Shift 组合形态不触发 shift 键映射");
         // 清映射后回落内建单击切换（shift_switch 默认开）
         eng.config.keymap.map.remove("shift");
         let mut s13 = Session::new(true);
         let o = eng.process_key(
             &mut s13,
-            KeyInput { key: KeyCode::ShiftLeft, modifiers: Modifiers::default(), is_press: true },
+            KeyInput { key: KeyCode::ShiftLeft, modifiers: Modifiers::default(), is_press: true,
+            },
         );
         assert!(o.consumed && o.commit.is_none(), "shift 无映射回落内建切换");
         assert!(!s13.chinese, "内建单击切英文");
@@ -11421,13 +11715,15 @@ mod tests {
         let mut s14 = Session::new(true);
         let o = eng.process_key(
             &mut s14,
-            KeyInput { key: KeyCode::ShiftLeft, modifiers: Modifiers::default(), is_press: true },
+            KeyInput { key: KeyCode::ShiftLeft, modifiers: Modifiers::default(), is_press: true,
+            },
         );
         assert_eq!(o.commit.as_deref(), Some("丙"), "左 Shift 精确名映射");
         let mut s15 = Session::new(true);
         let o = eng.process_key(
             &mut s15,
-            KeyInput { key: KeyCode::ShiftRight, modifiers: Modifiers::default(), is_press: true },
+            KeyInput { key: KeyCode::ShiftRight, modifiers: Modifiers::default(), is_press: true,
+            },
         );
         assert!(o.consumed && o.commit.is_none(), "右 Shift 未映射走内建切换");
         assert!(!s15.chinese, "右 Shift 内建切英文（左右互不影响）");
@@ -11437,7 +11733,8 @@ mod tests {
         let mut s16 = Session::new(true);
         let o = eng.process_key(
             &mut s16,
-            KeyInput { key: KeyCode::ShiftRight, modifiers: Modifiers::default(), is_press: true },
+            KeyInput { key: KeyCode::ShiftRight, modifiers: Modifiers::default(), is_press: true,
+            },
         );
         assert_eq!(o.commit.as_deref(), Some("丁"), "通用名 shift 兜底右 Shift（老配置兼容）");
 
@@ -11449,7 +11746,8 @@ mod tests {
         let mut s17 = Session::new(true);
         let o = eng.process_key(
             &mut s17,
-            KeyInput { key: KeyCode::Escape, modifiers: Modifiers::default(), is_press: true },
+            KeyInput { key: KeyCode::Escape, modifiers: Modifiers::default(), is_press: true,
+            },
         );
         assert!(!o.consumed && o.commit.is_none(), "escape 映射残留不生效（Esc 不可映射，空态透传）");
         // 编码中 Esc 仍清屏（固定行为不受映射影响）
@@ -11458,7 +11756,8 @@ mod tests {
         eng.process_key(&mut s18, key('d'));
         let o = eng.process_key(
             &mut s18,
-            KeyInput { key: KeyCode::Escape, modifiers: Modifiers::default(), is_press: true },
+            KeyInput { key: KeyCode::Escape, modifiers: Modifiers::default(), is_press: true,
+            },
         );
         assert!(o.consumed && o.commit.is_none() && s18.raw.is_empty(), "编码中 Esc 固定清屏");
         eng.config.keymap.map.remove("escape");
@@ -11472,7 +11771,8 @@ mod tests {
         eng.process_key(&mut s19, key('d'));
         let o = eng.process_key(
             &mut s19,
-            KeyInput { key: KeyCode::Numpad('5'), modifiers: Modifiers::default(), is_press: true },
+            KeyInput { key: KeyCode::Numpad('5'), modifiers: Modifiers::default(), is_press: true,
+            },
         );
         assert_eq!(o.commit.as_deref(), Some("到的"), "num5=select2 上屏第 2 候选");
         // 主排 5 不受小键盘映射影响：5 默认第 5 候选越界 → 死键/默认
@@ -11486,7 +11786,8 @@ mod tests {
         let mut s19c = Session::new(true);
         let o = eng.process_key(
             &mut s19c,
-            KeyInput { key: KeyCode::Numpad('5'), modifiers: Modifiers::default(), is_press: true },
+            KeyInput { key: KeyCode::Numpad('5'), modifiers: Modifiers::default(), is_press: true,
+            },
         );
         assert!(!o.consumed && o.commit.is_none(), "未映射 num5 透传零差异");
         // numadd → text:＋（空态直出 + 编码态顶屏＋）
@@ -11494,7 +11795,8 @@ mod tests {
         let mut s20 = Session::new(true);
         let o = eng.process_key(
             &mut s20,
-            KeyInput { key: KeyCode::Numpad('+'), modifiers: Modifiers::default(), is_press: true },
+            KeyInput { key: KeyCode::Numpad('+'), modifiers: Modifiers::default(), is_press: true,
+            },
         );
         assert_eq!(o.commit.as_deref(), Some("＋"), "numadd=text:＋ 空态直出");
         // numenter → switch：小键盘回车也能切中英
@@ -11503,7 +11805,8 @@ mod tests {
         let mut s21 = Session::new(true);
         let o = eng.process_key(
             &mut s21,
-            KeyInput { key: KeyCode::Numpad('\r'), modifiers: Modifiers::default(), is_press: true },
+            KeyInput { key: KeyCode::Numpad('\r'), modifiers: Modifiers::default(), is_press: true,
+            },
         );
         assert!(o.consumed, "numenter=switch 吞键");
         assert!(!s21.chinese, "小键盘回车切英文");
@@ -11758,7 +12061,8 @@ mod tests {
         // 切方案回来仍生效（switch_schema 同口径合并）
         let schema2 = root.join("码表").join("方案二");
         std::fs::create_dir_all(&schema2).unwrap();
-        std::fs::write(schema2.join("main.txt"), "#hufu-dict v1 name=t2\nsjh\t数据二\n").unwrap();
+        std::fs::write(schema2.join("main.txt"), "#hufu-dict v1 name=t2\nsjh\t数据二\n",
+        ).unwrap();
         eng.switch_schema("方案二").unwrap();
         let mut s3 = Session::new(true);
         for c in "sjh".chars() {
@@ -11803,14 +12107,12 @@ mod tests {
         std::fs::write(cd.join("STPhrases.txt"), "后来\t後來\n").unwrap();
         std::fs::write(
             cd.join("STCharacters.txt"),
-            "后\t後\n来\t來\n们\t們\n",
-        )
+            "后\t後\n来\t來\n们\t們\n")
         .unwrap();
         std::fs::write(cd.join("TSPhrases.txt"), "後來\t后来\n").unwrap();
         std::fs::write(
             cd.join("TSCharacters.txt"),
-            "後\t后\n來\t来\n們\t们\n",
-        )
+            "後\t后\n來\t来\n們\t们\n")
         .unwrap();
         (root, schema)
     }
@@ -11878,8 +12180,7 @@ mod tests {
         std::fs::remove_file(root.join("转换词典").join("TSCharacters.txt")).unwrap();
         std::fs::write(
             schema.join("main.txt"),
-            "#hufu-dict v1 name=t\nh\t後\n",
-        )
+            "#hufu-dict v1 name=t\nh\t後\n")
         .unwrap();
         let mut cfg = hufu_config::Config::default();
         cfg.opencc.enabled = true;
@@ -12039,8 +12340,7 @@ mod tests {
         let (root, schema) = opencc_paths_fixture("leaf");
         std::fs::write(
             schema.join("main.txt"),
-            "#hufu-dict v1 name=t\nqqqq\t后\n",
-        )
+            "#hufu-dict v1 name=t\nqqqq\t后\n")
         .unwrap();
         let mut cfg = hufu_config::Config::default();
         cfg.opencc.enabled = true;

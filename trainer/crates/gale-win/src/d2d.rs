@@ -73,129 +73,117 @@ fn line_break_end(chars: &[char], first: usize, mut end: usize) -> usize {
 /// 本函数做修正。位置向量直接复用原行的 DirectWrite 实测推进量
 /// （`pos[k+1] - pos[k]`），下划线、编码提示与光标因此保持像素级精度。
 ///
-/// 返回 `None` 表示没有词跨行、输入行集合原样可用（每帧调用的零分配快路径）。
+/// 返回 `None` 表示输入行集合原样可用，不需要提交新的布局。
 /// 超过一行宽度的超长词无法整体放下，保持原断行（词长于行时必然被切）。
 pub fn rewrap_words(
     lines: &[(usize, String, Vec<f32>)],
     words: &[(usize, usize)],
 ) -> Option<Vec<(usize, String, Vec<f32>)>> {
-    let multi: Vec<(usize, usize)> = words.iter().copied().filter(|(_, l)| *l >= 2).collect();
-    if multi.is_empty() || lines.len() < 2 {
+    let width = lines
+        .iter()
+        .filter_map(|line| line.2.last().copied())
+        .fold(0., f32::max);
+    rewrap_words_to_width(lines, words, width)
+}
+
+/// Reflow complete paragraphs using the actual available width. Existing
+/// DirectWrite scalar advances remain the sole measurement source; fitting words
+/// stay together, while a word wider than the viewport may break between scalars.
+/// Explicit newline gaps in the source offsets remain paragraph boundaries.
+pub fn rewrap_words_to_width(
+    lines: &[(usize, String, Vec<f32>)],
+    words: &[(usize, usize)],
+    width: f32,
+) -> Option<Vec<(usize, String, Vec<f32>)>> {
+    if lines.is_empty() || !width.is_finite() || width <= 0. {
         return None;
     }
-    let straddle = |out: &[(usize, String, Vec<f32>)], i: usize| -> Option<(usize, usize)> {
-        let n = out[i].1.chars().count();
-        let boundary = out[i].0 + n;
-        if n == 0 || i + 1 >= out.len() || out[i + 1].0 != boundary {
+    let multi: Vec<_> = words.iter().copied().filter(|&(_, len)| len >= 2).collect();
+    let overflows = lines
+        .iter()
+        .any(|line| line.2.last().is_some_and(|&x| x > width + 0.5));
+    let straddles = lines.windows(2).any(|pair| {
+        let boundary = pair[0].0 + pair[0].1.chars().count();
+        pair[1].0 == boundary
+            && multi.iter().any(|&(start, len)| {
+                start < boundary && start.checked_add(len).is_some_and(|end| end > boundary)
+            })
+    });
+    if !overflows && !straddles {
+        return None;
+    }
+
+    // Rebuild paragraph advances from the measured source lines. A newline is
+    // represented by an offset gap, so never merge across that gap or lose an
+    // empty line. More output lines may be created than the original char wrap.
+    let mut paragraphs: Vec<(usize, Vec<char>, Vec<f32>)> = Vec::new();
+    for (base, text, positions) in lines {
+        let chars: Vec<_> = text.chars().collect();
+        if positions.len() != chars.len() + 1 || positions.iter().any(|x| !x.is_finite()) {
             return None;
         }
-        let end2 = out[i + 1].0 + out[i + 1].1.chars().count();
-        multi
-            .iter()
-            .copied()
-            .find(|&(s, l)| s >= out[i].0 && s < boundary && s + l > boundary && s + l <= end2)
-    };
-    if (0..lines.len() - 1).all(|i| straddle(lines, i).is_none()) {
-        return None;
+        let append = paragraphs
+            .last()
+            .is_some_and(|(start, chars, _)| *start + chars.len() == *base);
+        if !append {
+            paragraphs.push((*base, Vec::new(), vec![0.]));
+        }
+        let (_, paragraph, advances) = paragraphs.last_mut().unwrap();
+        for (index, ch) in chars.into_iter().enumerate() {
+            paragraph.push(ch);
+            advances
+                .push(advances.last().copied().unwrap() + positions[index + 1] - positions[index]);
+        }
     }
-    let mut out: Vec<(usize, String, Vec<f32>)> = lines.to_vec();
-    // 可用行宽：原贪心排版里最宽的行尾位置（该宽度内的组合原布局已容纳过）
-    let width = out
-        .iter()
-        .map(|l| l.2.last().copied().unwrap_or(0.))
-        .fold(0.0_f32, f32::max);
-    let total: usize = out.iter().map(|l| l.1.chars().count()).sum();
-    let mut budget = total + out.len();
-    while budget > 0 {
-        let mut moved = false;
-        let mut i = 0;
-        while i + 1 < out.len() && budget > 0 {
-            let n = out[i].1.chars().count();
-            let boundary = out[i].0 + n;
-            if n == 0 || out[i + 1].0 != boundary {
-                i += 1;
+    let mut out = Vec::new();
+    for (base, chars, positions) in paragraphs {
+        let n = chars.len();
+        if n == 0 {
+            out.push((base, String::new(), vec![0.]));
+            continue;
+        }
+        // Protected boundaries only belong to words that actually fit. Oversize
+        // phrases deliberately keep the ordinary scalar-break fallback.
+        let mut protected = vec![None; n + 1];
+        for &(start, len) in &multi {
+            let Some(end) = start.checked_add(len) else {
+                continue;
+            };
+            if start < base || end > base + n {
                 continue;
             }
-            // 1) 词跨行：把词在本行尾部的字符整体下移
-            if let Some((ws, _)) = straddle(&out, i) {
-                move_chars_down(&mut out, i, boundary - ws);
-                budget -= 1;
-                moved = true;
-                continue; // 行 i 变短，重查本对（可能还有下一个跨行词）
+            let (start, end) = (start - base, end - base);
+            if positions[end] - positions[start] <= width + 0.5 {
+                protected[start + 1..end].fill(Some((start, end)));
             }
-            // 2) 行尾超宽（下移挤出来的）：把可断后缀（不在词内的断点）继续下移
-            let end_pos = out[i].2.last().copied().unwrap_or(0.);
-            if end_pos > width + 0.5 {
-                if let Some(k) = breakable_suffix(&out[i], &multi) {
-                    if k > 0 && k < n {
-                        move_chars_down(&mut out, i, k);
-                        budget -= 1;
-                        moved = true;
-                        continue;
-                    }
-                }
+        }
+        let mut first = 0;
+        while first < n {
+            let mut end = first + 1;
+            while end < n && positions[end + 1] - positions[first] <= width + 0.5 {
+                end += 1;
             }
-            i += 1;
-        }
-        if !moved {
-            break;
-        }
-    }
-    Some(out)
-}
-
-/// 把第 i 行末尾 k 个字符移到第 i+1 行行首（两行必须相邻且行 i+1 存在）。
-/// 位置向量按原行实测推进量重建；第 i+1 行的 base 相应前移 k。
-fn move_chars_down(out: &mut [(usize, String, Vec<f32>)], i: usize, k: usize) {
-    let n = out[i].1.chars().count();
-    if i + 1 >= out.len() || k == 0 || k > n {
-        return;
-    }
-    let chars: Vec<char> = out[i].1.chars().collect();
-    let prefix: String = chars[..n - k].iter().collect();
-    let suffix: String = chars[n - k..].iter().collect();
-    // 下移字符的推进量：pos[j+1] - pos[j]（pos 有 n+1 项，全部可测）
-    let suffix_adv: Vec<f32> = (n - k..n).map(|j| out[i].2[j + 1] - out[i].2[j]).collect();
-    out[i].1 = prefix;
-    out[i].2.truncate(n - k + 1);
-    let m = out[i + 1].1.chars().count();
-    if out[i + 1].2.len() < m + 1 {
-        // 位置向量异常：退化为按全宽近似（CJK 全宽场景误差可忽略）
-        let avg = out[i + 1].2.last().copied().unwrap_or(0.) / m.max(1) as f32;
-        out[i + 1].2 = (0..=m).map(|j| j as f32 * avg).collect();
-    }
-    let old_adv: Vec<f32> = (0..m)
-        .map(|j| out[i + 1].2[j + 1] - out[i + 1].2[j])
-        .collect();
-    let mut pos = Vec::with_capacity(m + k + 1);
-    pos.push(0.0_f32);
-    let mut acc = 0.0_f32;
-    for a in suffix_adv.iter().chain(old_adv.iter()) {
-        acc += a;
-        pos.push(acc);
-    }
-    out[i + 1].1 = format!("{suffix}{}", out[i + 1].1);
-    out[i + 1].2 = pos;
-    out[i + 1].0 -= k;
-}
-
-/// 行尾超宽时，找最小可下移后缀长度 k（n-k 是最后一个不在多字词内部的断点）。
-/// 单字/标点处可断；词内不可断。整行都在一个词里时返回 None。
-fn breakable_suffix(line: &(usize, String, Vec<f32>), multi: &[(usize, usize)]) -> Option<usize> {
-    let n = line.1.chars().count();
-    if n < 2 {
-        return None;
-    }
-    let inside = |g: usize| multi.iter().any(|&(s, l)| s < g && g < s + l);
-    for k in 1..n {
-        // 断点全局位置 = base + (n - k)；后缀为 [n-k, n)
-        if !inside(line.0 + n - k) {
-            return Some(k);
+            end = line_break_end(&chars, first, end);
+            if let Some((start, word_end)) = protected[end] {
+                // Punctuation adjustment may back into a fitting word at the
+                // line start. Prefer keeping that word over the punctuation rule.
+                end = if start > first { start } else { word_end };
+            }
+            let text: String = chars[first..end].iter().collect();
+            let advances = positions[first..=end]
+                .iter()
+                .map(|x| x - positions[first])
+                .collect();
+            out.push((base + first, text, advances));
+            first = end;
         }
     }
-    None
+    if out.len() == lines.len() && out.iter().zip(lines).all(|(a, b)| a.0 == b.0 && a.1 == b.1) {
+        None
+    } else {
+        Some(out)
+    }
 }
-
 /// 渲染目标尺寸
 #[derive(Debug, Clone, Copy)]
 pub struct RenderSize {
@@ -364,6 +352,26 @@ pub fn detected_cjk_family() -> &'static str {
     DETECTED_CJK_FAMILY.get_or_init(detect_cjk_family)
 }
 
+/// 已安装的自选字体优先；配置中的字体被卸载时按默认链回退。
+pub fn resolved_cjk_family(requested: &str) -> String {
+    static NAMES: OnceLock<HashSet<String>> = OnceLock::new();
+    let requested = requested.trim();
+    if requested.is_empty() {
+        return detected_cjk_family().into();
+    }
+    let names = NAMES.get_or_init(|| unsafe {
+        DWriteCreateFactory::<IDWriteFactory>(DWRITE_FACTORY_TYPE_SHARED)
+            .ok()
+            .and_then(|factory| system_family_names(&factory))
+            .unwrap_or_default()
+    });
+    if names.contains(&requested.to_lowercase()) {
+        requested.into()
+    } else {
+        detected_cjk_family().into()
+    }
+}
+
 fn detect_cjk_family() -> String {
     let factory: IDWriteFactory = unsafe {
         match DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED) {
@@ -419,11 +427,13 @@ unsafe fn localized_string(ls: &IDWriteLocalizedStrings, index: u32) -> Option<S
 }
 
 /// 字体 + 排版工具箱（一个 Renderer 一份）：
-/// - 正文家族 = [`detected_cjk_family`]，UI = Microsoft YaHei UI；
+/// - 正文家族 = 用户所选系统字体（缺失时走霞鹜/雅黑回退），UI = Microsoft YaHei UI；
 /// - (family, size) → IDWriteTextFormat 缓存（跟打器字号固定档位少，全缓存）；
 /// - 逐簇测宽（折行/贪吃蛇/光标定位的统一真值）。
 pub struct FontKit {
     dwrite: IDWriteFactory,
+    body_family: String,
+    requested_family: String,
     fmt_cache: HashMap<(FontFamily, u32), IDWriteTextFormat>,
     /// 测宽缓存：(family, size_q, ch) → 宽度（跟打器字符集小，命中率高）
     width_cache: HashMap<(FontFamily, u32, char), f32>,
@@ -437,9 +447,27 @@ impl FontKit {
         };
         Self {
             dwrite,
+            body_family: detected_cjk_family().into(),
+            requested_family: String::new(),
             fmt_cache: HashMap::new(),
             width_cache: HashMap::new(),
         }
+    }
+
+    /// 改字体时同时失效绘制与测宽缓存，折行、字框与光标保持一致。
+    pub fn set_body_family(&mut self, requested: &str) -> bool {
+        if self.requested_family == requested {
+            return false;
+        }
+        self.requested_family = requested.into();
+        let family = resolved_cjk_family(requested);
+        if self.body_family == family {
+            return false;
+        }
+        self.body_family = family;
+        self.fmt_cache.clear();
+        self.width_cache.clear();
+        true
     }
 
     /// 取（或建）文本格式。size 物理像素字号，量化到 0.25px 减少缓存键。
@@ -463,13 +491,16 @@ impl FontKit {
         size: f32,
     ) -> windows::core::Result<IDWriteTextFormat> {
         // 正文保留用户习惯，界面标签使用清晰的无衬线字体。
-        let name: PCWSTRLike = match family {
-            FontFamily::Lxgw => wide_null(detected_cjk_family()),
-            FontFamily::Ui => wide_null("Microsoft YaHei UI"),
-            FontFamily::Mono => wide_null("Consolas"),
+        let family_name = match family {
+            FontFamily::Lxgw => self.body_family.as_str(),
+            FontFamily::Ui => "Microsoft YaHei UI",
+            FontFamily::Mono => "Consolas",
         };
+        // PCWSTR borrows this buffer; keep it alive until DirectWrite has
+        // copied the family name in CreateTextFormat.
+        let name: Vec<u16> = family_name.encode_utf16().chain(Some(0)).collect();
         let fmt = self.dwrite.CreateTextFormat(
-            name,
+            windows::core::PCWSTR(name.as_ptr()),
             None,
             DWRITE_FONT_WEIGHT_NORMAL,
             windows::Win32::Graphics::DirectWrite::DWRITE_FONT_STYLE_NORMAL,
@@ -557,15 +588,6 @@ pub struct Renderer {
     last_frame_size: RenderSize,
     /// A failed optional effect must not prevent subsequent normal frames.
     blur_unavailable: bool,
-}
-
-type PCWSTRLike = windows::core::PCWSTR;
-
-fn wide_null(s: &str) -> PCWSTRLike {
-    // 短命字符串 → 宽字符（CreateTextFormat 会拷贝族名，安全）
-    let mut v: Vec<u16> = s.encode_utf16().collect();
-    v.push(0);
-    windows::core::PCWSTR(v.as_ptr())
 }
 
 /// 单字符 UTF-16（BMP 内 1 单元；罕见增平面字给代理对，量宽/绘制都兼容）
@@ -1656,15 +1678,14 @@ mod tests {
     }
 
     #[test]
-    fn rewrap_pushes_overflow_breakable_suffix_further_down() {
-        // 行宽 50（5 字）。词 (2,6)="CDEFGH" 跨 0/1 行 → 整词下移后行1 溢出，
-        // 尾部单字 "I"（不在词内）继续下移到行2；词本身 6 字宽于行宽，保留溢出
-        // （超长词不拆的既定取舍）。
+    fn rewrap_splits_a_phrase_wider_than_the_available_line() {
         let lines = vec![line(0, "ABCD"), line(4, "EFGHI"), line(9, "J")];
-        let out = rewrap_words(&lines, &[(2, 6)]).expect("有跨行词，应返回重排结果");
-        assert_eq!(out[0].1, "AB");
-        assert_eq!(out[1].1, "CDEFGH");
-        assert_eq!(out[2].1, "IJ");
+        let out = rewrap_words_to_width(&lines, &[(2, 6)], 50.).unwrap();
+        assert_eq!(
+            out.iter().map(|l| l.1.as_str()).collect::<Vec<_>>(),
+            ["ABCDE", "FGHIJ"]
+        );
+        assert!(out.iter().all(|l| l.2.last().unwrap() <= &50.));
         assert_eq!(
             out.iter().map(|l| l.1.chars().count()).sum::<usize>(),
             10,
@@ -1677,6 +1698,56 @@ mod tests {
                 "相邻行 base 必须连续"
             );
         }
+    }
+
+    #[test]
+    fn rewrap_appends_a_final_line_instead_of_clipping_its_overflow() {
+        let lines = vec![line(0, "ABCDE"), line(5, "FGHIJ")];
+        let words = [(4, 2)];
+        let out = rewrap_words_to_width(&lines, &words, 50.).unwrap();
+        assert_eq!(
+            out.iter().map(|l| l.1.as_str()).collect::<Vec<_>>(),
+            ["ABCD", "EFGHI", "J"]
+        );
+        assert_eq!(out.iter().map(|l| l.0).collect::<Vec<_>>(), [0, 4, 9]);
+        assert!(out.iter().all(|l| l.2.last().unwrap() <= &50.));
+        assert_eq!(
+            out.iter().map(|l| l.1.as_str()).collect::<String>(),
+            "ABCDEFGHIJ"
+        );
+        assert!(rewrap_words_to_width(&out, &words, 50.).is_none());
+    }
+
+    #[test]
+    fn rewrap_preserves_unicode_advances_and_explicit_paragraph_gaps() {
+        let lines = vec![
+            (0, "甲𠮷".into(), vec![0., 12., 19.]),
+            (2, "乙丙".into(), vec![0., 8., 19.]),
+            (5, "丁".into(), vec![0., 13.]),
+        ];
+        let out = rewrap_words_to_width(&lines, &[(1, 2)], 20.).unwrap();
+        assert_eq!(
+            out.iter().map(|l| (l.0, l.1.as_str())).collect::<Vec<_>>(),
+            [(0, "甲"), (1, "𠮷乙"), (3, "丙"), (5, "丁")]
+        );
+        assert_eq!(out[1].2, [0., 7., 15.]);
+        assert!(out.iter().all(|l| l.2.last().unwrap() <= &20.));
+        let blank_lines = vec![line(0, "甲乙"), line(3, ""), line(4, "丙丁")];
+        let out = rewrap_words_to_width(&blank_lines, &[], 10.).unwrap();
+        assert_eq!(
+            out.iter().map(|l| (l.0, l.1.as_str())).collect::<Vec<_>>(),
+            [(0, "甲"), (1, "乙"), (3, ""), (4, "丙"), (5, "丁")]
+        );
+    }
+
+    #[test]
+    fn rewrap_does_not_split_fitting_word_to_enforce_closing_punctuation_rule() {
+        let lines = vec![line(0, "甲"), line(1, "乙，")];
+        let out = rewrap_words_to_width(&lines, &[(0, 2)], 20.).unwrap();
+        assert_eq!(
+            out.iter().map(|l| l.1.as_str()).collect::<Vec<_>>(),
+            ["甲乙", "，"]
+        );
     }
 
     #[test]
@@ -2006,5 +2077,31 @@ mod tests {
         let a = kit.char_width(FontFamily::Ui, 13.0, '码');
         let b = kit.char_width(FontFamily::Ui, 13.0, '码');
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn custom_font_changes_layout_metrics_and_missing_font_falls_back() {
+        let format_family = |kit: &mut FontKit| {
+            let fmt = kit.format(FontFamily::Lxgw, 48.).unwrap();
+            let len = unsafe { fmt.GetFontFamilyNameLength() } as usize;
+            let mut name = vec![0u16; len + 1];
+            unsafe { fmt.GetFontFamilyName(&mut name).unwrap() };
+            String::from_utf16(&name[..len]).unwrap()
+        };
+        let mut kit = FontKit::new();
+        kit.set_body_family("Consolas");
+        assert_eq!(kit.body_family, "Consolas");
+        assert_eq!(format_family(&mut kit), "Consolas");
+        let before = kit.char_width(FontFamily::Lxgw, 48., 'W');
+        assert!(!kit.width_cache.is_empty());
+        assert!(kit.set_body_family("Arial"));
+        assert!(kit.width_cache.is_empty());
+        assert!(kit.fmt_cache.is_empty());
+        assert_eq!(format_family(&mut kit), "Arial");
+        let after = kit.char_width(FontFamily::Lxgw, 48., 'W');
+        assert!((before - after).abs() > 1.);
+        kit.set_body_family("__hufu_uninstalled_font__");
+        assert_eq!(kit.body_family, detected_cjk_family());
+        assert!(kit.format(FontFamily::Lxgw, 100.).is_ok());
     }
 }

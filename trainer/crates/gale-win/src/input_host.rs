@@ -12,11 +12,11 @@ use gale_core::stats::StatsEngine;
 use gale_core::GaleResult;
 
 use windows::core::{w, Interface};
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, LoadLibraryW};
 use windows::Win32::UI::Controls::RichEdit::{
-    EM_GETTEXTEX, EM_GETTEXTLENGTHEX, GETTEXTEX, GETTEXTLENGTHEX, GTL_NUMCHARS, GTL_PRECISE,
-    GT_DEFAULT,
+    EM_GETTEXTEX, EM_GETTEXTLENGTHEX, EM_SETUNDOLIMIT, GETTEXTEX, GETTEXTLENGTHEX, GTL_NUMCHARS,
+    GTL_PRECISE, GT_DEFAULT,
 };
 use windows::Win32::UI::Input::Ime::{
     ImmGetCompositionStringW, ImmGetContext, ImmReleaseContext, ImmSetCandidateWindow,
@@ -32,10 +32,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::TextServices::{ITfContextComposition, ITfRangeACP};
 use windows::Win32::UI::WindowsAndMessaging::{
     CallWindowProcW, CreateWindowExW, DefWindowProcW, GetCaretPos, GetParent, HideCaret,
-    SendMessageW,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, GWLP_WNDPROC, SWP_NOZORDER, SW_HIDE, SW_SHOWNA,
-    WINDOW_EX_STYLE, WM_CHAR, WM_KEYDOWN, WM_KEYUP, WM_SYSCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP,
-    WS_CHILD, WS_VISIBLE,
+    RegisterWindowMessageW, SendMessageW, SetPropW, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+    GWLP_WNDPROC, SWP_NOZORDER, SW_HIDE, SW_SHOWNA, WINDOW_EX_STYLE, WM_CHAR, WM_KEYDOWN, WM_KEYUP,
+    WM_SYSCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP, WS_CHILD, WS_VISIBLE,
 };
 
 // ── RichEdit 常量（windows 0.58 未绑定的部分，手工定义，值与 SDK 一致）──
@@ -73,6 +72,9 @@ pub enum HostEvent {
     Cancelled,
     /// 原始击键（统计用；vk 已过滤为统计键）
     Key { vk: u32 },
+    /// The active HuFu TIP confirmed a successful explicit candidate selection.
+    /// Sentence locks are reported immediately, even before text is committed.
+    CandidateSelection { rank: u8, vk: Option<u32> },
 }
 
 impl From<&HostEvent> for Option<InputEvent> {
@@ -134,6 +136,9 @@ static CANCEL_INTENT: AtomicBool = AtomicBool::new(false);
 /// 生产者：note_key（键泵在 TSF 改写 VK 前调用）；消费者：drain_key_times
 ///（统计）与 note_commit（配对判定，只读不消费）。
 static KEY_TIMES: Mutex<Vec<(u32, u64)>> = Mutex::new(Vec::new());
+/// Attribution must survive the per-frame heat-map drain until text arrives.
+static COMMIT_KEY_HISTORY: Mutex<Vec<(u32, u64)>> = Mutex::new(Vec::new());
+static EXACT_SELECTION_SOURCE: AtomicBool = AtomicBool::new(false);
 static PHYSICAL_EVENTS: Mutex<Vec<HostEvent>> = Mutex::new(Vec::new());
 /// EM_SETEDITSTYLE(SES_USECTF) 校验结果（InputHost::create 写入；
 /// false = TSF 桥可能没建立，上层可提示"TSF 输入法可能不可用"）
@@ -259,6 +264,9 @@ pub fn capture_physical_key(msg: &windows::Win32::UI::WindowsAndMessaging::MSG) 
             0x25 => push_cmd(CommandKey::CtrlLeft),
             0x27 => push_cmd(CommandKey::CtrlRight),
             0x56 => push_cmd(CommandKey::LoadClipboard),
+            // Native undo/redo must reach RichEdit through the message pump;
+            // relay_proc cannot handle a shortcut discarded before dispatch.
+            0x5A | 0x59 => return false,
             _ => {}
         }
         return true;
@@ -664,6 +672,25 @@ unsafe extern "system" fn relay_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
             }
         }};
     }
+    if msg >= 0xC000 && msg == input_outcome_message() {
+        if wp.0 <= 10 {
+            EXACT_SELECTION_SOURCE.store(true, Ordering::Relaxed);
+            if wp.0 != 0 {
+                let vk = (1..=255).contains(&lp.0).then_some(lp.0 as u32);
+                if let Ok(mut events) = PHYSICAL_EVENTS.lock() {
+                    events.push(HostEvent::CandidateSelection {
+                        rank: wp.0 as u8,
+                        vk,
+                    });
+                }
+                input_log(&format!(
+                    "exact candidate selection rank={} vk={vk:?}",
+                    wp.0
+                ));
+            }
+        }
+        return LRESULT(0);
+    }
     // 诊断：IME 消息与按键全记录（正常路径零开销——env 未设时直接跳过）
     if input_log_enabled() {
         match msg {
@@ -721,6 +748,13 @@ unsafe extern "system" fn relay_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
         }
     }
     match msg {
+        0x0051 => {
+            // WM_INPUTLANGCHANGE: the next IME may use legacy attribution.
+            EXACT_SELECTION_SOURCE.store(false, Ordering::Relaxed);
+            if let Ok(mut keys) = COMMIT_KEY_HISTORY.lock() {
+                keys.clear();
+            }
+        }
         WM_KEYDOWN | WM_SYSKEYDOWN => {
             let vk = wp.0 as u32;
             // ── 防作弊：训练正文区拦一切右键菜单通道（2026-11-08）──
@@ -882,6 +916,17 @@ pub fn note_key(vk: u32, t_ms: u64) {
             kt.drain(..256);
         }
     }
+    if let Ok(mut history) = COMMIT_KEY_HISTORY.lock() {
+        history.push((vk, t_ms));
+        if history.len() > 64 {
+            history.drain(..32);
+        }
+    }
+}
+
+fn input_outcome_message() -> u32 {
+    static MESSAGE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *MESSAGE.get_or_init(|| unsafe { RegisterWindowMessageW(w!("HuFu.Trainer.InputOutcome.v1")) })
 }
 
 /// 上屏归因（对照晴跟打 Pro Score.cs 的 20ms 窗语义）
@@ -956,27 +1001,39 @@ pub fn note_commit(t_ms: u64, committed_text: &str) {
     if committed_text.is_ascii() {
         return;
     }
-    let cause = match KEY_TIMES.lock() {
-        Ok(kt) => kt
-            .iter()
-            .rev()
-            .find(|(_, key_ms)| t_ms.abs_diff(*key_ms) <= COMMIT_PAIR_WINDOW_MS)
-            .map(|(vk, key_ms)| {
-                let cause = classify_commit_cause(*vk);
-                // Physical 0x0E is the heatmap identity for extended Enter;
-                // HostEvent::Key still carries ordinary VK_RETURN and counted it.
-                if cause == CommitCause::Select && *vk != 0x0E && !StatsEngine::is_stat_key(*vk) {
-                    CommitCause::SelectExtra {
-                        vk: *vk,
-                        lag_ms: t_ms.abs_diff(*key_ms),
+    let mut cause = match COMMIT_KEY_HISTORY.lock() {
+        Ok(mut history) => {
+            let cause = history
+                .iter()
+                .rev()
+                .find(|(_, key_ms)| *key_ms <= t_ms && t_ms - *key_ms <= COMMIT_PAIR_WINDOW_MS)
+                .map(|(vk, key_ms)| {
+                    let cause = classify_commit_cause(*vk);
+                    // Physical 0x0E is the heatmap identity for extended Enter;
+                    // HostEvent::Key still carries ordinary VK_RETURN and counted it.
+                    if cause == CommitCause::Select && *vk != 0x0E && !StatsEngine::is_stat_key(*vk)
+                    {
+                        CommitCause::SelectExtra {
+                            vk: *vk,
+                            lag_ms: t_ms.abs_diff(*key_ms),
+                        }
+                    } else {
+                        cause
                     }
-                } else {
-                    cause
-                }
-            })
-            .unwrap_or(CommitCause::Unknown),
+                })
+                .unwrap_or(CommitCause::Unknown);
+            history.clear();
+            cause
+        }
         Err(_) => CommitCause::Unknown,
     };
+    if EXACT_SELECTION_SOURCE.load(Ordering::Relaxed)
+        && matches!(cause, CommitCause::Select | CommitCause::SelectExtra { .. })
+    {
+        // The synchronous TIP event already counted this action, or explicitly
+        // proved no selection (for example an out-of-range key topping text).
+        cause = CommitCause::Unknown;
+    }
     input_log(&format!(
         "commit 配对 text={committed_text:?} cause={cause:?}"
     ));
@@ -1143,10 +1200,9 @@ impl InputHost {
                 WPARAM(0),
                 LPARAM(ENM_UPDATE as isize),
             );
-            // EM_SETUNDOLIMIT：limit 装在 wParam（lParam 恒 0）。此前把 10 万
-            // 误放在 lParam、wParam 传 0——而 wParam=0 是"禁用撤回"，导致
-            // Ctrl+Z 物理键完全失效（2026-11-09 修复）。
-            SendMessageW(hwnd, 0x435, WPARAM(100_000), LPARAM(0));
+            // EM_SETUNDOLIMIT 的 limit 在 wParam（lParam 恒 0）。使用 SDK
+            // 常量，避免误发 0x435（EM_EXLIMITTEXT）而没有设置撤销容量。
+            SendMessageW(hwnd, EM_SETUNDOLIMIT, WPARAM(100_000), LPARAM(0));
             // 显式开启 TSF 支持（RichEdit50W 默认开；显式设确保 CUAS→TSF 桥激活，
             // 纯 TSF 输入法（虎符）依赖此链路——architecture.md Mandate #1）。
             // 返回值校验（2026-11-08）：成功返回旧样式位（小非负值），失败为负
@@ -1172,6 +1228,15 @@ impl InputHost {
             let old = SetWindowLongPtrW(hwnd, GWLP_WNDPROC, relay_proc as *const () as isize);
             ORIG_PROC.store(old, Ordering::Relaxed);
             RELAY_HWND.store(hwnd.0 as isize, Ordering::Relaxed);
+            if input_outcome_message() != 0 {
+                // Only this typing control opts in; settings editors and other
+                // applications never receive the numeric outcome notification.
+                if let Err(error) =
+                    SetPropW(hwnd, w!("HuFu.Trainer.InputOutcome.v1"), HANDLE(1 as _))
+                {
+                    eprintln!("[gale] 精确选重通知不可用: {error}");
+                }
+            }
             // 宿主形态（2026-11-08 如实修订）：RichEdit 是**可见的 2×2 物理像素**
             // 子窗口，由 place() 每帧贴随绘制光标（rect 去抖，见 place）。
             // 不能用 1×1 region 或隐藏窗口——实测（2026-10-01）会让虎符（TSF
@@ -1392,6 +1457,16 @@ impl InputHost {
         self.cancellation = CompositionCancellation::default();
         COMPOSING.store(false, Ordering::Relaxed);
         CANCEL_INTENT.store(false, Ordering::Relaxed);
+        EXACT_SELECTION_SOURCE.store(false, Ordering::Relaxed);
+        if let Ok(mut history) = COMMIT_KEY_HISTORY.lock() {
+            history.clear();
+        }
+        if let Ok(mut events) = PHYSICAL_EVENTS.lock() {
+            events.clear();
+        }
+        if let Ok(mut causes) = COMMIT_CAUSES.lock() {
+            causes.clear();
+        }
     }
 
     /// 截断到 idx 个字符（点击回退用）
@@ -1907,6 +1982,7 @@ mod tests {
     #[test]
     fn commit_cause_pairing_within_20ms() {
         let _guard = COMMIT_PAIR_TEST_LOCK.lock().unwrap();
+        EXACT_SELECTION_SOURCE.store(false, Ordering::Relaxed);
         set_selection_keys(&[]);
         // 隔离：先清两个静态队列（与其它测试共享进程）
         let _ = drain_key_times(1024);
@@ -1955,8 +2031,47 @@ mod tests {
     static COMMIT_PAIR_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
+    fn heatmap_drain_keeps_pending_commit_attribution_and_a_commit_consumes_it() {
+        let _guard = COMMIT_PAIR_TEST_LOCK.lock().unwrap();
+        EXACT_SELECTION_SOURCE.store(false, Ordering::Relaxed);
+        COMMIT_KEY_HISTORY.lock().unwrap().clear();
+        let _ = drain_key_times(1024);
+        let _ = drain_commit_causes();
+        set_selection_keys(&[0xBA]);
+        note_key(0xBA, 1_000);
+        assert_eq!(drain_key_times(1024), vec![(0xBA, 1_000)]);
+        note_commit(1_015, "候选");
+        note_commit(1_016, "另一组");
+        assert_eq!(
+            drain_commit_causes(),
+            vec![CommitCause::Select, CommitCause::Unknown]
+        );
+        set_selection_keys(&[]);
+    }
+
+    #[test]
+    fn exact_selection_notifications_suppress_legacy_selection_guessing() {
+        let _guard = COMMIT_PAIR_TEST_LOCK.lock().unwrap();
+        EXACT_SELECTION_SOURCE.store(true, Ordering::Relaxed);
+        COMMIT_KEY_HISTORY.lock().unwrap().clear();
+        let _ = drain_key_times(1024);
+        let _ = drain_commit_causes();
+        set_selection_keys(&[0xDE, 0x10]);
+        for (index, vk) in [0x33, 0xDE, 0xA0].into_iter().enumerate() {
+            let now = 1_000 + index as u64 * 100;
+            note_key(vk, now);
+            let _ = drain_key_times(1024);
+            note_commit(now + 10, "候选");
+        }
+        assert_eq!(drain_commit_causes(), vec![CommitCause::Unknown; 3]);
+        EXACT_SELECTION_SOURCE.store(false, Ordering::Relaxed);
+        set_selection_keys(&[]);
+    }
+
+    #[test]
     fn scheme_selection_keys_support_oem_modifiers_and_replace_old_scheme() {
         let _guard = COMMIT_PAIR_TEST_LOCK.lock().unwrap();
+        EXACT_SELECTION_SOURCE.store(false, Ordering::Relaxed);
         let _ = drain_key_times(1024);
         let _ = drain_commit_causes();
         set_selection_keys(&[0xBA, 0xDE, 0x10, 0x14, 0x51, 999]);

@@ -36,6 +36,30 @@ impl Material {
     }
 }
 
+/// Display routes follow either the shortest base code or the longest phrase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HintStrategy {
+    Phrases,
+    #[default]
+    #[serde(other)]
+    Shortest,
+}
+impl HintStrategy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Shortest => "shortest",
+            Self::Phrases => "phrases",
+        }
+    }
+    pub fn from_str_lossy(value: &str) -> Self {
+        match value {
+            "phrases" => Self::Phrases,
+            _ => Self::Shortest,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
@@ -52,6 +76,9 @@ pub struct Config {
     pub win_position_physical: bool,
     /// 字号（跟打区，DIP）
     pub font_size: f32,
+    /// 正文字体家族；空串 = 自动选择霞鹜文楷，未安装时回退微软雅黑。
+    #[serde(default)]
+    pub font_family: String,
     #[serde(default)]
     pub hint_style: u8,
     #[serde(default = "default_motion_level")]
@@ -62,6 +89,13 @@ pub struct Config {
     pub hint_show_rank: bool,
     #[serde(default = "yes")]
     pub hint_color_words: bool,
+    /// 按候选序号为词组配色；关闭时沿用六档词色，旧配置默认关闭。
+    #[serde(default)]
+    pub hint_rank_colors: bool,
+    #[serde(default)]
+    pub hint_strategy: HintStrategy,
+    #[serde(default)]
+    pub hint_dynamic: bool,
     #[serde(default)]
     pub hint_underline: bool,
     #[serde(default)]
@@ -96,6 +130,7 @@ pub struct Config {
     /// 自定义颜色覆盖（键=主题键名 打对色/打错色/跟打区背景色/窗体背景色/光标色…，
     /// 值=RRGGBB 十六进制）。载入主题后叠加；空=全跟主题走。
     /// 持久化在 config.toml：color_打对色 = "33534a"。
+    /// 新增词色键（如词提一码色）缺省不写覆盖，旧四/五档自定义值仍独立保留。
     pub color_overrides: BTreeMap<String, String>,
     /// 今日字数记忆（date+chars）
     pub today: String,
@@ -129,7 +164,7 @@ fn hint_font_default() -> f32 {
     14.
 }
 fn score_fields_default() -> String {
-    "segment,speed,key_accuracy,code_len,word_rate,select_count,retype_count,chars,time,keys,backspaces,wrong,signature".into()
+    crate::scorecard::STANDARD_SCORE_FIELDS.to_string()
 }
 
 fn default_motion_level() -> u8 {
@@ -147,11 +182,15 @@ impl Default for Config {
             win_h: 800,
             win_position_physical: false,
             font_size: 36.0,
+            font_family: String::new(),
             hint_style: 0,
             motion_level: 2,
             hint_show_code: true,
             hint_show_rank: true,
             hint_color_words: true,
+            hint_rank_colors: false,
+            hint_strategy: HintStrategy::Shortest,
+            hint_dynamic: false,
             hint_underline: false,
             hint_word_bg: false,
             hint_font_size: 14.,
@@ -241,6 +280,7 @@ impl Config {
             font_size: get("font_size", &d.font_size.to_string())
                 .parse()
                 .unwrap_or(d.font_size),
+            font_family: get("font_family", "").trim().to_string(),
             material: match get("material", "Solid").as_str() {
                 "Acrylic" => Material::Acrylic,
                 "Blur" => Material::Blur,
@@ -251,6 +291,9 @@ impl Config {
             hint_show_code: get("hint_show_code", "true") == "true",
             hint_show_rank: get("hint_show_rank", "true") == "true",
             hint_color_words: get("hint_color_words", "true") == "true",
+            hint_rank_colors: get("hint_rank_colors", "false") == "true",
+            hint_strategy: HintStrategy::from_str_lossy(&get("hint_strategy", "shortest")),
+            hint_dynamic: get("hint_dynamic", "false") == "true",
             hint_underline: get("hint_underline", "false") == "true",
             hint_word_bg: get("hint_word_bg", "false") == "true",
             hint_font_size: get("hint_font_size", "14")
@@ -320,6 +363,7 @@ impl Config {
         };
         // 用户要求：成绩单不再出现「字准」。清掉旧配置里已保存的字准 token/字段。
         cfg.score_template = crate::scorecard::strip_character_accuracy(&cfg.score_template);
+        cfg.score_template = crate::scorecard::upgrade_builtin_template(&cfg.score_template);
         cfg.score_fields = cfg
             .score_fields
             .split(',')
@@ -327,6 +371,7 @@ impl Config {
             .filter(|key| !key.is_empty() && *key != "character_accuracy")
             .collect::<Vec<_>>()
             .join(",");
+        cfg.score_fields = crate::scorecard::upgrade_standard_fields(&cfg.score_fields);
         // Migrate only the uncustomized appearance defaults of the first preview.
         if !map.contains_key("design_version")
             && cfg.win_w == 1100
@@ -342,7 +387,7 @@ impl Config {
         cfg.opacity = cfg.opacity.clamp(10, 100);
         cfg.seg_chars = cfg.seg_chars.clamp(10, 1000);
         cfg.font_size = if cfg.font_size.is_finite() {
-            cfg.font_size.clamp(12.0, 160.0)
+            cfg.font_size.clamp(10.0, 100.0)
         } else {
             d.font_size
         };
@@ -370,14 +415,21 @@ impl Config {
         m.insert("win_y".into(), self.win_y.to_string());
         m.insert("win_w".into(), self.win_w.to_string());
         m.insert("win_h".into(), self.win_h.to_string());
-        m.insert("win_position_physical".into(), self.win_position_physical.to_string());
+        m.insert(
+            "win_position_physical".into(),
+            self.win_position_physical.to_string(),
+        );
         m.insert("font_size".into(), self.font_size.to_string());
+        m.insert("font_family".into(), self.font_family.clone());
         m.insert("hint_style".into(), self.hint_style.to_string());
         m.insert("motion_level".into(), self.motion_level.to_string());
+        m.insert("hint_strategy".into(), self.hint_strategy.as_str().into());
         for (key, value) in [
             ("hint_show_code", self.hint_show_code),
             ("hint_show_rank", self.hint_show_rank),
             ("hint_color_words", self.hint_color_words),
+            ("hint_rank_colors", self.hint_rank_colors),
+            ("hint_dynamic", self.hint_dynamic),
             ("hint_underline", self.hint_underline),
             ("hint_word_bg", self.hint_word_bg),
             ("score_auto_copy", self.score_auto_copy),
@@ -472,6 +524,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn hint_strategy_and_dynamic_preferences_roundtrip_with_safe_legacy_defaults() {
+        let old = Config::from_toml_text("").unwrap();
+        assert_eq!(old.hint_strategy, HintStrategy::Shortest);
+        assert!(!old.hint_dynamic);
+        let cfg = Config {
+            hint_strategy: HintStrategy::Phrases,
+            hint_dynamic: true,
+            ..Default::default()
+        };
+        let loaded = Config::from_toml_text(&cfg.to_toml_text()).unwrap();
+        assert_eq!(loaded.hint_strategy, HintStrategy::Phrases);
+        assert!(loaded.hint_dynamic);
+        assert_eq!(
+            Config::from_toml_text("hint_strategy = \"unknown\"")
+                .unwrap()
+                .hint_strategy,
+            HintStrategy::Shortest
+        );
+        assert_eq!(
+            serde_json::from_str::<HintStrategy>("\"unknown\"").unwrap(),
+            HintStrategy::Shortest
+        );
+        assert_eq!(
+            serde_json::to_string(&HintStrategy::Phrases).unwrap(),
+            "\"phrases\""
+        );
+    }
+
+    #[test]
     fn initial_preview_appearance_migrates_but_custom_font_survives() {
         let old = "win_w = 1100\nwin_h = 680\nfont_size = 64\nline_gap = 0.22\n";
         let cfg = Config::from_toml_text(old).unwrap();
@@ -520,6 +601,24 @@ mod tests {
         assert_eq!(d.line_gap, 0.66);
         assert_eq!(d.caret_speed, 12.0);
         assert_eq!(d.auto_next_delay_ms, 0);
+    }
+
+    #[test]
+    fn selected_font_and_full_size_range_survive_config_roundtrip() {
+        let cfg = Config::from_toml_text("font_family = \"霞鹜文楷 GB Screen\"\nfont_size = 100\n")
+            .unwrap();
+        let loaded = Config::from_toml_text(&cfg.to_toml_text()).unwrap();
+        assert_eq!(loaded.font_family, "霞鹜文楷 GB Screen");
+        assert_eq!(loaded.font_size, 100.);
+        assert_eq!(
+            Config::from_toml_text("font_size = 999").unwrap().font_size,
+            100.
+        );
+        assert_eq!(
+            Config::from_toml_text("font_size = 1").unwrap().font_size,
+            10.
+        );
+        assert!(Config::from_toml_text("").unwrap().font_family.is_empty());
     }
 
     /// 旧 config.toml（jifeng1 时代的旧默认值已写盘）缺字段时读新默认：
@@ -603,6 +702,76 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
     #[test]
+    fn word_color_overrides_keep_legacy_keys_and_roundtrip_one_code_color() {
+        // Legacy four-color profiles must retain their exact overrides while
+        // leaving the new one-code color to the current theme's default.
+        let legacy = Config::from_toml_text(
+            "color_词提简码色 = \"112233\"\n\
+             color_词提二字全码色 = \"223344\"\n\
+             color_词提三字全码色 = \"334455\"\n\
+             color_词提四字全码色 = \"445566\"\n",
+        )
+        .unwrap();
+        assert_eq!(legacy.color_overrides.len(), 4);
+        assert!(!legacy.color_overrides.contains_key("词提一码色"));
+        assert_eq!(
+            serde_json::from_str::<Config>(&serde_json::to_string(&legacy).unwrap())
+                .unwrap()
+                .color_overrides,
+            legacy.color_overrides
+        );
+
+        let mut five = legacy.clone();
+        five.color_overrides
+            .insert("词提二字三码色".into(), "556677".into());
+        let old_five = Config::from_toml_text(&five.to_toml_text()).unwrap();
+        assert_eq!(old_five.color_overrides, five.color_overrides);
+        assert!(!old_five.color_overrides.contains_key("词提一码色"));
+        let mut six = old_five;
+        six.color_overrides
+            .insert("词提一码色".into(), "c43e62".into());
+        let reloaded = Config::from_toml_text(&six.to_toml_text()).unwrap();
+        assert_eq!(reloaded.color_overrides, six.color_overrides);
+        assert_eq!(
+            serde_json::from_str::<Config>(&serde_json::to_string(&six).unwrap())
+                .unwrap()
+                .color_overrides,
+            six.color_overrides
+        );
+        for (key, value) in legacy.color_overrides {
+            assert_eq!(reloaded.color_overrides.get(&key), Some(&value));
+        }
+        let invalid_one = Config::from_toml_text(
+            "color_词提一码色 = \"invalid\"\ncolor_词提简码色 = \"112233\"\n",
+        )
+        .unwrap();
+        assert!(!invalid_one.color_overrides.contains_key("词提一码色"));
+        assert_eq!(invalid_one.color_overrides["词提简码色"], "112233");
+    }
+    #[test]
+    fn candidate_rank_colors_are_opt_in_and_roundtrip_with_custom_colors() {
+        let legacy = Config::from_toml_text("hint_color_words = true").unwrap();
+        assert!(!legacy.hint_rank_colors);
+        let mut snapshot = serde_json::to_value(&legacy).unwrap();
+        snapshot.as_object_mut().unwrap().remove("hint_rank_colors");
+        assert!(
+            !serde_json::from_value::<Config>(snapshot)
+                .unwrap()
+                .hint_rank_colors
+        );
+
+        let cfg = Config::from_toml_text(
+            "hint_rank_colors = true\ncolor_词提3选色 = \"123aef\"\ncolor_词提10选色 = \"456abc\"\n",
+        ).unwrap();
+        assert!(cfg.hint_rank_colors);
+        let loaded = Config::from_toml_text(&cfg.to_toml_text()).unwrap();
+        assert!(loaded.hint_rank_colors);
+        assert_eq!(loaded.color_overrides, cfg.color_overrides);
+        assert_eq!(loaded.color_overrides["词提3选色"], "123aef");
+        assert!(loaded.hint_color_words);
+    }
+
+    #[test]
     fn trainer_preferences_preserve_multiline_templates_and_independent_switches() {
         let mut cfg = Config::default();
         cfg.hint_show_code = false;
@@ -614,6 +783,8 @@ mod tests {
         cfg.score_fields = "segment,word_rate,retype".into();
         cfg.color_overrides
             .insert("词提三字全码色".into(), "123aef".into());
+        cfg.color_overrides
+            .insert("词提二字三码色".into(), "456abc".into());
         let loaded = Config::from_toml_text(&cfg.to_toml_text()).unwrap();
         assert!(!loaded.hint_show_code && loaded.hint_show_rank && loaded.hint_word_bg);
         assert_eq!(loaded.hint_font_size, 22.);
@@ -629,11 +800,15 @@ mod tests {
         );
     }
 }
-    #[test]
-    fn physical_window_position_roundtrips_and_legacy_config_keeps_old_coordinate_mode() {
-        let old = Config::from_toml_text("win_x = -1000\nwin_y = 40").unwrap();
-        assert!(!old.win_position_physical);
-        let mut cfg = old; cfg.win_position_physical = true; cfg.win_w = 960;
-        let restored = Config::from_toml_text(&cfg.to_toml_text()).unwrap();
-        assert!(restored.win_position_physical); assert_eq!(restored.win_x, -1000); assert_eq!(restored.win_w, 960);
-    }
+#[test]
+fn physical_window_position_roundtrips_and_legacy_config_keeps_old_coordinate_mode() {
+    let old = Config::from_toml_text("win_x = -1000\nwin_y = 40").unwrap();
+    assert!(!old.win_position_physical);
+    let mut cfg = old;
+    cfg.win_position_physical = true;
+    cfg.win_w = 960;
+    let restored = Config::from_toml_text(&cfg.to_toml_text()).unwrap();
+    assert!(restored.win_position_physical);
+    assert_eq!(restored.win_x, -1000);
+    assert_eq!(restored.win_w, 960);
+}

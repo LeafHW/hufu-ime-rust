@@ -67,7 +67,8 @@ pub struct StatsEngine {
     /// gale-app 输入宿主 drain_commit_causes → session 转发注入）。旧 JSON 缺省 0。
     #[serde(default)]
     pub ding_count: u32,
-    /// 选重次数（20ms 键-提交配对：提交由候选选重键完成）。旧 JSON 缺省 0。
+    /// 实际候选选择次数；虎符按选择事件计数，其他输入法保留键-提交配对。
+    /// 锁词后延迟上屏不延迟此计数。旧 JSON 缺省 0。
     #[serde(default)]
     pub select_count: u32,
     /// 组字会话起点（累计键数；None=未在组字）——运行态，不入 JSON
@@ -123,7 +124,7 @@ impl StatsEngine {
     pub fn note_ding(&mut self) {
         self.ding_count = self.ding_count.saturating_add(1);
     }
-    /// 20ms 配对账（P1-3 选重/标顶）：选重一次（候选选重键完成提交）。
+    /// 选重一次（真实候选选择事件，或其他输入法的键-提交配对）。
     pub fn note_select(&mut self) {
         self.select_count = self.select_count.saturating_add(1);
     }
@@ -242,6 +243,28 @@ impl StatsEngine {
         }
         self.last_key_ms = Some(ts_ms);
         self.on_key(&KeyEvent { vk, composing });
+    }
+
+    /// Count a normally excluded physical key when a real candidate-selection
+    /// event proves its use. The choice may only lock part of a sentence, so
+    /// this key belongs to the current unsettled batch until commit or cancel.
+    /// Ordinary statistical keys already arrived through on_key_timed.
+    pub fn on_proven_selection_key_timed(&mut self, vk: u32, ts_ms: u64) -> bool {
+        if vk == 0 || vk > 255 || vk == 0x0E || Self::is_stat_key(vk) {
+            return false;
+        }
+        self.begin_composition();
+        self.keys = self.keys.saturating_add(1);
+        self.composing_keys = self.composing_keys.saturating_add(1);
+        self.pending_composing_keys = self.pending_composing_keys.saturating_add(1);
+        if let Some(last) = self.last_key_ms {
+            self.per_key
+                .push((vk, ts_ms.saturating_sub(last).min(u32::MAX as u64) as u32));
+            self.last_key_ms = Some(ts_ms.max(last));
+        } else {
+            self.last_key_ms = Some(ts_ms);
+        }
+        true
     }
 
     /// Add a normally excluded key only after the input host proves that it
@@ -383,7 +406,7 @@ pub struct SegmentStats {
     /// 标顶次数（顶屏键完成提交；晴成绩单 `标顶N`）。旧 JSON 缺省 0。
     #[serde(default)]
     pub ding_count: u32,
-    /// 选重次数（候选选重键完成提交；晴成绩单 `选重N`）。旧 JSON 缺省 0。
+    /// 实际候选选择次数（含整句锁词；晴成绩单 `选重N`）。旧 JSON 缺省 0。
     #[serde(default)]
     pub select_count: u32,
     // ── 州州增值口径（`_research/stats-and-drill-models.md` §3.2 直译）──
@@ -999,6 +1022,61 @@ mod tests {
             "the completed selection never becomes next-round waste"
         );
         assert_eq!(st.commit_attributions[0].keys, 2);
+    }
+
+    #[test]
+    fn proven_selection_keys_wait_in_current_batch_without_rewriting_previous_commit() {
+        let mut st = StatsEngine::new();
+        st.on_key_timed(0x41, false, 100);
+        st.on_commit(1, 110);
+        st.on_key_timed(0x42, false, 200);
+        st.on_key_timed(0xA0, true, 300); // excluded until its selection is confirmed
+        assert!(st.on_proven_selection_key_timed(0xA0, 300));
+        assert!(st.on_proven_selection_key_timed(0x14, 500));
+        assert_eq!(st.keys, 4);
+        assert_eq!(st.attributed_keys, 1);
+        assert_eq!(st.commit_attributions[0].keys, 1);
+        assert_eq!(st.composition_start_keys, Some(1));
+        st.begin_composition(); // repeated composition observations cannot recount the keys
+        assert_eq!(st.composing_keys, 3);
+        assert_eq!(st.per_key, vec![(0x42, 100), (0xA0, 100), (0x14, 200)]);
+        st.on_commit(2, 3_000); // sentence locking can precede actual output by seconds
+        assert_eq!(st.commit_attributions[1].keys, 3);
+        assert_eq!(st.commit_attributions[0].keys, 1);
+        assert_eq!(st.attributed_keys, st.keys);
+    }
+
+    #[test]
+    fn proven_selection_keys_are_cancelled_with_the_pending_sentence_only() {
+        let mut st = StatsEngine::new();
+        st.on_key_timed(0x41, false, 100);
+        st.on_commit(1, 110);
+        st.on_key_timed(0x42, true, 200);
+        assert!(st.on_proven_selection_key_timed(0x70, 300));
+        st.cancel_composition();
+        assert_eq!(st.waste_codes, 1);
+        assert_eq!(st.waste_keys, 2);
+        assert_eq!(st.commit_attributions[0].keys, 1);
+        assert_eq!(st.keys, 3);
+        st.on_key_timed(0x43, true, 500);
+        st.on_commit(1, 600);
+        assert_eq!(st.commit_attributions[1].keys, 1);
+        assert_eq!(st.attributed_keys, st.keys);
+    }
+
+    #[test]
+    fn proven_selection_does_not_duplicate_statistical_keys_or_numpad_enter() {
+        let mut st = StatsEngine::new();
+        for vk in [0xBA, 0xDE, 0x32, 0x62, 0x0D] {
+            st.on_key_timed(vk, true, 100);
+            assert!(!st.on_proven_selection_key_timed(vk, 100));
+        }
+        assert!(!st.on_proven_selection_key_timed(0x0E, 100));
+        assert!(!st.on_proven_selection_key_timed(0, 100));
+        assert!(!st.on_proven_selection_key_timed(256, 100));
+        st.on_commit(1, 200);
+        assert_eq!(st.keys, 5);
+        assert_eq!(st.commit_attributions[0].keys, 5);
     }
 
     /// 并击口径：3 次 commit → commit_groups = 3，与串行键数并存

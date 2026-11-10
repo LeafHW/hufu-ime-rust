@@ -4,7 +4,7 @@ use gale_core::rules::{
     clean_body, fingerprint, CleaningPreset, RoundMetadata, SessionRules, TrainingMode,
 };
 use gale_core::score::{DifficultyTag, ScoreRecord, VALID_MIN_CHARS};
-use gale_core::segment::{split_smart, ParsedGroupText, Segment};
+use gale_core::segment::{parse_group_text, split_smart, ParsedGroupText, Segment};
 use gale_core::single::SingleSession;
 use gale_core::stats::{SegmentStats, StatsEngine};
 use gale_win::input_host::{BackspaceClass, BackspaceRouter, CommitCause};
@@ -177,6 +177,16 @@ impl Session {
         self.loaded();
         // 群文《难度》头（"普 1.84"）/文来标签——载入时解析，结算时随成绩进成绩单
         self.difficulty = parsed.difficulty.as_deref().and_then(DifficultyTag::parse);
+    }
+    /// Clipboard and QQ imports share format recognition. The parser only
+    /// removes metadata from a recognized article; plain text keeps smart splits.
+    pub fn load_text(&mut self, text: &str) {
+        let parsed = parse_group_text(text);
+        if parsed.segments.iter().any(|seg| !seg.mark.is_empty()) {
+            self.load_group(parsed);
+        } else {
+            self.load_book("自定义文字", text);
+        }
     }
     pub fn load_book(&mut self, title: &str, text: &str) {
         self.segments = split_smart(text, self.default_seg_chars);
@@ -436,7 +446,27 @@ impl Session {
         self.stats
             .on_key_timed(vk, composing, now.saturating_sub(self.paused_ms));
     }
-    /// 20ms 配对账（P1-3 选重/标顶）：Ding→标顶、Select→选重、Unknown 忽略。
+    /// A confirmed candidate choice is counted immediately, including sentence
+    /// locks that do not commit text yet. Default Space confirmation does not
+    /// produce this event; a choice without a physical key adds no guessed key.
+    pub fn on_candidate_selection(&mut self, vk: Option<u32>, now_ms: u64) {
+        if self.current_segment().text.is_empty()
+            || self.phase == Phase::Done
+            || self.recorded
+            || self.paused_at.is_some()
+        {
+            return;
+        }
+        let now = self.clock(now_ms);
+        self.begin(now);
+        self.stats.note_select();
+        if let Some(vk) = vk {
+            self.stats
+                .on_proven_selection_key_timed(vk, now.saturating_sub(self.paused_ms));
+        }
+    }
+
+    /// Other-input-method fallback: Ding→标顶、Select→选重、Unknown 忽略。
     /// main.rs 在每帧 poll 之后 drain_commit_causes 并逐条转发到这里；
     /// The final Commit reaches Done before this queue drains. Accept it until
     /// finalize sets recorded, otherwise every final selection/top-code is lost.
@@ -894,7 +924,7 @@ mod tests {
         s.on_key(0x41, 100);
         s.feed_input(
             InputEvent::Commit {
-                chars: "甲".into(),
+                chars: "甲".into()
             },
             200,
         );
@@ -929,6 +959,44 @@ mod tests {
             ],
         });
         s
+    }
+    #[test]
+    fn clipboard_and_group_load_share_article_metadata_cleanup() {
+        for newline in ["\n", "\r\n", "\r"] {
+            for footer in [
+                "-----第2-277101段-晴发文",
+                "-----第2段-----",
+                "—----第2段----—",
+            ] {
+                let raw = ["[普(1.84)]文章标题 [字数6]", " 正文。 ", footer].join(newline);
+                let mut s = Session::new(1);
+                s.load_text(&raw);
+                assert_eq!(s.source, SessionSource::Group, "{raw:?}");
+                assert_eq!(s.title, "文章标题");
+                assert_eq!(s.current_segment().text, " 正文。 ");
+                assert_eq!(s.total_segments(), 1, "group segments are not re-split");
+                assert!(s.difficulty.is_some());
+                assert_eq!(s.raw_segments[0].text, " 正文。 ");
+            }
+        }
+    }
+
+    #[test]
+    fn clipboard_plain_body_keeps_content_and_smart_segmentation() {
+        let raw = "《这是正文》\r\n  正文空格保留。\r\n\r\n下一行。";
+        let mut s = Session::new(5);
+        s.load_text(raw);
+        assert_eq!(s.title, "自定义文字");
+        assert_eq!(s.source, SessionSource::Library("自定义文字".into()));
+        assert!(s.difficulty.is_none());
+        assert!(s.total_segments() > 1);
+        assert_eq!(
+            s.segments
+                .iter()
+                .map(|seg| seg.text.as_str())
+                .collect::<String>(),
+            normalize_newlines(raw)
+        );
     }
     /// 逐字一键 + 末尾整段 commit：首键开表（started=start），elapsed = end−start。
     fn round(s: &mut Session, start: u64, end: u64, text: &str) {
@@ -1663,6 +1731,134 @@ mod tests {
             "an ordinary selection key was already counted"
         );
         assert_eq!(ordinary.select_count, 1);
+    }
+
+    #[test]
+    fn candidate_choices_count_before_delayed_sentence_commit_and_keep_each_choice() {
+        let mut s = session();
+        s.on_key(0x41, 100);
+        s.set_composing(true);
+        s.on_key(0xBA, 200);
+        s.on_candidate_selection(Some(0xBA), 200);
+        s.on_key(0xDE, 500);
+        s.on_candidate_selection(Some(0xDE), 500);
+        s.on_candidate_selection(None, 900); // a proven mouse choice invents no key
+        assert_eq!(s.stats.select_count, 3);
+        assert_eq!(s.stats.keys, 3);
+        assert!(s.stats.commit_attributions.is_empty());
+        assert_eq!(s.comparer.pos, 0);
+        s.feed_input(
+            InputEvent::Commit {
+                chars: "甲乙丙丁戊".into(),
+            },
+            5_000,
+        );
+        let r = s.finalize_current_at(5_000, 123).unwrap();
+        assert_eq!(r.select_count, 3);
+        assert_eq!(r.keys, 3);
+        assert_eq!(s.stats.commit_attributions[0].keys, 3);
+    }
+
+    #[test]
+    fn candidate_modifier_selection_stays_pending_and_last_character_is_counted() {
+        let mut s = session();
+        s.on_key(0x41, 100);
+        s.feed_input(
+            InputEvent::Commit {
+                chars: "甲".into()
+            },
+            200,
+        );
+        s.on_key(0x42, 300);
+        s.set_composing(true);
+        s.on_key(0xA0, 400); // ignored by ordinary physical-key counting
+        s.on_candidate_selection(Some(0xA0), 400);
+        assert_eq!(s.stats.select_count, 1);
+        assert_eq!(s.stats.keys, 3);
+        assert_eq!(s.stats.commit_attributions[0].keys, 1);
+        assert_eq!(s.stats.attributed_keys, 1);
+        s.feed_input(
+            InputEvent::Commit {
+                chars: "乙丙丁戊".into(),
+            },
+            2_000,
+        );
+        assert_eq!(s.phase, Phase::Done);
+        assert_eq!(s.stats.commit_attributions[1].keys, 2);
+        s.on_candidate_selection(Some(0x14), 2_010);
+        assert_eq!(
+            s.stats.select_count, 1,
+            "finished text rejects later choices"
+        );
+        let r = s.finalize_current_at(2_000, 123).unwrap();
+        assert_eq!(r.select_count, 1);
+        assert_eq!(r.keys, 3);
+        s.on_candidate_selection(Some(0x14), 2_100);
+        assert_eq!(s.stats.select_count, 1);
+        assert_eq!(s.stats.keys, 3);
+    }
+
+    #[test]
+    fn cancelled_sentence_keeps_actual_choices_and_does_not_charge_previous_output() {
+        let mut s = session();
+        s.on_key(0x41, 100);
+        s.feed_input(
+            InputEvent::Commit {
+                chars: "甲".into()
+            },
+            200,
+        );
+        s.on_key(0x42, 300);
+        s.set_composing(true);
+        s.on_candidate_selection(Some(0x14), 400);
+        s.cancel_composition();
+        assert_eq!(
+            s.stats.select_count, 1,
+            "the lock was an actual choice even if later cancelled"
+        );
+        assert_eq!(s.stats.waste_keys, 2);
+        assert_eq!(s.stats.commit_attributions[0].keys, 1);
+        s.on_key(0x43, 600);
+        s.feed_input(
+            InputEvent::Commit {
+                chars: "乙丙丁戊".into(),
+            },
+            700,
+        );
+        assert_eq!(s.stats.commit_attributions[1].keys, 1);
+        assert_eq!(s.finalize_current_at(700, 123).unwrap().select_count, 1);
+    }
+
+    #[test]
+    fn candidate_selection_ignores_empty_paused_and_recorded_rounds() {
+        let mut empty = Session::new(100);
+        empty.on_candidate_selection(Some(0x14), 100);
+        assert_eq!(empty.phase, Phase::Idle);
+        assert!(empty.started_ms.is_none());
+        assert_eq!(empty.stats.keys, 0);
+        assert_eq!(empty.stats.select_count, 0);
+
+        let mut s = session();
+        s.rules.pause_on_blur = true;
+        s.on_key(0x41, 100);
+        s.set_paused(true, 200);
+        s.on_candidate_selection(Some(0x14), 500);
+        assert_eq!(s.stats.keys, 1);
+        assert_eq!(s.stats.select_count, 0);
+        s.set_paused(false, 1_200);
+        s.on_candidate_selection(Some(0x14), 1_300);
+        assert_eq!(s.stats.keys, 2);
+        assert_eq!(s.stats.select_count, 1);
+        s.feed_input(
+            InputEvent::Commit {
+                chars: "甲".into()
+            },
+            1_400,
+        );
+        s.finalize_current_at(1_500, 123).unwrap();
+        s.on_candidate_selection(Some(0x14), 1_600);
+        assert_eq!(s.stats.keys, 2);
+        assert_eq!(s.stats.select_count, 1);
     }
 
     /// 整改12：直方图随段清零、结算冻结进 last_vk_histogram、换段保留快照。

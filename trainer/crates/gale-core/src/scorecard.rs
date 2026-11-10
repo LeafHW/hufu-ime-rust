@@ -9,6 +9,11 @@ pub struct ScorePreset {
     pub template: &'static str,
 }
 
+pub const STANDARD_SCORE_FIELDS: &str = "segment,speed,key_accuracy,strokes,code_len,word_rate,select_count,retype_count,chars,time,keys,backspaces,wrong,signature";
+const LEGACY_STANDARD_SCORE_FIELDS: &str = "segment,speed,key_accuracy,code_len,word_rate,select_count,retype_count,chars,time,keys,backspaces,wrong,signature";
+const LEGACY_COMPACT_TEMPLATE: &str =
+    "{segment}  速度{speed}  键准{key_accuracy}%  码长{code_len}  {retype_label}  {signature}";
+
 pub const SCORE_PRESETS: &[ScorePreset] = &[
     ScorePreset {
         id: "classic",
@@ -23,7 +28,12 @@ pub const SCORE_PRESETS: &[ScorePreset] = &[
     ScorePreset {
         id: "compact",
         name: "简洁成绩",
-        template: "{segment}  速度{speed}  键准{key_accuracy}%  码长{code_len}  {retype_label}  {signature}",
+        template: "{segment}  速度{speed}  键准{key_accuracy}%  击键{strokes}  码长{code_len}  {retype_label}  {signature}",
+    },
+    ScorePreset {
+        id: "standard",
+        name: "标准成绩",
+        template: "{segment}  速度{speed}  键准{key_accuracy}%  击键{strokes}  码长{code_len}  词率{word_rate}  选重{select_count}  重打{retype_count}  字数{chars}  用时{time}  总键数{keys}  退格{backspaces}  错字{wrong}  {signature}",
     },
 ];
 
@@ -66,6 +76,54 @@ pub fn preset(id: &str) -> &'static ScorePreset {
         .unwrap_or(&SCORE_PRESETS[0])
 }
 
+fn normalized_template(template: &str) -> String {
+    template.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Recognize the exact built-in contents even after an older build compressed
+/// their separating whitespace. Other templates remain user-authored.
+pub fn builtin_preset_id(template: &str) -> Option<&'static str> {
+    let normalized = normalized_template(template);
+    if normalized == normalized_template(LEGACY_COMPACT_TEMPLATE) {
+        return Some("compact");
+    }
+    SCORE_PRESETS
+        .iter()
+        .find(|p| normalized == normalized_template(p.template))
+        .map(|p| p.id)
+}
+
+/// Upgrade only the known old compact preset. Do not insert data into a custom
+/// template or change its literal whitespace.
+pub fn upgrade_builtin_template(template: &str) -> String {
+    if normalized_template(template) == normalized_template(LEGACY_COMPACT_TEMPLATE) {
+        preset("compact").template.into()
+    } else {
+        template.into()
+    }
+}
+
+/// Older standard field selections omitted keystrokes. Keep edited selections
+/// unchanged while bringing that exact built-in selection forward.
+pub fn upgrade_standard_fields(fields: &str) -> String {
+    let normalized = fields
+        .split(',')
+        .map(|key| match key.trim() {
+            "accuracy" => "key_accuracy",
+            "select" => "select_count",
+            "retype" => "retype_count",
+            "backspace" => "backspaces",
+            other => other,
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    if normalized == LEGACY_STANDARD_SCORE_FIELDS {
+        STANDARD_SCORE_FIELDS.into()
+    } else {
+        fields.into()
+    }
+}
+
 /// 用户要求成绩单不再出现「字准」。清掉历史模板/字段配置里的字准 token，
 /// 并压掉留下的多余空格；自定义模板若显式写 `{character_accuracy}` 也会被移除。
 pub fn strip_character_accuracy(template: &str) -> String {
@@ -80,11 +138,16 @@ pub fn strip_character_accuracy(template: &str) -> String {
     ] {
         out = out.replace(token, "");
     }
+    if out == template {
+        return out;
+    }
     out.lines()
         .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
         .collect::<Vec<_>>()
-        .join("
-")
+        .join(
+            "
+",
+        )
         .trim()
         .to_string()
 }
@@ -313,6 +376,41 @@ mod tests {
         assert_eq!(
             format_score_template(&r, "{accuracy}/{select}/{retype}/{backspace}", ""),
             "80.00/0/2/2"
+        );
+    }
+    #[test]
+    fn standard_and_compact_reports_keep_the_four_core_metrics() {
+        for id in ["standard", "compact"] {
+            let text = format_score_template(&record(), preset(id).template, "虎符");
+            for metric in ["速度95.00/100.00", "键准80.00%", "击键3.00", "码长2.00"] {
+                assert!(text.contains(metric), "{id}: missing {metric}: {text}");
+            }
+        }
+    }
+
+    #[test]
+    fn old_builtins_upgrade_without_rewriting_custom_templates_or_fields() {
+        for compact in [
+            LEGACY_COMPACT_TEMPLATE.to_string(),
+            normalized_template(LEGACY_COMPACT_TEMPLATE),
+        ] {
+            assert_eq!(builtin_preset_id(&compact), Some("compact"));
+            let upgraded = upgrade_builtin_template(&compact);
+            assert_eq!(upgraded, preset("compact").template);
+            assert_eq!(builtin_preset_id(&upgraded), Some("compact"));
+        }
+        assert_eq!(
+            upgrade_standard_fields(LEGACY_STANDARD_SCORE_FIELDS),
+            STANDARD_SCORE_FIELDS
+        );
+        assert_eq!(upgrade_standard_fields("segment,speed,accuracy,code_len,word_rate,select,retype,chars,time,keys,backspace,wrong,signature"), STANDARD_SCORE_FIELDS);
+        let custom = "速度  {speed}\n\n  我的成绩：{keys}";
+        assert_eq!(strip_character_accuracy(custom), custom);
+        assert_eq!(upgrade_builtin_template(custom), custom);
+        assert_eq!(builtin_preset_id(custom), None);
+        assert_eq!(
+            upgrade_standard_fields("segment,speed,keys"),
+            "segment,speed,keys"
         );
     }
     #[test]

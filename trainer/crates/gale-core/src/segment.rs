@@ -192,28 +192,28 @@ fn is_mark_char(c: char) -> bool {
 
 /// 尾行特征在行内的字节区间 Some((start, end))，end 在 "段" 之后。
 fn find_tail_marker(line: &str) -> Option<(usize, usize)> {
-    if !line.trim_start().starts_with("-----第") {
+    let trimmed = line.trim_start();
+    let start = line.len() - trimmed.len();
+    let dash_bytes = trimmed
+        .char_indices()
+        .take_while(|(_, c)| matches!(c, '-' | '—'))
+        .map(|(i, c)| i + c.len_utf8())
+        .last()
+        .unwrap_or(0);
+    if trimmed[..dash_bytes].chars().count() < 5 || !trimmed[dash_bytes..].starts_with('第') {
         return None;
     }
-    let mut from = 0usize;
-    while let Some(rel) = line[from..].find("-----第") {
-        let start = from + rel;
-        let mut i = start + "-----第".len();
-        let mark_start = i;
-        while i < line.len() {
-            let c = line[i..].chars().next().unwrap();
-            if is_mark_char(c) {
-                i += c.len_utf8();
-            } else {
-                break;
-            }
+    let mut i = start + dash_bytes + '第'.len_utf8();
+    let mark_start = i;
+    while i < line.len() {
+        let c = line[i..].chars().next().unwrap();
+        if is_mark_char(c) {
+            i += c.len_utf8();
+        } else {
+            break;
         }
-        if i > mark_start && line[i..].starts_with('段') {
-            return Some((start, i + '段'.len_utf8()));
-        }
-        from = start + 1;
     }
-    None
+    (i > mark_start && line[i..].starts_with('段')).then_some((start, i + '段'.len_utf8()))
 }
 
 /// 是否像一条晴系群文消息（任一行含尾行特征）
@@ -495,15 +495,39 @@ pub fn format_publish_local(
 /// 解析群文/跟打码全文 → 多段
 ///
 /// 双格式自动识别：
-/// - **旧版严格跟打码**（`-----第N段-----` 两侧横线）：多段流式解析（下方主循环）；
+/// - **旧版前置跟打码**（`-----第N段-----` 两侧横线）：多段流式解析（下方主循环）；
 /// - **晴系群文消息**（jifeng `parse_group_message` 移植）：首行标题 + 正文 + 尾行 `-----第2-277101段-晴发文`，
-///   含极速伪段号特判（段号 100000 时标题在段标记后）。
-/// 没有严格段号行时优先按晴系消息解析；都不中则整文作单段。
+///   也支持两侧横线的尾置段标，含极速伪段号特判（段号 100000 时标题在段标记后）。
+/// 复制的 CR/CRLF 分行先作结构归一；没有识别出格式时原文保留为单段。
 pub fn parse_group_text(raw: &str) -> ParsedGroupText {
-    // 旧版严格格式优先：出现任一 `-----第N段-----` 行就走多段路径（多段跟打码）
-    let has_strict = raw.lines().any(|l| parse_segment_mark(l).is_some());
+    let original_raw = raw;
+    let normalized = crate::compare::normalize_newlines(raw);
+    let raw = normalized.as_ref();
+    let lines: Vec<&str> = raw.lines().collect();
+    let strict_marks: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(i, l)| parse_segment_mark(l).map(|_| i))
+        .collect();
+    // The same strict marker can precede a legacy body or close a copied QQ
+    // message. A title + body before the first marker and no body after the last
+    // marker identifies the footer layout; otherwise keep legacy segmentation.
+    let strict_footer = strict_marks.first().is_some_and(|&first| {
+        lines[..first]
+            .iter()
+            .filter(|l| !l.trim().is_empty())
+            .count()
+            >= 2
+            && lines[strict_marks.last().unwrap() + 1..]
+                .iter()
+                .all(|l| l.trim().is_empty())
+            && !lines[..first].iter().all(|l| {
+                let t = l.trim();
+                t.is_empty() || t.starts_with("《发文》") || t.starts_with("《难度》")
+            })
+    });
+    let has_strict = !strict_marks.is_empty() && !strict_footer;
     if !has_strict {
-        let lines: Vec<&str> = raw.lines().collect();
         let tails: Vec<usize> = lines
             .iter()
             .enumerate()
@@ -553,7 +577,7 @@ pub fn parse_group_text(raw: &str) -> ParsedGroupText {
             } else {
                 vec![Segment {
                     mark: String::new(),
-                    text: raw.to_string(),
+                    text: original_raw.to_string(),
                 }]
             },
         };
@@ -992,6 +1016,54 @@ www.example.com 最新章节
         assert_eq!(p.segments.len(), 1);
         assert_eq!(p.segments[0].mark, "2-277101");
         assert_eq!(p.segments[0].text, "正文。");
+    }
+
+    #[test]
+    fn copied_strict_footer_strips_title_and_keeps_body() {
+        for newline in ["\n", "\r\n", "\r"] {
+            for marker in ["-----第12段-----", "—----第12段----—"] {
+                let raw = [
+                    "[普(1.84)]三国演义 [字数500]",
+                    "  第一行  ",
+                    "",
+                    "👩\u{200d}💻正文。",
+                    marker,
+                ]
+                .join(newline);
+                let p = parse_group_text(&raw);
+                assert_eq!(p.title, "三国演义", "{raw:?}");
+                assert_eq!(p.difficulty.as_deref(), Some("普 1.84"));
+                assert_eq!(p.segments.len(), 1);
+                assert_eq!(p.segments[0].mark, "12");
+                assert_eq!(p.segments[0].text, "  第一行  \n\n👩\u{200d}💻正文。");
+            }
+        }
+    }
+
+    #[test]
+    fn copied_strict_footer_messages_keep_separate_bodies() {
+        let p = parse_group_text("甲标题\n甲乙\n-----第2段-----\n\n乙标题\n丙丁\n-----第3段-----");
+        assert_eq!(p.title, "甲标题");
+        assert_eq!(p.segments.len(), 2);
+        assert_eq!(p.segments[0].mark, "2");
+        assert_eq!(p.segments[0].text, "甲乙");
+        assert_eq!(p.segments[1].mark, "3");
+        assert_eq!(p.segments[1].text, "丙丁");
+    }
+
+    #[test]
+    fn plain_copied_text_is_not_stripped_as_a_title() {
+        for raw in [
+            "《这是正文》\r  正文原样  \r\r下一行",
+            "[普(1.84)]正文中的格式示例\n下一行也保留",
+            "正文中的 -----第1段----- 示例\n  继续正文  ",
+        ] {
+            let p = parse_group_text(raw);
+            assert!(p.title.is_empty());
+            assert_eq!(p.segments.len(), 1);
+            assert!(p.segments[0].mark.is_empty());
+            assert_eq!(p.segments[0].text, raw);
+        }
     }
 
     #[test]

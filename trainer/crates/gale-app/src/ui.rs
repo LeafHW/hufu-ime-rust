@@ -145,7 +145,8 @@ pub fn elide_width(s: &str, max: f32, size: f32) -> String {
     out
 }
 pub struct Palette {
-    pub word_colors: [[f32; 4]; 4],
+    pub word_colors: [[f32; 4]; 6],
+    pub hint_rank_colors: [[f32; 4]; 10],
     pub article_bg: [f32; 4],
     pub correct: [f32; 4],
     pub bg: [f32; 4],
@@ -173,21 +174,39 @@ pub struct Palette {
     pub hint_bg: [f32; 4],
 }
 /// Semantic dictionary-word colors; punctuation and single characters stay neutral.
-pub fn hint_word_tint(p: &Palette, text: &str, code: &str, max_len: usize) -> Option<[f32; 4]> {
-    if !crate::analysis::is_multi_word(text) {
-        return None;
+pub fn hint_word_tint(p: &Palette, text: &str, code: &str, _max_len: usize) -> Option<[f32; 4]> {
+    crate::analysis::word_color_class(text, code).map(|class| p.word_colors[class as usize])
+}
+
+pub const HINT_RANK_COLOR_KEYS: [&str; 10] = [
+    "词提1选色",
+    "词提2选色",
+    "词提3选色",
+    "词提4选色",
+    "词提5选色",
+    "词提6选色",
+    "词提7选色",
+    "词提8选色",
+    "词提9选色",
+    "词提10选色",
+];
+
+/// Both color modes share the dictionary-word gate; only the color lookup changes.
+pub fn hint_word_tint_for_rank(
+    p: &Palette,
+    text: &str,
+    code: &str,
+    rank: usize,
+    max_len: usize,
+    rank_mode: bool,
+) -> Option<[f32; 4]> {
+    if !rank_mode {
+        return hint_word_tint(p, text, code, max_len);
     }
-    let n = text.chars().filter(|c| c.is_alphanumeric()).count();
-    let kind = if code.chars().count() < max_len.max(1) {
-        0
-    } else {
-        match n {
-            2 => 1,
-            3 => 2,
-            _ => 3,
-        }
-    };
-    Some(p.word_colors[kind])
+    crate::analysis::word_color_class(text, code)?;
+    rank.checked_sub(1)
+        .and_then(|i| p.hint_rank_colors.get(i))
+        .copied()
 }
 
 pub fn tokens(t: &Theme) -> Palette {
@@ -198,23 +217,48 @@ pub fn tokens(t: &Theme) -> Palette {
                 .get("词提简码色")
                 .copied()
                 .map(rgba)
-                .unwrap_or_else(|| hex(if light { "27754b" } else { "63c08d" })),
+                .unwrap_or_else(|| hex(if light { "16805b" } else { "7bdbac" })),
+            t.colors
+                .get("词提二字三码色")
+                .copied()
+                .map(rgba)
+                .unwrap_or_else(|| hex(if light { "4660ae" } else { "a5b8ff" })),
             t.colors
                 .get("词提二字全码色")
                 .copied()
                 .map(rgba)
-                .unwrap_or_else(|| hex(if light { "a45b16" } else { "db9b55" })),
+                .unwrap_or_else(|| hex(if light { "b45b08" } else { "ffae65" })),
             t.colors
                 .get("词提三字全码色")
                 .copied()
                 .map(rgba)
-                .unwrap_or_else(|| hex(if light { "2769a3" } else { "70a9e5" })),
+                .unwrap_or_else(|| hex(if light { "8550b0" } else { "c69bf2" })),
             t.colors
                 .get("词提四字全码色")
                 .copied()
                 .map(rgba)
-                .unwrap_or_else(|| hex(if light { "b63c38" } else { "df7974" })),
+                .unwrap_or_else(|| hex(if light { "216d91" } else { "7ecbfa" })),
+            t.colors
+                .get("词提一码色")
+                .copied()
+                .map(rgba)
+                .unwrap_or_else(|| hex(if light { "c43e62" } else { "ff7f9f" })),
         ],
+        hint_rank_colors: std::array::from_fn(|i| {
+            const LIGHT: [&str; 10] = [
+                "16805b", "4660ae", "b45b08", "c43e62", "8550b0", "216d91", "7a6b00", "0d7b76",
+                "a83a91", "8a6037",
+            ];
+            const DARK: [&str; 10] = [
+                "7bdbac", "a5b8ff", "ffae65", "ff7f9f", "c69bf2", "7ecbfa", "e3cd70", "6dd7cc",
+                "f29bdd", "dcaf89",
+            ];
+            t.colors
+                .get(HINT_RANK_COLOR_KEYS[i])
+                .copied()
+                .map(rgba)
+                .unwrap_or_else(|| hex(if light { LIGHT[i] } else { DARK[i] }))
+        }),
         article_bg: rgba(t.get("跟打区背景色")),
         correct: rgba(t.get("打对字色")),
         bg: rgba(t.get("窗体背景色")),
@@ -243,11 +287,16 @@ pub fn tokens(t: &Theme) -> Palette {
 /// Match editable color values to the resolved palette, including schema/skin defaults.
 pub fn setting_color(t: &Theme, key: &str) -> [f32; 4] {
     let p = tokens(t);
+    if let Some(i) = HINT_RANK_COLOR_KEYS.iter().position(|item| *item == key) {
+        return p.hint_rank_colors[i];
+    }
     match key {
         "词提简码色" => p.word_colors[0],
-        "词提二字全码色" => p.word_colors[1],
-        "词提三字全码色" => p.word_colors[2],
-        "词提四字全码色" => p.word_colors[3],
+        "词提二字三码色" => p.word_colors[1],
+        "词提二字全码色" => p.word_colors[2],
+        "词提三字全码色" => p.word_colors[3],
+        "词提四字全码色" => p.word_colors[4],
+        "词提一码色" => p.word_colors[5],
         _ => rgba(t.get(key)),
     }
 }
@@ -402,8 +451,7 @@ pub fn body_metrics(sess: &Session, cfg: &Config, w: f32) -> (f32, f32, f32) {
     } else {
         cfg.font_size
     })
-    .clamp(24., 64.)
-    .min((bw / 9.).max(24.));
+    .clamp(10., 100.);
     (
         bw,
         fs,
@@ -488,8 +536,16 @@ fn toolbar_button(
         w,
         32.,
         8.,
-        if selected { alpha(p.accent, 0.12) } else { p.surface2 },
-        Some(if selected { alpha(p.accent, 0.42) } else { p.line }),
+        if selected {
+            alpha(p.accent, 0.12)
+        } else {
+            p.surface2
+        },
+        Some(if selected {
+            alpha(p.accent, 0.42)
+        } else {
+            p.line
+        }),
     );
     f.push(DrawCmd::PushClip {
         x: x + 12.,
@@ -716,7 +772,9 @@ fn draw_chrome(
 /// space instead of keeping an empty code strip.
 pub fn line_height_for_anchor(cfg: &Config, fs: f32, base: f32, hints_visible: bool) -> f32 {
     if hints_visible && (cfg.hint_show_code || cfg.hint_show_rank) {
-        base.max(fs + cfg.hint_font_size + 18.)
+        // Keep the code row close to its word. The old +18 reserve made the
+        // annotation float below the line and pushed every article row apart.
+        base.max(fs + cfg.hint_font_size + 14.)
     } else {
         base
     }
@@ -748,16 +806,17 @@ pub fn build(
             "点击「从剪贴板载入」或按 Ctrl+V，也可在线取文、读取群文。",
             p.muted,
         );
-        crate::history::draw(&mut f, hs, sess, cfg, m, t, w, h);
+        if !(m.analysis_dock && h < 520.) {
+            crate::history::draw(&mut f, hs, sess, cfg, m, t, w, h);
+        }
         if m.analysis_dock && m.modal == Modal::None {
             crate::modals::draw_analysis_dock(&mut f, hs, m, sess, t, w, h);
         }
         return f;
     }
     let single = sess.source == SessionSource::Single;
-    let hints_visible = single
-        && gale_core::rules::hints_effective(m.hints, m.race)
-        && (cfg.hint_show_code || cfg.hint_show_rank);
+    let word_hints = gale_core::rules::hints_effective(m.hints, m.race);
+    let hints_visible = word_hints && (cfg.hint_show_code || cfg.hint_show_rank);
     let (bw, fs, base_lh) = body_metrics(sess, cfg, w);
     let lh = line_height_for_anchor(cfg, fs, base_lh, hints_visible);
     let x = (w - bw) / 2.;
@@ -765,7 +824,14 @@ pub fn build(
     let live = sess.live_stats(now_ms);
     let count = sess.current_segment().text.chars().count();
     let elapsed = sess.elapsed_ms(now_ms) as f64 / 1000.;
-    let top = if single { 236. } else { 208. };
+    let compact_analysis = m.analysis_dock && h < 700.;
+    let top = if compact_analysis {
+        100.
+    } else if single {
+        236.
+    } else {
+        208.
+    };
     // 理论分析停靠面板打开时正文区让位；成绩面板是浮层，不改变正文高度。
     let bottom = if m.analysis_dock {
         crate::modals::analysis_dock_rect(w, h).1 - 8.
@@ -782,75 +848,77 @@ pub fn build(
         (bottom - top + 16.).max(1.),
         p.article_bg,
     );
-    let speed = format!("{:.1}", live.para_speed);
-    let speed_size = 30_f32.min(112. / (speed.len().max(1) as f32 * 0.6));
-    mono(&mut f, x, 117., speed_size, speed.clone(), p.accent);
-    let speed_w = ui_text_width(&speed, speed_size);
-    text(&mut f, x + speed_w + 7., 132., 12., "字/分", p.muted);
-    let duration = format!("{:02}:{:04.1}", (elapsed / 60.) as u64, elapsed % 60.);
-    let mut metrics = vec![
-        ("击键/秒", format!("{:.2}", live.para_keys_per_sec)),
-        ("码长", format!("{:.2}", live.para_code_len)),
-        ("键准", format!("{:.1}%", live.para_accuracy)),
-        ("错字", sess.comparer.wrong.to_string()),
-        ("用时", duration.clone()),
-    ];
-    if w < 760. {
-        metrics.remove(1);
-    }
-    let metrics_x = x + (speed_w + 74.).max(196.);
-    let metrics_w = (bw - (metrics_x - x)).max(300.);
-    let pitch = (metrics_w / metrics.len() as f32).max(84.);
-    for (i, (label, value)) in metrics.iter().enumerate() {
-        let xx = metrics_x + i as f32 * pitch;
-        text(&mut f, xx, 116., FONT_HINT, *label, p.muted);
-        mono(&mut f, xx, 138., 18., value, p.text2);
-    }
-    let progress = format!(
-        "第 {} / {} {} · {} / {} 字{}",
-        sess.index + 1,
-        sess.total_segments(),
-        if single { "组" } else { "段" },
-        pos,
-        count,
-        if m.race { " · 赛制" } else { "" }
-    );
-    text(
-        &mut f,
-        x,
-        164.,
-        FONT_HINT,
-        elide_width(&progress, if w < 900. { bw - 116. } else { bw }, FONT_HINT),
-        p.muted,
-    );
-    rect(&mut f, x, 185., bw, 2., p.line);
-    rect(
-        &mut f,
-        x,
-        185.,
-        bw * (pos as f32 / count.max(1) as f32).clamp(0., 1.),
-        2.,
-        p.accent,
-    );
-    if single {
-        if !m.race {
-            chip(
-                &mut f,
-                hs,
-                x,
-                199.,
-                98.,
-                if m.hints {
-                    "字提 · 开"
-                } else {
-                    "字提 · 关"
-                },
-                Action::ToggleHints,
-                &p,
-                m.hints,
-            );
-        } else {
-            text(&mut f, x, 203., FONT_HINT, "赛制关闭字提", p.muted);
+    if !compact_analysis {
+        let speed = format!("{:.1}", live.para_speed);
+        let speed_size = 30_f32.min(112. / (speed.len().max(1) as f32 * 0.6));
+        mono(&mut f, x, 117., speed_size, speed.clone(), p.accent);
+        let speed_w = ui_text_width(&speed, speed_size);
+        text(&mut f, x + speed_w + 7., 132., 12., "字/分", p.muted);
+        let duration = format!("{:02}:{:04.1}", (elapsed / 60.) as u64, elapsed % 60.);
+        let mut metrics = vec![
+            ("击键/秒", format!("{:.2}", live.para_keys_per_sec)),
+            ("码长", format!("{:.2}", live.para_code_len)),
+            ("键准", format!("{:.1}%", live.para_accuracy)),
+            ("错字", sess.comparer.wrong.to_string()),
+            ("用时", duration.clone()),
+        ];
+        if w < 760. {
+            metrics.remove(1);
+        }
+        let metrics_x = x + (speed_w + 74.).max(196.);
+        let metrics_w = (bw - (metrics_x - x)).max(300.);
+        let pitch = (metrics_w / metrics.len() as f32).max(84.);
+        for (i, (label, value)) in metrics.iter().enumerate() {
+            let xx = metrics_x + i as f32 * pitch;
+            text(&mut f, xx, 116., FONT_HINT, *label, p.muted);
+            mono(&mut f, xx, 138., 18., value, p.text2);
+        }
+        let progress = format!(
+            "第 {} / {} {} · {} / {} 字{}",
+            sess.index + 1,
+            sess.total_segments(),
+            if single { "组" } else { "段" },
+            pos,
+            count,
+            if m.race { " · 赛制" } else { "" }
+        );
+        text(
+            &mut f,
+            x,
+            164.,
+            FONT_HINT,
+            elide_width(&progress, if w < 900. { bw - 116. } else { bw }, FONT_HINT),
+            p.muted,
+        );
+        rect(&mut f, x, 185., bw, 2., p.line);
+        rect(
+            &mut f,
+            x,
+            185.,
+            bw * (pos as f32 / count.max(1) as f32).clamp(0., 1.),
+            2.,
+            p.accent,
+        );
+        if single {
+            if !m.race {
+                chip(
+                    &mut f,
+                    hs,
+                    x,
+                    199.,
+                    98.,
+                    if m.hints {
+                        "字提 · 开"
+                    } else {
+                        "字提 · 关"
+                    },
+                    Action::ToggleHints,
+                    &p,
+                    m.hints,
+                );
+            } else {
+                text(&mut f, x, 203., FONT_HINT, "赛制关闭字提", p.muted);
+            }
         }
     }
     let active = lines.iter().rposition(|l| l.0 <= pos).unwrap_or(0);
@@ -861,7 +929,7 @@ pub fn build(
             .min(lines.len().saturating_sub(rows))
     } else {
         active
-            .saturating_sub(1)
+            .saturating_sub(rows.saturating_sub(1).min(1))
             .min(lines.len().saturating_sub(rows))
     };
     let visible_rows = lines.len().saturating_sub(first).min(rows);
@@ -930,10 +998,26 @@ pub fn build(
         let mut u16pos = 0;
         for (j, ch) in line_text.chars().enumerate() {
             let char_at = offset + j;
+            let tint = (word_hints && cfg.hint_color_words)
+                .then(|| {
+                    let at = m
+                        .words
+                        .partition_point(|word| word.start + word.len <= char_at);
+                    let word = m.words.get(at).filter(|word| word.start <= char_at)?;
+                    hint_word_tint_for_rank(
+                        &p,
+                        &word.text,
+                        word.code.as_deref()?,
+                        word.rank,
+                        m.max_code_length,
+                        cfg.hint_rank_colors,
+                    )
+                })
+                .flatten();
             let c = match sess.comparer.states.get(char_at) {
                 Some(CharState::Wrong) => p.red,
                 Some(CharState::Correct) => p.correct,
-                _ => p.text2,
+                _ => tint.unwrap_or(p.text2),
             };
             spans.push((u16pos, ch.len_utf16() as u32, alpha(c, dim)));
             u16pos += ch.len_utf16() as u32;
@@ -1004,7 +1088,7 @@ pub fn build(
                 );
             }
         }
-        if hints_visible {
+        if word_hints {
             for z in &m.words {
                 if z.start < *offset || z.start >= offset + line_text.chars().count() {
                     continue;
@@ -1016,7 +1100,42 @@ pub fn build(
                     .copied()
                     .unwrap_or(bw)
                     - widths.get(local).copied().unwrap_or(0.);
+                // Punctuation keeps its neutral article colour and, like F10,
+                // gets no code row of its own even if the dictionary lists a
+                // literal key for it.
+                if !z.text.chars().any(char::is_alphanumeric) {
+                    continue;
+                }
                 if let Some(code) = &z.code {
+                    let tint = cfg
+                        .hint_color_words
+                        .then(|| {
+                            hint_word_tint_for_rank(
+                                &p,
+                                &z.text,
+                                code,
+                                z.rank,
+                                m.max_code_length,
+                                cfg.hint_rank_colors,
+                            )
+                        })
+                        .flatten();
+                    if crate::analysis::is_multi_word(&z.text) {
+                        // A soft baseline keeps the word boundary visible
+                        // without the heavy, fully saturated rule that used to
+                        // compete with the article text.
+                        let underline = tint
+                            .map(|color| alpha(color, 0.62))
+                            .unwrap_or(p.hint_underline);
+                        rect(
+                            &mut f,
+                            wx + 1.,
+                            yy + fs + 4.,
+                            (ww - 2.).max(0.),
+                            2.,
+                            underline,
+                        );
+                    }
                     let hint_size = cfg.hint_font_size;
                     let shown_code = if cfg.hint_show_code {
                         code.as_str()
@@ -1029,20 +1148,34 @@ pub fn build(
                         String::new()
                     };
                     let hint_advance = hint_size * 0.6;
-                    let hx = wx
-                        + (ww - (shown_code.len() + rank.len()) as f32 * hint_advance).max(0.) / 2.;
-                    let code_color = alpha(p.hint_code, dim);
+                    let code_width = shown_code.chars().count() as f32 * hint_advance;
+                    let rank_size = hint_size * 0.78;
+                    let rank_width = rank.chars().count() as f32 * rank_size * 0.6;
+                    let code_rank_gap = if code_width > 0. && rank_width > 0. {
+                        2.
+                    } else {
+                        0.
+                    };
+                    let hx = wx + (ww - code_width - code_rank_gap - rank_width).max(0.) / 2.;
+                    let code_color = alpha(tint.unwrap_or(p.hint_code), dim);
                     if !shown_code.is_empty() {
                         mono(&mut f, hx, yy + fs + 9., hint_size, shown_code, code_color);
                     }
                     if !rank.is_empty() {
                         mono(
                             &mut f,
-                            hx + shown_code.chars().count() as f32 * hint_advance,
+                            hx + code_width + code_rank_gap,
                             yy + fs + 5.,
-                            hint_size,
+                            rank_size,
                             rank,
-                            alpha(p.hint_badge, dim),
+                            alpha(
+                                if cfg.hint_rank_colors {
+                                    tint.unwrap_or(p.hint_badge)
+                                } else {
+                                    p.hint_badge
+                                },
+                                dim,
+                            ),
                         );
                     }
                 }
@@ -1050,7 +1183,9 @@ pub fn build(
         }
     }
     f.push(DrawCmd::PopClip);
-    crate::history::draw(&mut f, hs, sess, cfg, m, t, w, h);
+    if !(m.analysis_dock && h < 520.) {
+        crate::history::draw(&mut f, hs, sess, cfg, m, t, w, h);
+    }
     if m.analysis_dock && m.modal == Modal::None {
         crate::modals::draw_analysis_dock(&mut f, hs, m, sess, t, w, h);
     }
@@ -1062,6 +1197,20 @@ mod tests {
     use super::*;
     use crate::modals::HintWord;
     use gale_core::segment::{ParsedGroupText, Segment};
+
+    #[test]
+    fn hundred_pixel_body_text_is_not_reduced_by_window_width() {
+        let cfg = Config {
+            font_size: 100.,
+            ..Default::default()
+        };
+        let session = Session::new(100);
+        for width in [640., 800., 1280.] {
+            let (_, size, line_height) = body_metrics(&session, &cfg, width);
+            assert_eq!(size, 100.);
+            assert!(line_height >= 140.);
+        }
+    }
 
     fn fixture() -> (Session, Model, Config, Vec<(usize, String, Vec<f32>)>) {
         let mut sess = Session::new(100);
@@ -1079,10 +1228,11 @@ mod tests {
                 start: 0,
                 len: 2,
                 text: "甲乙".into(),
-                code: Some("stale-code".into()),
+                code: Some("abcd".into()),
                 rank: 2,
                 tail: ";".into(),
             }],
+            max_code_length: 4,
             ..Default::default()
         };
         let cfg = Config {
@@ -1105,7 +1255,7 @@ mod tests {
     }
 
     #[test]
-    fn article_ignores_retired_hints_and_preserves_typing_states() {
+    fn article_word_hints_preserve_typing_states_and_leave_single_characters_neutral() {
         let (mut sess, model, cfg, lines) = fixture();
         sess.comparer.states[0] = CharState::Correct;
         sess.comparer.states[1] = CharState::Wrong;
@@ -1135,8 +1285,169 @@ mod tests {
         assert_eq!(spans[0].2, p.correct);
         assert_eq!(spans[1].2, p.red);
         assert_eq!(spans[2].2, p.text2);
+        assert!(frame.cmds.iter().any(|cmd| matches!(cmd,
+            DrawCmd::TextRun { text, .. } if text == "abcd")));
+
+        let (sess, mut model, cfg, lines) = fixture();
+        let draw = |model: &Model| {
+            build(
+                &sess,
+                &cfg,
+                &theme,
+                model,
+                800.,
+                600.,
+                0,
+                0.,
+                &mut Animation::default(),
+                &mut Vec::new(),
+                &lines,
+            )
+        };
+        let frame = draw(&model);
+        let spans = frame
+            .cmds
+            .iter()
+            .find_map(|cmd| match cmd {
+                DrawCmd::StyledLine { spans, .. } => Some(spans),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(spans[0].2, hint_word_tint(&p, "甲乙", "abcd", 4).unwrap());
+        assert_eq!(spans[2].2, p.text2);
+        for race in [false, true] {
+            model.race = race;
+            model.hints = race;
+            let frame = draw(&model);
+            assert!(!frame.cmds.iter().any(|cmd| matches!(cmd,
+                DrawCmd::TextRun { text, .. } if text == "abcd")));
+            assert!(frame
+                .cmds
+                .iter()
+                .filter_map(|cmd| match cmd {
+                    DrawCmd::StyledLine { spans, .. } => Some(spans),
+                    _ => None,
+                })
+                .flatten()
+                .all(|span| span.2 == p.text2));
+        }
+    }
+
+    #[test]
+    fn punctuation_keeps_neutral_color_and_never_gets_a_code_row() {
+        let mut sess = Session::new(100);
+        sess.load_book("标点", "甲，乙");
+        let model = Model {
+            hints: true,
+            words: vec![
+                HintWord {
+                    start: 0,
+                    len: 1,
+                    text: "甲".into(),
+                    code: Some("a".into()),
+                    rank: 1,
+                    tail: String::new(),
+                },
+                HintWord {
+                    start: 1,
+                    len: 1,
+                    text: "，".into(),
+                    code: Some(",".into()),
+                    rank: 1,
+                    tail: String::new(),
+                },
+                HintWord {
+                    start: 2,
+                    len: 1,
+                    text: "乙".into(),
+                    code: Some("b".into()),
+                    rank: 1,
+                    tail: String::new(),
+                },
+            ],
+            max_code_length: 4,
+            ..Default::default()
+        };
+        let cfg = Config {
+            font_size: 36.,
+            ..Default::default()
+        };
+        let theme = theme("墨玉");
+        let p = tokens(&theme);
+        let lines = vec![(0, "甲，乙".into(), vec![0., 36., 72., 108.])];
+        let frame = build(
+            &sess,
+            &cfg,
+            &theme,
+            &model,
+            800.,
+            600.,
+            0,
+            0.,
+            &mut Animation::default(),
+            &mut Vec::new(),
+            &lines,
+        );
         assert!(!frame.cmds.iter().any(|cmd| matches!(cmd,
-            DrawCmd::TextRun { text, .. } if text == "stale-code")));
+            DrawCmd::TextRun { text, .. } if text == ","
+        )));
+        let spans = frame
+            .cmds
+            .iter()
+            .find_map(|cmd| match cmd {
+                DrawCmd::StyledLine { spans, .. } => Some(spans),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(spans[1].2, p.text2);
+        assert!(frame.cmds.iter().any(|cmd| matches!(cmd,
+            DrawCmd::TextRun { text, .. } if text == "a"
+        )));
+    }
+
+    #[test]
+    fn rank_color_mode_ignores_code_class_and_preserves_neutral_items() {
+        for name in ["墨玉", "宣纸"] {
+            let mut t = theme(name);
+            let p = tokens(&t);
+            for rank in 1..=10 {
+                let expected = Some(p.hint_rank_colors[rank - 1]);
+                for (word, code) in [("一简词", "a"), ("二三", "abc"), ("四字词组", "abcd")]
+                {
+                    assert_eq!(
+                        hint_word_tint_for_rank(&p, word, code, rank, 4, true),
+                        expected
+                    );
+                    assert_eq!(
+                        hint_word_tint_for_rank(&p, word, code, rank, 4, false),
+                        hint_word_tint(&p, word, code, 4)
+                    );
+                }
+                for (word, code) in [("单", "a"), ("……", "ab"), ("词，词", "a"), ("缺词", "")]
+                {
+                    assert_eq!(hint_word_tint_for_rank(&p, word, code, rank, 4, true), None);
+                }
+                assert_eq!(
+                    setting_color(&t, HINT_RANK_COLOR_KEYS[rank - 1]),
+                    expected.unwrap()
+                );
+            }
+            for rank in [0, 11, usize::MAX] {
+                assert_eq!(
+                    hint_word_tint_for_rank(&p, "词组", "ab", rank, 4, true),
+                    None
+                );
+            }
+            for (i, color) in p.hint_rank_colors.iter().enumerate() {
+                assert!(!p.hint_rank_colors[..i].contains(color));
+            }
+            t.set("词提3选色", gale_core::theme::Color::rgb(18, 58, 239));
+            let custom = tokens(&t);
+            assert_eq!(custom.hint_rank_colors[2], hex("123aef"));
+            assert_eq!(setting_color(&t, "词提3选色"), hex("123aef"));
+            assert_eq!(custom.word_colors, p.word_colors);
+            assert_eq!(custom.hint_rank_colors[1], p.hint_rank_colors[1]);
+        }
     }
 
     #[test]
@@ -1247,23 +1558,150 @@ mod tests {
     }
 
     #[test]
-    fn word_semantics_follow_code_length_and_single_characters_stay_neutral() {
+    fn hundred_pixel_article_scrolls_to_current_row_in_small_window() {
+        let (mut sess, model, mut cfg, mut lines) = fixture();
+        cfg.font_size = 100.;
+        sess.comparer.pos = 8;
+        for (_, text, positions) in &mut lines {
+            *positions = (0..=text.chars().count())
+                .map(|i| i as f32 * 100.)
+                .collect();
+        }
+        for (w, h) in [(640., 420.), (800., 600.), (1280., 800.)] {
+            let mut anim = Animation::default();
+            let frame = build(
+                &sess,
+                &cfg,
+                &theme("墨玉"),
+                &model,
+                w,
+                h,
+                0,
+                0.,
+                &mut anim,
+                &mut Vec::new(),
+                &lines,
+            );
+            let (_, caret_y) = anim.caret.expect("current row must remain visible");
+            assert!(caret_y >= 208. && caret_y + 107. <= ledger_bar_y(h) - 8.);
+            assert!(frame.cmds.iter().any(|cmd| matches!(cmd,
+                DrawCmd::StyledLine { text, size, .. } if text.contains('壬') && *size == 100.)));
+        }
+    }
+
+    #[test]
+    fn compact_analysis_leaves_room_for_full_size_article_and_code_annotations() {
+        let (sess, mut model, mut cfg, mut lines) = fixture();
+        cfg.font_size = 100.;
+        model.analysis_dock = true;
+        for (_, text, positions) in &mut lines {
+            *positions = (0..=text.chars().count())
+                .map(|i| i as f32 * 100.)
+                .collect();
+        }
+        for (w, h) in [(640., 420.), (800., 600.)] {
+            let mut anim = Animation::default();
+            let frame = build(
+                &sess,
+                &cfg,
+                &theme("墨玉"),
+                &model,
+                w,
+                h,
+                0,
+                0.,
+                &mut anim,
+                &mut Vec::new(),
+                &lines,
+            );
+            let bottom = crate::modals::analysis_dock_rect(w, h).1 - 8.;
+            assert!(anim.caret.unwrap().1 + 107. < bottom);
+            assert!(
+                frame.cmds.iter().any(|cmd| matches!(cmd,
+                    DrawCmd::TextRun { text, y, h, .. } if text == "abcd" && y + h <= bottom
+                )),
+                "the whole hint row must fit above the dock"
+            );
+        }
+    }
+
+    #[test]
+    fn word_semantics_follow_six_classes_and_single_characters_stay_neutral() {
         let p = tokens(&theme("宣纸"));
         assert_eq!(hint_word_tint(&p, "单", "a", 4), None);
         assert_eq!(hint_word_tint(&p, "……", "a", 4), None);
+        assert_eq!(hint_word_tint(&p, "词，词", "a", 4), None);
+        assert_eq!(hint_word_tint(&p, "词组", "", 4), None);
+        assert_eq!(hint_word_tint(&p, "一码词", "a", 4), Some(p.word_colors[5]));
         assert_eq!(hint_word_tint(&p, "简词", "ab", 4), Some(p.word_colors[0]));
         assert_eq!(
             hint_word_tint(&p, "二字", "abcd", 4),
-            Some(p.word_colors[1])
-        );
-        assert_eq!(
-            hint_word_tint(&p, "三字词", "abcd", 4),
             Some(p.word_colors[2])
         );
         assert_eq!(
-            hint_word_tint(&p, "四字词语", "abcd", 4),
+            hint_word_tint(&p, "三字词", "abcd", 4),
             Some(p.word_colors[3])
         );
+        assert_eq!(
+            hint_word_tint(&p, "四字词语", "abcd", 4),
+            Some(p.word_colors[4])
+        );
         assert_eq!(hint_word_tint(&p, "二字", "abc", 3), Some(p.word_colors[1]));
+        assert_eq!(hint_word_tint(&p, "二字", "abc", 4), Some(p.word_colors[1]));
+        assert_eq!(
+            hint_word_tint(&p, "三字词", "abc", 3),
+            Some(p.word_colors[0])
+        );
+        assert_eq!(
+            p.word_colors,
+            [
+                hex("16805b"),
+                hex("4660ae"),
+                hex("b45b08"),
+                hex("8550b0"),
+                hex("216d91"),
+                hex("c43e62"),
+            ]
+        );
+        let p = tokens(&theme("墨玉"));
+        assert_eq!(
+            p.word_colors,
+            [
+                hex("7bdbac"),
+                hex("a5b8ff"),
+                hex("ffae65"),
+                hex("c69bf2"),
+                hex("7ecbfa"),
+                hex("ff7f9f"),
+            ]
+        );
+    }
+
+    #[test]
+    fn one_code_color_resolves_defaults_and_overrides_without_changing_legacy_colors() {
+        for (name, one_default) in [("宣纸", "c43e62"), ("墨玉", "ff7f9f")] {
+            let mut t = theme(name);
+            t.set("词提简码色", Color::rgb(0x12, 0x34, 0x56));
+            t.set("词提四字全码色", Color::rgb(0x65, 0x43, 0x21));
+            let legacy = tokens(&t);
+            assert_eq!(
+                hint_word_tint(&legacy, "一码", "a", 4),
+                Some(hex(one_default))
+            );
+            assert_eq!(
+                hint_word_tint(&legacy, "简码", "ab", 4),
+                Some(hex("123456"))
+            );
+            assert_eq!(
+                hint_word_tint(&legacy, "长词全码", "abcd", 4),
+                Some(hex("654321"))
+            );
+
+            t.set("词提一码色", Color::rgb(0x9a, 0x87, 0x65));
+            let custom = tokens(&t);
+            assert_eq!(setting_color(&t, "词提一码色"), hex("9a8765"));
+            assert_eq!(hint_word_tint(&custom, "一码", "a", 4), Some(hex("9a8765")));
+            assert_eq!(custom.word_colors[..5], legacy.word_colors[..5]);
+        }
     }
 }

@@ -158,6 +158,11 @@ pub struct KeyOutcome {
     /// 提交前需回删的已上屏字符数（数字后「1.」再按 . → 回删半角点换「。」）
     #[serde(default)]
     pub back: u8,
+    /// 本键实际执行的显式候选选择，1 起名次；整句锁词也立即报告。
+    /// 空格首选确认、无效/越界选重和普通输入为 None，独立于音效。
+    /// JSON 保留 null，供新宿主区别“精确无选重”与旧服务缺失此字段。
+    #[serde(default)]
+    pub selection: Option<u8>,
     /// 最新的会话状态（组合串 / 候选 / 辅助提示）
     pub state: Option<SessionState>,
     /// 提示音标签（sound.enabled 时由引擎填充：key/select/commit/page）
@@ -166,11 +171,18 @@ pub struct KeyOutcome {
 }
 
 impl KeyOutcome {
+    /// 标记已执行的候选选择，调用点必须已验证名次可用。
+    pub fn with_selection(mut self, rank: u8) -> Self {
+        self.selection = (1..=10).contains(&rank).then_some(rank);
+        self
+    }
+
     pub fn passthrough() -> Self {
         KeyOutcome {
             consumed: false,
             commit: None,
             back: 0,
+            selection: None,
             state: None,
             sound: None,
         }
@@ -180,6 +192,7 @@ impl KeyOutcome {
             consumed: true,
             commit: None,
             back: 0,
+            selection: None,
             state: Some(state),
             sound: None,
         }
@@ -189,6 +202,7 @@ impl KeyOutcome {
             consumed: true,
             commit: Some(text.into()),
             back: 0,
+            selection: None,
             state: Some(state),
             sound: None,
         }
