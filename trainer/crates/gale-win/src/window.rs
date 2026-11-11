@@ -28,7 +28,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     PeekMessageW, PostQuitMessage, RegisterClassW, SetForegroundWindow, SetTimer, ShowWindow,
     TranslateMessage, CS_HREDRAW, CS_VREDRAW, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCLIENT,
     HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, MSG, PM_REMOVE, SW_RESTORE, SW_SHOW,
-    WINDOW_EX_STYLE, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_LBUTTONDOWN,
+    WINDOW_EX_STYLE, WM_COMMAND, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_LBUTTONDOWN,
     WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE, WM_NCHITTEST, WM_PAINT, WM_QUIT,
     WM_SETFOCUS, WM_SIZE, WM_TIMER, WNDCLASSW, WS_OVERLAPPEDWINDOW,
 };
@@ -735,6 +735,11 @@ fn wndproc_min() -> bool {
 /// 输入层固定为 RichEdit 宿主（input_host）；自建 HIMC 的 ime_imm 后端
 /// 已删除（probe-imm REPORT 证伪：CUAS 桥拆不掉、自建上下文挂不稳）。
 unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    if msg == windows::Win32::UI::WindowsAndMessaging::WM_ACTIVATE && wp.0 & 0xffff == 0 {
+        // Preserve focus loss relative to keys, including native reactivation
+        // inside the same message-pump iteration.
+        crate::input_host::note_focus_lost();
+    }
     if msg == windows::Win32::UI::WindowsAndMessaging::WM_CLOSE {
         *NORMAL_BOUNDS.lock().unwrap_or_else(|e| e.into_inner()) = normal_window_bounds(hwnd);
     }
@@ -802,6 +807,10 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
     match msg {
         WM_DESTROY => {
             PostQuitMessage(0);
+            LRESULT(0)
+        }
+        WM_COMMAND if crate::font_picker::selection_command(wp, lp) => {
+            request_frame();
             LRESULT(0)
         }
         WM_SETFOCUS => {

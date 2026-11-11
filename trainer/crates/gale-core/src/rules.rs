@@ -55,6 +55,8 @@ pub struct SessionRules {
     pub mode: TrainingMode,
     pub quotes: QuoteRules,
     pub word_hints: bool,
+    /// Legacy serialized rule, retained for saved-round fingerprints. The host
+    /// now pauses all modes on focus loss and resumes on the next typing key.
     pub pause_on_blur: bool,
     pub allow_paste: bool,
 }
@@ -337,6 +339,10 @@ pub struct RoundMetadata {
     pub cleaned: bool,
     pub pasted: bool,
     pub complete: bool,
+    /// Last-character comparison frozen at settlement. Older records lack this
+    /// evidence; only an explicitly complete, zero-error record proves it then.
+    #[serde(default)]
+    pub last_char_correct: Option<bool>,
     /// 开打时冻结的词提快照（赛制经 normalized() 恒 false）。
     /// 结算时成绩单用它打 `[词提开]` 标记（score::race_badge）——练习成绩是否带提示
     /// 必须可事后甄别（research-digest §B）。旧记录/快照缺省 false。

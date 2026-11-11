@@ -122,6 +122,11 @@ impl Comparer {
         !self.states.is_empty() && self.pos >= self.states.len()
     }
 
+    /// A round may finish with earlier errors, but its last character must match.
+    pub fn finished_with_correct_last_char(&self) -> bool {
+        self.is_done() && self.states.last() == Some(&CharState::Correct)
+    }
+
     /// 喂入统一事件流。`now_ms` 由调用方注入（便于测试）。
     /// 返回本事件产生的上屏字符列表（供统计/渲染用）。
     /// 同时维护时间事件流（州州 Report 同构：长度变化 + 距上一事件毫秒）。

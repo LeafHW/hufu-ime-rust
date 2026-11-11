@@ -896,6 +896,32 @@ pub fn aw_hwnd() -> isize {
 /// 结束清零。短锁使用，绝不跨消息循环持有。
 static ADDWORD_HWND: std::sync::Mutex<isize> = std::sync::Mutex::new(0);
 
+/// Tab 只在文本框中循环；加权模式未创建选重位框，自动跳过。
+/// 鼠标点到按钮/开关后，Tab 从首框进入，Shift+Tab 从末框进入。
+unsafe fn cycle_edit_focus(hwnd: HWND, backwards: bool) {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetFocus, IsWindowEnabled};
+
+    let order = [ID_WORD, ID_POS, ID_CODE];
+    let focus = GetFocus();
+    let current = order.iter().position(|id| {
+        matches!(GetDlgItem(hwnd, *id), Ok(control) if control == focus)
+    });
+    let n = order.len();
+    let start = current.unwrap_or(if backwards { 0 } else { n - 1 });
+    let step = if backwards { n - 1 } else { 1 };
+    for offset in 1..=n {
+        let id = order[(start + step * offset) % n];
+        if let Ok(control) = GetDlgItem(hwnd, id) {
+            if GetWindowLongW(control, GWL_STYLE) as u32 & WS_VISIBLE.0 != 0
+                && IsWindowEnabled(control).as_bool()
+            {
+                let _ = SetFocus(control);
+                break;
+            }
+        }
+    }
+}
+
 fn open_common() {
     std::thread::spawn(|| unsafe {
         // 【2026-11-02 加词窗回归】先给本线程打"虎符自建 UI 线程"标记：下面
@@ -1151,55 +1177,14 @@ fn open_common() {
         }
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-            // 【RichEdit Tab 2026-10-07】词框 RichEdit 的 DLGC 应答吞
-            // Tab——IsDialogMessage 拿不到导航权。词框内 Tab/Shift+Tab
-            // 手动导航三框环（词→编码→选重→词）。
+            // RichEdit 会吞 Tab，显式限制为文本框循环（词→选重位→编码）。
             if msg.message == windows::Win32::UI::WindowsAndMessaging::WM_KEYDOWN
                 && msg.wParam.0 as u16 == 0x09 /* VK_TAB */
             {
-                let foc = 
-                    windows::Win32::UI::Input::KeyboardAndMouse::GetFocus()
-                ;
-                // 【编码/选重位对换 2026-10-08】Tab 环与行序同步。
-                // 【2026-11-03】加入占位符 toggle 与主/次按钮——旧环只
-                // 在三框内循环，键盘用户永远到不了开关/确定（全键盘可达）。
-                let mut order = vec![ID_WORD, ID_POS, ID_CODE];
-                if !is_weight_mode() {
-                    order.push(ID_PH);
-                }
-                order.push(ID_OK);
-                order.push(ID_CANCEL);
-                let cur = order.iter().position(|i| {
-                    matches!(
-                         GetDlgItem(hwnd, *i) ,
-                        Ok(h) if h == foc
-                    )
-                });
-                if let Some(c) = cur {
-                    #[link(name = "user32")]
-                    unsafe extern "system" {
-                        fn GetKeyState(vkey: i32) -> i16;
-                    }
-                    let shift = ( GetKeyState(0x10)  as u16 & 0x8000) != 0;
-                    let n = order.len();
-                    let step = if shift { n - 1 } else { 1 };
-                    // 跳过禁用控件（词/编码空时“确定”不可聚焦），
-                    // 保证键盘用户 Tab 始终能走到下一个可用控件。
-                    let mut moved = false;
-                    for k in 1..=n {
-                        let idx = (c + step * k) % n;
-                        if let Ok(h) = GetDlgItem(hwnd, order[idx]) {
-                            if windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled(h).as_bool() {
-                                let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(h);
-                                moved = true;
-                                break;
-                            }
-                        }
-                    }
-                    if moved {
-                        continue;
-                    }
-                }
+                let shift = (windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState(0x10)
+                    as u16 & 0x8000) != 0;
+                cycle_edit_focus(hwnd, shift);
+                continue;
             }
             // 【2026-11-03】无系统对话框模板：显式接管 Enter/Esc，
             // 保证 owner-draw 按钮下键盘确定/取消仍然可用。
@@ -2286,14 +2271,9 @@ unsafe fn paint_scene(hwnd: HWND, hdc: HDC) {
 
     // 底栏
     hline(hdc, M, WIN_W - M, footer_top, th.border);
-    // 两行键盘提示（单行会与右侧按钮重叠）：开关/确定/取消都可全键盘。
-    if weight {
-        let _ = draw_text(hdc, "Tab 切换", M, ch - 48, small_font(), th.muted);
-        let _ = draw_text(hdc, "Enter 确定 · Esc 取消", M, ch - 26, small_font(), th.muted);
-    } else {
-        let _ = draw_text(hdc, "Tab 切换 · 空格 勾选占位符", M, ch - 48, small_font(), th.muted);
-        let _ = draw_text(hdc, "Enter 确定 · Esc 取消", M, ch - 26, small_font(), th.muted);
-    }
+    // 两行键盘提示，避免与右侧按钮重叠。
+    let _ = draw_text(hdc, "Tab 切换输入框", M, ch - 48, small_font(), th.muted);
+    let _ = draw_text(hdc, "Enter 确定 · Esc 取消", M, ch - 26, small_font(), th.muted);
     // 外框
     round_box(hdc, 0, 0, cw, ch, 14, 0, th.border);
 }
@@ -3163,6 +3143,92 @@ fn http_post_json(path: &str, body: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires a Windows desktop; creates only a hidden private test window"]
+    fn native_tab_cycles_only_available_text_fields() {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, GetFocus};
+
+        struct TestWindow {
+            hwnd: HWND,
+            old_focus: HWND,
+        }
+        impl Drop for TestWindow {
+            fn drop(&mut self) {
+                unsafe {
+                    let _ = SetFocus(self.old_focus);
+                    let _ = DestroyWindow(self.hwnd);
+                }
+            }
+        }
+
+        unsafe {
+            let old_focus = GetFocus();
+            let hwnd = CreateWindowExW(
+                WINDOW_EX_STYLE(0), w!("STATIC"), w!("Tab test"),
+                WS_OVERLAPPEDWINDOW, 0, 0, 200, 200, None, None,
+                GetModuleHandleW(None).unwrap(), None,
+            ).unwrap();
+            let _window = TestWindow { hwnd, old_focus };
+            let field = |id| {
+                let control = create_child(
+                    hwnd, w!("EDIT"), w!(""), WINDOW_EX_STYLE(0), WS_TABSTOP.0,
+                    0, 0, 100, 20, id,
+                );
+                assert!(!control.0.is_null());
+                control
+            };
+            let word = field(ID_WORD);
+            let pos = field(ID_POS);
+            let code = field(ID_CODE);
+            let toggle = create_child(
+                hwnd, w!("BUTTON"), w!(""), WINDOW_EX_STYLE(0), WS_TABSTOP.0,
+                0, 0, 100, 20, ID_PH,
+            );
+            assert!(!toggle.0.is_null());
+
+            let _ = SetFocus(word);
+            for expected in [pos, code, word, pos, code, word] {
+                cycle_edit_focus(hwnd, false);
+                assert_eq!(GetFocus(), expected);
+            }
+            for expected in [code, pos, word, code, pos, word] {
+                cycle_edit_focus(hwnd, true);
+                assert_eq!(GetFocus(), expected);
+            }
+
+            // A mouse-focused non-edit control must re-enter the text field cycle.
+            let _ = SetFocus(toggle);
+            cycle_edit_focus(hwnd, false);
+            assert_eq!(GetFocus(), word);
+            let _ = SetFocus(toggle);
+            cycle_edit_focus(hwnd, true);
+            assert_eq!(GetFocus(), code);
+
+            let _ = EnableWindow(pos, false);
+            let _ = SetFocus(word);
+            cycle_edit_focus(hwnd, false);
+            assert_eq!(GetFocus(), code);
+            cycle_edit_focus(hwnd, true);
+            assert_eq!(GetFocus(), word);
+
+            let _ = EnableWindow(pos, true);
+            let _ = ShowWindow(pos, SW_HIDE);
+            cycle_edit_focus(hwnd, false);
+            assert_eq!(GetFocus(), code);
+            cycle_edit_focus(hwnd, true);
+            assert_eq!(GetFocus(), word);
+
+            // The shared weight window has no position edit at all.
+            DestroyWindow(pos).unwrap();
+            for expected in [code, word, code, word] {
+                cycle_edit_focus(hwnd, false);
+                assert_eq!(GetFocus(), expected);
+            }
+            cycle_edit_focus(hwnd, true);
+            assert_eq!(GetFocus(), code);
+        }
+    }
 
     fn bmp(w: u32, h: u32, frames: Vec<Vec<u8>>) -> crate::ssfwin::SsfBitmap {
         crate::ssfwin::SsfBitmap {

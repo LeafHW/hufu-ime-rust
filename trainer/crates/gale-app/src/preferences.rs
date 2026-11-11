@@ -65,7 +65,7 @@ const HINT_COLORS: &[(&str, &str, &str)] = &[
     ("词提二字全码色", "二字全码", "ffae65"),
     ("词提三字全码色", "三字全码", "c69bf2"),
     ("词提四字全码色", "长词全码", "7ecbfa"),
-    ("词提下划线色", "词组连线", "58a6f5"),
+    ("词提下划线色", "词组括线", "58a6f5"),
 ];
 const RANK_COLORS: &[(&str, &str, &str)] = &[
     ("词提1选色", "1 选", "7bdbac"),
@@ -80,7 +80,7 @@ const RANK_COLORS: &[(&str, &str, &str)] = &[
     ("词提10选色", "10 选", "dcaf89"),
     ("词提编码色", "单字编码", "d0c9b9"),
     ("词提角标色", "选重数字", "d0c9b9"),
-    ("词提下划线色", "词组连线", "58a6f5"),
+    ("词提下划线色", "词组括线", "58a6f5"),
 ];
 
 // 词提页
@@ -219,7 +219,6 @@ fn field_label(label: &str) -> &str {
 /// 字段 chip 的短标签：4 列网格下 6 字以上会截断，改用等义短名。
 fn chip_label<'a>(key: &str, title: &'a str) -> &'a str {
     match key {
-        "race" => "赛制标记",
         "legacy_report" => "经典成绩",
         "retype_label" => "首打/重打",
         _ => field_label(title),
@@ -271,6 +270,9 @@ fn body_y(y: f32) -> f32 {
 /// 成绩单模板编辑框（内容区坐标；绘制与原生 FieldSpec 共用同一组常量）。
 fn score_editor_rect(bx: f32, by: f32, bw: f32) -> (f32, f32, f32, f32) {
     (bx, by + SCORE_EDITOR_Y, bw, SCORE_EDITOR_H)
+}
+fn font_picker_rect(bx: f32, by: f32, bw: f32) -> (f32, f32, f32, f32) {
+    (bx + 44., by + 142., (bw - 164.).max(40.), 32.)
 }
 fn score_chip_rect(x: f32, y: f32, w: f32, index: usize) -> (f32, f32, f32) {
     let gap = 8.;
@@ -828,16 +830,17 @@ fn hint_preview(f: &mut Frame, m: &Model, t: &Theme, x: f32, py: f32, w: f32) {
             .flatten();
         body_text(f, sx, py + 42., 24., *word, tint.unwrap_or(p.text2));
         if m.hints && word.chars().count() > 1 {
-            line(
+            crate::ui::word_bracket(
                 f,
                 sx,
-                py + 68.,
+                py + 42.,
                 word.chars().count() as f32 * 24.,
+                24.,
                 tint.unwrap_or(p.hint_underline),
             );
         }
         if show_code {
-            mono(f, sx, py + 72., size, *code, tint.unwrap_or(p.hint_code));
+            mono(f, sx, py + 81., size, *code, tint.unwrap_or(p.hint_code));
         }
         if show_rank && *rank > 1 {
             let code_w = if show_code {
@@ -848,7 +851,7 @@ fn hint_preview(f: &mut Frame, m: &Model, t: &Theme, x: f32, py: f32, w: f32) {
             mono(
                 f,
                 sx + code_w + 2.,
-                py + 68.,
+                py + 77.,
                 size,
                 rank.to_string(),
                 tint.unwrap_or(p.hint_badge),
@@ -1199,6 +1202,22 @@ pub(super) fn fields(m: &Model, x: f32, y: f32, pw: f32, _ph: f32) -> Vec<FieldS
     }
 }
 
+pub(super) fn font_picker(m: &Model, x: f32, y: f32, pw: f32) -> Option<FieldSpec> {
+    if tab(m) != 2 {
+        return None;
+    }
+    let (x, y, w, h) = font_picker_rect(body_x(x), body_y(y), body_w(pw));
+    Some(FieldSpec {
+        id: "body_font",
+        x,
+        y,
+        w,
+        h,
+        multi: false,
+        password: false,
+    })
+}
+
 /// 固定面板高度：四页切换不跳动，短窗口整页滚动。
 pub(super) fn content_height(_m: &Model, _pw: f32) -> f32 {
     CONTENT_HEIGHT
@@ -1323,27 +1342,17 @@ fn appearance_page(
         x + 44.,
         y + 150.,
         T_NOTE,
-        elide_width(&font_name, (w - 292.).max(40.), T_NOTE),
+        elide_width(&font_name, (w - 164.).max(40.), T_NOTE),
         p.text,
     );
     outline_button(
         f,
         hs,
-        x + w - 238.,
+        x + w - 108.,
         y + 142.,
         108.,
         "默认霞鹜",
         Action::FontDefault,
-        t,
-    );
-    outline_button(
-        f,
-        hs,
-        x + w - 120.,
-        y + 142.,
-        120.,
-        "选择系统字体",
-        Action::FontChoose,
         t,
     );
     let typography_w = (w - 24.) / 2.;
@@ -1708,7 +1717,7 @@ fn hint_color_preview(f: &mut Frame, m: &Model, t: &Theme, x: f32, py: f32, w: f
             let underline = tint
                 .map(|color| alpha(color, 0.62))
                 .unwrap_or(p.hint_underline);
-            rect(f, wx, word_y + size + 3., word_w.max(0.), 2., underline);
+            crate::ui::word_bracket(f, wx, word_y, word_w, size, underline);
         }
         let code_w = if show_code {
             code.chars().count() as f32 * code_size * 0.6
@@ -1727,7 +1736,7 @@ fn hint_color_preview(f: &mut Frame, m: &Model, t: &Theme, x: f32, py: f32, w: f
             mono(
                 f,
                 hx,
-                word_y + size + 8.,
+                word_y + size + 15.,
                 code_size,
                 code,
                 alpha(tint.unwrap_or(p.hint_code), 0.92),
@@ -1737,7 +1746,7 @@ fn hint_color_preview(f: &mut Frame, m: &Model, t: &Theme, x: f32, py: f32, w: f
             mono(
                 f,
                 hx + code_w + gap,
-                word_y + size + 4.,
+                word_y + size + 11.,
                 rank_size,
                 rank.to_string(),
                 alpha(tint.unwrap_or(p.hint_badge), 0.95),
@@ -1864,6 +1873,32 @@ mod tests {
                 drawn_round_rect(&f, field.x, field.y, field.w, field.h),
                 "tab={tab} {w}x{h}: 原生框与绘制矩形不一致"
             );
+        }
+    }
+
+    #[test]
+    fn system_font_picker_stays_inside_the_appearance_page_body() {
+        for (w, h) in [(1280., 800.), (800., 600.)] {
+            let mut m = preference_model(2);
+            let field = crate::modals::font_picker(&m, w, h).unwrap();
+            let hs = hit_targets(&m, w, h);
+            let reset = hs
+                .iter()
+                .find(|hit| hit.action == Action::FontDefault)
+                .unwrap();
+            assert!(field.w >= 40. && field.h == 32.);
+            assert!(field.x + field.w <= reset.x - 8.);
+            if h == 600. {
+                m.panel_scroll = 80.;
+                let scrolled = crate::modals::font_picker(&m, w, h).unwrap();
+                assert_eq!(scrolled.y, field.y - 80.);
+                m.panel_scroll = 160.;
+                assert!(crate::modals::font_picker(&m, w, h).is_none());
+            }
+            select_page(&mut m, 1);
+            assert!(crate::modals::font_picker(&m, w, h).is_none());
+            m.modal = crate::modals::Modal::None;
+            assert!(crate::modals::font_picker(&m, w, h).is_none());
         }
     }
 
@@ -2020,7 +2055,6 @@ mod tests {
         for a in [
             Action::Theme("宣纸".into()),
             Action::Font(2),
-            Action::FontChoose,
             Action::FontDefault,
             Action::MotionLevel(2),
             Action::AppearanceReset,

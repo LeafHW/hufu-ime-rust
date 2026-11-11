@@ -52,7 +52,6 @@ pub enum Action {
     Exit,
     Minimize,
     Maximize,
-    ToggleRace,
     ToggleHints,
     Restart,
     Previous,
@@ -72,7 +71,6 @@ pub enum Action {
     Theme(String),
     Material(Material),
     Font(i32),
-    FontChoose,
     FontDefault,
     Motion,
     Accent(String),
@@ -150,7 +148,6 @@ pub struct Model {
     pub modal: Modal,
     pub panel_scroll: f32,
     pub scroll: f32,
-    pub race: bool,
     pub hints: bool,
     pub reduced_motion: bool,
     pub paused: bool,
@@ -283,10 +280,15 @@ pub fn fields(m: &Model, w: f32, h: f32) -> Vec<FieldSpec> {
         Modal::Preferences => preferences::fields(m, x, y, pw, ph),
         _ => Vec::new(),
     };
+    clip_native_fields(&mut v, m, w, h);
+    v
+}
+fn clip_native_fields(v: &mut [FieldSpec], m: &Model, w: f32, h: f32) {
+    let (x, y, pw, ph) = panel_for_model(m, w, h);
     let top = y + PANEL_HEAD;
     let bottom = y + panel_view(ph, h) - PANEL_FOOT;
     let scroll = m.panel_scroll.clamp(0., (ph - panel_view(ph, h)).max(0.));
-    for z in &mut v {
+    for z in v {
         z.y -= scroll;
         let end = (z.y + z.h).min(bottom);
         let right = (z.x + z.w).min(x + pw - 12.);
@@ -295,7 +297,18 @@ pub fn fields(m: &Model, w: f32, h: f32) -> Vec<FieldSpec> {
         z.w = (right - z.x).max(0.);
         z.h = (end - z.y).max(0.);
     }
-    v
+}
+
+/// 原生下拉随设置页滚动，部分越出正文时隐藏，避免覆盖固定页头/页脚。
+pub fn font_picker(m: &Model, w: f32, h: f32) -> Option<FieldSpec> {
+    if m.modal != Modal::Preferences {
+        return None;
+    }
+    let (x, y, pw, _) = panel_for_model(m, w, h);
+    let mut field = preferences::font_picker(m, x, y, pw)?;
+    let height = field.h;
+    clip_native_fields(std::slice::from_mut(&mut field), m, w, h);
+    (field.h >= height && field.w > 0.).then_some(field)
 }
 fn command_y(c: &DrawCmd) -> Option<f32> {
     match c {
@@ -934,16 +947,6 @@ fn draw_more(
             "F2".into(),
         ));
     }
-    left_items.push((
-        if m.race {
-            "切换到练习模式".into()
-        } else {
-            "切换到赛制模式".into()
-        },
-        "赛制会关闭提示、粘贴与失焦暂停".into(),
-        Action::ToggleRace,
-        "".into(),
-    ));
     let right_items: Vec<(String, String, Action, String)> = vec![
         (
             "跟打器设置".into(),
@@ -1090,7 +1093,7 @@ pub(super) fn appearance_preview(
     }
     let fs = (cfg.font_size / 2.).clamp(14., 32.);
     let hint_fs = cfg.hint_font_size.max(14.);
-    let hints_visible = gale_core::rules::hints_effective(m.hints, m.race);
+    let hints_visible = m.hints;
     let lh = if hints_visible {
         (fs * (1. + cfg.line_gap) + 9.).max(fs + hint_fs + 11.)
     } else {
@@ -2696,7 +2699,7 @@ mod tests {
         }
     }
     #[test]
-    fn more_preserves_secondary_actions_without_overlap_in_both_modes() {
+    fn more_preserves_secondary_actions_without_overlap_for_text_and_single_drills() {
         let cfg = Config::default();
         let t = crate::ui::theme("墨玉");
         for (w, h) in [(640., 420.), (640., 480.), (800., 600.)] {
@@ -2719,11 +2722,12 @@ mod tests {
                     Action::Open(Modal::Groups),
                     Action::Open(Modal::Preferences),
                     Action::Open(Modal::Rules),
-                    Action::ToggleRace,
                     Action::Folder,
                 ] {
                     assert!(hits.iter().any(|hit| hit.action == action));
                 }
+                assert!(!frame.cmds.iter().any(|cmd| matches!(cmd,
+                    DrawCmd::TextRun { text, .. } if text.contains("赛制"))));
                 assert_eq!(
                     hits.iter().any(|hit| hit.action == Action::PostArticle),
                     !single

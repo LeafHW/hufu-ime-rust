@@ -418,6 +418,46 @@ unsafe fn system_family_names(factory: &IDWriteFactory) -> Option<HashSet<String
     Some(names)
 }
 
+/// 正文字体下拉与渲染使用同一个 DirectWrite 字体集。
+/// 每个家族显示一个名称，优先中文，其次英文，避免列出重复字形/字号。
+pub fn installed_font_families() -> Result<Vec<String>, String> {
+    unsafe {
+        let factory: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)
+            .map_err(|e| format!("无法读取系统字体：{e}"))?;
+        let mut collection = None;
+        factory.GetSystemFontCollection(&mut collection, false)
+            .map_err(|e| format!("无法读取系统字体：{e}"))?;
+        let collection = collection.ok_or("系统字体集合为空")?;
+        let mut names = Vec::new();
+        for i in 0..collection.GetFontFamilyCount() {
+            let Ok(family) = collection.GetFontFamily(i) else { continue };
+            let Ok(localized) = family.GetFamilyNames() else { continue };
+            let mut index = 0;
+            for locale in [w!("zh-CN"), w!("en-US")] {
+                let mut found = windows::Win32::Foundation::BOOL(0);
+                if localized.FindLocaleName(locale, &mut index, &mut found).is_ok()
+                    && found.as_bool()
+                {
+                    break;
+                }
+                index = 0;
+            }
+            if let Some(name) = localized_string(&localized, index) {
+                if !name.is_empty() && !name.starts_with('@') {
+                    names.push(name);
+                }
+            }
+        }
+        names.sort_by_key(|name| name.to_lowercase());
+        names.dedup_by(|a, b| a.to_lowercase() == b.to_lowercase());
+        if names.is_empty() {
+            Err("系统字体集合为空".into())
+        } else {
+            Ok(names)
+        }
+    }
+}
+
 /// 取本地化串第 index 项
 unsafe fn localized_string(ls: &IDWriteLocalizedStrings, index: u32) -> Option<String> {
     let len = ls.GetStringLength(index).ok()? as usize;

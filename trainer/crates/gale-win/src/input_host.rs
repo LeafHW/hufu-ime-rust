@@ -72,6 +72,12 @@ pub enum HostEvent {
     Cancelled,
     /// 原始击键（统计用；vk 已过滤为统计键）
     Key { vk: u32 },
+    /// A real editing/selection key that resumes the clock without adding a
+    /// statistical key (undo/redo, or a configured non-statistical IME key).
+    ResumeKey { vk: u32 },
+    /// Top-level deactivation, ordered with physical keys. The host's final
+    /// text diff follows this queue, so the app must flush it before pausing.
+    FocusLost,
     /// The active HuFu TIP confirmed a successful explicit candidate selection.
     /// Sentence locks are reported immediately, even before text is committed.
     CandidateSelection { rank: u8, vk: Option<u32> },
@@ -140,6 +146,20 @@ static KEY_TIMES: Mutex<Vec<(u32, u64)>> = Mutex::new(Vec::new());
 static COMMIT_KEY_HISTORY: Mutex<Vec<(u32, u64)>> = Mutex::new(Vec::new());
 static EXACT_SELECTION_SOURCE: AtomicBool = AtomicBool::new(false);
 static PHYSICAL_EVENTS: Mutex<Vec<HostEvent>> = Mutex::new(Vec::new());
+
+/// Called from the top-level window procedure even when focus leaves and
+/// returns within one native message-pump iteration.
+pub fn note_focus_lost() {
+    if let Ok(mut events) = PHYSICAL_EVENTS.lock() {
+        events.push(HostEvent::FocusLost);
+    }
+}
+
+fn push_resume_key(vk: u32) {
+    if let Ok(mut events) = PHYSICAL_EVENTS.lock() {
+        events.push(HostEvent::ResumeKey { vk });
+    }
+}
 /// EM_SETEDITSTYLE(SES_USECTF) 校验结果（InputHost::create 写入；
 /// false = TSF 桥可能没建立，上层可提示"TSF 输入法可能不可用"）
 static CTF_OK: AtomicBool = AtomicBool::new(true);
@@ -259,6 +279,14 @@ pub fn capture_physical_key(msg: &windows::Win32::UI::WindowsAndMessaging::MSG) 
             query_tick_ms(),
         );
     }
+    let physical_vk = physical_heatmap_vk(vk, msg.lParam.0 as usize);
+    let resume_selection = {
+        let configured = SELECTION_KEYS.lock().unwrap_or_else(|e| e.into_inner());
+        nonstat_selection_resumes(physical_vk, composing, &configured)
+    };
+    if resume_selection {
+        push_resume_key(physical_vk);
+    }
     if ctrl && !composing {
         match vk {
             0x25 => push_cmd(CommandKey::CtrlLeft),
@@ -266,7 +294,10 @@ pub fn capture_physical_key(msg: &windows::Win32::UI::WindowsAndMessaging::MSG) 
             0x56 => push_cmd(CommandKey::LoadClipboard),
             // Native undo/redo must reach RichEdit through the message pump;
             // relay_proc cannot handle a shortcut discarded before dispatch.
-            0x5A | 0x59 => return false,
+            0x5A | 0x59 => {
+                push_resume_key(vk);
+                return false;
+            }
             _ => {}
         }
         return true;
@@ -982,6 +1013,13 @@ impl SelectionKeys {
     fn contains(&self, vk: u32) -> bool {
         vk < 256 && self.0[vk as usize]
     }
+}
+
+fn nonstat_selection_resumes(vk: u32, composing: bool, keys: &SelectionKeys) -> bool {
+    composing
+        && !StatsEngine::is_stat_key(vk)
+        && !matches!(vk, 0x1b | 0x70..=0x7b)
+        && keys.contains(vk)
 }
 static SELECTION_KEYS: Mutex<SelectionKeys> = Mutex::new(SelectionKeys::empty());
 
@@ -1794,6 +1832,24 @@ mod tests {
         assert_eq!(ev, Some(InputEvent::Backspace));
         let ev: Option<InputEvent> = (&HostEvent::Preedit("n".into())).into();
         assert_eq!(ev, None);
+        assert_eq!(Option::<InputEvent>::from(&HostEvent::FocusLost), None);
+        assert_eq!(
+            Option::<InputEvent>::from(&HostEvent::ResumeKey { vk: 0x5a }),
+            None
+        );
+    }
+
+    #[test]
+    fn only_configured_nonstat_selection_keys_resume_during_composition() {
+        let keys = SelectionKeys::from_vks(&[0x10, 0x14, 0x41, 0x1b, 0x70]);
+        assert!(nonstat_selection_resumes(0xa0, true, &keys));
+        assert!(nonstat_selection_resumes(0xa1, true, &keys));
+        assert!(nonstat_selection_resumes(0x14, true, &keys));
+        assert!(!nonstat_selection_resumes(0x14, false, &keys));
+        assert!(!nonstat_selection_resumes(0x11, true, &keys));
+        assert!(!nonstat_selection_resumes(0x41, true, &keys));
+        assert!(!nonstat_selection_resumes(0x1b, true, &keys));
+        assert!(!nonstat_selection_resumes(0x70, true, &keys));
     }
 
     #[test]

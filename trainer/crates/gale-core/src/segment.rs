@@ -6,6 +6,44 @@
 //! 3. **本地文章库**：Pain 风格 文章/分类/xxx.txt。
 
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
+
+/// 还原胡泊式群文：发文端将正文 Unicode 码点 +1，载入时减回。
+/// 与静打 v4.8.3 `qq_bridge.restore_shifted_body` 的静态提取结果对齐：
+/// 至少三个密文标点（全角减号/同上号），且不比正常中文标点少，才尝试还原。
+/// 只用于已识别群文的正文，标题和段标始终原样保留。
+pub fn restore_shifted_body(body: &str) -> Cow<'_, str> {
+    let markers = body.chars().filter(|c| matches!(*c, '－' | '〃')).count();
+    let normal = body
+        .chars()
+        .filter(|c| matches!(*c, '，' | '。' | '！' | '？'))
+        .count();
+    if markers < 3 || markers < normal {
+        return Cow::Borrowed(body);
+    }
+
+    let mut restored = String::with_capacity(body.len());
+    for c in body.chars() {
+        if matches!(c, '\r' | '\n' | '\0') {
+            restored.push(c);
+        } else if let Some(original) = char::from_u32(c as u32 - 1) {
+            restored.push(original);
+        } else {
+            // 码点回退落在代理区时不是合法 Rust 文本，保留整段，避免部分还原。
+            return Cow::Borrowed(body);
+        }
+    }
+    if restored
+        .chars()
+        .filter(|c| matches!(*c, '，' | '。'))
+        .count()
+        >= markers
+    {
+        Cow::Owned(restored)
+    } else {
+        Cow::Borrowed(body)
+    }
+}
 
 /// 一段跟打文
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -414,7 +452,7 @@ pub fn parse_group_message(text: &str) -> Option<GroupArticle> {
     if strip > 0 && body.len() > strip {
         body.drain(0..strip);
     }
-    let content = body.join("\n");
+    let content = restore_shifted_body(&body.join("\n")).into_owned();
     if clean_invisible(&content).trim().is_empty() {
         return None;
     }
@@ -601,7 +639,7 @@ pub fn parse_group_text(raw: &str) -> ParsedGroupText {
         if !body.trim().is_empty() {
             out.push(Segment {
                 mark: mark.clone().unwrap_or_else(|| (out.len() + 1).to_string()),
-                text: body,
+                text: restore_shifted_body(&body).into_owned(),
             });
         }
         lines.clear();
@@ -723,6 +761,60 @@ pub fn split_smart(raw: &str, target_chars: usize) -> Vec<Segment> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shifted_body_restores_hupo_unicode_vector() {
+        // 固定向量同时覆盖汉字、标点、扩展区汉字、emoji、英文、数字和换行。
+        let cipher = "佡奾－丗畍〃\r\n冎观－朌双〃𠀁😁!BCD!234\0";
+        let plain = "你好，世界。\r\n再见，朋友。𠀀😀 ABC 123\0";
+        let restored = restore_shifted_body(cipher);
+        assert_eq!(restored, plain);
+        assert_eq!(restored.chars().count(), cipher.chars().count());
+        assert_eq!(restore_shifted_body(&restored), plain);
+    }
+
+    #[test]
+    fn shifted_body_keeps_plain_text_and_ambiguous_markers() {
+        for plain in [
+            "",
+            "正常正文，重复标记－〃－，也保留。没有加密！",
+            "两个标记－〃不够判定",
+            "\u{e000}－〃－", // 回退会落在非法 Unicode 代理区，整段保留。
+        ] {
+            assert!(matches!(restore_shifted_body(plain), Cow::Borrowed(_)));
+            assert_eq!(restore_shifted_body(plain), plain);
+        }
+        // 静态证据中 markers == normal 仍会还原，避免把报告里的“多于”误作 >。
+        assert_eq!(
+            restore_shifted_body("－〃－，。！"),
+            "，。，\u{ff0b}\u{3001}\u{ff00}"
+        );
+    }
+
+    #[test]
+    fn encrypted_group_body_loads_through_shared_parsers() {
+        let cipher = "佡奾－丗畍〃冎观－朌双〃";
+        let plain = "你好，世界。再见，朋友。";
+        for tail in ["-----第7段-胡泊", "-----第7段-----"] {
+            let message = format!("原样标题 [字数12]\n{cipher}\n{tail}");
+            let article = parse_group_message(&message).unwrap();
+            assert_eq!(article.title, "原样标题");
+            assert_eq!(article.mark, "7");
+            assert_eq!(article.content, plain);
+            let parsed = parse_group_text(&message);
+            assert_eq!(parsed.title, "原样标题");
+            assert_eq!(parsed.segments[0].text, plain);
+        }
+        // 旧前置段标和一次复制多条群文也独立解码，普通文本不启发式改写。
+        let legacy = format!("《发文》原样标题\n-----第7段-----\n{cipher}");
+        assert_eq!(parse_group_text(&legacy).segments[0].text, plain);
+        let several =
+            format!("甲标题\n{cipher}\n-----第7段-胡泊\n\n乙标题\n正文。\n-----第8段-晴发文");
+        let parsed = parse_group_text(&several);
+        assert_eq!(parsed.segments[0].text, plain);
+        assert_eq!(parsed.segments[1].text, "正文。");
+        assert_eq!(parse_group_text(cipher).segments[0].text, cipher);
+    }
 
     #[test]
     fn smart_split_keeps_crlf_pair_and_all_original_bytes() {

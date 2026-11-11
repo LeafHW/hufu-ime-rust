@@ -16,8 +16,6 @@ use gale_win::d2d::{Align, DrawCmd, FontFamily, Frame};
 pub const FONT_HINT: f32 = 14.0;
 /// 面板/头部主标签字号（标题、面板名）。
 pub const FONT_LABEL: f32 = 14.0;
-/// 赛制下字提行的"停手才显示"门限（毫秒，晴口径 B：赛制词提全关、字提停手 5s 显示）。
-pub const ZITI_IDLE_MS: f64 = 5000.;
 /// 底部状态行高度。
 pub const STATUS_H: f32 = 28.;
 /// 底部成绩栏高度。
@@ -105,6 +103,32 @@ pub fn round(
 }
 pub fn line(f: &mut Frame, x: f32, y: f32, w: f32, c: [f32; 4]) {
     rect(f, x, y, w, 1., c)
+}
+/// A separate underbracket for each phrase; the upturned ends expose boundaries
+/// even when adjacent words share a colour. Keep it below the text glyphs.
+fn word_bracket_offset(size: f32) -> f32 {
+    // WenKai's visible glyphs can extend below the nominal em box at large sizes.
+    (size * 0.24).clamp(10., 24.)
+}
+pub fn word_bracket(f: &mut Frame, x: f32, y: f32, w: f32, size: f32, c: [f32; 4]) {
+    let inset = (size * 0.14).clamp(2.5, 10.).min(w / 4.);
+    let width = (w - 2. * inset).max(0.);
+    if width == 0. {
+        return;
+    }
+    let stroke = if size < 24. { 1.5 } else { 2. };
+    let rise = (size * 0.10).clamp(3., 8.);
+    let bottom = y + size + word_bracket_offset(size);
+    rect(f, x + inset, bottom, width, stroke, c);
+    rect(f, x + inset, bottom - rise, stroke, rise, c);
+    rect(
+        f,
+        x + inset + width - stroke,
+        bottom - rise,
+        stroke,
+        rise,
+        c,
+    );
 }
 pub fn elide(s: &str, n: usize) -> String {
     let v: String = s.chars().take(n).collect();
@@ -756,7 +780,7 @@ fn draw_chrome(
         if sess.current_segment().text.is_empty() {
             "等待载入文章"
         } else if m.paused {
-            "已暂停"
+            "已暂停 · 按键继续"
         } else if sess.phase == crate::session::Phase::Done {
             "本段完成"
         } else if sess.started_ms.is_some() {
@@ -772,11 +796,10 @@ fn draw_chrome(
 /// space instead of keeping an empty code strip.
 pub fn line_height_for_anchor(cfg: &Config, fs: f32, base: f32, hints_visible: bool) -> f32 {
     if hints_visible && (cfg.hint_show_code || cfg.hint_show_rank) {
-        // Keep the code row close to its word. The old +18 reserve made the
-        // annotation float below the line and pushed every article row apart.
-        base.max(fs + cfg.hint_font_size + 14.)
+        // Reserve the bracket and its code row together, including small fonts.
+        base.max(fs + word_bracket_offset(fs) + cfg.hint_font_size + 10.)
     } else {
-        base
+        base.max(fs + word_bracket_offset(fs) + 6.)
     }
 }
 pub fn build(
@@ -815,15 +838,15 @@ pub fn build(
         return f;
     }
     let single = sess.source == SessionSource::Single;
-    let word_hints = gale_core::rules::hints_effective(m.hints, m.race);
+    let word_hints = m.hints;
     let hints_visible = word_hints && (cfg.hint_show_code || cfg.hint_show_rank);
     let (bw, fs, base_lh) = body_metrics(sess, cfg, w);
     let lh = line_height_for_anchor(cfg, fs, base_lh, hints_visible);
     let x = (w - bw) / 2.;
     let pos = sess.comparer.pos;
-    let live = sess.live_stats(now_ms);
+    let header = sess.header_stats(now_ms);
     let count = sess.current_segment().text.chars().count();
-    let elapsed = sess.elapsed_ms(now_ms) as f64 / 1000.;
+    let elapsed = header.elapsed_ms as f64 / 1000.;
     let compact_analysis = m.analysis_dock && h < 700.;
     let top = if compact_analysis {
         100.
@@ -849,17 +872,17 @@ pub fn build(
         p.article_bg,
     );
     if !compact_analysis {
-        let speed = format!("{:.1}", live.para_speed);
+        let speed = format!("{:.1}", header.speed);
         let speed_size = 30_f32.min(112. / (speed.len().max(1) as f32 * 0.6));
         mono(&mut f, x, 117., speed_size, speed.clone(), p.accent);
         let speed_w = ui_text_width(&speed, speed_size);
         text(&mut f, x + speed_w + 7., 132., 12., "字/分", p.muted);
         let duration = format!("{:02}:{:04.1}", (elapsed / 60.) as u64, elapsed % 60.);
         let mut metrics = vec![
-            ("击键/秒", format!("{:.2}", live.para_keys_per_sec)),
-            ("码长", format!("{:.2}", live.para_code_len)),
-            ("键准", format!("{:.1}%", live.para_accuracy)),
-            ("错字", sess.comparer.wrong.to_string()),
+            ("击键/秒", format!("{:.2}", header.keys_per_sec)),
+            ("码长", format!("{:.2}", header.code_len)),
+            ("键准", format!("{:.1}%", header.accuracy)),
+            ("错字", header.wrong.to_string()),
             ("用时", duration.clone()),
         ];
         if w < 760. {
@@ -874,13 +897,12 @@ pub fn build(
             mono(&mut f, xx, 138., 18., value, p.text2);
         }
         let progress = format!(
-            "第 {} / {} {} · {} / {} 字{}",
+            "第 {} / {} {} · {} / {} 字",
             sess.index + 1,
             sess.total_segments(),
             if single { "组" } else { "段" },
             pos,
             count,
-            if m.race { " · 赛制" } else { "" }
         );
         text(
             &mut f,
@@ -900,25 +922,21 @@ pub fn build(
             p.accent,
         );
         if single {
-            if !m.race {
-                chip(
-                    &mut f,
-                    hs,
-                    x,
-                    199.,
-                    98.,
-                    if m.hints {
-                        "字提 · 开"
-                    } else {
-                        "字提 · 关"
-                    },
-                    Action::ToggleHints,
-                    &p,
-                    m.hints,
-                );
-            } else {
-                text(&mut f, x, 203., FONT_HINT, "赛制关闭字提", p.muted);
-            }
+            chip(
+                &mut f,
+                hs,
+                x,
+                199.,
+                98.,
+                if m.hints {
+                    "字提 · 开"
+                } else {
+                    "字提 · 关"
+                },
+                Action::ToggleHints,
+                &p,
+                m.hints,
+            );
         }
     }
     let active = lines.iter().rposition(|l| l.0 <= pos).unwrap_or(0);
@@ -1121,20 +1139,10 @@ pub fn build(
                         })
                         .flatten();
                     if crate::analysis::is_multi_word(&z.text) {
-                        // A soft baseline keeps the word boundary visible
-                        // without the heavy, fully saturated rule that used to
-                        // compete with the article text.
                         let underline = tint
                             .map(|color| alpha(color, 0.62))
                             .unwrap_or(p.hint_underline);
-                        rect(
-                            &mut f,
-                            wx + 1.,
-                            yy + fs + 4.,
-                            (ww - 2.).max(0.),
-                            2.,
-                            underline,
-                        );
+                        word_bracket(&mut f, wx, yy, ww, fs, underline);
                     }
                     let hint_size = cfg.hint_font_size;
                     let shown_code = if cfg.hint_show_code {
@@ -1159,13 +1167,20 @@ pub fn build(
                     let hx = wx + (ww - code_width - code_rank_gap - rank_width).max(0.) / 2.;
                     let code_color = alpha(tint.unwrap_or(p.hint_code), dim);
                     if !shown_code.is_empty() {
-                        mono(&mut f, hx, yy + fs + 9., hint_size, shown_code, code_color);
+                        mono(
+                            &mut f,
+                            hx,
+                            yy + fs + word_bracket_offset(fs) + 5.,
+                            hint_size,
+                            shown_code,
+                            code_color,
+                        );
                     }
                     if !rank.is_empty() {
                         mono(
                             &mut f,
                             hx + code_width + code_rank_gap,
-                            yy + fs + 5.,
+                            yy + fs + word_bracket_offset(fs) + 1.,
                             rank_size,
                             rank,
                             alpha(
@@ -1255,6 +1270,171 @@ mod tests {
     }
 
     #[test]
+    fn header_renders_previous_metrics_after_loading_and_resets_on_the_first_key() {
+        let (mut sess, model, cfg, _) = fixture();
+        for i in 0..10 {
+            sess.on_key(0x41 + i, 100 + i as u64 * 100);
+        }
+        sess.feed_input(
+            gale_core::compare::InputEvent::Commit {
+                chars: "错乙丙丁戊己庚辛壬癸".into(),
+            },
+            2100,
+        );
+        sess.finalize_current_at(2100, 1).unwrap();
+        let draw_header = |sess: &Session, now| {
+            let text = &sess.current_segment().text;
+            let lines = vec![(
+                0,
+                text.clone(),
+                (0..=text.chars().count()).map(|i| i as f32 * 36.).collect(),
+            )];
+            build(
+                sess,
+                &cfg,
+                &theme("墨玉"),
+                &model,
+                1280.,
+                800.,
+                now,
+                0.,
+                &mut Animation::default(),
+                &mut Vec::new(),
+                &lines,
+            )
+            .cmds
+            .into_iter()
+            .filter_map(|cmd| match cmd {
+                DrawCmd::TextRun { y, text, .. } if y == 117. || y == 138. => Some(text),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+        };
+        let previous = draw_header(&sess, 3100);
+        assert_eq!(
+            previous,
+            ["300.0", "5.00", "1.00", "100.0%", "1", "00:02.0"]
+        );
+        sess.load_book("新文章", "新文章甲乙丙丁戊己庚");
+        assert_eq!(draw_header(&sess, 7100), previous);
+        assert_eq!(
+            sess.comparer.pos, 0,
+            "the new text is ready despite the retained header"
+        );
+        sess.on_key(0x41, 8100);
+        assert_eq!(
+            draw_header(&sess, 9100),
+            ["0.0", "1.00", "0.00", "100.0%", "0", "00:01.0"]
+        );
+    }
+
+    #[test]
+    fn adjacent_words_have_separate_brackets_below_the_text_at_all_sizes() {
+        let article = "好处坏处好的经常不要";
+        let mut sess = Session::new(100);
+        sess.load_book("相邻词组", article);
+        let model = Model {
+            hints: true,
+            words: ["好处", "坏处", "好的", "经常", "不要"]
+                .into_iter()
+                .enumerate()
+                .map(|(i, text)| HintWord {
+                    start: i * 2,
+                    len: 2,
+                    text: text.into(),
+                    code: Some("abcd".into()),
+                    rank: 1,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let theme = theme("墨玉");
+        let underline = tokens(&theme).hint_underline;
+        for size in [10., 36., 100.] {
+            let cfg = Config {
+                font_size: size,
+                hint_color_words: false,
+                ..Default::default()
+            };
+            let lines = vec![(
+                0,
+                article.into(),
+                (0..=10).map(|i| i as f32 * size).collect(),
+            )];
+            let frame = build(
+                &sess,
+                &cfg,
+                &theme,
+                &model,
+                1280.,
+                800.,
+                0,
+                0.,
+                &mut Animation::default(),
+                &mut Vec::new(),
+                &lines,
+            );
+            let article_y = frame
+                .cmds
+                .iter()
+                .find_map(|cmd| match cmd {
+                    DrawCmd::StyledLine { y, .. } => Some(*y),
+                    _ => None,
+                })
+                .unwrap();
+            let rules: Vec<_> = frame
+                .cmds
+                .iter()
+                .filter_map(|cmd| match cmd {
+                    DrawCmd::Rect {
+                        x, y, w, h, color, ..
+                    } if *h <= 2.
+                        && *color == underline
+                        && *y == article_y + size + word_bracket_offset(size) =>
+                    {
+                        Some((*x, *w))
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(rules.len(), 5);
+            for pair in rules.windows(2) {
+                assert!(pair[1].0 - (pair[0].0 + pair[0].1) >= 5. - 0.01);
+            }
+            let rise = (size * 0.10).clamp(3., 8.);
+            let ends: Vec<_> = frame
+                .cmds
+                .iter()
+                .filter_map(|cmd| match cmd {
+                    DrawCmd::Rect {
+                        x, y, w, h, color, ..
+                    } if *w <= 2.
+                        && *h == rise
+                        && *color == underline
+                        && *y == article_y + size + word_bracket_offset(size) - rise =>
+                    {
+                        Some((*x, *y, *w))
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(ends.len(), 10, "each phrase needs two upturned ends");
+            for (rule, ends) in rules.iter().zip(ends.chunks_exact(2)) {
+                assert_eq!(ends[0].0, rule.0);
+                assert_eq!(ends[1].0 + ends[1].2, rule.0 + rule.1);
+                assert!(
+                    ends[0].1 > article_y + size,
+                    "brackets must clear the glyphs"
+                );
+            }
+            assert!(frame.cmds.iter().any(|cmd| matches!(cmd,
+                DrawCmd::StyledLine { text, .. } if text == article)));
+            assert!(line_height_for_anchor(&cfg, size, size * 1.4, false) > size + 12.);
+        }
+    }
+
+    #[test]
     fn article_word_hints_preserve_typing_states_and_leave_single_characters_neutral() {
         let (mut sess, model, cfg, lines) = fixture();
         sess.comparer.states[0] = CharState::Correct;
@@ -1315,22 +1495,19 @@ mod tests {
             .unwrap();
         assert_eq!(spans[0].2, hint_word_tint(&p, "甲乙", "abcd", 4).unwrap());
         assert_eq!(spans[2].2, p.text2);
-        for race in [false, true] {
-            model.race = race;
-            model.hints = race;
-            let frame = draw(&model);
-            assert!(!frame.cmds.iter().any(|cmd| matches!(cmd,
-                DrawCmd::TextRun { text, .. } if text == "abcd")));
-            assert!(frame
-                .cmds
-                .iter()
-                .filter_map(|cmd| match cmd {
-                    DrawCmd::StyledLine { spans, .. } => Some(spans),
-                    _ => None,
-                })
-                .flatten()
-                .all(|span| span.2 == p.text2));
-        }
+        model.hints = false;
+        let frame = draw(&model);
+        assert!(!frame.cmds.iter().any(|cmd| matches!(cmd,
+            DrawCmd::TextRun { text, .. } if text == "abcd")));
+        assert!(frame
+            .cmds
+            .iter()
+            .filter_map(|cmd| match cmd {
+                DrawCmd::StyledLine { spans, .. } => Some(spans),
+                _ => None,
+            })
+            .flatten()
+            .all(|span| span.2 == p.text2));
     }
 
     #[test]

@@ -3,6 +3,8 @@
 //! Run from trainer/:
 //! cargo run -p gale-app --example design_review --target x86_64-pc-windows-gnu -- <output-dir>
 //! Append a screen filter such as `77..80` or `72,75,77` to render only those screens.
+//! `87..90` compares consecutive same-colour words at 100/36px in dark/light themes,
+//! with code/rank rows hidden so bracket boundaries are the only grouping cue.
 //!
 //! This program creates one hidden render surface. It does not capture the desktop,
 //! create an InputHost, connect to QQ/online services, or read/write user settings.
@@ -399,6 +401,46 @@ fn word_hint_fixture(m: &mut Model) -> Session {
     sess
 }
 
+/// Consecutive words deliberately share one colour class. Code/rank rows are
+/// hidden by the scene so only the product's word-boundary drawing separates them.
+fn consecutive_word_fixture(m: &mut Model, words: &[&str]) -> Session {
+    *m = Model::default();
+    m.hints = true;
+    m.max_code_length = 4;
+    m.status = "括形底线布局样本 · 未连接虎符服务".into();
+    m.schema = "相邻同类词 · 人工布局配方".into();
+    m.schema_ver = "visual-fixture".into();
+    let mut start = 0;
+    for word in words {
+        let len = word.chars().count();
+        m.words.push(HintWord {
+            text: (*word).into(),
+            code: Some("aaah".into()),
+            rank: 1,
+            start,
+            len,
+            ..HintWord::default()
+        });
+        start += len;
+    }
+    let mut sess = Session::new(100);
+    sess.set_rules(SessionRules {
+        mode: TrainingMode::Practice,
+        word_hints: true,
+        ..SessionRules::default()
+    })
+    .expect("consecutive-word fixture rules");
+    sess.load_group(ParsedGroupText {
+        title: "括形底线视觉样本（人工配方）".into(),
+        difficulty: None,
+        segments: vec![Segment {
+            mark: "1".into(),
+            text: words.concat(),
+        }],
+    });
+    sess
+}
+
 fn drill_fixture() -> Session {
     let tables = builtin_tables();
     let (title, text) = tables[0];
@@ -573,7 +615,6 @@ fn completed_fixture(m: &mut Model, mode: TrainingMode, done: usize) -> Session 
     for index in 0..done {
         m.latest = Some(finish_segment(&mut sess, index));
     }
-    m.race = mode == TrainingMode::Race;
     m.hints = false;
     m.history = sess.results.iter().flatten().cloned().collect();
     sess
@@ -671,14 +712,14 @@ fn main() -> Result<(), Box<dyn Error>> {
                     (number, number)
                 }
             };
-            if start < 1 || end > 86 || start > end {
-                return Err("screen filter must select numbers in 1..86".into());
+            if start < 1 || end > 90 || start > end {
+                return Err("screen filter must select numbers in 1..90".into());
             }
             selected.extend(start..=end);
         }
         selected
     } else {
-        (1..=86).collect()
+        (1..=90).collect()
     };
     std::fs::create_dir_all(&output)?;
     unsafe {
@@ -1101,6 +1142,32 @@ fn main() -> Result<(), Box<dyn Error>> {
                     _ => "86-rank-colors-analysis-dark-1280x800.bmp",
                 }
             }
+            87..=90 => {
+                let large = matches!(screen, 87 | 89);
+                sess = consecutive_word_fixture(
+                    &mut m,
+                    if large {
+                        &["今天", "明天", "后天"]
+                    } else {
+                        &["好处", "坏处", "好的", "经常", "不要"]
+                    },
+                );
+                cfg.font_size = if large { 100. } else { 36. };
+                cfg.hint_show_code = false;
+                cfg.hint_show_rank = false;
+                cfg.hint_color_words = true;
+                cfg.hint_rank_colors = false;
+                cfg.hint_underline = true;
+                if screen >= 89 {
+                    theme_name = "宣纸";
+                }
+                match screen {
+                    87 => "87-bracket-boundaries-100-dark-1280x800.bmp",
+                    88 => "88-bracket-boundaries-36-dark-1280x800.bmp",
+                    89 => "89-bracket-boundaries-100-light-1280x800.bmp",
+                    _ => "90-bracket-boundaries-36-light-1280x800.bmp",
+                }
+            }
             _ => unreachable!(),
         };
         if m.ledger_open {
@@ -1144,7 +1211,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         renderer.fonts.set_body_family(&cfg.font_family);
         let (body_w, font_size, _) = ui::body_metrics(&sess, &cfg, width);
         let mut lines = renderer.wrap_text(&sess.current_segment().text, font_size, body_w);
-        if gale_core::rules::hints_effective(m.hints, m.race) {
+        if m.hints {
             let boundaries: Vec<_> = m
                 .words
                 .iter()
@@ -1198,6 +1265,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             "screen":screen,"file":name,"logical_size":[width,height],"pixel_size":[width as u32,height as u32],
             "theme":theme_name,"modal":format!("{:?}",m.modal),"phase":format!("{:?}",sess.phase),
             "font_size":cfg.font_size,"single_character_hints":single,"report_tab":m.field("report_tab"),"ledger_open":m.ledger_open,"analysis_dock":m.analysis_dock,"ledger_scroll":m.ledger_scroll,"analysis_scroll":m.analysis_dock_scroll,
+            "hint_show_code":cfg.hint_show_code,"hint_show_rank":cfg.hint_show_rank,
             "requested_font_family":cfg.font_family,"resolved_font_family":gale_win::d2d::resolved_cjk_family(&cfg.font_family),
             "hint_strategy":cfg.hint_strategy.as_str(),"hint_dynamic":cfg.hint_dynamic,"hint_settings_locked":m.field("hint_settings_locked"),
             "hint_recipe_source":if screen >= 72 { Some("manual-layout-recipes-not-server-analysis") } else { None },

@@ -143,6 +143,15 @@ fn physical_ctrl_z_and_ctrl_y_reach_native_undo_and_document_diff() {
         "Ctrl+Z must undo the last native input group"
     );
     let undone = host.poll();
+    let resume = undone
+        .iter()
+        .position(|event| matches!(event, HostEvent::ResumeKey { vk: 0x5a }))
+        .expect("undo emits a physical resume marker");
+    let change = undone
+        .iter()
+        .position(|event| matches!(event, HostEvent::Backspace))
+        .expect("undo emits a document change");
+    assert!(resume < change, "resume precedes the undo diff");
     assert_eq!(
         undone
             .iter()
@@ -165,6 +174,15 @@ fn physical_ctrl_z_and_ctrl_y_reach_native_undo_and_document_diff() {
         "Ctrl+Y must redo the native input group"
     );
     let redone = host.poll();
+    let resume = redone
+        .iter()
+        .position(|event| matches!(event, HostEvent::ResumeKey { vk: 0x59 }))
+        .expect("redo emits a physical resume marker");
+    let change = redone
+        .iter()
+        .position(|event| matches!(event, HostEvent::Commit(_)))
+        .expect("redo emits a document change");
+    assert!(resume < change, "resume precedes the redo diff");
     assert!(redone
         .iter()
         .any(|event| matches!(event, HostEvent::Commit(s) if s == "乙")));

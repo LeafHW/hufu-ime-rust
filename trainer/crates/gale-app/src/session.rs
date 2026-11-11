@@ -52,6 +52,10 @@ pub struct Session {
     pub composing: bool,
     pub recorded: bool,
     pub last_stats: Option<SegmentStats>,
+    /// Keep the previous header visible after loading/resetting a paragraph.
+    /// This display-only snapshot never contributes to scores or aggregates.
+    #[serde(skip)]
+    retained_header_stats: Option<HeaderStats>,
     pub done_chars: u64,
     pub done_keys: u64,
     pub done_bs: u64,
@@ -120,6 +124,7 @@ impl Session {
             composing: false,
             recorded: false,
             last_stats: None,
+            retained_header_stats: None,
             done_chars: 0,
             done_keys: 0,
             done_bs: 0,
@@ -216,6 +221,9 @@ impl Session {
         self.loaded();
     }
     fn reset_current(&mut self) {
+        if self.started_ms.is_some() {
+            self.retained_header_stats = Some(self.current_header_stats(self.last_clock_ms));
+        }
         self.comparer = Comparer::new(&self.current_segment().text);
         self.comparer.quote_rules = self.rules.quotes.clone();
         self.stats = StatsEngine::new();
@@ -363,6 +371,11 @@ impl Session {
         self.last_clock_ms = self.last_clock_ms.max(now);
         self.last_clock_ms
     }
+    /// Advance the event clock without starting a round. Loading new text can
+    /// then retain the exact displayed duration even when the old round is unfinished.
+    pub fn update_clock(&mut self, now_ms: u64) {
+        self.clock(now_ms);
+    }
     fn begin(&mut self, now: u64) {
         if self.phase != Phase::Idle || self.current_segment().text.is_empty() {
             return;
@@ -379,6 +392,7 @@ impl Session {
         self.current_retype_count = *attempts;
         *attempts = attempts.saturating_add(1);
         self.phase = Phase::Typing;
+        self.retained_header_stats = None;
         self.started_ms = Some(now);
         self.comparer.started_at = Some(now);
     }
@@ -417,7 +431,7 @@ impl Session {
             self.composing = false;
             self.preedit.clear();
         }
-        if self.comparer.is_done() {
+        if self.comparer.finished_with_correct_last_char() {
             self.finished_ms = Some(now);
             self.phase = Phase::Done;
         }
@@ -542,9 +556,10 @@ impl Session {
         self.feed_input(InputEvent::Commit { chars: text.into() }, now_ms);
         Ok(())
     }
+    /// Focus loss pauses every mode. Focus return alone must not resume the clock;
+    /// the host explicitly resumes immediately before the next accepted key.
     pub fn set_paused(&mut self, paused: bool, now_ms: u64) {
-        let rules = self.frozen_rules.as_ref().unwrap_or(&self.rules);
-        if rules.mode == TrainingMode::Race || !rules.pause_on_blur || self.phase != Phase::Typing {
+        if self.phase != Phase::Typing {
             return;
         }
         let now = self.clock(now_ms);
@@ -555,6 +570,9 @@ impl Session {
         } else if let Some(start) = self.paused_at.take() {
             self.paused_ms = self.paused_ms.saturating_add(now.saturating_sub(start));
         }
+    }
+    pub fn is_paused(&self) -> bool {
+        self.paused_at.is_some()
     }
     pub fn stop(&mut self) {
         self.stop_at(self.last_clock_ms);
@@ -618,6 +636,7 @@ impl Session {
             cleaned: self.cleaned,
             pasted: self.pasted,
             complete: self.comparer.is_done(),
+            last_char_correct: Some(self.comparer.finished_with_correct_last_char()),
             // 开打时冻结的词提快照（frozen_rules 即 begin() 冻结）；成绩单 [词提开] 标记引用
             word_hints: rules.word_hints,
         });
@@ -681,6 +700,29 @@ impl Session {
             code_len: if c > 0.0 { k / c } else { 0.0 },
             done_chars: chars,
         }
+    }
+
+    fn current_header_stats(&self, now_ms: u64) -> HeaderStats {
+        let elapsed_ms = self.elapsed_ms(now_ms);
+        let st = self.stats.finalize(&self.comparer, elapsed_ms);
+        HeaderStats {
+            speed: st.speed,
+            accuracy: st.accuracy_pro,
+            keys_per_sec: st.strokes_per_sec,
+            code_len: st.code_len,
+            wrong: st.wrong,
+            elapsed_ms,
+        }
+    }
+    /// Header metrics may remain from the previous paragraph while the new
+    /// paragraph waits for its first key. Other statistics always use live_stats.
+    pub fn header_stats(&self, now_ms: u64) -> HeaderStats {
+        if self.phase == Phase::Idle {
+            if let Some(previous) = self.retained_header_stats {
+                return previous;
+            }
+        }
+        self.current_header_stats(now_ms)
     }
 
     /// 面板通道（P1-4）：secondary_panels::draw 拿不到墙钟参数——用最近一次
@@ -890,6 +932,16 @@ impl Session {
         Ok(s)
     }
 }
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HeaderStats {
+    pub speed: f64,
+    pub accuracy: f64,
+    pub keys_per_sec: f64,
+    pub code_len: f64,
+    pub wrong: usize,
+    pub elapsed_ms: u64,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct LiveStats {
     /// 整场速度（字/分）：已结算段（过 <5 硬门）+ 当前段实时，不重复计数。
@@ -1135,6 +1187,101 @@ mod tests {
         assert_eq!(live.keys_per_sec, 2.);
         assert!((live.code_len - 1.2).abs() < 1e-9);
     }
+
+    #[test]
+    fn header_keeps_completed_metrics_across_all_loaders_until_the_first_key() {
+        let mut s = session();
+        round(&mut s, 100, 1100, "错乙丙丁戊");
+        let record = s.finalize_current_at(1100, 1).unwrap();
+        let completed = s.header_stats(1500);
+        assert_eq!(completed.speed, record.speed);
+        assert_eq!(completed.accuracy, record.accuracy);
+        assert_eq!(completed.keys_per_sec, record.strokes_per_sec);
+        assert_eq!(completed.code_len, record.code_len);
+        assert_eq!(completed.wrong, 1);
+        assert_eq!(completed.elapsed_ms, record.time_ms);
+
+        s.next_segment();
+        assert_eq!(s.header_stats(3000), completed);
+        assert_eq!(s.live_stats(3000).para_speed, 0.);
+        s.jump(1);
+        assert_eq!(
+            s.header_stats(4000),
+            completed,
+            "restarting an idle paragraph retains the same values"
+        );
+        s.load_group(ParsedGroupText {
+            title: "群文".into(),
+            difficulty: None,
+            segments: vec![Segment {
+                mark: "3".into(),
+                text: "新群文内容".into(),
+            }],
+        });
+        assert_eq!(s.header_stats(5000), completed);
+        s.load_text("剪贴板的新内容");
+        assert_eq!(s.header_stats(6000), completed);
+        s.load_book("在线文章", "另一篇新文章");
+        assert_eq!(s.header_stats(7000), completed);
+        s.load_single(SingleSession {
+            title: "单字".into(),
+            group_size: 10,
+            items: vec!["新".into(), "字".into()],
+            group_index: 0,
+            seed: 0,
+        });
+        assert_eq!(s.header_stats(8000), completed);
+        assert_eq!(
+            s.aggregate().chars,
+            0,
+            "retained metrics are never added to a newly loaded article"
+        );
+        assert!(s.last_stats.is_none());
+        assert_eq!(s.stats.keys, 0);
+        s.set_preedit("x".into());
+        s.on_key(0x1b, 8500);
+        assert_eq!(
+            s.header_stats(9000),
+            completed,
+            "composition notifications and Esc do not start a new round"
+        );
+
+        s.on_key(0x41, 10000);
+        let fresh = s.header_stats(11000);
+        assert_eq!(fresh.speed, 0.);
+        assert_eq!(fresh.keys_per_sec, 1.);
+        assert_eq!(fresh.code_len, 0.);
+        assert_eq!(fresh.wrong, 0);
+        assert_eq!(fresh.elapsed_ms, 1000);
+        assert_eq!(s.stats.keys, 1);
+        s.feed_input(
+            InputEvent::Commit {
+                chars: "新".into()
+            },
+            11000,
+        );
+        assert_eq!(s.header_stats(11000).speed, 60.);
+    }
+
+    #[test]
+    fn replacing_an_unfinished_round_retains_its_current_values_without_recording_it() {
+        let mut s = session();
+        round(&mut s, 100, 1100, "甲乙");
+        s.update_clock(3100);
+        let previous = s.header_stats(3100);
+        assert_eq!(previous.elapsed_ms, 3000);
+        assert_eq!(previous.speed, 40.);
+        s.load_book("直接换文", "新内容");
+        assert_eq!(s.phase, Phase::Idle);
+        assert!(s.started_ms.is_none());
+        assert_eq!(s.header_stats(10000), previous);
+        assert_eq!(s.stats.keys, 0);
+        assert!(s.results.iter().all(Option::is_none));
+        assert_eq!(s.live_stats(10000).done_chars, 0);
+        s.on_key(0x42, 11000);
+        assert_eq!(s.header_stats(12000).elapsed_ms, 1000);
+        assert_eq!(s.header_stats(12000).keys_per_sec, 1.);
+    }
     #[test]
     fn cross_segment_retries_replace_only_their_slot() {
         let mut s = session();
@@ -1337,7 +1484,80 @@ mod tests {
         let r = s.finalize_current(1100).unwrap();
         assert_eq!(r.chars, 1);
         assert_eq!(r.time_ms, 1000);
+        assert!(
+            !r.can_send_score(),
+            "an explicitly interrupted round keeps only a local record"
+        );
         assert!(!r.round.unwrap().complete);
+    }
+    #[test]
+    fn wrong_last_character_can_be_corrected_before_completion_and_sending() {
+        let mut s = session();
+        round(&mut s, 100, 1100, "甲乙丙丁错");
+        assert!(s.comparer.is_done(), "all positions have been compared");
+        assert_eq!(
+            s.phase,
+            Phase::Typing,
+            "a wrong ending must remain editable"
+        );
+        assert!(s.finished_ms.is_none());
+        assert_eq!(s.elapsed_ms(1300), 1200, "correction time remains counted");
+
+        s.on_key(0x08, 1300);
+        s.feed_input(InputEvent::Backspace, 1300);
+        s.on_key(0x41, 1400);
+        s.feed_input(
+            InputEvent::Commit {
+                chars: "戊".into()
+            },
+            1500,
+        );
+        assert_eq!(s.phase, Phase::Done);
+        let r = s.finalize_current_at(1500, 1).unwrap();
+        assert_eq!(r.wrong, 0);
+        assert_eq!(r.corrections, 1);
+        assert_eq!(r.time_ms, 1400);
+        assert!(r.can_send_score());
+    }
+    #[test]
+    fn stopping_after_wrong_last_character_does_not_allow_sending() {
+        let mut s = session();
+        round(&mut s, 100, 1100, "甲乙丙丁错");
+        s.stop_at(1200);
+        let r = s.finalize_current_at(1200, 1).unwrap();
+        assert!(r.round.as_ref().unwrap().complete);
+        assert_eq!(r.round.as_ref().unwrap().last_char_correct, Some(false));
+        assert!(!r.can_send_score());
+        let saved = serde_json::to_string(&r).unwrap();
+        let history: ScoreRecord = serde_json::from_str(&saved).unwrap();
+        assert!(
+            !history.can_send_score(),
+            "history must preserve the sending gate"
+        );
+    }
+    #[test]
+    fn earlier_errors_do_not_block_sending_when_the_last_character_is_correct() {
+        let mut s = session();
+        round(&mut s, 100, 1100, "错乙丙丁戊");
+        assert_eq!(s.phase, Phase::Done);
+        let r = s.finalize_current_at(1100, 1).unwrap();
+        assert_eq!(r.wrong, 1);
+        assert!(
+            r.effective_speed < r.speed,
+            "existing wrong-character penalty remains"
+        );
+        assert!(r.can_send_score());
+    }
+    #[test]
+    fn equivalent_final_quote_allows_completion_and_sending() {
+        let mut s = session();
+        s.load_text("“甲乙丙”");
+        round(&mut s, 100, 1100, "”甲乙丙“");
+        assert_eq!(s.phase, Phase::Done);
+        let r = s.finalize_current_at(1100, 1).unwrap();
+        assert_eq!(r.wrong, 0);
+        assert_eq!(r.round.as_ref().unwrap().quote_relaxed, 2);
+        assert!(r.can_send_score());
     }
     #[test]
     fn rules_and_body_frozen_until_restart() {
@@ -1358,7 +1578,8 @@ mod tests {
             },
             1100,
         );
-        assert_eq!(s.elapsed_ms(1100), 1000);
+        assert_eq!(s.elapsed_ms(1100), 100);
+        assert_eq!(s.typed_len(), 0, "delayed commits cannot resume a race");
         assert!(s.feed_paste("甲", 1200).is_err());
     }
     #[test]
@@ -1435,6 +1656,107 @@ mod tests {
         partial.stop_at(1300);
         assert_eq!(partial.elapsed_ms(1500), 200);
         assert_eq!(partial.finalize_current_at(1500, 123).unwrap().time_ms, 200);
+    }
+
+    #[test]
+    fn focus_pause_applies_to_all_modes_and_legacy_preferences() {
+        for mode in [TrainingMode::Practice, TrainingMode::Race] {
+            let mut s = session();
+            let mut rules = SessionRules::default();
+            rules.mode = mode;
+            rules.pause_on_blur = false;
+            s.set_rules(rules).unwrap();
+            s.set_paused(true, 50);
+            assert!(!s.is_paused(), "an idle round has no running clock");
+            s.on_key(0x41, 100);
+            s.set_paused(true, 200);
+            assert!(s.is_paused());
+            assert_eq!(s.elapsed_ms(1200), 100);
+            s.set_paused(false, 1200);
+            assert!(!s.is_paused());
+            s.on_key(0x42, 1200);
+            s.feed_input(
+                InputEvent::Commit {
+                    chars: "甲乙丙丁戊".into(),
+                },
+                1300,
+            );
+            assert_eq!(s.elapsed_ms(1300), 200);
+            s.set_paused(true, 1400);
+            assert!(!s.is_paused(), "a completed round stays completed");
+            s.jump(0);
+            assert!(!s.is_paused());
+        }
+    }
+
+    #[test]
+    fn focus_return_waits_for_key_and_multiple_pauses_share_active_time_axis() {
+        let mut s = session();
+        s.on_key(0x41, 100);
+        s.feed_input(
+            InputEvent::Commit {
+                chars: "甲".into()
+            },
+            200,
+        );
+        s.set_paused(true, 300);
+        s.set_paused(true, 800);
+
+        // Delayed host events and waiting after focus return do not resume a round.
+        s.on_key(0x42, 900);
+        s.feed_input(InputEvent::Backspace, 1000);
+        s.feed_input(
+            InputEvent::Commit {
+                chars: "乙丙丁戊".into(),
+            },
+            1100,
+        );
+        s.on_candidate_selection(Some(0x32), 1200);
+        assert!(s.is_paused());
+        assert_eq!(s.phase, Phase::Typing);
+        assert_eq!(s.typed_len(), 1);
+        assert_eq!(s.stats.keys, 1);
+        assert_eq!(s.stats.select_count, 0);
+        assert_eq!(s.elapsed_ms(1500), 200);
+
+        s.set_paused(false, 1600);
+        s.on_key(0x42, 1600);
+        s.feed_input(
+            InputEvent::Commit {
+                chars: "乙".into()
+            },
+            1700,
+        );
+        assert_eq!(s.elapsed_ms(1700), 300);
+        s.set_paused(true, 1800);
+        s.set_paused(false, 2800);
+        s.on_key(0x43, 2800);
+        s.feed_input(
+            InputEvent::Commit {
+                chars: "丙丁戊".into(),
+            },
+            2900,
+        );
+        assert_eq!(s.phase, Phase::Done);
+        assert_eq!(s.elapsed_ms(9000), 500);
+        assert_eq!(s.stats.keys, 3, "each resume key is counted once");
+        assert_eq!(
+            s.stats
+                .per_key
+                .iter()
+                .map(|(_, dt)| *dt)
+                .collect::<Vec<_>>(),
+            vec![200, 200]
+        );
+        assert_eq!(
+            s.comparer
+                .timing_events
+                .iter()
+                .map(|event| event.dt_ms)
+                .collect::<Vec<_>>(),
+            vec![100, 200, 200]
+        );
+        assert_eq!(s.finalize_current_at(9000, 123).unwrap().time_ms, 500);
     }
 
     #[test]

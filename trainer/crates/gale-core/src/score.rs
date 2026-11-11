@@ -130,6 +130,15 @@ fn default_version() -> String {
 }
 
 impl ScoreRecord {
+    /// All score sending paths share this gate, including historical records.
+    /// A legacy zero-error completed round also proves its ending was correct.
+    pub fn can_send_score(&self) -> bool {
+        self.chars > 0
+            && self.round.as_ref().is_some_and(|round| {
+                round.complete && round.last_char_correct.unwrap_or(self.wrong == 0)
+            })
+    }
+
     /// 结算构造（产线路径）：accuracy **直接取晴精确式** accuracy_pro（消除新增调用点
     /// 静默回退简化式的路径——简化对照式在 SegmentStats.accuracy_simple，不进本结构）。
     /// `difficulty` 为载文链难度（Session 侧持有；无则 None）。
@@ -589,6 +598,57 @@ mod tests {
         ScoreRecord::from_stats(&s, "听的能力", "群文", "999", 0, 1_790_555_080, None)
     }
 
+    #[test]
+    fn score_sending_requires_proven_completion_and_correct_ending() {
+        let mut r = sample_record();
+        assert!(
+            !r.can_send_score(),
+            "legacy records with no completion metadata are unproven"
+        );
+        r.round = Some(crate::rules::RoundMetadata {
+            complete: true,
+            last_char_correct: Some(true),
+            ..Default::default()
+        });
+        assert!(r.can_send_score(), "earlier wrong characters are allowed");
+        r.round.as_mut().unwrap().last_char_correct = Some(false);
+        assert!(!r.can_send_score());
+        r.wrong = 0;
+        assert!(
+            !r.can_send_score(),
+            "explicit ending evidence takes precedence"
+        );
+        r.round.as_mut().unwrap().last_char_correct = Some(true);
+        r.round.as_mut().unwrap().complete = false;
+        assert!(!r.can_send_score(), "a correct partial suffix is not completion");
+    }
+
+    #[test]
+    fn legacy_history_only_allows_completed_zero_error_scores() {
+        let mut r = sample_record();
+        r.round = Some(crate::rules::RoundMetadata {
+            complete: true,
+            ..Default::default()
+        });
+        let mut old = serde_json::to_value(&r).unwrap();
+        old["round"]
+            .as_object_mut()
+            .unwrap()
+            .remove("last_char_correct");
+        let mut history: ScoreRecord = serde_json::from_value(old).unwrap();
+        assert!(
+            !history.can_send_score(),
+            "legacy errors do not prove the ending"
+        );
+        history.wrong = 0;
+        assert!(
+            history.can_send_score(),
+            "complete plus zero errors proves the ending"
+        );
+        history.round.as_mut().unwrap().complete = false;
+        assert!(!history.can_send_score(), "Esc records remain ineligible");
+    }
+
     /// P1-1/P1-2/P1-5 + 全串等值：有错字 → 罚后/裸速双数字、无括注、无「字准」、单行无尾换行。
     /// 键准走产线精确式：(208−3−6×2)/(196+3)×196/208 = 91.39%。
     #[test]
@@ -662,6 +722,7 @@ mod tests {
                 cleaned: false,
                 pasted: false,
                 complete,
+                last_char_correct: None,
                 word_hints,
             }
         }

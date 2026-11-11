@@ -553,24 +553,89 @@ fn completed_segment_action(command: CommandKey, done: bool, modal: Modal) -> Op
     }
 }
 
-/// A network response may replace only the untouched session it was requested
-/// for. Paused practice retains Phase::Typing, so it is protected as well.
-fn accept_online_article(
-    fetch_session: Option<(u64, u64)>,
-    request_id: u64,
-    generation: u64,
-    sess: &Session,
-    pending_scores: usize,
-) -> bool {
-    fetch_session == Some((request_id, generation))
-        && sess.phase != Phase::Typing
-        && !sess.composing
-        && sess.preedit.is_empty()
-        && !(sess.phase == Phase::Done
-            && !sess.recorded
-            && sess.comparer.pos > 0
-            && sess.stats.keys > 0)
-        && pending_scores < 32
+/// Esc dismisses panels only; the active round and its clock stay untouched.
+fn escape_action(modal: Modal, ledger_open: bool, analysis_dock: bool) -> Option<Action> {
+    if modal != Modal::None {
+        Some(Action::Close)
+    } else if ledger_open {
+        Some(Action::ToggleLedger)
+    } else if analysis_dock {
+        Some(Action::ToggleAnalysis)
+    } else {
+        None
+    }
+}
+
+/// Physical keys precede their document changes in the host queue. Resume at
+/// that boundary so the first key and its commit are included, while delayed
+/// IME notifications and simply returning to the window keep the clock paused.
+#[derive(Default)]
+struct DispatchedInput {
+    // The host emits one cause per non-ASCII commit, including rejected ones.
+    accepted_commits: Vec<bool>,
+}
+impl DispatchedInput {
+    fn apply_commit_causes(
+        self,
+        sess: &mut Session,
+        causes: Vec<gale_win::input_host::CommitCause>,
+    ) {
+        for (accepted, cause) in self.accepted_commits.into_iter().zip(causes) {
+            if accepted {
+                sess.on_commit_cause(cause);
+            }
+        }
+    }
+}
+
+fn dispatch_host_events(
+    sess: &mut Session,
+    events: Vec<HostEvent>,
+    can_resume: bool,
+    now: u64,
+) -> DispatchedInput {
+    let mut dispatched = DispatchedInput::default();
+    let batch_has_commit = events.iter().any(|e| matches!(e, HostEvent::Commit(_)));
+    let mut pause_after_flush = false;
+    for ev in events {
+        match ev {
+            HostEvent::Key { vk } => {
+                if can_resume && gale_core::stats::StatsEngine::is_stat_key(vk) {
+                    sess.set_paused(false, now);
+                    pause_after_flush = false;
+                }
+                sess.on_key(vk, now);
+            }
+            HostEvent::ResumeKey { .. } => {
+                if can_resume {
+                    sess.set_paused(false, now);
+                    pause_after_flush = false;
+                }
+            }
+            // The final document diff is appended after physical events. Keep
+            // this last commit, then pause even if focus returned in this batch.
+            HostEvent::FocusLost => pause_after_flush = true,
+            HostEvent::CandidateSelection { vk, .. } => sess.on_candidate_selection(vk, now),
+            HostEvent::Commit(chars) => {
+                let has_cause = !chars.is_ascii();
+                let previous_pos = sess.comparer.pos;
+                sess.feed_input(gale_core::compare::InputEvent::Commit { chars }, now);
+                if has_cause {
+                    dispatched
+                        .accepted_commits
+                        .push(sess.comparer.pos > previous_pos);
+                }
+            }
+            HostEvent::Backspace => sess.feed_input(gale_core::compare::InputEvent::Backspace, now),
+            HostEvent::Composing(c) => sess.set_composing_from_host(c, batch_has_commit),
+            HostEvent::Preedit(p) => sess.set_preedit(p),
+            HostEvent::Cancelled => sess.cancel_composition(),
+        }
+    }
+    if pause_after_flush {
+        sess.set_paused(true, now);
+    }
+    dispatched
 }
 
 /// P0 单实例守卫（任务 3）：命名互斥体 `HuFu-Trainer-SingleInstance` 为主判据。
@@ -764,6 +829,7 @@ struct App {
     layout_key: (u64, u32, u32),
     layout: Vec<(usize, String, Vec<f32>)>,
     edits: BTreeMap<String, NativeEdit>,
+    font_picker: Option<gale_win::font_picker::NativeFontPicker>,
     edit_epoch: u64,
     hits: Vec<modals::Hit>,
     /// 最近一次鼠标位置（逻辑坐标），用于悬停高亮。
@@ -776,8 +842,6 @@ struct App {
     article: Option<WenlaiArticle>,
     /// Last accepted online source; random mode must survive advancing a round.
     article_fetch: Option<FetchParams>,
-    /// In-flight fetch id and the practice generation it may replace.
-    fetch_session: Option<(u64, u64)>,
     shelf: Vec<gale_core::wenlai::ShelfBook>,
     chats: Vec<qq_bridge::ChatWindow>,
     tx: mpsc::Sender<Bg>,
@@ -879,6 +943,10 @@ fn run() -> Result<(), String> {
     let loaded = profile::load(&dir)?;
     let mut startup_warning = loaded.warning;
     let mut cfg = loaded.config;
+    // Old profiles may still contain the retired mode setting. Active rounds
+    // now share ordinary typing rules; saved scores keep their original rules.
+    cfg.session_rules.mode = TrainingMode::Practice;
+    cfg.session_rules.pause_on_blur = true;
     let sync_online_user = loaded.user;
     let sync_online_password = loaded.password;
     if let Some(account) = &loaded.account {
@@ -920,6 +988,9 @@ fn run() -> Result<(), String> {
         .unwrap_or_else(|_| Session::new(cfg.seg_chars));
     if sess.frozen_rules.is_none() {
         let _ = sess.set_rules(cfg.session_rules.clone());
+    } else {
+        sess.rules.mode = TrainingMode::Practice;
+        sess.rules.pause_on_blur = true;
     }
     let history = ScoreStore::open(&dir.join("统计"))
         .map(|store| store.load_all())
@@ -929,7 +1000,6 @@ fn run() -> Result<(), String> {
     model.history = history;
     model.rule_save_preset = true;
     model.hints = sess.rules.word_hints;
-    model.race = sess.rules.mode == TrainingMode::Race;
     model.quote_relaxed = sess.rules.quotes.enabled;
     model.reduced_motion = gale_win::edit::reduced_motion() || cfg.motion_level == 0;
     model.status = "Ctrl+V 载文 · F3 重打 · F4 群载文 · F5 选群".into();
@@ -975,6 +1045,7 @@ fn run() -> Result<(), String> {
         layout_key: (0, 0, 0),
         layout: Vec::new(),
         edits: BTreeMap::new(),
+        font_picker: None,
         edit_epoch: u64::MAX,
         hits: Vec::new(),
         hover: None,
@@ -984,7 +1055,6 @@ fn run() -> Result<(), String> {
         online,
         article: None,
         article_fetch: None,
-        fetch_session: None,
         shelf: Vec::new(),
         chats: Vec::new(),
         tx,
@@ -1086,6 +1156,7 @@ fn run() -> Result<(), String> {
             break;
         }
         let now = app.ms();
+        app.sess.update_clock(now);
         let seconds = app.clock.elapsed().as_secs_f64();
         // 注册卡"发送验证码"60s 冷却：每秒折算剩余秒刷新按钮禁用态显示。
         let code_wait = app
@@ -1128,40 +1199,17 @@ fn run() -> Result<(), String> {
         if !events.is_empty() {
             app.snapshot_dirty = true;
         }
-        if accept_host {
+        let dispatched = if accept_host {
             // P1-6：Composing(false) 与 Commit 同批 = 提交清空（不置 protect）；
             // 只有 Composing(false) = 退格删空/Esc 取消（置 protect）。
-            let batch_has_commit = events.iter().any(|e| matches!(e, HostEvent::Commit(_)));
-            for ev in events {
-                match ev {
-                    HostEvent::Key { vk } => app.sess.on_key(vk, now),
-                    HostEvent::CandidateSelection { vk, .. } => {
-                        app.sess.on_candidate_selection(vk, now)
-                    }
-                    HostEvent::Commit(s) => app
-                        .sess
-                        .feed_input(gale_core::compare::InputEvent::Commit { chars: s }, now),
-                    HostEvent::Backspace => app
-                        .sess
-                        .feed_input(gale_core::compare::InputEvent::Backspace, now),
-                    HostEvent::Composing(c) => {
-                        app.sess.set_composing_from_host(c, batch_has_commit)
-                    }
-                    HostEvent::Preedit(p) => app.sess.set_preedit(p),
-                    HostEvent::Cancelled => app.sess.cancel_composition(),
-                }
-            }
-        }
+            dispatch_host_events(&mut app.sess, events, focused, now)
+        } else {
+            DispatchedInput::default()
+        };
         // P1-3 选重/标顶（任务 2）：每帧 poll 之后立即 drain 20ms 配对结果
         //（input_host 顺序契约：必须在 poll 之后），Ding→标顶/Select→选重/
         // Unknown 忽略；模态打开时只清队列不记账。
-        if accept_host {
-            for cause in gale_win::input_host::drain_commit_causes() {
-                app.sess.on_commit_cause(cause);
-            }
-        } else {
-            let _ = gale_win::input_host::drain_commit_causes();
-        }
+        dispatched.apply_commit_causes(&mut app.sess, gale_win::input_host::drain_commit_causes());
         // 整改12：每帧取走击键时间戳队列（poll 之后、选重 20ms 配对已消费本帧
         // 击键），按热力图口径计入本段 VK 直方图；模态打开时只清队列不记账。
         for (vk, _) in gale_win::input_host::drain_key_times(1024) {
@@ -1177,8 +1225,10 @@ fn run() -> Result<(), String> {
             app.sess.on_backspace_up();
         }
         bs_down_prev = bs_down;
-        let paused = (!focused || app.model.modal != Modal::None) && !app.model.race;
-        app.sess.set_paused(paused, now);
+        if !focused || app.model.modal != Modal::None {
+            app.sess.set_paused(true, now);
+        }
+        let paused = app.sess.is_paused();
         if paused != app.model.paused {
             app.model.paused = paused;
             gale_win::window::request_frame();
@@ -1195,18 +1245,11 @@ fn run() -> Result<(), String> {
         app.refresh_dynamic_hints(now);
         for cmd in gale_win::input_host::drain_cmds() {
             let a = match cmd {
-                CommandKey::Escape => {
-                    if app.model.modal != Modal::None {
-                        Some(Action::Close)
-                    } else if app.model.ledger_open {
-                        Some(Action::ToggleLedger)
-                    } else if app.model.analysis_dock {
-                        Some(Action::ToggleAnalysis)
-                    } else {
-                        app.sess.stop_at(now);
-                        None
-                    }
-                }
+                CommandKey::Escape => escape_action(
+                    app.model.modal,
+                    app.model.ledger_open,
+                    app.model.analysis_dock,
+                ),
                 CommandKey::F1 => Some(Action::Open(Modal::Preferences)),
                 CommandKey::F7 => Some(Action::OpenAppearanceSettings),
                 CommandKey::F10 => Some(Action::ToggleAnalysis),
@@ -1254,17 +1297,16 @@ fn run() -> Result<(), String> {
                 }
                 // 【群三件套 2026-11-09】单段结算弹窗退役；绑定群且开自动发
                 // 成绩时，打完一段把晴兼容成绩单直接发到群。
-                if app.cfg.auto_send_score && app.model.bound.is_some() {
-                    app.act(Action::SendScoreToGroup, false);
+                if app.cfg.auto_send_score && app.model.bound.is_some() && record.can_send_score() {
+                    // Send the round just settled, even while a history row is selected.
+                    app.send_score_to_group(&record);
                 }
                 app.snapshot();
                 // 整改2b：在线练习（正文来自文来）结算后 1.5s 自动取下一段；
-                // 赛制（竞赛段）结算不自动跳，等发文确认。
                 if app.online_auto_next
                     && app.online_logged_in
                     && app.online_article_current
                     && app.article.is_some()
-                    && app.sess.rules.mode != TrainingMode::Race
                 {
                     app.auto_next_at = Some(now + 1500);
                 }
@@ -1281,7 +1323,6 @@ fn run() -> Result<(), String> {
                     && app.article.is_some()
                     && matches!(app.model.modal, Modal::None)
                     && app.sess.phase == Phase::Done
-                    && app.sess.rules.mode != TrainingMode::Race
                 {
                     app.act(Action::OnlineFetch(1), false);
                 }
@@ -1615,7 +1656,7 @@ impl App {
         true
     }
     /// 整改2a：在线文章直达跟打区（预览流程退役的唯一载入口）。
-    /// Network responses are checked against their session before reaching here.
+    /// The online worker filters superseded requests before reaching here.
     fn load_online_article(&mut self) {
         let Some(a) = self.article.clone() else {
             self.toast("请先取文");
@@ -2310,12 +2351,20 @@ impl App {
         });
     }
     fn capture_fields(&mut self) -> bool {
+        let font_changed =
+            if let Some(family) = self.font_picker.as_mut().and_then(|p| p.take_selection()) {
+                self.cfg.font_family = family;
+                self.save_config();
+                true
+            } else {
+                false
+            };
         // Old controls must not overwrite a newly loaded draft before draw()
         // rebuilds the controls for the updated model.
         if self.edit_epoch != self.model.modal_epoch {
-            return false;
+            return font_changed;
         }
-        let mut changed = false;
+        let mut changed = font_changed;
         for (k, e) in &self.edits {
             let text = e.text();
             if self.model.field(k) != text {
@@ -2352,23 +2401,12 @@ impl App {
             self.host.hide_caret();
         }
         let now = self.ms();
-        for ev in self.host.poll() {
-            match ev {
-                HostEvent::Commit(chars) => self
-                    .sess
-                    .feed_input(gale_core::compare::InputEvent::Commit { chars }, now),
-                HostEvent::Backspace => self
-                    .sess
-                    .feed_input(gale_core::compare::InputEvent::Backspace, now),
-                HostEvent::Composing(c) => self.sess.set_composing(c),
-                HostEvent::Preedit(p) => self.sess.set_preedit(p),
-                HostEvent::Cancelled => self.sess.cancel_composition(),
-                HostEvent::Key { vk } => self.sess.on_key(vk, now),
-                HostEvent::CandidateSelection { vk, .. } => {
-                    self.sess.on_candidate_selection(vk, now)
-                }
-            }
+        let dispatched = dispatch_host_events(&mut self.sess, self.host.poll(), false, now);
+        dispatched.apply_commit_causes(&mut self.sess, gale_win::input_host::drain_commit_causes());
+        if m != Modal::None {
+            self.sess.set_paused(true, now);
         }
+        self.model.paused = self.sess.is_paused();
         gale_win::window::request_frame();
     }
     fn sync_rule_model(&mut self) {
@@ -2427,8 +2465,8 @@ impl App {
             .panel_scroll
             .clamp(0., (ph - (lh - 48.).min(ph)).max(0.));
         let (bw, fs, base_lh) = ui::body_metrics(&self.sess, &self.cfg, lw);
-        let hints_visible = gale_core::rules::hints_effective(self.model.hints, self.model.race)
-            && (self.cfg.hint_show_code || self.cfg.hint_show_rank);
+        let hints_visible =
+            self.model.hints && (self.cfg.hint_show_code || self.cfg.hint_show_rank);
         let lheight = ui::line_height_for_anchor(&self.cfg, fs, base_lh, hints_visible);
         let key = (self.generation, fs.to_bits(), bw.to_bits());
         if self.layout_key != key {
@@ -2437,7 +2475,7 @@ impl App {
                 .wrap_text(&self.sess.current_segment().text, fs, bw);
             self.layout_key = key;
         }
-        if gale_core::rules::hints_effective(self.model.hints, self.model.race) {
+        if self.model.hints {
             let boundaries: Vec<_> = self
                 .model
                 .words
@@ -2547,6 +2585,18 @@ impl App {
                     Err(e) => self.toast(format!("编辑框不可用：{e}")),
                 }
             }
+            if self.font_picker.is_none()
+                && self.model.modal == Modal::Preferences
+                && self.model.field("pref_tab") == "2"
+            {
+                match gale_win::font_picker::NativeFontPicker::new(
+                    self.win.hwnd,
+                    &self.cfg.font_family,
+                ) {
+                    Ok(picker) => self.font_picker = Some(picker),
+                    Err(error) => self.toast(error),
+                }
+            }
             self.edit_epoch = self.model.modal_epoch;
             if let Some(z) = specs.first() {
                 if let Some(e) = self.edits.get(z.id) {
@@ -2569,6 +2619,22 @@ impl App {
                     e.place(z.x, top, z.w, bottom - top);
                 }
             }
+        }
+        let picker_rect = modals::font_picker(&self.model, lw, lh);
+        let picker_error = if let Some(picker) = &mut self.font_picker {
+            if let Some(z) = picker_rect {
+                let error = picker.set_current(&self.cfg.font_family).err();
+                picker.place(z.x, z.y, z.w, z.h);
+                error
+            } else {
+                picker.hide();
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(error) = picker_error {
+            self.toast(error);
         }
     }
     fn poll_trainer_status(&mut self, now: u64) {
@@ -2675,7 +2741,7 @@ impl App {
             self.full_words_breaks.clear();
         }
         self.last_analyze_whole = whole_book;
-        let hints = gale_core::rules::hints_effective(self.sess.rules.word_hints, self.model.race);
+        let hints = self.sess.rules.word_hints;
         if !hints || status["hint_unavailable_reason"].is_string() {
             self.analyzing = false;
             self.analyzed = generation;
@@ -3146,10 +3212,8 @@ impl App {
                     // A manual fetch (including shelf selection) takes over the
                     // pending automatic advance instead of queuing a second one.
                     self.auto_next_at = None;
-                    self.fetch_session = Some((id, self.generation));
                 }
                 if identity_change {
-                    self.fetch_session = None;
                     self.pending_login_password = identity_password.map(|p| (id, p));
                     self.online_logged_in = false;
                     self.model.online_authenticated = false;
@@ -3235,22 +3299,6 @@ impl App {
                     self.model.online_status = "登录已过期，请重新登录；当前预览保留".into();
                 }
                 Ok(OnlinePayload::Article(a, params)) => {
-                    let expected_session = self.fetch_session;
-                    if expected_session.is_some_and(|(id, _)| id == r.id) {
-                        self.fetch_session = None;
-                    }
-                    if !accept_online_article(
-                        expected_session,
-                        r.id,
-                        self.generation,
-                        &self.sess,
-                        self.pending_scores.len(),
-                    ) {
-                        let message = "当前练习已变化，已忽略取文结果，请重新取文";
-                        self.model.online_status = message.into();
-                        self.toast(message);
-                        continue;
-                    }
                     // Validate before committing either the article or its
                     // continuation source; rejection must preserve both.
                     if a.text.chars().count() > 100000 {
@@ -3356,9 +3404,6 @@ impl App {
                     self.toast("验证码已发送，请查收邮箱");
                 }
                 Err(e) => {
-                    if self.fetch_session.is_some_and(|(id, _)| id == r.id) {
-                        self.fetch_session = None;
-                    }
                     if self
                         .pending_login_password
                         .as_ref()
@@ -3407,14 +3452,14 @@ impl App {
         ));
         self.snapshot();
     }
-    fn score_text(&self) -> Option<String> {
+    fn score_record(&self) -> Option<&gale_core::score::ScoreRecord> {
         if self.model.ledger_open {
             if let Some(record) = self
                 .model
                 .selected_history
                 .and_then(|index| self.model.history.get(index))
             {
-                return Some(self.format_record(record));
+                return Some(record);
             }
         }
         if self.sess.phase != Phase::Done || !self.sess.recorded {
@@ -3424,12 +3469,36 @@ impl App {
             .results
             .get(self.sess.current_index())
             .and_then(Option::as_ref)
+    }
+    fn score_text(&self) -> Option<String> {
+        self.score_record().map(|record| self.format_record(record))
+    }
+    fn sendable_score_text(&self) -> Option<String> {
+        self.score_record()
+            .filter(|record| record.can_send_score())
             .map(|record| self.format_record(record))
+    }
+    fn send_score_to_group(&mut self, record: &gale_core::score::ScoreRecord) {
+        if !record.can_send_score() {
+            self.toast("成绩只有打完且最后一字正确才能发送");
+            return;
+        }
+        match self.model.bound.and_then(|i| self.chats.get(i).cloned()) {
+            Some(chat) => {
+                let text = self.format_record(record);
+                let label = format!("成绩已发送到「{}」", chat.title);
+                self.spawn_send(chat, text, label);
+            }
+            None => {
+                self.toast("未绑定群，请先选择");
+                self.open(Modal::Groups);
+            }
+        }
     }
     fn race_text(&self) -> String {
         let a = self.sess.aggregate();
         // 段数取 a.segments（<5 硬门口径，与整场聚合一致——原 results 计数
-        // 会把 Esc 弃打的短段也算进去，与下面的字数/速度口径打架）。
+        // 会把中断的短段也算进去，与下面的字数/速度口径打架）。
         let mut s = format!(
             "《{}》 整场赛报\n{}段 / {}字 / {:0.2}秒 / 总速度{:0.2}\n",
             self.sess.title,
@@ -3494,29 +3563,6 @@ impl App {
         ) {
             self.rule_generation += 1;
             self.model.rule_preview.clear();
-        }
-        if self.pending_scores.len() >= 32
-            && matches!(
-                a,
-                Action::Previous
-                    | Action::Restart
-                    | Action::Next
-                    | Action::ToggleRace
-                    | Action::LoadClipboard
-                    | Action::OnlineLoadOnly
-                    | Action::OnlineLoad
-                    | Action::ReadGroup
-            )
-        {
-            self.toast("成绩正在保存，请稍候再开始下一段");
-            return;
-        }
-        // 整改5：F1-F4 跳段/取文不再弹"是否中断打文"确认——直接执行。
-        // 打字中读群文时，先把未完成段按中断处理（jump 复位本段），
-        // 与原确认后路径的语义一致；Esc 停表语义不变（主循环 Escape 分支）。
-        if self.sess.phase == Phase::Typing && a == Action::ReadGroup {
-            self.sess.jump(self.sess.index);
-            self.reset_host();
         }
         match a {
             Action::None => {}
@@ -3733,28 +3779,6 @@ impl App {
                     self.open(Modal::None);
                 }
             }
-            Action::ToggleRace => {
-                if self.sess.frozen_rules.is_some() {
-                    self.sess.jump(self.sess.index);
-                }
-                let mut r = self.sess.rules.clone();
-                r.mode = if r.mode == TrainingMode::Race {
-                    TrainingMode::Practice
-                } else {
-                    TrainingMode::Race
-                };
-                match self.sess.set_rules(r) {
-                    Ok(()) => {
-                        self.model.race = self.sess.rules.mode == TrainingMode::Race;
-                        self.model.hints = self.sess.rules.word_hints;
-                        self.model.quote_relaxed = self.sess.rules.quotes.enabled;
-                        self.reset_host();
-                        self.open(Modal::None);
-                        self.save_config();
-                    }
-                    Err(e) => self.toast(e),
-                }
-            }
             Action::ToggleHints => {
                 let mut r = self.sess.rules.clone();
                 r.word_hints = !r.word_hints;
@@ -3804,17 +3828,6 @@ impl App {
                 // 外观页字号 +/- 与 Ctrl+滚轮统一口径（10..=100）。
                 self.cfg.font_size = (self.cfg.font_size + d as f32).clamp(10., 100.);
                 self.save_config();
-            }
-            Action::FontChoose => {
-                let current = gale_win::d2d::resolved_cjk_family(&self.cfg.font_family);
-                match gale_win::font_picker::choose_font(self.win.hwnd, &current) {
-                    Ok(Some(family)) => {
-                        self.cfg.font_family = family;
-                        self.save_config();
-                    }
-                    Ok(None) => {}
-                    Err(error) => self.toast(error),
-                }
             }
             Action::FontDefault => {
                 self.cfg.font_family.clear();
@@ -3867,10 +3880,10 @@ impl App {
                 }
             }
             Action::SendScore => {
-                if let Some(s) = self.score_text() {
+                if let Some(s) = self.sendable_score_text() {
                     self.copy(&s);
                 } else {
-                    self.toast("当前没有可发送的成绩");
+                    self.toast("成绩只有打完且最后一字正确才能发送");
                 }
             }
             Action::ToggleAutoSend => {
@@ -3883,18 +3896,10 @@ impl App {
                 });
             }
             Action::SendScoreToGroup => {
-                match self.model.bound.and_then(|i| self.chats.get(i).cloned()) {
-                    Some(chat) => match self.score_text() {
-                        Some(s) => {
-                            let label = format!("成绩已发送到「{}」", chat.title);
-                            self.spawn_send(chat, s, label);
-                        }
-                        None => self.toast("当前没有可发送的成绩"),
-                    },
-                    None => {
-                        self.toast("未绑定群，请先选择");
-                        self.open(Modal::Groups);
-                    }
+                if let Some(record) = self.score_record().cloned() {
+                    self.send_score_to_group(&record);
+                } else {
+                    self.toast("成绩只有打完且最后一字正确才能发送");
                 }
             }
             Action::PostArticle => {
@@ -4784,48 +4789,6 @@ mod persistence_tests {
         assert_eq!(key(&split_a), key(&[1]));
     }
     #[test]
-    fn online_article_requires_the_current_request_and_practice_generation() {
-        let sess = Session::new(100);
-        assert!(accept_online_article(Some((7, 3)), 7, 3, &sess, 0));
-        assert!(!accept_online_article(None, 7, 3, &sess, 0));
-        // A newer fetch supersedes the old response even in the same session.
-        assert!(!accept_online_article(Some((8, 3)), 7, 3, &sess, 0));
-        // Restarting/loading local text increments generation before return.
-        assert!(!accept_online_article(Some((7, 3)), 7, 4, &sess, 0));
-        assert!(!accept_online_article(Some((7, 3)), 7, 3, &sess, 32));
-    }
-
-    #[test]
-    fn online_article_preserves_typing_paused_composition_and_unrecorded_results() {
-        let mut sess = Session::new(100);
-        sess.load_book("当前练习", "甲乙");
-        sess.composing = true;
-        assert!(!accept_online_article(Some((7, 3)), 7, 3, &sess, 0));
-        sess.composing = false;
-        sess.preedit = "a".into();
-        assert!(!accept_online_article(Some((7, 3)), 7, 3, &sess, 0));
-        sess.preedit.clear();
-        sess.on_key(65, 10);
-        assert_eq!(sess.phase, Phase::Typing);
-        assert!(!accept_online_article(Some((7, 3)), 7, 3, &sess, 0));
-        sess.set_paused(true, 20);
-        assert_eq!(sess.phase, Phase::Typing);
-        assert!(!accept_online_article(Some((7, 3)), 7, 3, &sess, 0));
-        sess.set_paused(false, 30);
-        sess.feed_input(
-            gale_core::compare::InputEvent::Commit {
-                chars: "甲乙".into(),
-            },
-            40,
-        );
-        assert_eq!(sess.phase, Phase::Done);
-        assert!(!sess.recorded);
-        assert!(!accept_online_article(Some((7, 3)), 7, 3, &sess, 0));
-        assert!(sess.finalize_current_at(50, 1000).is_some());
-        assert!(accept_online_article(Some((7, 3)), 7, 3, &sess, 1));
-    }
-
-    #[test]
     fn completed_round_continues_only_from_typing_view() {
         let panels = [
             Modal::None,
@@ -4846,6 +4809,278 @@ mod persistence_tests {
             }
         }
     }
+
+    #[test]
+    fn escape_only_dismisses_panels_and_leaves_the_round_running() {
+        assert_eq!(
+            escape_action(Modal::Preferences, true, true),
+            Some(Action::Close)
+        );
+        assert_eq!(
+            escape_action(Modal::None, true, true),
+            Some(Action::ToggleLedger)
+        );
+        assert_eq!(
+            escape_action(Modal::None, false, true),
+            Some(Action::ToggleAnalysis)
+        );
+        let mut sess = Session::new(100);
+        sess.load_book("Esc", "甲乙");
+        dispatch_host_events(
+            &mut sess,
+            vec![HostEvent::Key { vk: 0x41 }, HostEvent::Commit("甲".into())],
+            true,
+            100,
+        );
+        assert_eq!(escape_action(Modal::None, false, false), None);
+        assert_eq!(sess.phase, Phase::Typing);
+        assert_eq!(sess.elapsed_ms(600), 500);
+        assert!(!sess.is_paused());
+        assert!(!sess.recorded);
+        assert!(sess.finished_ms.is_none());
+        dispatch_host_events(
+            &mut sess,
+            vec![HostEvent::Key { vk: 0x42 }, HostEvent::Commit("乙".into())],
+            true,
+            1100,
+        );
+        assert_eq!(sess.phase, Phase::Done);
+        assert_eq!(sess.elapsed_ms(1100), 1000);
+    }
+
+    #[test]
+    fn refocus_waits_for_a_physical_typing_key_before_processing_its_commit() {
+        let mut sess = Session::new(100);
+        sess.load_book("焦点", "甲乙丙");
+        dispatch_host_events(
+            &mut sess,
+            vec![HostEvent::Key { vk: 0x41 }, HostEvent::Commit("甲".into())],
+            true,
+            100,
+        );
+        sess.set_paused(true, 200);
+        dispatch_host_events(&mut sess, vec![], true, 1000);
+        dispatch_host_events(
+            &mut sess,
+            vec![HostEvent::Commit("错".into()), HostEvent::Backspace],
+            true,
+            1100,
+        );
+        dispatch_host_events(
+            &mut sess,
+            vec![
+                HostEvent::Key { vk: 0x10 },
+                HostEvent::Preedit("b".into()),
+                HostEvent::Composing(true),
+            ],
+            true,
+            1200,
+        );
+        assert_eq!(escape_action(Modal::None, false, false), None);
+        assert!(sess.is_paused());
+        assert_eq!(sess.elapsed_ms(1900), 100);
+        assert_eq!(sess.typed_len(), 1);
+        assert_eq!(sess.stats.keys, 1);
+        dispatch_host_events(
+            &mut sess,
+            vec![
+                HostEvent::Composing(false),
+                HostEvent::Key { vk: 0x42 },
+                HostEvent::Commit("乙".into()),
+            ],
+            true,
+            2000,
+        );
+        assert!(!sess.is_paused());
+        assert_eq!(sess.elapsed_ms(2000), 100);
+        assert_eq!(sess.typed_len(), 2);
+        assert_eq!(sess.stats.keys, 2);
+        dispatch_host_events(
+            &mut sess,
+            vec![HostEvent::Key { vk: 0x43 }, HostEvent::Commit("丙".into())],
+            true,
+            2100,
+        );
+        assert_eq!(sess.phase, Phase::Done);
+        assert_eq!(sess.elapsed_ms(9000), 200);
+        assert_eq!(sess.stats.keys, 3);
+    }
+
+    #[test]
+    fn background_and_modal_keys_cannot_resume_the_clock() {
+        let mut sess = Session::new(100);
+        sess.load_book("焦点", "甲乙");
+        dispatch_host_events(
+            &mut sess,
+            vec![HostEvent::Key { vk: 0x41 }, HostEvent::Commit("甲".into())],
+            true,
+            100,
+        );
+        sess.set_paused(true, 200);
+        dispatch_host_events(
+            &mut sess,
+            vec![HostEvent::Key { vk: 0x42 }, HostEvent::Commit("乙".into())],
+            false,
+            1200,
+        );
+        assert!(sess.is_paused());
+        assert_eq!(sess.phase, Phase::Typing);
+        assert_eq!(sess.typed_len(), 1);
+        assert_eq!(sess.stats.keys, 1);
+        assert_eq!(sess.elapsed_ms(1900), 100);
+    }
+
+    #[test]
+    fn focus_loss_flushes_the_last_commit_before_latching_the_pause() {
+        let mut sess = Session::new(100);
+        sess.load_book("焦点", "甲乙丙");
+        dispatch_host_events(&mut sess, vec![HostEvent::Key { vk: 0x41 }], true, 100);
+        dispatch_host_events(
+            &mut sess,
+            vec![HostEvent::FocusLost, HostEvent::Commit("甲".into())],
+            false,
+            200,
+        );
+        assert_eq!(sess.typed_len(), 1, "the IME blur flush is kept once");
+        assert!(sess.is_paused());
+        dispatch_host_events(&mut sess, vec![HostEvent::Commit("错".into())], true, 1000);
+        assert_eq!(sess.typed_len(), 1, "a later notification cannot resume");
+        dispatch_host_events(
+            &mut sess,
+            vec![
+                HostEvent::Key { vk: 0x42 },
+                HostEvent::FocusLost,
+                HostEvent::Commit("乙".into()),
+            ],
+            true,
+            1100,
+        );
+        assert!(
+            sess.is_paused(),
+            "a quick refocus does not undo deactivation"
+        );
+        assert_eq!(sess.typed_len(), 2);
+        dispatch_host_events(
+            &mut sess,
+            vec![
+                HostEvent::FocusLost,
+                HostEvent::Key { vk: 0x43 },
+                HostEvent::Commit("丙".into()),
+            ],
+            true,
+            2100,
+        );
+        assert!(!sess.is_paused(), "only a key after deactivation resumes");
+        assert_eq!(sess.phase, Phase::Done);
+        assert_eq!(sess.elapsed_ms(9000), 100);
+        assert_eq!(sess.stats.keys, 3);
+    }
+
+    #[test]
+    fn paused_commit_causes_are_discarded_but_blur_flush_causes_are_kept() {
+        use gale_win::input_host::CommitCause;
+        let mut sess = Session::new(100);
+        sess.load_book("归因", "甲乙丙");
+        dispatch_host_events(&mut sess, vec![HostEvent::Key { vk: 0x41 }], true, 100);
+        let flushed = dispatch_host_events(
+            &mut sess,
+            vec![HostEvent::FocusLost, HostEvent::Commit("甲".into())],
+            false,
+            200,
+        );
+        flushed.apply_commit_causes(&mut sess, vec![CommitCause::Select]);
+        assert!(sess.is_paused());
+        assert_eq!(
+            sess.stats.select_count, 1,
+            "the accepted blur flush keeps its cause"
+        );
+        let delayed =
+            dispatch_host_events(&mut sess, vec![HostEvent::Commit("错".into())], true, 1200);
+        delayed.apply_commit_causes(&mut sess, vec![CommitCause::Select]);
+        assert_eq!(sess.typed_len(), 1);
+        assert_eq!(
+            sess.stats.select_count, 1,
+            "a rejected commit cannot change statistics"
+        );
+        let resumed = dispatch_host_events(
+            &mut sess,
+            vec![HostEvent::Key { vk: 0x42 }, HostEvent::Commit("乙".into())],
+            true,
+            2200,
+        );
+        resumed.apply_commit_causes(&mut sess, vec![CommitCause::Select]);
+        assert_eq!(sess.stats.select_count, 2);
+    }
+
+    #[test]
+    fn undo_redo_and_special_selection_keys_resume_without_inventing_stat_keys() {
+        let mut sess = Session::new(100);
+        sess.load_book("编辑", "甲乙");
+        dispatch_host_events(
+            &mut sess,
+            vec![HostEvent::Key { vk: 0x41 }, HostEvent::Commit("甲".into())],
+            true,
+            100,
+        );
+        sess.set_paused(true, 200);
+        dispatch_host_events(
+            &mut sess,
+            vec![HostEvent::ResumeKey { vk: 0x5a }, HostEvent::Backspace],
+            true,
+            1200,
+        );
+        assert!(!sess.is_paused());
+        assert_eq!(sess.typed_len(), 0);
+        assert_eq!(
+            sess.stats.keys, 1,
+            "Ctrl+Z is still excluded from typing keys"
+        );
+        assert_eq!(sess.elapsed_ms(1300), 200);
+        sess.set_paused(true, 1300);
+        dispatch_host_events(
+            &mut sess,
+            vec![
+                HostEvent::ResumeKey { vk: 0x59 },
+                HostEvent::Commit("甲".into()),
+            ],
+            true,
+            2300,
+        );
+        assert_eq!(sess.typed_len(), 1);
+        assert_eq!(sess.stats.keys, 1);
+        sess.set_paused(true, 2400);
+        dispatch_host_events(
+            &mut sess,
+            vec![HostEvent::CandidateSelection { rank: 3, vk: None }],
+            true,
+            3000,
+        );
+        assert!(
+            sess.is_paused(),
+            "a candidate notification is not a fresh key"
+        );
+        dispatch_host_events(
+            &mut sess,
+            vec![
+                HostEvent::ResumeKey { vk: 0x14 },
+                HostEvent::CandidateSelection {
+                    rank: 3,
+                    vk: Some(0x14),
+                },
+                HostEvent::Commit("乙".into()),
+            ],
+            true,
+            3400,
+        );
+        assert_eq!(sess.phase, Phase::Done);
+        assert_eq!(
+            sess.stats.keys, 2,
+            "the proven selection key is counted once"
+        );
+        assert_eq!(sess.stats.select_count, 1);
+        assert_eq!(sess.elapsed_ms(9000), 300);
+    }
+
     fn fixture() -> gale_core::score::ScoreRecord {
         let mut s = Session::new(100);
         s.load_book("test", "甲");
