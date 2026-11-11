@@ -251,6 +251,27 @@ fn unix_secs() -> u64 {
         .unwrap_or_default()
         .as_secs()
 }
+/// 【词提诊断 2026-11-12】排查期打点：append 到 数据/trainer-debug.log。
+/// 只用标准文件 API（零解释器铁律），低频事件直写。
+/// 发布版置 ENABLED=false（零 IO 零开销）；排障时改回 true 即复用。
+fn dbg_hint(line: String) {
+    const ENABLED: bool = false;
+    if !ENABLED {
+        return;
+    }
+    use std::io::Write;
+    let ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let path = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("数据").join("trainer-debug.log")))
+        .unwrap_or_else(|| PathBuf::from("trainer-debug.log"));
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(f, "[{ms}] {line}");
+    }
+}
 /// Every analysis request uses the same scalar offsets for round boundaries.
 /// Empty segments do not add duplicate or out-of-range breaks.
 fn segment_analysis_breaks(segments: &[gale_core::segment::Segment]) -> Vec<usize> {
@@ -419,6 +440,11 @@ impl RetryBackoff {
         let delay = (400u64 << self.failures.min(4)).min(4000);
         self.retry_at = now.saturating_add(delay);
     }
+    /// 【换段提速 2026-11-12】排队型被拒（"正在分析另一篇文章"）不是
+    /// 故障：旧文分析几百毫秒内完成，固定 150ms 快重试，不吃指数退避。
+    fn soft_fail(&mut self, now: u64) {
+        self.retry_at = now.saturating_add(150);
+    }
     fn reset(&mut self) {
         *self = Self::default();
     }
@@ -530,9 +556,19 @@ impl LiveSchemaStatus {
 
 /// Only derived views change when a dictionary revision changes. In particular,
 /// the active round, its input host and its frozen scoring rules stay intact.
-fn clear_live_hint_views(model: &mut Model, sess: &mut Session) {
-    model.words.clear();
-    sess.full_analysis = None;
+/// 【词提防闪烁 2026-11-12】词库 revision 微变（打字调频让 schema_ver 持续变化）
+/// 时保留旧词提显示（stale-while-revalidate）：analyze 重拉到达后原子替换。
+/// 仅当词库不可用（preserve=false）才硬清空，避免显示与词库脱节的死数据。
+fn retire_hint_views(model: &mut Model, sess: &mut Session, preserve: bool) {
+    dbg_hint(format!(
+        "retire preserve={preserve} words={} full_analysis={}",
+        model.words.len(),
+        sess.full_analysis.is_some()
+    ));
+    if !preserve {
+        model.words.clear();
+        sess.full_analysis = None;
+    }
     model.fields.remove("analysis_error");
     model.fields.remove("analysis_failed_key");
 }
@@ -1651,12 +1687,20 @@ impl App {
         self.host.reset_text();
         self.anim.caret = None;
         self.model.words.clear();
+        // 【换段提速 2026-11-12】旧段请求即使回来也会因 generation 变化被
+        // 丢弃——不必等它：立即解除单飞标志，让新段请求马上发出，
+        // 否则换段要干等旧请求在途数秒（着色延迟主因）。
+        self.analyzing = false;
+        dbg_hint("reset_host_clear (换段/重置)".into());
         // Switching segments used to clear the prefetched whole-book hints and
         // wait for another service round-trip. Re-slice the cached words first;
         // The independent status poll refreshes the schema in the background.
-        self.refill_from_full_words();
+        let hit = self.refill_from_full_words();
+        dbg_hint(format!("reset_host refill_hit={hit} words={}", self.model.words.len()));
         self.generation = self.generation.wrapping_add(1);
         self.full_retry.reset();
+        // 【换段提速】新段是新语境：旧段攒下的深退避不惩罚新段首请求。
+        self.display_retry.reset();
         self.analyze();
         gale_win::window::request_frame();
     }
@@ -1673,6 +1717,19 @@ impl App {
             || self.full_words_dynamic_boundary != self.analysis_dynamic_boundary()
             || self.full_words_ver != self.model.schema_ver
         {
+            // 【词提诊断 2026-11-12】记录缓存未命中的具体守卫，定位换段空窗。
+            dbg_hint(format!(
+                "refill_miss whole={} empty={} text_eq={} breaks_eq={} strat_eq={} spans_eq={} auto4={} dyn_eq={} ver_eq={}",
+                self.last_analyze_whole,
+                self.full_words.is_empty(),
+                self.full_words_of == self.analysis_text(),
+                self.full_words_breaks == self.analysis_breaks(),
+                self.full_words_strategy == self.cfg.hint_strategy,
+                self.full_words_required_spans == self.analysis_required_spans(),
+                self.full_words_auto4,
+                self.full_words_dynamic_boundary == self.analysis_dynamic_boundary(),
+                self.full_words_ver == self.model.schema_ver,
+            ));
             return false;
         }
         self.refill_segment_words();
@@ -2677,7 +2734,7 @@ impl App {
             wake(hwnd);
         });
     }
-    fn invalidate_live_hints(&mut self) {
+    fn invalidate_live_hints(&mut self, preserve_views: bool) {
         self.analyzed = 0;
         self.analyzed_key.clear();
         self.full_words.clear();
@@ -2690,7 +2747,7 @@ impl App {
         self.full_fetch_hash = None;
         self.display_retry.reset();
         self.full_retry.reset();
-        clear_live_hint_views(&mut self.model, &mut self.sess);
+        retire_hint_views(&mut self.model, &mut self.sess, preserve_views);
         self.layout_key = (u64::MAX, 0, 0);
         // Keep both single-flight locks: old requests must finish before the
         // latest revision is dispatched, even after several rapid switches.
@@ -2775,11 +2832,21 @@ impl App {
         self.last_analyze_whole = whole_book;
         let hints = self.sess.rules.word_hints;
         if !hints || status["hint_unavailable_reason"].is_string() {
+            dbg_hint(format!(
+                "send_abort hints={} snapshot_reason={:?} words_was={}",
+                hints,
+                status["hint_unavailable_reason"].as_str(),
+                self.model.words.len()
+            ));
             self.analyzing = false;
             self.analyzed = generation;
             self.analyzed_key = request_key;
             self.display_retry.reset();
-            self.model.words.clear();
+            // 【词提防闪烁 2026-11-12】仅用户显式关闭词提(!hints)才清空显示；
+            // 快照临时不可用(引擎忙)时保留旧词提，状态轮询恢复后自动替换。
+            if !hints {
+                self.model.words.clear();
+            }
             return;
         }
         let single = self.sess.source == session::SessionSource::Single;
@@ -2836,6 +2903,10 @@ impl App {
                         return Err("当前虎符服务不支持新词提规则，请更新服务后重试".into());
                     }
                     analysis::response_entries(&text, &value)?;
+                    dbg_hint(format!(
+                        "analyze_ok words={}",
+                        value["words"].as_array().map(|a| a.len()).unwrap_or(0),
+                    ));
                     Ok(value)
                 })
             })();
@@ -2918,7 +2989,12 @@ impl App {
                         StatusOutcome::Ready { changed } => {
                             self.apply_trainer_status();
                             if changed {
-                                self.invalidate_live_hints();
+                                // 【词提防闪烁 2026-11-12】打字调频让 schema_ver
+                                // 持续微变；词库仍可用时保留旧词提（后台重拉
+                                // 到达后原子替换），只有词库不可用才清空显示。
+                                let preserve =
+                                    self.live_schema.revision.unavailable_reason.is_none();
+                                self.invalidate_live_hints(preserve);
                             }
                             self.analyze();
                             self.fetch_full_analysis();
@@ -2935,7 +3011,12 @@ impl App {
                     let failure_recorded = current_revision && r.is_err();
                     if failure_recorded {
                         let now = self.ms();
-                        self.display_retry.fail(now);
+                        // 排队被拒（另一篇在途）走快重试；真故障走指数退避。
+                        if r.as_ref().is_err_and(|e| e.contains("另一篇")) {
+                            self.display_retry.soft_fail(now);
+                        } else {
+                            self.display_retry.fail(now);
+                        }
                     }
                     if current_revision && request_key == self.hint_analysis_key() {
                         let r = r.and_then(|value| {
@@ -3044,6 +3125,7 @@ impl App {
                                 }
                             }
                             Err(e) => {
+                                dbg_hint(format!("analyze_err ({e})"));
                                 if !failure_recorded {
                                     let now = self.ms();
                                     self.display_retry.fail(now);
@@ -3054,8 +3136,12 @@ impl App {
                                     self.model.status =
                                         format!("词提请求失败 · 已用本地缓存 · {e}");
                                 } else {
-                                    self.model.words.clear();
-                                    self.model.status = format!("词提暂不可用 · {e}");
+                                    // 【词提防闪烁 2026-11-12 日志定案】引擎忙/
+                                    // 单飞冲突是瞬时态：请求失败不得清空正在显示
+                                    // 的词提（清空=用户可见闪烁），保留旧值等重试
+                                    // 成功后整帧替换。words 本就对应当前段切片，
+                                    // 下一轮成功响应必然覆盖。
+                                    self.model.status = format!("词提请求失败 · 重试中 · {e}");
                                 }
                             }
                         }
@@ -4674,7 +4760,13 @@ mod persistence_tests {
         model
             .fields
             .insert("analysis_error".into(), "old error".into());
-        clear_live_hint_views(&mut model, &mut sess);
+        // 【词提防闪烁 2026-11-12】词库可用（preserve=true）时保留词提与
+        // F10 旧视图，仅清错误字段；不可用（preserve=false）才硬清空。
+        retire_hint_views(&mut model, &mut sess, true);
+        assert_eq!(model.words.len(), 1);
+        assert!(sess.full_analysis.is_some());
+        assert!(model.field("analysis_error").is_empty());
+        retire_hint_views(&mut model, &mut sess, false);
         assert_eq!(serde_json::to_value(&sess).unwrap(), before);
         assert_eq!(sess.vk_histogram.get(&0x41), Some(&3));
         assert!(sess.composing);

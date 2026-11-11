@@ -42,7 +42,7 @@ pub fn normalize_text(text: &str, state: &mut QuoteState) -> (String, usize) {
             _ => c,
         })
         .collect();
-    let mut chars = fold_dash_variants(chars, &mut changed);
+    let chars = fold_dash_variants(chars, &mut changed);
 
     // ── 第二阶段：中文句内 ASCII/变体标点 → 全角，带前后文条件 ──────────
     let mut out: Vec<char> = Vec::with_capacity(chars.len());
