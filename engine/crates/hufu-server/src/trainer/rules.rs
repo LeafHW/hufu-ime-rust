@@ -278,6 +278,10 @@ pub(super) fn route(
                 }
                 let rank = option.hint.rank.max(1);
                 let phrase = if option.len > 1 { option.len } else { 0 };
+                // 【键数平粘词优先 2026-11-12 用户改判】含尾标点的粘词
+                // （如「怎么办？」@kol）与「正词+标点单打」键数打平时
+                // 由粘词胜出——一键成词、显示侧已完整画线着色分档。
+                // 2026-11-11 的 +1 罚分同日撤销；粘词仅在严格更费键时输。
                 // Explicit selection is enumerated before a bare first
                 // candidate, matching the reference's stable tie handling.
                 if !option.hint.tail.is_empty() {
@@ -318,7 +322,16 @@ pub(super) fn route(
                         state,
                         start,
                         old_state,
-                        metric(strategy, mode, 0, code.len(), 0, code.len(), phrase, 0),
+                        metric(
+                            strategy,
+                            mode,
+                            0,
+                            code.len(),
+                            0,
+                            code.len(),
+                            phrase,
+                            0,
+                        ),
                         Step {
                             start,
                             len: option.len,

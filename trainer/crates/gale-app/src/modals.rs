@@ -153,6 +153,11 @@ pub struct Model {
     pub paused: bool,
     pub status: String,
     pub words: Vec<HintWord>,
+    /// 【下一个字编码 2026-11-12】与当前分析文本逐字对齐的单字码表；
+    /// whole=true 为全文坐标（换段免重取），否则 char_codes_seg 段内坐标。
+    pub char_codes: Vec<Option<crate::analysis::CharCode>>,
+    pub char_codes_whole: bool,
+    pub char_codes_seg: usize,
     pub max_code_length: usize,
     pub schema: String,
     pub schema_ver: String,
@@ -1210,18 +1215,34 @@ pub(super) fn appearance_preview(
                         mono(f, xx, yy + fs + 5., hint_size, code, c);
                     }
                     if cfg.hint_show_rank && word.rank > 1 {
-                        mono(
-                            f,
-                            xx + if cfg.hint_show_code {
-                                code.chars().count() as f32 * hint_size * 0.6
-                            } else {
-                                0.
-                            },
-                            yy + fs + 2.,
-                            hint_size,
-                            word.rank.to_string(),
-                            c,
-                        );
+                        // 【选重数字角标 2026-11-11】与正文同口径。
+                        if cfg.hint_rank_corner {
+                            let ds = (fs * 0.52).max(9.);
+                            let dw =
+                                word.rank.to_string().chars().count() as f32 * ds * 0.6;
+                            let word_w = word.len as f32 * fs;
+                            mono(
+                                f,
+                                xx + word_w - dw - 1.,
+                                yy - ds * 0.38,
+                                ds,
+                                word.rank.to_string(),
+                                c,
+                            );
+                        } else {
+                            mono(
+                                f,
+                                xx + if cfg.hint_show_code {
+                                    code.chars().count() as f32 * hint_size * 0.6
+                                } else {
+                                    0.
+                                },
+                                yy + fs + 2.,
+                                hint_size,
+                                word.rank.to_string(),
+                                c,
+                            );
+                        }
                     }
                 }
             }
@@ -2053,6 +2074,65 @@ mod tests {
         s
     }
     #[test]
+    fn header_shows_next_char_code_beside_elapsed_time() {
+        let mut sess = Session::new(100);
+        sess.load_book("单字码", "你好吗");
+        let mut model = Model {
+            hints: true,
+            ..Default::default()
+        };
+        // 全文坐标：光标在第 1 位「好」，rank2 应追加选重尾键。
+        model.char_codes = vec![
+            Some(crate::analysis::CharCode {
+                code: "ni".into(),
+                rank: 1,
+                tail: "_".into(),
+            }),
+            Some(crate::analysis::CharCode {
+                code: "hc".into(),
+                rank: 2,
+                tail: ";".into(),
+            }),
+            Some(crate::analysis::CharCode {
+                code: "ma".into(),
+                rank: 1,
+                tail: "_".into(),
+            }),
+        ];
+        model.char_codes_whole = true;
+        sess.comparer.pos = 1;
+        let cfg = Config {
+            font_size: 36.,
+            focus_dim: false,
+            ..Default::default()
+        };
+        let lines = vec![(0, "你好吗".to_string(), vec![0., 36., 72., 108.])];
+        let theme = crate::ui::theme("墨玉");
+        let frame = crate::ui::build(
+            &sess,
+            &cfg,
+            &theme,
+            &model,
+            1280.,
+            800.,
+            0,
+            0.,
+            &mut crate::ui::Animation::default(),
+            &mut Vec::new(),
+            &lines,
+        );
+        let texts: Vec<&str> = frame
+            .cmds
+            .iter()
+            .filter_map(|cmd| match cmd {
+                DrawCmd::TextRun { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(texts.contains(&"编码"), "应有编码标签，实测 {texts:?}");
+        assert!(texts.contains(&"hc ;"), "rank2 追加选重尾键，实测 {texts:?}");
+    }
+    #[test]
     fn physical_heatmap_uses_visible_height_and_keeps_footer_button_complete() {
         for (w, h) in [(800., 600.), (640., 420.)] {
             let mut model = Model::default();
@@ -2369,7 +2449,12 @@ mod tests {
             })
             .unwrap();
         for (i, word) in words.iter().enumerate() {
-            let expected = if i < 6 { p.word_colors[i] } else { p.text2 };
+            // …… 是多字词，带一码按 One 档着色（2026-11-12 含标点词对齐）
+            let expected = match word.text.as_str() {
+                "……" => p.word_colors[5],
+                _ if i < 6 => p.word_colors[i],
+                _ => p.text2,
+            };
             assert_eq!(spans[word.start].2, expected, "article {}", word.text);
         }
         sess.full_analysis = Some(crate::FullAnalysis {
@@ -2401,8 +2486,14 @@ mod tests {
             )), "F10 {}", word.text);
         }
         for word in words.iter().skip(6) {
+            // …… 是多字词，带一码按 One 档着色（2026-11-12 含标点词对齐）
+            let expected = if word.text == "……" {
+                p.word_colors[5]
+            } else {
+                p.text
+            };
             assert!(frame.cmds.iter().any(|cmd| matches!(cmd,
-                DrawCmd::TextRun { text, color, font: gale_win::d2d::FontFamily::Lxgw, .. } if text == &word.text && *color == p.text
+                DrawCmd::TextRun { text, color, font: gale_win::d2d::FontFamily::Lxgw, .. } if text == &word.text && *color == expected
             )), "F10 nonword {} stays neutral", word.text);
         }
     }

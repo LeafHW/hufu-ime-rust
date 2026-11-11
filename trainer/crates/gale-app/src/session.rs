@@ -75,6 +75,10 @@ pub struct Session {
     word_attribution: Option<gale_core::scorecard::WordRateTracker>,
     pub cleaned: bool,
     pub pasted: bool,
+    /// 载文时标点/引号规范的处数（0=原文已规范）；UI 载入后 toast 提示。
+    /// 旧快照缺省 0。
+    #[serde(default)]
+    pub normalize_count: usize,
     /// 载文难度（群文《难度》头 / 文来难度；结算时随成绩入 ScoreRecord.difficulty，
     /// 成绩单输出 `难度普(1.84)`）。旧快照缺省 None。
     #[serde(default)]
@@ -139,6 +143,7 @@ impl Session {
             word_attribution: Some(gale_core::scorecard::WordRateTracker::default()),
             cleaned: false,
             pasted: false,
+            normalize_count: 0,
             difficulty: None,
             default_seg_chars: seg_chars.clamp(10, 10000),
             frozen_text_hash: String::new(),
@@ -153,6 +158,18 @@ impl Session {
         }
     }
     fn loaded(&mut self) {
+        // 载文标点/引号规范（原跟打器 normalize_quotes 口径，2026-11-12）：
+        // 全角数字、破折号变体、中文句内 ASCII 标点、直引号方向、句末标点
+        // 入引号。规范结果就是跟打目标与 raw 基线；引号状态跨段携带。
+        let mut quote_state = gale_core::normalize::QuoteState::default();
+        let mut norm_count = 0usize;
+        for seg in &mut self.segments {
+            let (text, changed) =
+                gale_core::normalize::normalize_text(&seg.text, &mut quote_state);
+            seg.text = text;
+            norm_count += changed;
+        }
+        self.normalize_count = norm_count;
         self.index = 0;
         self.raw_segments = self.segments.clone();
         self.normalize_working_newlines();
@@ -1025,10 +1042,11 @@ mod tests {
                 s.load_text(&raw);
                 assert_eq!(s.source, SessionSource::Group, "{raw:?}");
                 assert_eq!(s.title, "文章标题");
-                assert_eq!(s.current_segment().text, " 正文。 ");
+                // 载文规范：全角标点后的 ASCII 空白按排版噪声剥除（原版口径）
+                assert_eq!(s.current_segment().text, " 正文。");
                 assert_eq!(s.total_segments(), 1, "group segments are not re-split");
                 assert!(s.difficulty.is_some());
-                assert_eq!(s.raw_segments[0].text, " 正文。 ");
+                assert_eq!(s.raw_segments[0].text, " 正文。");
             }
         }
     }

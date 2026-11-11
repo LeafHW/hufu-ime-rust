@@ -260,6 +260,11 @@ fn version(s: &Schema, cfg: &Config, sentence: bool) -> String {
     (Arc::as_ptr(&s.personal) as usize).hash(&mut h);
     s.adjust.to_lines().hash(&mut h);
     s.user_dict.to_lines().hash(&mut h);
+    // 【补充语料词提 2026-11-11】语料内容变化必须失效词提缓存
+    for e in &s.supplement.entries {
+        e.word.hash(&mut h);
+        e.weight.to_bits().hash(&mut h);
+    }
     for e in &s.user_dict.entries {
         e.weight.to_bits().hash(&mut h);
     }
@@ -834,6 +839,10 @@ struct Analyzer<'a> {
     route_mode: RouteMode,
     extra: HashMap<String, Vec<String>>,
     extra_prefixes: HashSet<String>,
+    /// 【补充语料词提 2026-11-11】(组合码, 词) 对：引擎把这些词注入整句
+    /// 词图并用挂起机制让字词模式全码也能打出；词提必须同样可见，
+    /// 否则正文里这些词永远没有提示（用户实测漏词）。
+    supp_pairs: HashSet<(String, String)>,
     started: Instant,
     work: usize,
     exceeded: bool,
@@ -853,6 +862,44 @@ impl<'a> Analyzer<'a> {
                 .entry(e.text.clone())
                 .or_default()
                 .push(e.code.clone());
+        }
+        // 【补充语料词提 2026-11-11】组合码推导与 Engine::build_supplement_cache
+        // 同口径：≥2 字、≤4 字、每字至多 4 码、每词至多 32 组合。
+        // 单字不进（码表本身有单字，补充语料单字只是整句加权）。
+        let mut supp_pairs: HashSet<(String, String)> = HashSet::new();
+        for e in &s.supplement.entries {
+            let chars: Vec<char> = e.word.chars().collect();
+            if chars.len() < 2 || chars.len() > 4 {
+                continue;
+            }
+            let mut combos: Vec<String> = vec![String::new()];
+            for ch in chars {
+                let codes = s.dict.codes_of(&ch.to_string());
+                if codes.is_empty() {
+                    combos.clear();
+                    break;
+                }
+                let mut next = Vec::with_capacity(combos.len() * 4);
+                for c in &combos {
+                    for code in codes.iter().take(4) {
+                        let mut merged = c.clone();
+                        merged.push_str(code);
+                        next.push(merged);
+                    }
+                }
+                combos = next;
+                if combos.len() > 32 {
+                    combos.truncate(32);
+                }
+            }
+            for c in combos {
+                if supp_pairs.insert((c.clone(), e.word.clone())) {
+                    extra.entry(e.word.clone()).or_default().push(c);
+                }
+            }
+            if supp_pairs.len() > 20_000 {
+                break;
+            }
         }
         let mut extra_prefixes = HashSet::new();
         for codes in extra.values() {
@@ -874,6 +921,7 @@ impl<'a> Analyzer<'a> {
             route_mode: RouteMode::Display,
             extra,
             extra_prefixes,
+            supp_pairs,
             started: Instant::now(),
             work: 0,
             exceeded: false,
@@ -972,21 +1020,58 @@ impl<'a> Analyzer<'a> {
         if sentence {
             return None;
         }
+        if rank > 10 {
+            // 【候选翻页可达 2026-11-12】引擎翻页键纯翻页（默认 -/=，
+            // 2026-09-06 改判后不选定），第 11-20 名可「翻页×N + 页内选重键」
+            // 打出；两页封顶控制 DP 枚举规模。翻页键本身必须对当前编码
+            // 无延伸/映射冲突，且不得与选重键重叠。
+            if rank > 20 {
+                return None;
+            }
+            let c = &self.cfg.candidates;
+            let paging = c.paging_keys.chars().find(|&p| {
+                !(self.mapped(p, false)
+                    || self.extends(code, p)
+                    || p == self.cfg.reverse.prefix
+                    || p.is_control()
+                    || !p.is_ascii()
+                    || p.is_ascii_uppercase()
+                    || "~!@#$%^&*()_+{}|:\\\"<>?".contains(p)
+                    || "_234567890".contains(p)
+                    || p == c.second_select
+                    || p == c.third_select
+                    || c.custom_select_keys.contains(&p))
+            })?;
+            let mut tail = String::new();
+            for _ in 0..(rank - 1) / 10 {
+                tail.push(paging);
+            }
+            tail.push(self.selector_char(code, (rank - 1) % 10 + 1)?);
+            return Some(tail);
+        }
+        self.selector_char(code, rank).map(|k| k.to_string())
+    }
+
+    /// 页内选重键（1..=10）：二选/三选/自定义优先，数字兜底，
+    /// 与 on_rank_key 同序消解键位冲突；任一冲突即返回 None。
+    /// 【候选翻页可达 2026-11-12】从 selection_tail 抽出，供第 11-20 名
+    /// 翻页路径复用（页内位次 = (rank-1)%10+1）。
+    fn selector_char(&self, code: &str, inpage: usize) -> Option<char> {
         let c = &self.cfg.candidates;
         let mut keys = Vec::new();
-        if rank == 2 {
+        if inpage == 2 {
             keys.push(c.second_select);
         }
-        if rank == 3 {
+        if inpage == 3 {
             keys.push(c.third_select);
         }
-        if let Some(&k) = c.custom_select_keys.get(rank - 1) {
+        if let Some(&k) = c.custom_select_keys.get(inpage - 1) {
             keys.push(k);
         }
-        keys.push(if rank == 10 {
+        keys.push(if inpage == 10 {
             '0'
         } else {
-            char::from_digit(rank as u32, 10)?
+            char::from_digit(inpage as u32, 10)?
         });
         keys.into_iter()
             .find(|&k| {
@@ -1022,7 +1107,7 @@ impl<'a> Analyzer<'a> {
                 } else {
                     0
                 };
-                resolved == rank
+                resolved == inpage
                     && (!c.paging_keys.contains(k)
                         || k == c.second_select
                         || k == c.third_select
@@ -1032,7 +1117,6 @@ impl<'a> Analyzer<'a> {
                         || k == c.third_select
                         || c.custom_select_keys.contains(&k))
             })
-            .map(|k| k.to_string())
     }
     fn budget(&mut self, cost: usize) -> bool {
         self.work = self.work.saturating_add(cost);
@@ -1181,7 +1265,8 @@ impl<'a> Analyzer<'a> {
                 continue;
             };
             let rank = idx + 1;
-            if rank > 10
+            // 【候选翻页可达 2026-11-12】第 11-20 名可翻页选出（两页封顶）
+            if rank > 20
                 || entries[..=idx].iter().any(|e| {
                     e.text.contains('{') || e.commit_override.as_ref().is_some_and(|v| v != &e.text)
                 })
@@ -1242,12 +1327,29 @@ impl<'a> Analyzer<'a> {
                 .entry(code.clone())
                 .or_insert_with(|| self.s.candidates(&code));
             let Some(index) = entries.iter().position(|entry| entry.text == text) else {
+                // 【补充语料词提 2026-11-11】补充语料词不在码表候选里
+                //（引擎以整句词图/挂起路径打出）：按「唯一首选」合成提示，
+                // 尾键走真实首选口径（空格上屏）；空格被映射/编码可延伸
+                // 拿不到尾键时按 rank>1 同策略跳过（合成词打不完不如不提）。
+                if self.supp_pairs.contains(&(code.clone(), text.to_string())) {
+                    if let Some(selector) = self.selection_tail(&code, 1, 1, false, false) {
+                        hints.push((
+                            Hint {
+                                code: Some(code.clone()),
+                                rank: 1,
+                                tail: selector,
+                            },
+                            true,
+                        ));
+                    }
+                }
                 continue;
             };
             let rank = index + 1;
             // page_size only limits the displayed rows. The engine accepts
-            // direct rank keys up to ten even when fewer rows are visible.
-            if rank > 10
+            // direct rank keys up to ten even when fewer rows are visible;
+            // ranks 11-20 are reachable through paging keys.
+            if rank > 20
                 || entries[..=index].iter().any(|entry| {
                     entry.text.contains('{')
                         || entry
@@ -1345,6 +1447,15 @@ impl<'a> Analyzer<'a> {
             self.cfg.candidates.third_select,
         ]);
         selectors.extend(self.cfg.candidates.custom_select_keys.iter().copied());
+        // 【候选翻页可达 2026-11-12】翻页键作用于挂起态的候选列表（纯翻页），
+        // 挂起时不能充当下一词首键——并入 can_start 的拦截集合。
+        selectors.extend(
+            self.cfg
+                .candidates
+                .paging_keys
+                .chars()
+                .filter(|p| p.is_ascii() && !p.is_control()),
+        );
         let required = self.required_spans.clone();
         let mut steps = rules::route(
             &chars,
@@ -1588,6 +1699,94 @@ mod tests {
     // analyze 端点带进程级单飞锁（ANALYZING），cargo test 默认并行线程
     // 会让两个发 analyze 的测试互相撞 429——用共享锁把它们串行化。
     static ANALYZE_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// 【候选翻页可达 2026-11-12】第 11-20 名经「翻页键 + 页内选重键」
+    /// 打出（两页封顶）；第 21 名起依旧不可达。翻页键取配置里第一个
+    /// 无冲突字符（默认 -/= 之一）。
+    #[test]
+    fn candidates_rank_eleven_to_twenty_reach_paging_tail() {
+        let _serial = crate::GLOBALS_TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let _analyze_gate = ANALYZE_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = std::env::temp_dir().join(format!("hufu-trainer-paging-{}", std::process::id()));
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(dir.clone());
+        let schema_dir = dir.join("码表/test");
+        std::fs::create_dir_all(&schema_dir).unwrap();
+        // 21 个同码字按权重降序 → 引擎候选 rank 1..21
+        let chars = [
+            "甲", "乙", "丙", "丁", "戊", "己", "庚", "辛", "壬", "癸", "子", "丑", "寅",
+            "卯", "辰", "巳", "午", "未", "申", "酉", "戌",
+        ];
+        let mut dict = String::from("---\nname: test\nsort: by_weight\n...\n");
+        for (i, ch) in chars.iter().enumerate() {
+            dict.push_str(&format!("{ch}\tjq\t{}\n", 921 - i));
+        }
+        std::fs::write(schema_dir.join("test.dict.yaml"), &dict).unwrap();
+        let mut cfg = Config::default();
+        cfg.schema.current = "test".into();
+        cfg.sentence.enabled = false;
+        cfg.save(&dir.join("config.json")).unwrap();
+        let host = Mutex::new(Host::new(&dir).unwrap());
+        let request = |body| Request {
+            method: "POST".into(),
+            path: "/api/trainer/analyze".into(),
+            query: Default::default(),
+            headers: Default::default(),
+            body: serde_json::to_vec(&body).unwrap(),
+        };
+        let call = |req: &Request| {
+            let mut response = route(&host, req);
+            for _ in 0..40 {
+                if response.status != 503 {
+                    return response;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+                response = route(&host, req);
+            }
+            response
+        };
+        let post = |body| {
+            let response = call(&request(body));
+            assert_eq!(
+                response.status,
+                200,
+                "{}",
+                String::from_utf8_lossy(&response.body)
+            );
+            serde_json::from_slice::<serde_json::Value>(&response.body).unwrap()
+        };
+        // rank 12：一页翻页 + 页内第 2 位（二选 ';'）
+        let r12 = post(serde_json::json!({"text":"丑"}));
+        assert_eq!(r12["words"][0]["rank"], 12);
+        let tail = r12["words"][0]["tail"].as_str().unwrap();
+        assert_eq!(tail.chars().count(), 2, "{tail}");
+        assert!(tail.ends_with(';'), "rank12 inpage selector, got {tail}");
+        assert!(
+            "-=".contains(tail.chars().next().unwrap()),
+            "rank12 paging prefix, got {tail}"
+        );
+        // rank 13：一页翻页 + 页内第 3 位
+        let r13 = post(serde_json::json!({"text":"寅"}));
+        assert_eq!(r13["words"][0]["rank"], 13);
+        let tail13 = r13["words"][0]["tail"].as_str().unwrap();
+        assert_eq!(tail13.chars().count(), 2, "{tail13}");
+        assert!(
+            "-=".contains(tail13.chars().next().unwrap()),
+            "rank13 paging prefix, got {tail13}"
+        );
+        // rank 21：两页封顶之外 → 无码可提
+        let r21 = post(serde_json::json!({"text":"戌"}));
+        assert!(
+            r21["words"][0]["code"].is_null(),
+            "{}",
+            serde_json::to_string_pretty(&r21["words"]).unwrap()
+        );
+    }
 
     #[test]
     fn trainer_setting_guards_open_and_single_analysis_has_separate_cache() {
@@ -2028,6 +2227,71 @@ mod tests {
     }
 
     #[test]
+    fn supplement_words_receive_hints() {
+        // 【补充语料词提 2026-11-11】语料词由引擎注入整句词图并以挂起
+        // 机制可打出，词提必须同样可见——此前 sources 剥离 supplement
+        // 导致正文里这些词永远无提示（用户实测漏词：上屏/傲慢 等）。
+        let _serial = crate::GLOBALS_TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let _analyze_gate = ANALYZE_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let dir =
+            std::env::temp_dir().join(format!("hufu-trainer-supp-{}", std::process::id()));
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(dir.clone());
+        let schema_dir = dir.join("码表/test");
+        std::fs::create_dir_all(&schema_dir).unwrap();
+        let table = "---\nname: test\nsort: by_weight\n...\n你\tjx\t800\n好\tbh\t800\n新\tx\t800\n词\tc\t800\n";
+        std::fs::write(schema_dir.join("test.dict.yaml"), table).unwrap();
+        std::fs::write(schema_dir.join("补充语料.txt"), "新词\t1000\n").unwrap();
+        let mut cfg = Config::default();
+        cfg.schema.current = "test".into();
+        cfg.sentence.enabled = false;
+        cfg.save(&dir.join("config.json")).unwrap();
+        let host = Mutex::new(Host::new(&dir).unwrap());
+        let response = route(
+            &host,
+            &Request {
+                method: "POST".into(),
+                path: "/api/trainer/analyze".into(),
+                query: Default::default(),
+                headers: Default::default(),
+                body: serde_json::to_vec(&serde_json::json!({
+                    "text": "新词",
+                    "route_mode": "display",
+                    "include_full": true
+                }))
+                .unwrap(),
+            },
+        );
+        assert_eq!(
+            response.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&response.body)
+        );
+        let value: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        let words: Vec<(String, String)> = value["words"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|word| {
+                (
+                    word["text"].as_str().unwrap().to_string(),
+                    word["code"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        assert!(
+            words.iter().any(|(t, c)| t == "新词" && c == "xc"),
+            "supplement word must carry its combo-code hint: {words:?}"
+        );
+    }
+
+    #[test]
     fn selection_keys_follow_candidates_and_active_mapping_with_shift_overrides() {
         let _serial = crate::GLOBALS_TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         let mut cfg = Config::default();
@@ -2165,13 +2429,37 @@ mod tests {
                     }
                 }
             }
-            assert!(Analyzer::new(&engine.schema, &engine.config, false)
-                .hint(words[10])
-                .code
-                .is_none());
-            assert!(Analyzer::new(&engine.schema, &engine.config, false)
-                .routing_hints(words[10])
-                .is_empty(), "rank eleven still needs paging and has no direct key recipe");
+            // 【候选翻页可达 2026-11-12】rank 11-20 可「编码+翻页键+页内
+            // 选重键」打出，且经引擎按键回放确实上屏。
+            let eleventh = Analyzer::new(&engine.schema, &engine.config, false)
+                .hint(words[10]);
+            assert_eq!(eleventh.code.as_deref(), Some("ab"), "{page_size}");
+            assert_eq!(eleventh.rank, 11, "{page_size}");
+            assert_eq!(eleventh.tail.chars().count(), 2, "{page_size}");
+            assert!(
+                "-=".contains(eleventh.tail.chars().next().unwrap()),
+                "{page_size}: {}",
+                eleventh.tail
+            );
+            assert_eq!(eleventh.tail.chars().nth(1), Some('1'), "{page_size}");
+            assert_eq!(
+                Analyzer::new(&engine.schema, &engine.config, false)
+                    .routing_hints(words[10])
+                    .len(),
+                1,
+                "{page_size}: rank eleven is now reachable through paging"
+            );
+            let mut session = hufu_engine::Session::new(true);
+            let mut committed = String::new();
+            for key in format!("ab{}", eleventh.tail).chars() {
+                if let Some(text) = engine
+                    .process_key(&mut session, hufu_types::KeyInput::char_key(key))
+                    .commit
+                {
+                    committed.push_str(&text);
+                }
+            }
+            assert_eq!(committed, words[10], "{page_size}/rank 11 paging replay");
         }
     }
 
@@ -2624,13 +2912,41 @@ mod tests {
             400
         );
     }
+    /// 【键数平粘词优先 2026-11-12 用户改判】「怎么办？」@kol+选重（4 键，
+    /// rank1）与「怎么办」@k+选重2键 +「？」↑/ 2键（4 键）平键时，粘词
+    /// 胜出（rank 分量更低）；撤销 2026-11-11 的 +1 罚分。粘词仅在严格
+    /// 更费键时输。
     #[test]
-    fn inaccessible_page_is_not_a_hint() {
+    fn glued_punctuation_word_wins_key_ties() {
         let _serial = crate::GLOBALS_TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
-        let entries = (0..11).map(|i| ("a", format!("字{i}"))).collect::<Vec<_>>();
+        let s = schema(vec![
+            ("k", "怎"),
+            ("k", "怎么办"),
+            ("kol", "怎么办？"),
+        ]);
+        let c = Config::default();
+        let mut analyzer = Analyzer::new(&s, &c, false);
+        analyzer.route_mode = RouteMode::Display;
+        let route = analyzer.analyze("怎么办？", std::time::Instant::now()).unwrap();
+        assert_eq!(route.len(), 1);
+        assert_eq!(route[0].text, "怎么办？");
+        assert_eq!(route[0].hint.code.as_deref(), Some("kol"));
+        assert_eq!(route[0].hint.rank, 1);
+    }
+
+    #[test]
+    fn paging_reaches_rank_eleven_but_not_twentyone() {
+        let _serial = crate::GLOBALS_TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let entries = (0..21).map(|i| ("a", format!("字{i}"))).collect::<Vec<_>>();
         let s = schema(entries.iter().map(|(c, t)| (*c, t.as_str())).collect());
         let c = Config::default();
-        assert!(Analyzer::new(&s, &c, false).hint("字10").code.is_none());
+        // 【候选翻页可达 2026-11-12】第 11 名有翻页配方；第 21 名两页封顶之外。
+        let eleventh = Analyzer::new(&s, &c, false).hint("字10");
+        assert_eq!(eleventh.code.as_deref(), Some("a"));
+        assert_eq!(eleventh.rank, 11);
+        assert_eq!(eleventh.tail.chars().count(), 2);
+        assert!("-=".contains(eleventh.tail.chars().next().unwrap()));
+        assert!(Analyzer::new(&s, &c, false).hint("字20").code.is_none());
     }
     #[test]
     fn z_domain_and_one_key_auto_commit_are_not_false_recipes() {

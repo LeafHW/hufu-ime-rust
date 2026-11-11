@@ -87,6 +87,9 @@ pub struct Config {
     pub hint_show_code: bool,
     #[serde(default = "yes")]
     pub hint_show_rank: bool,
+    /// 【选重数字角标 2026-11-11】数字显示在词的右上角；关闭时随编码行。
+    #[serde(default)]
+    pub hint_rank_corner: bool,
     #[serde(default = "yes")]
     pub hint_color_words: bool,
     /// 按候选序号为词组配色；关闭时沿用六档词色，旧配置默认关闭。
@@ -187,6 +190,7 @@ impl Default for Config {
             motion_level: 2,
             hint_show_code: true,
             hint_show_rank: true,
+            hint_rank_corner: false,
             hint_color_words: true,
             hint_rank_colors: false,
             hint_strategy: HintStrategy::Shortest,
@@ -290,6 +294,7 @@ impl Config {
             motion_level: get("motion_level", "2").parse::<u8>().unwrap_or(2).min(3),
             hint_show_code: get("hint_show_code", "true") == "true",
             hint_show_rank: get("hint_show_rank", "true") == "true",
+            hint_rank_corner: get("hint_rank_corner", "false") == "true",
             hint_color_words: get("hint_color_words", "true") == "true",
             hint_rank_colors: get("hint_rank_colors", "false") == "true",
             hint_strategy: HintStrategy::from_str_lossy(&get("hint_strategy", "shortest")),
@@ -427,6 +432,7 @@ impl Config {
         for (key, value) in [
             ("hint_show_code", self.hint_show_code),
             ("hint_show_rank", self.hint_show_rank),
+            ("hint_rank_corner", self.hint_rank_corner),
             ("hint_color_words", self.hint_color_words),
             ("hint_rank_colors", self.hint_rank_colors),
             ("hint_dynamic", self.hint_dynamic),

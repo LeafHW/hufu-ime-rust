@@ -168,6 +168,14 @@ static CTF_OK: AtomicBool = AtomicBool::new(true);
 /// Only the real typing control contributes statistics; modal editors never do.
 static ROUND_DONE: AtomicBool = AtomicBool::new(false);
 static RESULT_KEY_TARGET: AtomicIsize = AtomicIsize::new(0);
+/// 跟打器当前有 Esc 可关的面板（模态/账本/分析坞）时为 true。
+/// Esc 只在有面板可关时被跟打器吞下；无面板时必须放行——虎符的
+/// 空态 Esc 撤回（无组字时撤回上一段上屏）恰好工作在「未组字」
+/// 状态，吞键会把这个功能在跟打器里饿死（2026-11-11 用户反馈）。
+static ESC_PANEL_OPEN: AtomicBool = AtomicBool::new(false);
+pub fn set_esc_panel_open(open: bool) {
+    ESC_PANEL_OPEN.store(open, Ordering::Relaxed);
+}
 pub fn set_round_done(done: bool) {
     ROUND_DONE.store(done, Ordering::Relaxed);
 }
@@ -233,7 +241,9 @@ pub fn capture_physical_key(msg: &windows::Win32::UI::WindowsAndMessaging::MSG) 
         push_cmd(k);
         return true;
     }
-    if vk == 0x1b && !composing {
+    if vk == 0x1b && !composing && ESC_PANEL_OPEN.load(Ordering::Relaxed) {
+        // 只在有面板可关时吞；无面板放行 → 消息正常进泵，RichEdit/TSF
+        // 拿到 Esc：虎符空态撤回就绪时由 TIP 消费，否则 RichEdit 无动作。
         push_cmd(CommandKey::Escape);
         return true;
     }
@@ -840,10 +850,13 @@ unsafe extern "system" fn relay_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
                 return call_orig!();
             }
             match vk {
-                0x1B if !composing => {
+                0x1B if !composing && ESC_PANEL_OPEN.load(Ordering::Relaxed) => {
                     push_cmd(CommandKey::Escape);
                     return LRESULT(0);
                 }
+                // 无面板时的空态 Esc 落 `_ => {}` 放行：RichEdit→TSF 键处理器，
+                // 虎符空态撤回（引擎就绪 + 有光标）时被 TIP 消费撤回上一段
+                // 上屏；撤回不可用时 RichEdit 对 Esc 无动作，等价于无功能。
                 0x70 => {
                     push_cmd(CommandKey::F1);
                     return LRESULT(0);

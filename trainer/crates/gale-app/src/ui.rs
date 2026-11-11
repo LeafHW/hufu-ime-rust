@@ -888,6 +888,35 @@ pub fn build(
         if w < 760. {
             metrics.remove(1);
         }
+        // 【下一个字编码 2026-11-12】光标处单字的独立编码（非词提配方）：
+        // 全文坐标按段起点换算；rank>1 追加选重尾键。
+        let seg_start: usize = sess
+            .segments
+            .iter()
+            .take(sess.index)
+            .map(|s| s.text.chars().count())
+            .sum();
+        let code_at = if m.char_codes_whole {
+            seg_start + pos
+        } else if m.char_codes_seg == sess.index {
+            pos
+        } else {
+            usize::MAX
+        };
+        let next_code = m
+            .char_codes
+            .get(code_at)
+            .cloned()
+            .flatten()
+            .map(|cc| {
+                if cc.rank > 1 && !cc.tail.is_empty() {
+                    format!("{} {}", cc.code, cc.tail)
+                } else {
+                    cc.code
+                }
+            })
+            .unwrap_or_else(|| "—".into());
+        metrics.push(("编码", next_code));
         let metrics_x = x + (speed_w + 74.).max(196.);
         let metrics_w = (bw - (metrics_x - x)).max(300.);
         let pitch = (metrics_w / metrics.len() as f32).max(84.);
@@ -1155,10 +1184,18 @@ pub fn build(
                     } else {
                         String::new()
                     };
+                    // 【选重数字角标 2026-11-11】hint_rank_corner：数字从
+                    // 编码行移到词右上角（上标式角标），编码行只居中显示
+                    // 编码本身，居中计算不再计入数字宽度。
+                    let rank_in_code_row = rank.is_empty() || !cfg.hint_rank_corner;
                     let hint_advance = hint_size * 0.6;
                     let code_width = shown_code.chars().count() as f32 * hint_advance;
                     let rank_size = hint_size * 0.78;
-                    let rank_width = rank.chars().count() as f32 * rank_size * 0.6;
+                    let rank_width = if rank_in_code_row {
+                        rank.chars().count() as f32 * rank_size * 0.6
+                    } else {
+                        0.
+                    };
                     let code_rank_gap = if code_width > 0. && rank_width > 0. {
                         2.
                     } else {
@@ -1177,21 +1214,38 @@ pub fn build(
                         );
                     }
                     if !rank.is_empty() {
-                        mono(
-                            &mut f,
-                            hx + code_width + code_rank_gap,
-                            yy + fs + word_bracket_offset(fs) + 1.,
-                            rank_size,
-                            rank,
-                            alpha(
-                                if cfg.hint_rank_colors {
-                                    tint.unwrap_or(p.hint_badge)
-                                } else {
-                                    p.hint_badge
-                                },
-                                dim,
-                            ),
+                        let rank_color = alpha(
+                            if cfg.hint_rank_colors {
+                                tint.unwrap_or(p.hint_badge)
+                            } else {
+                                p.hint_badge
+                            },
+                            dim,
                         );
+                        if cfg.hint_rank_corner {
+                            // 词右上角：字号随正文缩放，右缘对齐词宽，上缘
+                            // 略高于词顶形成上标观感（行距内，不打穿上行）。
+                            let corner_size = (fs * 0.52).max(9.);
+                            let corner_w =
+                                rank.chars().count() as f32 * corner_size * 0.6;
+                            mono(
+                                &mut f,
+                                wx + ww - corner_w - 1.,
+                                yy - corner_size * 0.38,
+                                corner_size,
+                                rank,
+                                rank_color,
+                            );
+                        } else {
+                            mono(
+                                &mut f,
+                                hx + code_width + code_rank_gap,
+                                yy + fs + word_bracket_offset(fs) + 1.,
+                                rank_size,
+                                rank,
+                                rank_color,
+                            );
+                        }
                     }
                 }
             }
@@ -1313,7 +1367,7 @@ mod tests {
         let previous = draw_header(&sess, 3100);
         assert_eq!(
             previous,
-            ["300.0", "5.00", "1.00", "100.0%", "1", "00:02.0"]
+            ["300.0", "5.00", "1.00", "100.0%", "1", "00:02.0", "—"]
         );
         sess.load_book("新文章", "新文章甲乙丙丁戊己庚");
         assert_eq!(draw_header(&sess, 7100), previous);
@@ -1324,7 +1378,7 @@ mod tests {
         sess.on_key(0x41, 8100);
         assert_eq!(
             draw_header(&sess, 9100),
-            ["0.0", "1.00", "0.00", "100.0%", "0", "00:01.0"]
+            ["0.0", "1.00", "0.00", "100.0%", "0", "00:01.0", "—"]
         );
     }
 
@@ -1600,7 +1654,7 @@ mod tests {
                         hint_word_tint(&p, word, code, 4)
                     );
                 }
-                for (word, code) in [("单", "a"), ("……", "ab"), ("词，词", "a"), ("缺词", "")]
+                for (word, code) in [("单", "a"), ("缺词", "")]
                 {
                     assert_eq!(hint_word_tint_for_rank(&p, word, code, rank, 4, true), None);
                 }
@@ -1806,8 +1860,9 @@ mod tests {
     fn word_semantics_follow_six_classes_and_single_characters_stay_neutral() {
         let p = tokens(&theme("宣纸"));
         assert_eq!(hint_word_tint(&p, "单", "a", 4), None);
-        assert_eq!(hint_word_tint(&p, "……", "a", 4), None);
-        assert_eq!(hint_word_tint(&p, "词，词", "a", 4), None);
+        // 含标点多字词现在正常分档（原版口径，2026-11-12 对齐）
+        assert_eq!(hint_word_tint(&p, "……", "a", 4), Some(p.word_colors[5]));
+        assert_eq!(hint_word_tint(&p, "词，词", "a", 4), Some(p.word_colors[5]));
         assert_eq!(hint_word_tint(&p, "词组", "", 4), None);
         assert_eq!(hint_word_tint(&p, "一码词", "a", 4), Some(p.word_colors[5]));
         assert_eq!(hint_word_tint(&p, "简词", "ab", 4), Some(p.word_colors[0]));

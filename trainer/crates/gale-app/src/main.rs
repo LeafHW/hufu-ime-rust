@@ -708,6 +708,16 @@ enum Bg {
         SchemaRevision,
         Result<serde_json::Value, String>,
     ),
+    /// 【下一个字编码】single=true 单字码表响应。
+    CharCodes(
+        u64,
+        String,
+        String,
+        usize,
+        bool,
+        SchemaRevision,
+        Result<serde_json::Value, String>,
+    ),
     Chats(Vec<qq_bridge::ChatWindow>),
     Article(Result<String, String>),
     Saved(Result<(), String>),
@@ -870,6 +880,11 @@ struct App {
     route_cache: VecDeque<(String, serde_json::Value)>,
     /// 本次 analyze 是否按整篇请求（false=超长回退单段，响应为段内坐标）。
     last_analyze_whole: bool,
+    /// 【下一个字编码】单字码表缓存控制（数据在 model.char_codes）。
+    /// char_codes_of=策略|分析文本；char_codes_ver=生成时的 schema 版本。
+    char_codes_of: String,
+    char_codes_ver: String,
+    char_codes_pending: bool,
     theme_generation: u64,
     rule_generation: u64,
     rule_busy: bool,
@@ -1077,6 +1092,9 @@ fn run() -> Result<(), String> {
         dynamic_hint_due: None,
         route_cache: VecDeque::new(),
         last_analyze_whole: false,
+        char_codes_of: String::new(),
+        char_codes_ver: String::new(),
+        char_codes_pending: false,
         theme_generation: 0,
         rule_generation: 0,
         rule_busy: false,
@@ -1189,6 +1207,11 @@ fn run() -> Result<(), String> {
             app.analyzed = 0;
             app.analyze();
         }
+        // Esc 吞键门：有可关面板时跟打器才拦截 Esc；无面板时放行给
+        // RichEdit/TSF（虎符空态 Esc 撤回在未组字时工作，见 input_host）。
+        gale_win::input_host::set_esc_panel_open(
+            app.model.modal != Modal::None || app.model.ledger_open || app.model.analysis_dock,
+        );
         let accept_host = app.model.modal == Modal::None && (focused || was_focused);
         was_focused = focused;
         app.online_pending = app.online.as_ref().map(|o| o.pending_count()).unwrap_or(0);
@@ -1681,6 +1704,9 @@ impl App {
                 text: a.text,
             }],
         });
+        if self.sess.normalize_count > 0 {
+            self.toast(&format!("已规范 {} 处标点/引号", self.sess.normalize_count));
+        }
         self.online_article_current = true;
         self.model.ledger_open = false;
         self.model.selected_history = None;
@@ -1696,6 +1722,7 @@ impl App {
         for (key, value) in [
             ("hint_show_code", self.cfg.hint_show_code),
             ("hint_show_rank", self.cfg.hint_show_rank),
+            ("hint_rank_corner", self.cfg.hint_rank_corner),
             ("hint_color_words", self.cfg.hint_color_words),
             ("hint_rank_colors", self.cfg.hint_rank_colors),
             ("hint_dynamic", self.cfg.hint_dynamic),
@@ -1766,6 +1793,7 @@ impl App {
                 let field = match *key {
                     "hint_show_code" => &mut self.cfg.hint_show_code,
                     "hint_show_rank" => &mut self.cfg.hint_show_rank,
+                    "hint_rank_corner" => &mut self.cfg.hint_rank_corner,
                     "hint_color_words" => &mut self.cfg.hint_color_words,
                     "hint_rank_colors" => &mut self.cfg.hint_rank_colors,
                     "hint_dynamic" => &mut self.cfg.hint_dynamic,
@@ -2702,6 +2730,10 @@ impl App {
         }
     }
     fn analyze(&mut self) {
+        // 【下一个字编码 2026-11-12】单字码表与词提同源触发，但独立守卫/缓存：
+        // 词提关闭或本条分析被去重挡下时仍保持可用。
+        let (cc_text, _, _, _, cc_whole) = self.hint_analysis_input();
+        self.fetch_char_codes(&cc_text, cc_whole);
         if self.analyzing
             || self.full_analyzing
             || !self.live_schema.ready()
@@ -2811,9 +2843,70 @@ impl App {
             wake(hwnd);
         });
     }
+    /// 【下一个字编码 2026-11-12】单字码表后台请求：single=true 显示路由，
+    /// 响应与请求文本逐字对齐。键=策略|文本；缓存到 model.char_codes。
+    fn fetch_char_codes(&mut self, text: &str, whole_book: bool) {
+        let key = format!("{}|{}", self.cfg.hint_strategy.as_str(), text);
+        if self.char_codes_pending
+            || (self.char_codes_of == key
+                && self.char_codes_ver == self.model.schema_ver
+                && self.model.char_codes_whole == whole_book
+                && (whole_book || self.model.char_codes_seg == self.sess.index))
+        {
+            return;
+        }
+        self.char_codes_pending = true;
+        let tx = self.tx.clone();
+        let hwnd = self.win.hwnd;
+        let generation = self.generation;
+        let revision = self.live_schema.revision.clone();
+        let request = text.to_string();
+        let strategy = self.cfg.hint_strategy.as_str().to_string();
+        let seg = self.sess.index;
+        std::thread::spawn(move || {
+            let r = local_json(
+                local_port(),
+                "/api/trainer/analyze",
+                Some(serde_json::json!({
+                    "text": request, "single": true, "theory_auto4": true,
+                    "breaks": [], "strategy": strategy, "required_spans": [],
+                    "dynamic_boundary": null, "route_mode": "display",
+                })),
+            );
+            let _ = tx.send(Bg::CharCodes(generation, key, request, seg, whole_book, revision, r));
+            wake(hwnd);
+        });
+    }
     fn collect_background(&mut self) {
         while let Ok(r) = self.rx.try_recv() {
             match r {
+                Bg::CharCodes(g, key, text, seg, whole, revision, result) => {
+                    self.char_codes_pending = false;
+                    let (cur_text, _, _, _, cur_whole) = self.hint_analysis_input();
+                    let current = g == self.generation
+                        && revision == self.live_schema.revision
+                        && whole == cur_whole
+                        && key == format!("{}|{}", self.cfg.hint_strategy.as_str(), cur_text)
+                        && (whole || seg == self.sess.index);
+                    if !current {
+                        self.fetch_char_codes(&cur_text, cur_whole);
+                    } else if let Ok(value) = result {
+                        if self.live_schema.revision.accepts(
+                            &revision,
+                            value["schema_ver"].as_str().unwrap_or(""),
+                        ) {
+                            if let Ok(codes) = analysis::response_char_codes(&text, &value) {
+                                self.char_codes_of = key;
+                                self.char_codes_ver =
+                                    value["schema_ver"].as_str().unwrap_or("").to_string();
+                                self.model.char_codes = codes;
+                                self.model.char_codes_whole = whole;
+                                self.model.char_codes_seg = seg;
+                                gale_win::window::request_frame();
+                            }
+                        }
+                    }
+                }
                 Bg::TrainerStatus(request, result) => {
                     let now = self.ms();
                     match self.live_schema.complete(request, now, result) {
@@ -3443,6 +3536,9 @@ impl App {
             return;
         }
         self.sess.load_text(&text);
+        if self.sess.normalize_count > 0 {
+            self.toast(&format!("已规范 {} 处标点/引号", self.sess.normalize_count));
+        }
         self.online_article_current = false;
         self.reset_host();
         self.open(Modal::None);

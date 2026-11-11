@@ -85,15 +85,15 @@ const RANK_COLORS: &[(&str, &str, &str)] = &[
 
 // 词提页
 const PRACTICE_SWITCH_Y: f32 = 72.;
-const PRACTICE_SWITCH_H: f32 = 44.;
-const PRACTICE_SWITCH_PITCH: f32 = 48.;
-const PRACTICE_STRATEGY_Y: f32 = 270.;
-const PRACTICE_DYNAMIC_Y: f32 = 336.;
-const PRACTICE_SIZE_LABEL_Y: f32 = 388.;
-const PRACTICE_SIZE_Y: f32 = 408.;
+const PRACTICE_SWITCH_H: f32 = 40.;
+const PRACTICE_SWITCH_PITCH: f32 = 44.;
+const PRACTICE_STRATEGY_Y: f32 = 298.;
+const PRACTICE_DYNAMIC_Y: f32 = 358.;
+const PRACTICE_SIZE_LABEL_Y: f32 = 406.;
+const PRACTICE_SIZE_Y: f32 = 424.;
 const PRACTICE_SIZE_H: f32 = 48.;
-const PRACTICE_PREVIEW_Y: f32 = 468.;
-const PRACTICE_PREVIEW_H: f32 = 148.;
+const PRACTICE_PREVIEW_Y: f32 = 484.;
+const PRACTICE_PREVIEW_H: f32 = 144.;
 
 // 成绩单页
 const SCORE_G1_LABEL_Y: f32 = 124.;
@@ -643,6 +643,11 @@ fn practice_page(f: &mut Frame, hs: &mut Vec<Hit>, m: &Model, t: &Theme, x: f32,
             "首选不标数字，从第二候选起显示",
         ),
         (
+            "hint_rank_corner",
+            "选重数字角标",
+            "数字显示在词的右上角；关闭时随编码行显示",
+        ),
+        (
             "hint_color_words",
             "词组着色",
             "仅词组着色，单字与标点保持普通字色",
@@ -666,8 +671,8 @@ fn practice_page(f: &mut Frame, hs: &mut Vec<Hit>, m: &Model, t: &Theme, x: f32,
             title,
             desc,
             true,
-            5.,
-            25.,
+            4.,
+            23.,
         );
     }
     let locked = m.field("hint_settings_locked") == "true";
@@ -695,7 +700,7 @@ fn practice_page(f: &mut Frame, hs: &mut Vec<Hit>, m: &Model, t: &Theme, x: f32,
             f,
             hs,
             x + i as f32 * (choice_w + 8.),
-            strategy_y + 22.,
+            strategy_y + 20.,
             choice_w,
             30.,
             label,
@@ -732,12 +737,12 @@ fn practice_page(f: &mut Frame, hs: &mut Vec<Hit>, m: &Model, t: &Theme, x: f32,
         "动态词提",
         "按正确进度重算后续词提",
         false,
-        5.,
-        25.,
+        4.,
+        23.,
     );
     if locked {
         hs.truncate(route_hits);
-        rect(f, x, strategy_y + 22., w, 30., alpha(p.bg, 0.35));
+        rect(f, x, strategy_y + 20., w, 30., alpha(p.bg, 0.35));
         rect(f, x, dynamic_y, w, PRACTICE_SWITCH_H, alpha(p.bg, 0.35));
     }
     // 字号步进：数值 + − / + 一组 32 高按钮。
@@ -843,19 +848,35 @@ fn hint_preview(f: &mut Frame, m: &Model, t: &Theme, x: f32, py: f32, w: f32) {
             mono(f, sx, py + 81., size, *code, tint.unwrap_or(p.hint_code));
         }
         if show_rank && *rank > 1 {
-            let code_w = if show_code {
-                code.chars().count() as f32 * size * 0.6
+            // 【选重数字角标 2026-11-11】与正文渲染同口径：角标模式把
+            // 数字画到词右上角，否则跟在编码后面。
+            if enabled(m, "hint_rank_corner", false) {
+                let ds = 24. * 0.52;
+                let dw = rank.to_string().chars().count() as f32 * ds * 0.6;
+                let word_w = word.chars().count() as f32 * 24.;
+                mono(
+                    f,
+                    sx + word_w - dw - 1.,
+                    py + 42. - ds * 0.38,
+                    ds,
+                    rank.to_string(),
+                    tint.unwrap_or(p.hint_badge),
+                );
             } else {
-                0.
-            };
-            mono(
-                f,
-                sx + code_w + 2.,
-                py + 77.,
-                size,
-                rank.to_string(),
-                tint.unwrap_or(p.hint_badge),
-            );
+                let code_w = if show_code {
+                    code.chars().count() as f32 * size * 0.6
+                } else {
+                    0.
+                };
+                mono(
+                    f,
+                    sx + code_w + 2.,
+                    py + 77.,
+                    size,
+                    rank.to_string(),
+                    tint.unwrap_or(p.hint_badge),
+                );
+            }
         }
         note(f, sx, py + 100., cell - 8., caption, p.muted);
     }

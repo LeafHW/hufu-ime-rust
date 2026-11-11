@@ -9,6 +9,7 @@ pub mod compare;
 pub mod config;
 pub mod library;
 pub mod mini_toml;
+pub mod normalize;
 pub mod report;
 pub mod rules;
 pub mod score;

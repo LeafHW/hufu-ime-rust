@@ -562,7 +562,8 @@ fn load_snapshot(key: &SourceKey, before: &Fingerprint) -> Loaded {
         ));
     }
     schema.symbols = Default::default();
-    schema.supplement = Default::default();
+    // 【补充语料词提 2026-11-11】补充语料不再剥离：Analyzer 需要它把
+    // 语料词（引擎整句词图/挂起可打出）纳入词提来源；实测漏词修复。
     schema.pinyin = None;
     schema.unicode_block = None;
     schema.split = None;

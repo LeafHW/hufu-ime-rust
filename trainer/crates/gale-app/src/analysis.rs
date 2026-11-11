@@ -1,8 +1,12 @@
 //! Dictionary analysis shared by the live panel and native layout fixtures.
 use std::collections::BTreeMap;
 
+/// A word earns the bracket and tint when it spans at least two characters,
+/// matching the original trainer: punctuation glued into a routed word (such
+/// as 「怎么办？」) still gets its underline and colour class. Single
+/// characters never do. 【含标点词显示对齐 2026-11-12】
 pub fn is_multi_word(text: &str) -> bool {
-    text.chars().take(2).count() == 2 && text.chars().all(char::is_alphanumeric)
+    text.chars().count() >= 2
 }
 
 /// The six prompt colors describe word length and base-code length, without
@@ -70,6 +74,48 @@ pub struct FullAnalysisEntry {
     pub rank: u64,
     #[serde(default)]
     pub tail: String,
+}
+
+/// 【下一个字编码 2026-11-12】单字码：该字独立成词时的显示路由配方。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CharCode {
+    pub code: String,
+    pub rank: usize,
+    pub tail: String,
+}
+
+/// 解析 single=true 的 analyze 响应为与正文逐字对齐的单字码表；
+/// 词库无码的字为 None。响应必须恰好逐字覆盖（多字词条目报错）。
+pub fn response_char_codes(
+    text: &str,
+    value: &serde_json::Value,
+) -> Result<Vec<Option<CharCode>>, String> {
+    let entries = response_entries(text, value)?;
+    let mut chars = text.chars();
+    let mut out = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let Some(ch) = chars.next() else {
+            return Err("单字码表与正文长度不一致".into());
+        };
+        if entry.word.chars().count() != 1 || entry.word.chars().next() != Some(ch) {
+            return Err("单字码响应包含多字词条目".into());
+        }
+        out.push(
+            entry
+                .code
+                .clone()
+                .filter(|c| !c.is_empty())
+                .map(|code| CharCode {
+                    code,
+                    rank: entry.rank as usize,
+                    tail: entry.tail.clone(),
+                }),
+        );
+    }
+    if chars.next().is_some() {
+        return Err("单字码表与正文长度不一致".into());
+    }
+    Ok(out)
 }
 
 pub struct AnalysisSummary {
@@ -352,6 +398,31 @@ mod tests {
         }
     }
     #[test]
+    fn char_codes_parse_single_response_per_char() {
+        let v = serde_json::json!({"words":[
+            {"text":"怎","start":0,"len":1,"code":"jq","rank":1,"tail":"_"},
+            {"text":"呢","start":1,"len":1,"code":"nz","rank":2,"tail":";"},
+            {"text":"￥","start":2,"len":1},
+        ]});
+        let codes = response_char_codes("怎呢￥", &v).unwrap();
+        assert_eq!(codes.len(), 3);
+        let first = codes[0].as_ref().unwrap();
+        assert_eq!(first.code, "jq");
+        assert_eq!(first.rank, 1);
+        let second = codes[1].as_ref().unwrap();
+        assert_eq!(second.code, "nz");
+        assert_eq!(second.rank, 2);
+        assert_eq!(second.tail, ";");
+        assert!(codes[2].is_none(), "无码字为 None");
+    }
+    #[test]
+    fn char_codes_reject_word_entries() {
+        let v = serde_json::json!({"words":[
+            {"text":"怎么","start":0,"len":2,"code":"zm","rank":1,"tail":"_"},
+        ]});
+        assert!(response_char_codes("怎么", &v).is_err());
+    }
+    #[test]
     fn prompt_word_colors_use_the_six_extracted_classes() {
         use WordColorClass::*;
         for (word, code, expected) in [
@@ -367,9 +438,11 @@ mod tests {
             ("四字词语", "abcd", Some(Long)),
             ("𠮷甲", "abc", Some(Two3)),
             ("甲", "a", None),
-            ("……", "a", None),
-            ("……", "abc", None),
-            ("词，词", "abc", None),
+            // 含标点多字词按原版口径参与分档（2026-11-12 对齐）
+            ("……", "a", Some(One)),
+            ("……", "abc", Some(Two3)),
+            ("词，词", "abc", Some(Short)),
+            ("怎么办？", "k", Some(One)),
             ("词组", "", None),
         ] {
             assert_eq!(word_color_class(word, code), expected, "{word}/{code}");
@@ -387,8 +460,11 @@ mod tests {
     fn native_multichar_punctuation_counts_one_shifted_key_chord() {
         assert!(is_multi_word("世界"));
         assert!(!is_multi_word("的"));
-        assert!(!is_multi_word("……"));
-        assert!(!is_multi_word("——"));
+        // Punctuation-glued multi-character words now count as words for the
+        // bracket and tint, matching the original trainer's rendering.
+        assert!(is_multi_word("……"));
+        assert!(is_multi_word("——"));
+        assert!(is_multi_word("怎么办？"));
         assert_eq!(display_keys("ab ^_$"), "ab_↑6↑-↑4");
         let v = serde_json::json!({"words":[
             {"text":"…","start":0,"len":1},{"text":"…","start":1,"len":1},
