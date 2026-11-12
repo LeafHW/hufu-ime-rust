@@ -60,6 +60,100 @@ impl HintStrategy {
     }
 }
 
+/// 【2026-11-12 用户拍板】正文呈现模式：
+/// - `Copybook` 字贴模式：原来的做法——直接在发文区里跟打，光标逐字推进；
+/// - `Split` 传统/对照模式：上方文章对照区、下方独立输入框，打字结果落在输入框里。
+///
+/// 持久化到 config.toml 的 `display_mode`（旧配置缺省 = 字贴，行为完全不变）。
+/// 手写 serde：未知/未来值一律回退字贴，坏配置不会让 profile 加载失败。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DisplayMode {
+    #[default]
+    Copybook,
+    Split,
+}
+
+impl serde::Serialize for DisplayMode {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+impl<'de> serde::Deserialize<'de> for DisplayMode {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Ok(Self::from_str_lossy(&String::deserialize(d)?))
+    }
+}
+
+impl DisplayMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Copybook => "copybook",
+            Self::Split => "split",
+        }
+    }
+    pub fn from_str_lossy(value: &str) -> Self {
+        match value.trim() {
+            "split" | "traditional" | "对照" | "传统" => Self::Split,
+            _ => Self::Copybook,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Copybook => "字贴",
+            Self::Split => "对照",
+        }
+    }
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Copybook => "发文区直接跟打，光标逐字推进",
+            Self::Split => "上方文章对照，下方输入框跟打",
+        }
+    }
+    pub fn is_split(self) -> bool {
+        matches!(self, Self::Split)
+    }
+}
+
+/// 【快捷键 2026-11-13】可自设的动作表：(id, 名称, 默认组合键)。
+/// 只收录“命令型”快捷键；Enter/空格/Ctrl+V/Ctrl+Z/Ctrl+Y 是打字与编辑键，固定不可改。
+pub const SHORTCUT_DEFAULTS: &[(&str, &str, &str)] = &[
+    ("settings", "设置", "F1"),
+    ("post", "发送当前文章", "F2"),
+    ("appearance", "外观与颜色", "F7"),
+    ("analysis", "理论分析", "F10"),
+    ("restart", "重打本段", "F3"),
+    ("read_group", "读取群文", "F4"),
+    ("groups", "选群", "F5"),
+    ("online", "在线发文", "F8"),
+    ("rules", "群/规则", "F9"),
+    ("minimal", "极简模式", "F11"),
+    ("toggle_mode", "字贴 / 对照", "F12"),
+    ("menu", "视图菜单", "Menu"),
+    ("prev_segment", "上一段", "Ctrl+Left"),
+    ("next_segment", "下一段", "Ctrl+Right"),
+    ("load_clipboard_alt", "载文（备用键）", "Alt+E"),
+];
+
+fn split_ratio_default() -> f32 {
+    0.58
+}
+/// 解析 + 夹紧一个浮点配置；NaN/inf/坏值一律回退 `fallback`。
+fn clamp_finite(value: String, fallback: f32, lo: f32, hi: f32) -> f32 {
+    value
+        .parse::<f32>()
+        .ok()
+        .filter(|v| v.is_finite())
+        .unwrap_or(fallback)
+        .clamp(lo, hi)
+}
+fn split_ratio_clamped(value: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(0.35, 0.78)
+    } else {
+        split_ratio_default()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
@@ -105,12 +199,46 @@ pub struct Config {
     pub hint_word_bg: bool,
     #[serde(default = "hint_font_default")]
     pub hint_font_size: f32,
+    /// 【选重数字 2026-11-13】角标加粗：有些屏/字号下数字太细看不清。
+    #[serde(default)]
+    pub hint_rank_bold: bool,
+    /// 【选重数字 2026-11-13】角标垂直偏移（DIP）：负=离字更远（更高），正=更近。
+    #[serde(default)]
+    pub hint_rank_offset: f32,
+    /// 【字间距 2026-11-13】正文与输入框的额外字距（DIP，0=系统原生排版）。
+    #[serde(default)]
+    pub letter_spacing: f32,
+    /// 【成绩面板 2026-11-13】展开后高度（DIP，0=按成绩条数自动）；拖动面板上沿修改。
+    #[serde(default)]
+    pub ledger_panel_h: f32,
+
+    // ── 【快捷键自设 2026-11-13】动作 id → 组合键（缺省用 SHORTCUT_DEFAULTS）──
+    /// 例：shortcut_online = "Ctrl+Shift+O"、shortcut_analysis = "F10"。
+    #[serde(default)]
+    pub shortcuts: BTreeMap<String, String>,
     #[serde(default = "yes")]
     pub score_auto_copy: bool,
     #[serde(default)]
     pub score_template: String,
     #[serde(default = "score_fields_default")]
     pub score_fields: String,
+
+    // ── 【2026-11-12 视图体系】字贴/对照双模式 + 极简模式 + 窗口置顶 ──
+    /// 正文呈现模式（字贴/对照）。旧配置缺省 = 字贴，行为与之前完全一致。
+    #[serde(default)]
+    pub display_mode: DisplayMode,
+    /// 极简模式：隐藏标题栏/工具栏/统计带/底栏，正文满窗（两种正文模式通用）。
+    #[serde(default)]
+    pub minimal: bool,
+    /// 极简模式顶部静默数据条（速度/键准/进度）。关掉后极简只剩正文。
+    #[serde(default = "yes")]
+    pub minimal_hud: bool,
+    /// 对照模式中文章对照区高度占正文带的比例（其余给输入框）。拖动分栏把手改。
+    #[serde(default = "split_ratio_default")]
+    pub split_ratio: f32,
+    /// 窗口置顶（右键菜单/设置页可切换）。
+    #[serde(default)]
+    pub always_on_top: bool,
 
     /// 窗口材质
     pub material: Material,
@@ -198,9 +326,19 @@ impl Default for Config {
             hint_underline: false,
             hint_word_bg: false,
             hint_font_size: 14.,
+            hint_rank_bold: false,
+            hint_rank_offset: 0.,
+            letter_spacing: 0.,
+            ledger_panel_h: 0.,
+            shortcuts: BTreeMap::new(),
             score_auto_copy: true,
             score_template: String::new(),
             score_fields: score_fields_default(),
+            display_mode: DisplayMode::Copybook,
+            minimal: false,
+            minimal_hud: true,
+            split_ratio: split_ratio_default(),
+            always_on_top: false,
             material: Material::Solid,
             opacity: 100,
             seg_chars: 100,
@@ -228,7 +366,21 @@ impl Default for Config {
 }
 
 impl Config {
-    fn read_saved(path: &Path) -> GaleResult<Self> {
+    /// 某个动作当前生效的组合键（用户自设优先，否则默认值；未知 id 返回空）。
+    pub fn shortcut(&self, id: &str) -> String {
+        self.shortcuts
+            .get(id)
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                SHORTCUT_DEFAULTS
+                    .iter()
+                    .find(|(key, _, _)| *key == id)
+                    .map(|(_, _, chord)| (*chord).to_string())
+            })
+            .unwrap_or_default()
+    }    fn read_saved(path: &Path) -> GaleResult<Self> {
         use std::io::Read;
         let mut text = String::new();
         std::fs::File::open(path)?
@@ -307,9 +459,36 @@ impl Config {
                 .filter(|v| v.is_finite())
                 .unwrap_or(14.)
                 .clamp(14., 28.),
+            hint_rank_bold: get("hint_rank_bold", "false") == "true",
+            hint_rank_offset: clamp_finite(get("hint_rank_offset", "0"), 0., -12., 16.),
+            letter_spacing: clamp_finite(get("letter_spacing", "0"), 0., 0., 12.),
+            ledger_panel_h: clamp_finite(get("ledger_panel_h", "0"), 0., 0., 900.),
+            shortcuts: {
+                let mut map = BTreeMap::new();
+                for (id, _, default) in SHORTCUT_DEFAULTS {
+                    let value = get(&format!("shortcut_{id}"), default);
+                    let value = value.trim();
+                    if !value.is_empty() && value != *default {
+                        map.insert((*id).to_string(), value.to_string());
+                    }
+                }
+                map
+            },
             score_auto_copy: get("score_auto_copy", "true") == "true",
             score_template: get("score_template", ""),
             score_fields: get("score_fields", &d.score_fields),
+            display_mode: DisplayMode::from_str_lossy(&get(
+                "display_mode",
+                d.display_mode.as_str(),
+            )),
+            minimal: get("minimal", "false") == "true",
+            minimal_hud: get("minimal_hud", "true") == "true",
+            split_ratio: split_ratio_clamped(
+                get("split_ratio", &d.split_ratio.to_string())
+                    .parse::<f32>()
+                    .unwrap_or(d.split_ratio),
+            ),
+            always_on_top: get("always_on_top", "false") == "true",
             opacity: get("opacity", &d.opacity.to_string())
                 .parse()
                 .unwrap_or(d.opacity),
@@ -443,8 +622,24 @@ impl Config {
             m.insert(key.into(), value.to_string());
         }
         m.insert("hint_font_size".into(), self.hint_font_size.to_string());
+        m.insert("hint_rank_bold".into(), self.hint_rank_bold.to_string());
+        m.insert("hint_rank_offset".into(), self.hint_rank_offset.to_string());
+        m.insert("letter_spacing".into(), self.letter_spacing.to_string());
+        m.insert("ledger_panel_h".into(), self.ledger_panel_h.to_string());
+        // 快捷键：只写偏离默认的值，默认不落盘（保持配置文件干净）。
+        for (id, _, default) in SHORTCUT_DEFAULTS {
+            let value = self.shortcut(id);
+            if !value.is_empty() && value != *default {
+                m.insert(format!("shortcut_{id}"), value);
+            }
+        }
         m.insert("score_template".into(), self.score_template.clone());
         m.insert("score_fields".into(), self.score_fields.clone());
+        m.insert("display_mode".into(), self.display_mode.as_str().into());
+        m.insert("minimal".into(), self.minimal.to_string());
+        m.insert("minimal_hud".into(), self.minimal_hud.to_string());
+        m.insert("split_ratio".into(), self.split_ratio.to_string());
+        m.insert("always_on_top".into(), self.always_on_top.to_string());
         m.insert("material".into(), format!("{:?}", self.material));
         m.insert("opacity".into(), self.opacity.to_string());
         m.insert("seg_chars".into(), self.seg_chars.to_string());
@@ -777,9 +972,105 @@ mod tests {
         assert!(loaded.hint_color_words);
     }
 
+    /// 视图体系（2026-11-12）：旧配置默认字贴、profile.json 缺字段可加载、
+    /// 坏值/越界夹紧、未知枚举回退字贴。
     #[test]
-    fn trainer_preferences_preserve_multiline_templates_and_independent_switches() {
-        let mut cfg = Config::default();
+    fn view_modes_roundtrip_with_legacy_defaults_and_clamped_ratio() {
+        let legacy = Config::from_toml_text("font_size = 36").unwrap();
+        assert_eq!(legacy.display_mode, DisplayMode::Copybook);
+        assert!(!legacy.minimal);
+        assert!(legacy.minimal_hud);
+        assert!(!legacy.always_on_top);
+        assert!((legacy.split_ratio - 0.58).abs() < 1e-6);
+        assert_eq!(DisplayMode::label(legacy.display_mode), "字贴");
+
+        let cfg = Config {
+            display_mode: DisplayMode::Split,
+            minimal: true,
+            minimal_hud: false,
+            split_ratio: 0.7,
+            always_on_top: true,
+            ..Default::default()
+        };
+        let loaded = Config::from_toml_text(&cfg.to_toml_text()).unwrap();
+        assert_eq!(loaded.display_mode, DisplayMode::Split);
+        assert!(loaded.minimal && !loaded.minimal_hud && loaded.always_on_top);
+        assert!((loaded.split_ratio - 0.7).abs() < 1e-6);
+
+        let bad = Config::from_toml_text("split_ratio = 9\ndisplay_mode = \"weird\"").unwrap();
+        assert!((bad.split_ratio - 0.78).abs() < 1e-6);
+        assert_eq!(bad.display_mode, DisplayMode::Copybook);
+        assert_eq!(
+            Config::from_toml_text("split_ratio = NaN")
+                .unwrap()
+                .split_ratio,
+            split_ratio_default()
+        );
+        assert_eq!(
+            DisplayMode::from_str_lossy("traditional"),
+            DisplayMode::Split
+        );
+        assert_eq!(DisplayMode::from_str_lossy("对照"), DisplayMode::Split);
+        assert_eq!(DisplayMode::from_str_lossy(""), DisplayMode::Copybook);
+
+        // profile.json（云同步）兼容：旧快照没有这些新字段也能加载。
+        let mut snapshot = serde_json::to_value(&cfg).unwrap();
+        for key in [
+            "display_mode",
+            "minimal",
+            "minimal_hud",
+            "split_ratio",
+            "always_on_top",
+        ] {
+            snapshot.as_object_mut().unwrap().remove(key);
+        }
+        let old = serde_json::from_value::<Config>(snapshot).unwrap();
+        assert_eq!(old.display_mode, DisplayMode::Copybook);
+        assert!(!old.minimal && old.minimal_hud);
+        assert!((old.split_ratio - 0.58).abs() < 1e-6);
+    }
+
+    /// 2026-11-13：选重数字加粗/高低、字间距、成绩面板高度都要能存下来，
+    /// 旧配置缺省安全、坏值夹紧。
+    #[test]
+    fn rank_digit_typography_and_ledger_height_roundtrip_with_clamps() {
+        let legacy = Config::from_toml_text("font_size = 36").unwrap();
+        assert!(!legacy.hint_rank_bold);
+        assert_eq!(legacy.hint_rank_offset, 0.);
+        assert_eq!(legacy.letter_spacing, 0.);
+        assert_eq!(legacy.ledger_panel_h, 0.);
+
+        let cfg = Config {
+            hint_rank_bold: true,
+            hint_rank_offset: -3.5,
+            letter_spacing: 2.5,
+            ledger_panel_h: 320.,
+            ..Default::default()
+        };
+        let loaded = Config::from_toml_text(&cfg.to_toml_text()).unwrap();
+        assert!(loaded.hint_rank_bold);
+        assert!((loaded.hint_rank_offset + 3.5).abs() < 1e-4);
+        assert!((loaded.letter_spacing - 2.5).abs() < 1e-4);
+        assert!((loaded.ledger_panel_h - 320.).abs() < 1e-4);
+
+        let bad = Config::from_toml_text(
+            "hint_rank_offset = 99\nletter_spacing = -5\nledger_panel_h = 9999",
+        )
+        .unwrap();
+        assert_eq!(bad.hint_rank_offset, 16.);
+        assert_eq!(bad.letter_spacing, 0.);
+        assert_eq!(bad.ledger_panel_h, 900.);
+        assert_eq!(
+            Config::from_toml_text("letter_spacing = NaN")
+                .unwrap()
+                .letter_spacing,
+            0.
+        );
+    }
+
+
+    #[test]
+    fn trainer_preferences_preserve_multiline_templates_and_independent_switches() {        let mut cfg = Config::default();
         cfg.hint_show_code = false;
         cfg.hint_show_rank = true;
         cfg.hint_word_bg = true;
@@ -817,4 +1108,38 @@ fn physical_window_position_roundtrips_and_legacy_config_keeps_old_coordinate_mo
     assert!(restored.win_position_physical);
     assert_eq!(restored.win_x, -1000);
     assert_eq!(restored.win_w, 960);
+}
+
+#[cfg(test)]
+mod shortcut_config_tests {
+    use super::Config;
+
+    #[test]
+    fn shortcuts_default_inherit_and_roundtrip() {
+        let cfg = Config::default();
+        assert_eq!(cfg.shortcut("online"), "F8");
+        assert_eq!(cfg.shortcut("minimal"), "F11");
+        assert_eq!(cfg.shortcut("unknown-id"), "");
+
+        let mut custom = Config::default();
+        custom
+            .shortcuts
+            .insert("online".into(), "Ctrl+Shift+O".into());
+        custom
+            .shortcuts
+            .insert("analysis".into(), "Alt+F12".into());
+        let text = custom.to_toml_text();
+        assert!(text.contains("shortcut_online"));
+        let back = Config::from_toml_text(&text).expect("roundtrip");
+        assert_eq!(back.shortcut("online"), "Ctrl+Shift+O");
+        assert_eq!(back.shortcut("analysis"), "Alt+F12");
+        assert_eq!(back.shortcut("settings"), "F1");
+
+        // 回到默认后不落盘（配置保持干净）。
+        let mut defaults = custom.clone();
+        defaults.shortcuts.clear();
+        let plain = defaults.to_toml_text();
+        assert!(!plain.contains("shortcut_online"));
+        assert_eq!(defaults.shortcut("online"), "F8");
+    }
 }

@@ -13,16 +13,16 @@ pub(crate) mod preferences;
 // Modal text always remains legible at the actual window size. Decorative
 // geometry and the training article's configured size are independent.
 fn text(f: &mut Frame, x: f32, y: f32, size: f32, s: impl Into<String>, c: [f32; 4]) {
-    crate::ui::text(f, x, y, size.max(15.), s, c)
+    crate::ui::text(f, x, y, size.max(13.), s, c)
 }
 fn mono(f: &mut Frame, x: f32, y: f32, size: f32, s: impl Into<String>, c: [f32; 4]) {
-    crate::ui::mono(f, x, y, size.max(15.), s, c)
+    crate::ui::mono(f, x, y, size.max(13.), s, c)
 }
 fn right(f: &mut Frame, x: f32, y: f32, size: f32, s: impl Into<String>, c: [f32; 4]) {
-    crate::ui::right(f, x, y, size.max(15.), s, c)
+    crate::ui::right(f, x, y, size.max(13.), s, c)
 }
 fn body_text(f: &mut Frame, x: f32, y: f32, size: f32, s: impl Into<String>, c: [f32; 4]) {
-    crate::ui::body_text(f, x, y, size.max(15.), s, c)
+    crate::ui::body_text(f, x, y, size.max(13.), s, c)
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Modal {
@@ -35,6 +35,8 @@ pub enum Modal {
     Confirm,
     /// 本段按键热力图（结算后，数据 Session::last_vk_histogram）。
     Heatmap,
+    /// 理论码长分析弹窗：整篇文章一页显示，可复制为图片（2026-11-13）。
+    Analysis,
     /// Less frequent actions, kept out of the practice toolbar.
     More,
 }
@@ -47,6 +49,25 @@ pub enum Action {
     ToggleLedger,
     /// 主窗口底部理论分析停靠面板开关（F10）。
     ToggleAnalysis,
+    // ── 【视图体系 2026-11-12】字贴/对照双模式 + 极简模式 + 视图菜单 ──
+    /// 切换正文呈现模式（字贴/对照）。
+    SetDisplayMode(gale_core::config::DisplayMode),
+    /// 字贴 ⇄ 对照 互换（F12；右键菜单）。
+    ToggleDisplayMode,
+    /// 极简模式开关（F11）：隐藏标题栏/工具栏/统计带/底栏。
+    ToggleMinimal,
+    /// 极简模式顶部静默数据条开关。
+    ToggleMinimalHud,
+    /// 窗口置顶开关。
+    ToggleTopmost,
+    /// 打开视图菜单（锚点=逻辑坐标；右键/工具栏「视图」/菜单键共用）。
+    OpenMenuAt(f32, f32),
+    /// 关闭视图菜单（Esc / 点击外部 / 开始打字）。
+    CloseMenu,
+    /// 菜单内字号步进（±1）。
+    StepFont(i32),
+    /// 菜单内对照分栏比例步进（±1 → ±2%）。
+    StepSplit(i32),
     /// 打开 F1 设置并定位到「外观」页（F7）。
     OpenAppearanceSettings,
     Exit,
@@ -209,6 +230,20 @@ pub struct Model {
     pub analysis_dock: bool,
     /// 理论分析停靠面板滚动偏移（DIP）。
     pub analysis_dock_scroll: f32,
+    /// 【视图体系 2026-11-12】窗口内自绘右键/视图菜单：Some = 展开。
+    pub menu: Option<CtxMenu>,
+    /// 最近一次指针位置（逻辑坐标）：菜单行 hover、极简悬停控件的显隐。
+    /// 由主循环在 draw 前写入（不参与持久化）。
+    pub pointer: Option<(f32, f32)>,
+}
+
+/// 窗口内自绘右键/视图菜单的锚点（逻辑坐标）。
+/// 具体排版在 `ctxmenu.rs`；这里只保存位置，保证 Model 不依赖绘制细节。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CtxMenu {
+    /// 菜单左上角锚点（逻辑 DIP；绘制时会夹进窗口并可能向上翻转）。
+    pub x: f32,
+    pub y: f32,
 }
 impl Model {
     pub fn open(&mut self, m: Modal) {
@@ -245,9 +280,13 @@ pub fn panel(m: Modal, w: f32, h: f32) -> (f32, f32, f32, f32) {
         Modal::Rules => (1040., 900.),
         Modal::Confirm => (560., 300.),
         Modal::Heatmap => (1040., 620.),
+        Modal::Analysis => (1460., 1000.),
         _ => (880., 596.),
     };
-    let ph = if matches!(m, Modal::Heatmap | Modal::Groups | Modal::More) {
+    let ph = if matches!(
+        m,
+        Modal::Heatmap | Modal::Groups | Modal::More | Modal::Analysis
+    ) {
         panel_view(ph, h)
     } else {
         ph
@@ -580,7 +619,7 @@ fn text_block(
 ) {
     // Wrap with the same clamped size the drawing helper uses; otherwise a
     // caller passing 13.5 wraps wider than the 15 DIP glyphs and overflows.
-    let size = size.max(15.);
+    let size = size.max(13.);
     for (i, l) in wrap(s, (w / size).max(1.) as usize)
         .into_iter()
         .take(max_lines)
@@ -662,7 +701,7 @@ fn panel_header(f: &mut Frame, hs: &mut Vec<Hit>, m: Modal, x: f32, y: f32, pw: 
         Modal::Preferences => (
             "palette",
             "跟打器设置",
-            "练习、成绩、配色、外观与数据",
+            "练习、成绩、外观、界面与数据、快捷键",
             "F1",
         ),
         Modal::Heatmap => (
@@ -915,6 +954,7 @@ fn draw_groups(
 fn draw_more(
     f: &mut Frame,
     hs: &mut Vec<Hit>,
+    cfg: &Config,
     m: &Model,
     sess: &Session,
     t: &Theme,
@@ -933,13 +973,13 @@ fn draw_more(
             "重打本段".into(),
             "从头开始当前段".into(),
             Action::Restart,
-            "F3".into(),
+            cfg.shortcut("restart"),
         ),
         (
             "选择群聊".into(),
             "绑定或取消 QQ 群".into(),
             Action::Open(Modal::Groups),
-            "F5".into(),
+            cfg.shortcut("groups"),
         ),
     ];
     if sess.source != crate::session::SessionSource::Single
@@ -949,7 +989,7 @@ fn draw_more(
             "发送当前文章".into(),
             "按晴发文格式发到目标群".into(),
             Action::PostArticle,
-            "F2".into(),
+            cfg.shortcut("post"),
         ));
     }
     let right_items: Vec<(String, String, Action, String)> = vec![
@@ -957,13 +997,13 @@ fn draw_more(
             "跟打器设置".into(),
             "词提、成绩单与配色".into(),
             Action::Open(Modal::Preferences),
-            "F1".into(),
+            cfg.shortcut("settings"),
         ),
         (
             "清洗规则".into(),
             "正则清洗、原文与结果预览".into(),
             Action::Open(Modal::Rules),
-            "F9".into(),
+            cfg.shortcut("rules"),
         ),
         (
             "打开数据目录".into(),
@@ -1400,13 +1440,15 @@ struct AnalysisBlock {
 /// Shared rhythm for both the measured layout and the draw pass. Keeping these
 /// numbers in one place prevents the code row from drifting away from the word
 /// when only one of the two call sites is adjusted.
-fn analysis_metrics(m: &Model) -> (f32, f32, f32, f32, f32) {
-    let fs = analysis_font(m);
+fn analysis_metrics_at(fs: f32) -> (f32, f32, f32, f32, f32) {
     let ks = (fs * 0.62).max(13.);
     let line_h = fs * 1.34;
     let key_gap = (fs * 0.18).max(4.);
     let key_line_h = ks * 1.35;
     (fs, ks, line_h, key_gap, key_line_h)
+}
+fn analysis_metrics(m: &Model) -> (f32, f32, f32, f32, f32) {
+    analysis_metrics_at(analysis_font(m))
 }
 
 /// Punctuation stays in the article color and carries no code row. Grouping it
@@ -1420,7 +1462,17 @@ fn analysis_punctuation(word: &str) -> bool {
 }
 
 fn analysis_blocks(fa: &crate::FullAnalysis, m: &Model, width: f32) -> (Vec<AnalysisBlock>, f32) {
-    let (fs, ks, line_h, key_gap, key_line_h) = analysis_metrics(m);
+    analysis_blocks_at(fa, m, width, analysis_font(m))
+}
+
+/// 指定字号的排版：弹窗按一页容纳整篇文章时会把字号逐级调小。
+fn analysis_blocks_at(
+    fa: &crate::FullAnalysis,
+    m: &Model,
+    width: f32,
+    fs: f32,
+) -> (Vec<AnalysisBlock>, f32) {
+    let (fs, ks, line_h, key_gap, key_line_h) = analysis_metrics_at(fs);
     let available = width.max(fs * 2.);
     let word_gap = (fs * 0.38).max(8.);
     let row_gap = (fs * 0.50).max(10.);
@@ -1554,8 +1606,13 @@ pub fn analysis_dock_height(h: f32) -> f32 {
     (h * 0.36).clamp(120., 300.).min((h - 300.).max(120.))
 }
 pub fn analysis_dock_rect(w: f32, h: f32) -> (f32, f32, f32, f32) {
+    analysis_dock_rect_for(&Config::default(), w, h)
+}/// 极简模式没有状态行/成绩栏：停靠面板贴底 12px（正文仍让位）。
+pub fn analysis_dock_rect_for(cfg: &Config, w: f32, h: f32) -> (f32, f32, f32, f32) {
     let dh = analysis_dock_height(h);
-    let bottom = if h < 520. {
+    let bottom = if cfg.minimal {
+        h - 12.
+    } else if h < 520. {
         h - crate::ui::STATUS_H - 8.
     } else {
         crate::ui::ledger_bar_y(h) - 8.
@@ -1635,7 +1692,20 @@ pub(crate) fn draw_analysis_dock(
     w: f32,
     h: f32,
 ) {
-    let (x, y, pw, dh) = analysis_dock_rect(w, h);
+    draw_analysis_dock_for(f, hs, m, sess, t, &Config::default(), w, h)
+}
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn draw_analysis_dock_for(
+    f: &mut Frame,
+    hs: &mut Vec<Hit>,
+    m: &Model,
+    sess: &Session,
+    t: &Theme,
+    cfg: &Config,
+    w: f32,
+    h: f32,
+) {
+    let (x, y, pw, dh) = analysis_dock_rect_for(cfg, w, h);
     let p = tokens(t);
     round(f, x, y, pw, dh, 12., p.surface, Some(p.line2));
     let auto4 = analysis_auto4(m);
@@ -1707,17 +1777,16 @@ pub(crate) fn draw_analysis_dock(
             ("缺字", summary.missing_chars.to_string()),
             ("理论键", summary.known_keys.to_string()),
         ];
+        // 五等分列：label 在上、数值在下，两行共用同一条左轴线（值不再随
+        // 标签宽度左右跳），第 5 列"理论键"也不会比其它列多缩进。
         let step = ((pw - 40.) / 5.).max(96.);
         for (i, (label, value)) in items.iter().enumerate() {
             let sx = x + 20. + i as f32 * step;
-            text(f, sx, y + 46., 12., *label, p.muted);
-            // Keep a clear gutter between the caption and its number; the old
-            // fixed +46 offset collided once a four-character label was used.
-            let value_x = sx + crate::ui::ui_text_width(label, 12.).max(26.) + 12.;
+            text(f, sx, y + 42., 12., *label, p.muted);
             mono(
                 f,
-                value_x,
-                y + 42.,
+                sx,
+                y + 55.,
                 16.,
                 value,
                 if i == 3 && summary.missing_chars > 0 {
@@ -1900,6 +1969,389 @@ pub(crate) fn draw_analysis_dock(
         }
     }
 }
+/// 一页适配：从 24px 逐级缩小字号，直到整篇文章的理论词条块塞进弹窗可视区。
+fn analysis_fit(
+    fa: &crate::FullAnalysis,
+    m: &Model,
+    width: f32,
+    height: f32,
+) -> (f32, Vec<AnalysisBlock>, f32) {
+    let mut fs = 24.;
+    loop {
+        let (blocks, total) = analysis_blocks_at(fa, m, width, fs);
+        if total <= height || fs <= 8.5 {
+            return (fs, blocks, total);
+        }
+        fs -= 0.5;
+    }
+}
+
+/// 理论分析弹窗的正文几何：header 112 + 正文 + footer 44。
+fn analysis_modal_body_geom(x: f32, y: f32, pw: f32, ph: f32) -> (f32, f32, f32, f32) {
+    let body_w = (pw - 48.).max(200.);
+    let body_x = x + 24.;
+    let body_y = y + 112.;
+    let body_h = (ph - 112. - 44.).max(120.);
+    (body_x, body_y, body_w, body_h)
+}
+
+/// 弹窗一页适配结果：字号、内容总高、可视高。主循环滚轮用。
+pub fn analysis_modal_fit_metrics(
+    sess: &Session,
+    m: &Model,
+    w: f32,
+    h: f32,
+) -> Option<(f32, f32, f32)> {
+    let fa = sess.full_analysis.as_ref()?;
+    let (x, y, pw, ph) = panel_for_model(m, w, h);
+    let (_, _, body_w, body_h) = analysis_modal_body_geom(x, y, pw, ph);
+    let (fs, _, total) = analysis_fit(fa, m, body_w, body_h);
+    Some((fs, total, body_h))
+}
+
+/// 复制图片时重绘的整页帧（窗口底色 + 弹窗内容，无遮罩）。
+pub fn analysis_modal_frame(
+    m: &Model,
+    sess: &Session,
+    t: &Theme,
+    w: f32,
+    h: f32,
+) -> Frame {
+    let mut f = Frame::new(w, h);
+    let p = tokens(t);
+    rect(&mut f, 0., 0., w, h, p.bg);
+    let (x, y, pw, ph) = panel_for_model(m, w, h);
+    round(&mut f, x, y, pw, ph, 16., p.surface, Some(p.line2));
+    let mut hs = Vec::new();
+    draw_analysis_modal(&mut f, &mut hs, m, sess, t, x, y, pw, ph);
+    f
+}
+
+/// 词条块绘制：词在块内居中，编码行与选重角标共用一套行高节奏。
+#[allow(clippy::too_many_arguments)]
+fn draw_analysis_blocks(
+    f: &mut Frame,
+    m: &Model,
+    t: &Theme,
+    fa: &crate::FullAnalysis,
+    blocks: &[AnalysisBlock],
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    scroll: f32,
+    fs: f32,
+) -> f32 {
+    let p = tokens(t);
+    let (fs, ks, line_h, key_gap, key_line_h) = analysis_metrics_at(fs);
+    f.push(DrawCmd::PushClip {
+        x,
+        y,
+        w: width,
+        h: height,
+    });
+    let mut drawn_bottom: f32 = 0.;
+    for block in blocks
+        .iter()
+        .filter(|b| b.y + b.h >= scroll && b.y < scroll + height)
+    {
+        let bx = x + block.x;
+        let by = y + block.y - scroll;
+        drawn_bottom = drawn_bottom.max(by + block.h);
+        let entry = &fa.entries[block.source_index];
+        let color = entry
+            .code
+            .as_deref()
+            .filter(|_| m.field("hint_color_words") != "false")
+            .and_then(|code| {
+                crate::ui::hint_word_tint_for_rank(
+                    &p,
+                    &entry.word,
+                    code,
+                    usize::try_from(entry.rank).unwrap_or(0),
+                    fa.max_code_length,
+                    m.field("hint_rank_colors") == "true",
+                )
+            })
+            .unwrap_or(p.text);
+        let key_color = if block.missing {
+            p.red
+        } else {
+            alpha(color, 0.78)
+        };
+        f.push(DrawCmd::PushClip {
+            x: bx,
+            y: by,
+            w: block.w + 2.,
+            h: block.h,
+        });
+        for (i, word) in block.words.iter().enumerate() {
+            let word_w = analysis_text_width(word, fs, false);
+            let ox = (block.w - word_w).max(0.) / 2.;
+            crate::ui::body_text(f, bx + ox, by + i as f32 * line_h, fs, word, color);
+        }
+        if !block.punctuation {
+            let key_y = by + block.words.len() as f32 * line_h + key_gap;
+            for (i, keys) in block.keys.iter().enumerate() {
+                let rank = if i == 0 && block.rank > 1 {
+                    block.rank.to_string()
+                } else {
+                    String::new()
+                };
+                let key_w = analysis_text_width(keys, ks, true);
+                let rank_size = ks * 0.78;
+                let rank_w = rank.chars().count() as f32 * rank_size * 0.6;
+                let rank_gap = if key_w > 0. && rank_w > 0. { 2. } else { 0. };
+                let ox = (block.w - key_w - rank_gap - rank_w).max(0.) / 2.;
+                let row_y = key_y + i as f32 * key_line_h;
+                mono(f, bx + ox, row_y, ks, keys, key_color);
+                if !rank.is_empty() {
+                    mono(
+                        f,
+                        bx + ox + key_w + rank_gap,
+                        row_y - 3.,
+                        rank_size,
+                        rank,
+                        alpha(color, 0.9),
+                    );
+                }
+            }
+        }
+        f.push(DrawCmd::PopClip);
+    }
+    f.push(DrawCmd::PopClip);
+    drawn_bottom
+}
+
+/// 理论码长分析弹窗：整篇文章一页显示 + 复制图片（2026-11-13 取代底部停靠面板）。
+fn draw_analysis_modal(
+    f: &mut Frame,
+    hs: &mut Vec<Hit>,
+    m: &Model,
+    sess: &Session,
+    t: &Theme,
+    x: f32,
+    y: f32,
+    pw: f32,
+    ph: f32,
+) {
+    let p = tokens(t);
+    let auto4 = analysis_auto4(m);
+    let heatmap = analysis_is_heatmap(m);
+    // ── 头部：标题 + 词库标记 + 右侧操作 ───────────────────────────
+    text(f, x + 24., y + 20., 18., "理论码长分析", p.text);
+    let title_w = crate::ui::ui_text_width("理论码长分析", 18.);
+    if let Some(fa) = &sess.full_analysis {
+        if !fa.schema.is_empty() {
+            let chip_w = (crate::ui::ui_text_width(&fa.schema, 11.) + 18.).min(260.);
+            let cx = x + 24. + title_w + 12.;
+            round(
+                f,
+                cx,
+                y + 21.,
+                chip_w,
+                22.,
+                6.,
+                p.surface2,
+                Some(alpha(p.line, 0.9)),
+            );
+            f.push(DrawCmd::PushClip {
+                x: cx + 9.,
+                y: y + 25.,
+                w: chip_w - 18.,
+                h: 16.,
+            });
+            text(f, cx + 9., y + 25., 11., elide_width(&fa.schema, chip_w - 18., 11.), p.muted);
+            f.push(DrawCmd::PopClip);
+        }
+    }
+    let close_x = x + pw - 24. - 30.;
+    let copy_w = 96.;
+    let copy_x = close_x - 12. - copy_w;
+    let view_w = 76.;
+    let view_x = copy_x - 10. - view_w;
+    let auto_w = 90.;
+    let auto_x = view_x - 10. - auto_w;
+    analysis_icon_button(f, hs, close_x, y + 15., 30., "×", Action::Close, t);
+    btn(
+        f,
+        hs,
+        copy_x,
+        y + 14.,
+        copy_w,
+        "复制图片",
+        crate::aux_marker("analysis_copy"),
+        t,
+        true,
+    );
+    analysis_chip(
+        f,
+        hs,
+        view_x,
+        y + 14.,
+        view_w,
+        if heatmap { "全文编码" } else { "热力图" },
+        crate::aux_marker("analysis_view"),
+        t,
+        heatmap,
+    );
+    analysis_chip(
+        f,
+        hs,
+        auto_x,
+        y + 14.,
+        auto_w,
+        "四码首选",
+        crate::aux_marker("analysis_auto4"),
+        t,
+        auto4,
+    );
+    // ── 汇总：五等分列，label 与数值都左对齐同一条轴线 ─────────────
+    let mut summary_slot = 0;
+    if let Some(fa) = &sess.full_analysis {
+        let summary = crate::analysis::summarize(fa, auto4);
+        let items = [
+            ("码长", format!("{:.4}", summary.avg_code_len)),
+            ("字数", summary.char_count.to_string()),
+            ("选重", summary.select_count.to_string()),
+            ("缺字", summary.missing_chars.to_string()),
+            ("理论键", summary.known_keys.to_string()),
+        ];
+        let inner = pw - 48.;
+        let pitch = (inner / 5.).max(96.);
+        for (i, (label, value)) in items.iter().enumerate() {
+            let sx = x + 24. + i as f32 * pitch;
+            text(f, sx, y + 60., 11., *label, p.muted);
+            mono(
+                f,
+                sx,
+                y + 75.,
+                17.,
+                value,
+                if i == 3 && summary.missing_chars > 0 {
+                    p.red
+                } else {
+                    p.text
+                },
+            );
+        }
+        summary_slot = 5;
+    }
+    let _ = summary_slot;
+    line(f, x + 24., y + 104., pw - 48., p.line);
+    // ── 正文 ───────────────────────────────────────────────────────
+    let (body_x, body_y, body_w, body_h) = analysis_modal_body_geom(x, y, pw, ph);
+    if let Some(fa) = &sess.full_analysis {
+        if heatmap {
+            let summary = crate::analysis::summarize(fa, auto4);
+            f.push(DrawCmd::PushClip {
+                x: body_x,
+                y: body_y,
+                w: body_w,
+                h: body_h,
+            });
+            crate::keyboard::draw_main(
+                f,
+                t,
+                body_x + 4.,
+                body_y + 2.,
+                body_w - 8.,
+                body_h - 6.,
+                |key| summary.key_counts.get(&key).copied().unwrap_or(0),
+            );
+            f.push(DrawCmd::PopClip);
+        } else {
+            let (fs, blocks, total_h) = analysis_fit(fa, m, body_w, body_h);
+            let max = (total_h - body_h).max(0.);
+            let scroll = m.analysis_dock_scroll.clamp(0., max);
+            draw_analysis_blocks(
+                f, m, t, fa, &blocks, body_x, body_y, body_w, body_h, scroll, fs,
+            );
+            if max > 0. {
+                let thumb = (body_h * body_h / total_h).clamp(18., body_h);
+                rect(f, body_x + body_w + 4., body_y, 5., body_h, alpha(p.text, 0.07));
+                rect(
+                    f,
+                    body_x + body_w + 4.,
+                    body_y + scroll / max * (body_h - thumb),
+                    5.,
+                    thumb,
+                    alpha(p.accent, 0.7),
+                );
+            }
+            let entries = fa.entries.len();
+            let chars: usize = fa.entries.iter().map(|e| e.word.chars().count()).sum();
+            let note = format!("整篇 {chars} 字 · {entries} 个词条 · 字号 {fs:.1}");
+            text(f, x + 24., y + ph - 30., 11., note, p.muted);
+            right(
+                f,
+                x + pw - 24.,
+                y + ph - 30.,
+                11.,
+                if max > 0. {
+                    "滚轮可滚动 · 复制图片自动适配一页"
+                } else {
+                    "已适配一页显示"
+                },
+                p.muted,
+            );
+        }
+    } else {
+        let empty = sess.current_segment().text.is_empty();
+        let loading = m.field("analysis_loading") == "true";
+        let error = m.field("analysis_error");
+        text(
+            f,
+            body_x,
+            body_y + 10.,
+            16.,
+            if empty {
+                "请先载入文章"
+            } else if loading {
+                "正在分析当前文章…"
+            } else if error.is_empty() {
+                "当前文章尚未取得理论分析"
+            } else {
+                "理论分析未完成"
+            },
+            p.text2,
+        );
+        if !loading {
+            let detail = if empty {
+                "点击主窗口「从剪贴板载入」或按 Ctrl+V，再打开理论分析。".to_string()
+            } else if error.is_empty() {
+                "重新请求后，这里会显示全文逐词编码与理论码长。".to_string()
+            } else {
+                error
+            };
+            let lines = analysis_wrap(&detail, body_w, 13., false);
+            for (i, line_text) in lines.iter().take(3).enumerate() {
+                text(
+                    f,
+                    body_x,
+                    body_y + 44. + i as f32 * 19.,
+                    13.,
+                    line_text,
+                    p.muted,
+                );
+            }
+            if !empty {
+                btn(
+                    f,
+                    hs,
+                    body_x,
+                    body_y + body_h - 40.,
+                    104.,
+                    "重新分析",
+                    crate::aux_marker("analysis_retry"),
+                    t,
+                    false,
+                );
+            }
+        }
+    }
+}
+
 fn modal_content_height(m: &Model, pw: f32) -> f32 {
     match m.modal {
         Modal::Preferences => preferences::content_height(m, pw),
@@ -1942,14 +2394,15 @@ pub fn draw(
             h: ph,
             action: Action::None,
         });
-        if !matches!(m.modal, Modal::Online | Modal::Rules) {
+        if !matches!(m.modal, Modal::Online | Modal::Rules | Modal::Analysis) {
             panel_header(f, hs, m.modal, x, y, pw, t);
         }
         match m.modal {
-            Modal::More => draw_more(f, hs, m, sess, t, x, y, pw, ph),
+            Modal::More => draw_more(f, hs, cfg, m, sess, t, x, y, pw, ph),
             Modal::Groups => draw_groups(f, hs, m, sess, cfg, t, x, y, pw, ph),
             Modal::Preferences => preferences::draw(f, hs, m, sess, cfg, t, x, y, pw, ph),
             Modal::Heatmap => draw_heatmap(f, hs, sess, t, x, y, pw, ph),
+            Modal::Analysis => draw_analysis_modal(f, hs, m, sess, t, x, y, pw, ph),
             Modal::Online | Modal::Rules => {
                 crate::secondary_panels::draw(f, hs, m, sess, cfg, t, x, y, pw, ph)
             }
@@ -2074,6 +2527,30 @@ mod tests {
         s
     }
     #[test]
+    fn analysis_modal_fits_the_whole_article_on_one_page() {
+        let mut s = analysis_session(160);
+        let mut m = Model::default();
+        m.open(Modal::Analysis);
+        let (fs, total, body_h) = analysis_modal_fit_metrics(&s, &m, 1280., 800.)
+            .expect("analysis metrics");
+        assert!(fs <= 24. && fs >= 8., "fit font size {fs}");
+        assert!(
+            total <= body_h + 0.5,
+            "one-page fit: content {total} vs body {body_h}"
+        );
+        // 弹窗绘制：标题、汇总、复制图片、整篇词条都在，并且没有遮罩后仍是自绘面板。
+        let t = crate::ui::theme("墨玉");
+        let mut f = Frame::new(1280., 800.);
+        let mut hs = Vec::new();
+        let (x, y, pw, ph) = panel_for_model(&m, 1280., 800.);
+        draw_analysis_modal(&mut f, &mut hs, &m, &s, &t, x, y, pw, ph);
+        assert!(hs.iter().any(|h| h.action == crate::aux_marker("analysis_copy")));
+        assert!(f.cmds.iter().any(|c| matches!(c, DrawCmd::TextRun { text, .. } if text == "理论码长分析")));
+        assert!(f.cmds.iter().any(|c| matches!(c, DrawCmd::TextRun { text, .. } if text == "复制图片")));
+        // 移除分析后再请求：返回 None 而不是 panic。
+        s.full_analysis = None;
+        assert!(analysis_modal_fit_metrics(&s, &m, 1280., 800.).is_none());
+    }    #[test]
     fn header_shows_next_char_code_beside_elapsed_time() {
         let mut sess = Session::new(100);
         sess.load_book("单字码", "你好吗");

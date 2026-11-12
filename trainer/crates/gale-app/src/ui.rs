@@ -69,6 +69,110 @@ pub fn mono(f: &mut Frame, x: f32, y: f32, size: f32, s: impl Into<String>, c: [
 pub fn body_text(f: &mut Frame, x: f32, y: f32, size: f32, s: impl Into<String>, c: [f32; 4]) {
     run(f, x, y, size, s, c, FontFamily::Lxgw, Align::Left)
 }
+/// 【选重数字 2026-11-13】角标统一绘制：`hint_rank_bold` 叠半像素伪加粗，
+/// `hint_rank_offset` 调整离字的远近（负=更远，正=更近）。
+pub fn rank_digit(
+    f: &mut Frame,
+    cfg: &gale_core::config::Config,
+    x: f32,
+    y: f32,
+    size: f32,
+    s: &str,
+    c: [f32; 4],
+) {
+    let y = y + cfg.hint_rank_offset;
+    mono(f, x, y, size, s, c);
+    if cfg.hint_rank_bold {
+        mono(f, x + 0.9, y, size, s, c);
+    }
+}
+
+/// 【字间距 2026-11-13】按额外字距重排换行结果：每行内累加 `advance + spacing`，
+/// 放不下就就地折行，offsets/widths 保持与原文逐字对应。
+pub fn flow_with_spacing(
+    lines: &[(usize, String, Vec<f32>)],
+    spacing: f32,
+    bw: f32,
+) -> Vec<(usize, String, Vec<f32>)> {
+    if spacing <= 0.01 {
+        return lines.to_vec();
+    }
+    let limit = bw.max(8.);
+    let mut out: Vec<(usize, String, Vec<f32>)> = Vec::with_capacity(lines.len() + 8);
+    for (offset, text, widths) in lines {
+        if text.is_empty() {
+            out.push((*offset, String::new(), vec![0.]));
+            continue;
+        }
+        let mut buf = String::new();
+        let mut pos = vec![0.];
+        let mut used = 0.;
+        let mut line_start = *offset;
+        for (k, ch) in text.chars().enumerate() {
+            let a = widths.get(k).copied().unwrap_or(0.);
+            let b = widths.get(k + 1).copied().unwrap_or(a);
+            let adv = (b - a).max(1.);
+            let extra = if buf.is_empty() { 0. } else { spacing };
+            if !buf.is_empty() && used + extra + adv > limit {
+                out.push((line_start, std::mem::take(&mut buf), std::mem::take(&mut pos)));
+                line_start = offset + k;
+                pos = vec![0.];
+                used = 0.;
+            }
+            let extra = if buf.is_empty() { 0. } else { spacing };
+            used += extra + adv;
+            buf.push(ch);
+            pos.push(used);
+        }
+        if !buf.is_empty() {
+            out.push((line_start, buf, pos));
+        }
+    }
+    out
+}
+
+/// 字距 > 0 时逐字绘制（位置来自重排后的 widths）；= 0 仍走整行 StyledLine。
+#[allow(clippy::too_many_arguments)]
+fn styled_line(
+    f: &mut Frame,
+    x: f32,
+    y: f32,
+    w: f32,
+    size: f32,
+    text: &str,
+    spans: Vec<(u32, u32, [f32; 4])>,
+    color: [f32; 4],
+    spacing: f32,
+    widths: &[f32],
+) {
+    if spacing <= 0.01 {
+        f.push(DrawCmd::StyledLine {
+            x,
+            y,
+            w,
+            size,
+            text: text.to_string(),
+            spans,
+            color,
+        });
+        return;
+    }
+    let mut u16pos = 0u32;
+    for (j, ch) in text.chars().enumerate() {
+        let start = u16pos;
+        let end = start + ch.len_utf16() as u32;
+        u16pos = end;
+        let mut c = color;
+        for (s, l, sc) in &spans {
+            if *s < end && *s + *l > start {
+                c = *sc;
+                break;
+            }
+        }
+        let cx = x + widths.get(j).copied().unwrap_or(j as f32 * size);
+        body_text(f, cx, y, size, ch.to_string(), c);
+    }
+}
 pub fn right(f: &mut Frame, x: f32, y: f32, size: f32, s: impl Into<String>, c: [f32; 4]) {
     run(f, x, y, size, s, c, FontFamily::Ui, Align::Right)
 }
@@ -461,6 +565,11 @@ pub struct Animation {
     pub last_input: f64,
     pub wrong_at: f64,
     pub correct_at: f64,
+    /// 【对照模式 2026-11-12】光标所在行行高（DIP）——IME 组字窗/候选窗
+    /// 锚点需要真实行高；字贴模式=文章行高，对照模式=输入卡行高。
+    pub input_line_h: f32,
+    /// 【对照模式 2026-11-12】分栏把手命中区（DIP）：主循环据此拖动分栏。
+    pub split_divider: Option<(f32, f32, f32, f32)>,
 }
 impl Animation {
     pub fn active(&self, n: f64) -> bool {
@@ -469,7 +578,16 @@ impl Animation {
 }
 pub fn body_metrics(sess: &Session, cfg: &Config, w: f32) -> (f32, f32, f32) {
     let single = sess.source == SessionSource::Single;
-    let bw = (w - 64.).min(if single { 960. } else { 1000. }).max(180.);
+    // 对照模式的上下两张卡用满窗口宽度（左右各 12px 边），不再套字贴的 1000 上限，
+    // 否则卡片左右会空出大片。字贴模式保持原阅读宽度。
+    // 对照模式：左右各留 ~36px 包边（太贴边会显得局促），极简下收窄到 16px。
+    let bw = if cfg.display_mode.is_split() && !cfg.minimal {
+        (w - 96.).max(360.).min(1600.)
+    } else if cfg.display_mode.is_split() {
+        (w - 56.).max(360.).min(1600.)
+    } else {
+        (w - 64.).min(if single { 960. } else { 1000. }).max(180.)
+    };
     let fs = (if single {
         cfg.font_size * 42. / 36.
     } else {
@@ -609,18 +727,26 @@ fn toolbar_button(
     x + w
 }
 // The chrome uses the resolved theme, including user overrides.
+#[allow(clippy::too_many_arguments)]
 fn draw_chrome(
     f: &mut Frame,
     hs: &mut Vec<Hit>,
     sess: &Session,
-    _cfg: &Config,
+    cfg: &Config,
     m: &Model,
     t: &Theme,
     w: f32,
     h: f32,
+    now_ms: u64,
 ) {
     let p = tokens(t);
+    // 极简模式：整张 chrome 收起，只留顶部静默带（两种正文模式通用）。
+    if cfg.minimal {
+        draw_minimal_chrome(f, hs, sess, cfg, m, t, w, h, now_ms);
+        return;
+    }
     rect(f, 0., 0., w, h, p.bg);
+
     rect(f, 0., 0., w, 48., p.bg2);
     line(f, 0., 48., w, p.line);
     body_text(f, 22., 11., 22., "符", p.accent);
@@ -663,6 +789,13 @@ fn draw_chrome(
     let y = 60.;
     let wide = w >= 960.;
     let compact = w < 800.;
+    // 快捷键标签跟随自设（Ctrl+V 是固定编辑键）。
+    let key_online = cfg.shortcut("online");
+    let key_groups = cfg.shortcut("groups");
+    let key_read = cfg.shortcut("read_group");
+    let key_restart = cfg.shortcut("restart");
+    let key_analysis = cfg.shortcut("analysis");
+    let key_settings = cfg.shortcut("settings");
     let left = [
         (
             "从剪贴板载入",
@@ -672,23 +805,28 @@ fn draw_chrome(
         ),
         (
             "在线发文",
-            if wide { "F8" } else { "" },
+            if wide { key_online.as_str() } else { "" },
             Action::Open(Modal::Online),
             false,
         ),
         (
             "选群",
-            if wide { "F5" } else { "" },
+            if wide { key_groups.as_str() } else { "" },
             Action::Open(Modal::Groups),
             false,
         ),
         (
             "读取群文",
-            if wide { "F4" } else { "" },
+            if wide { key_read.as_str() } else { "" },
             Action::ReadGroup,
             false,
         ),
-        ("重打", if wide { "F3" } else { "" }, Action::Restart, false),
+        (
+            "重打",
+            if wide { key_restart.as_str() } else { "" },
+            Action::Restart,
+            false,
+        ),
     ];
     let mut xx = 24.;
     for (label, key, action, selected) in left {
@@ -697,10 +835,17 @@ fn draw_chrome(
         }
         xx = toolbar_button(f, hs, xx, y, label, key, action, t, selected) + 8.;
     }
-    let more_w = toolbar_width("更多", "");
-    let settings_w = toolbar_width("设置", "F1");
-    let analysis_w = toolbar_width("理论分析", "F10");
-    let settings_x = w - 24. - more_w - 8. - settings_w;
+    // 窄窗优先保留高频入口：<1080 时「更多」收进「视图」菜单页脚（同一组动作
+    // 也在菜单里，F7/F9 等快捷键不变），避免与新增的「视图」按钮挤在一起。
+    let show_more = w >= 1080.;
+    let more_w = if show_more { toolbar_width("更多", "") } else { 0. };
+    let settings_w = toolbar_width("设置", key_settings.as_str());
+    let analysis_w = toolbar_width("理论分析", key_analysis.as_str());
+    // 【视图菜单 2026-11-12】工具栏入口：与右键菜单同一张卡片（按钮下缘展开）。
+    let view_w = toolbar_width("视图", "");
+    let more_gap = if show_more { more_w + 8. } else { 0. };
+    let settings_x = w - 24. - more_gap - view_w - 8. - settings_w;
+    let view_x = settings_x + settings_w + 8.;
     let analysis_x = settings_x - 8. - analysis_w;
     toolbar_button(
         f,
@@ -708,7 +853,7 @@ fn draw_chrome(
         analysis_x,
         y,
         "理论分析",
-        "F10",
+        key_analysis.as_str(),
         Action::ToggleAnalysis,
         t,
         m.analysis_dock,
@@ -719,7 +864,7 @@ fn draw_chrome(
         settings_x,
         y,
         "设置",
-        "F1",
+        key_settings.as_str(),
         Action::Open(Modal::Preferences),
         t,
         m.modal == Modal::Preferences,
@@ -727,14 +872,27 @@ fn draw_chrome(
     toolbar_button(
         f,
         hs,
-        w - 24. - more_w,
+        view_x,
         y,
-        "更多",
+        "视图",
         "",
-        Action::Open(Modal::More),
+        Action::OpenMenuAt(view_x, y + 40.),
         t,
-        false,
+        m.menu.is_some(),
     );
+    if show_more {
+        toolbar_button(
+            f,
+            hs,
+            w - 24. - more_w,
+            y,
+            "更多",
+            "",
+            Action::Open(Modal::More),
+            t,
+            false,
+        );
+    }
     line(f, 0., 104., w, p.line);
     // 底部状态行（成绩栏由 history.rs 绘制在它上方）。
     rect(f, 0., h - STATUS_H, w, STATUS_H, p.bg2);
@@ -802,6 +960,843 @@ pub fn line_height_for_anchor(cfg: &Config, fs: f32, base: f32, hints_visible: b
         base.max(fs + word_bracket_offset(fs) + 6.)
     }
 }
+
+// ════════════════ 视图体系（2026-11-12）：极简模式 / 对照分栏 ════════════════
+//
+// 用户需求：① 「传统（对照）模式」——上方发文区对照、下方独立输入框跟打；
+// ② 「极简模式」——红框里的工具栏/统计/底栏全部收起，正文满窗，两种模式通用；
+// ③ 右键菜单集中常用设置；④ 任意模式下左键按住都能拖动窗口（见 main.rs）。
+
+/// 【极简模式】顶部静默带：2px 进度线 + 状态行 + 一行完整数据（与常规统计带同指标）。
+pub const MINIMAL_ROW_H: f32 = 26.;
+/// 对照模式：文章卡与输入卡之间的分栏把手区高度。
+pub const SPLIT_GAP: f32 = 12.;
+
+/// 极简顶栏高度：数据行可关（`minimal_hud=false` 时只留状态行）。
+pub fn minimal_band_h(cfg: &Config) -> f32 {
+    if cfg.minimal_hud {
+        66.
+    } else {
+        34.
+    }
+}
+
+/// 极简模式正文起点（顶栏 + 8px 呼吸）。
+pub fn minimal_top(cfg: &Config) -> f32 {
+    minimal_band_h(cfg) + 8.
+}
+
+/// 兼容常量：默认（带数据行）极简正文起点。
+pub const MINIMAL_TOP: f32 = 74.;
+
+/// 极简模式右上角「窗口控制胶囊」矩形（常驻半透明，悬停提亮）。
+pub fn minimal_controls_rect(w: f32) -> (f32, f32, f32, f32) {
+    (w - 12. - 140., 5., 140., 26.)
+}
+
+/// 正文带的上下边界：极简模式满窗；常规模式按标题栏/工具栏/统计带/底栏让位。
+pub fn body_region(cfg: &Config, m: &Model, w: f32, h: f32, single: bool) -> (f32, f32) {
+    if cfg.minimal {
+        let top = minimal_top(cfg);
+        // 极简模式没有底栏：成绩面板/理论分析都是浮层，正文照常让位。
+        let bottom = if m.analysis_dock {
+            crate::modals::analysis_dock_rect_for(cfg, w, h).1 - 8.
+        } else if m.ledger_open {
+            crate::history::panel_rect_for(cfg, m, w, h).1 - 8.
+        } else {
+            h - 16.
+        };
+        return (top, bottom.max(top + 24.));
+    }
+    // 对照模式在矮窗口把统计带压成一行（见 build 里的紧凑统计条），正文带提前；
+    // 上下各留 8px 呼吸，两张卡不贴统计带/底栏。
+    let split_compact = cfg.display_mode.is_split() && h < 560.;
+    let top = if m.analysis_dock && h < 700. {
+        100.
+    } else if split_compact {
+        156.
+    } else if single {
+        236.
+    } else {
+        216.
+    };
+    let bottom = if m.analysis_dock {
+        crate::modals::analysis_dock_rect_for(cfg, w, h).1 - 8.
+    } else if m.ledger_open {
+        crate::history::panel_rect_for(cfg, m, w, h).1 - 8.
+    } else {
+        ledger_bar_y(h) - 8.
+    };
+    (top, bottom)
+}
+/// 对照模式几何：文章卡 / 分栏把手 / 输入卡。文章区占比取 `cfg.split_ratio`
+///（拖动把手实时改），按整行吸附文章卡高度；极矮窗口文章区收起，保证输入卡至少一行。
+#[derive(Debug, Clone, Copy)]
+pub struct SplitGeom {
+    pub x: f32,
+    pub pane_w: f32,
+    pub top: f32,
+    pub article_h: f32,
+    pub divider_y: f32,
+    pub input_y: f32,
+    pub input_h: f32,
+    pub line_h: f32,
+    /// 窗口太矮：文章对照区收起，只留输入卡（header 里有提示）。
+    pub collapsed: bool,
+}
+
+pub fn split_geom(
+    cfg: &Config,
+    bw: f32,
+    fs: f32,
+    lh: f32,
+    w: f32,
+    top: f32,
+    bottom: f32,
+) -> SplitGeom {
+    let x = (w - bw) / 2. - 12.;
+    let pane_w = bw + 24.;
+    let span = (bottom - top).max(48.);
+    let line_h = (fs * 1.34).max(fs + 8.);
+    let article_min = (lh + 20.).min(span * 0.62);
+    let input_min = (24. + 16. + line_h).min(span * 0.6);
+    let avail = (span - SPLIT_GAP).max(40.);
+    let ratio = if cfg.split_ratio.is_finite() {
+        cfg.split_ratio.clamp(0.35, 0.78)
+    } else {
+        0.58
+    };
+    if avail < article_min + input_min {
+        return SplitGeom {
+            x,
+            pane_w,
+            top,
+            article_h: 0.,
+            divider_y: top,
+            input_y: top,
+            input_h: (bottom - top).max(24.),
+            line_h,
+            collapsed: true,
+        };
+    }
+    let max_input = (avail - article_min).max(1.);
+    let input_h = (avail * (1. - ratio)).clamp(input_min.min(max_input), max_input);
+    let mut article_h = (avail - input_h).max(20.);
+    // 整行吸附：多余高度让给输入卡，文章卡不会留一整块空白。
+    let rows = ((article_h - 20.) / lh).floor().max(1.);
+    let snapped = rows * lh + 20.;
+    if article_h - snapped > lh * 0.35 {
+        article_h = snapped;
+    }
+    let divider_y = top + article_h;
+    let input_y = divider_y + SPLIT_GAP;
+    SplitGeom {
+        x,
+        pane_w,
+        top,
+        article_h,
+        divider_y,
+        input_y,
+        input_h: (bottom - input_y).max(24.),
+        line_h,
+        collapsed: false,
+    }
+}
+
+/// 极简模式常驻小动作：在线发文 / 选群 / 理论分析 / 成绩记录（右侧），
+/// 与右上角窗口控制胶囊同排；统计行在下一行，指标与常规统计带一致。
+fn draw_minimal_chrome(
+    f: &mut Frame,
+    hs: &mut Vec<Hit>,
+    sess: &Session,
+    cfg: &Config,
+    m: &Model,
+    t: &Theme,
+    w: f32,
+    h: f32,
+    now_ms: u64,
+) {
+    let p = tokens(t);
+    rect(f, 0., 0., w, h, p.bg);
+    let band = minimal_band_h(cfg);
+    line(f, 0., band, w, alpha(p.line, 0.85));
+    let count = sess.current_segment().text.chars().count();
+    let pos = sess.comparer.pos.min(count);
+    rect(f, 0., 0., w, 2., alpha(p.line, 0.65));
+    if count > 0 {
+        rect(
+            f,
+            0.,
+            0.,
+            (w * pos as f32 / count as f32).clamp(0., w),
+            2.,
+            p.accent,
+        );
+    }
+    // ── 第一行：状态（左）+ 四个常驻动作 + 窗口控制（右）──────────────
+    let controls = minimal_controls_rect(w);
+    let mut rx = controls.0 - 10.;
+    for (label, action) in [
+        ("成绩记录", Action::ToggleLedger),
+        ("理论分析", Action::ToggleAnalysis),
+        ("选群", Action::Open(crate::modals::Modal::Groups)),
+        ("在线发文", Action::Open(crate::modals::Modal::Online)),
+    ] {
+        let bw = ui_text_width(label, 11.) + 16.;
+        rx -= bw;
+        let hot = m
+            .pointer
+            .is_some_and(|(px, py)| px >= rx && px < rx + bw && py >= 5. && py < 27.);
+        if hot {
+            round(f, rx, 5., bw, 22., 6., alpha(p.accent, 0.13), None);
+        }
+        text(
+            f,
+            rx + 8.,
+            9.,
+            11.,
+            label,
+            if hot { p.accent } else { p.muted },
+        );
+        hs.push(Hit {
+            x: rx,
+            y: 5.,
+            w: bw,
+            h: 22.,
+            action,
+        });
+        rx -= 8.;
+    }
+    draw_minimal_controls(f, hs, m, t, w);
+    let (dot, word) = if count == 0 {
+        (p.muted, "等待载入文章")
+    } else if m.paused {
+        (p.copper, "已暂停")
+    } else if sess.phase == crate::session::Phase::Done {
+        (p.green, "本段完成")
+    } else if sess.started_ms.is_some() {
+        (p.accent, "练习中")
+    } else {
+        (p.muted, "首键开始计时")
+    };
+    round(f, 20., 14., 5., 5., 2.5, dot, None);
+    let progress = if count == 0 {
+        String::new()
+    } else {
+        format!(
+            "第 {} / {} {} · {} / {} 字 · {word}",
+            sess.index + 1,
+            sess.total_segments(),
+            if sess.source == SessionSource::Single {
+                "组"
+            } else {
+                "段"
+            },
+            pos,
+            count,
+        )
+    };
+    let label = if m.status.contains("TSF") {
+        m.status.clone()
+    } else if progress.is_empty() {
+        word.into()
+    } else {
+        progress
+    };
+    text(
+        f,
+        30.,
+        8.5,
+        12.,
+        elide_width(&label, (rx - 34.).max(80.), 12.),
+        p.muted,
+    );
+    // ── 第二行：与常规统计带一致的完整指标 ──────────────────────────
+    if cfg.minimal_hud {
+        let header = sess.header_stats(now_ms);
+        let speed = format!("{:.1}", header.speed);
+        mono(f, 20., 32., 19., speed.clone(), p.accent);
+        let speed_w = ui_text_width(&speed, 19.);
+        text(f, 20. + speed_w + 5., 39., 10., "字/分", p.muted);
+        let elapsed = header.elapsed_ms as f64 / 1000.;
+        let duration = format!("{:02}:{:04.1}", (elapsed / 60.) as u64, elapsed % 60.);
+        let seg_start: usize = sess
+            .segments
+            .iter()
+            .take(sess.index)
+            .map(|s| s.text.chars().count())
+            .sum();
+        let code_at = if m.char_codes_whole {
+            seg_start + pos
+        } else if m.char_codes_seg == sess.index {
+            pos
+        } else {
+            usize::MAX
+        };
+        let next_code = m
+            .char_codes
+            .get(code_at)
+            .cloned()
+            .flatten()
+            .map(|cc| {
+                if cc.rank > 1 && !cc.tail.is_empty() {
+                    format!("{} {}", cc.code, cc.tail)
+                } else {
+                    cc.code
+                }
+            })
+            .unwrap_or_else(|| "—".into());
+        let mut items = vec![
+            ("击键/秒", format!("{:.2}", header.keys_per_sec)),
+            ("码长", format!("{:.2}", header.code_len)),
+            ("键准", format!("{:.1}%", header.accuracy)),
+            ("错字", header.wrong.to_string()),
+            ("用时", duration),
+            ("编码", next_code),
+        ];
+        if w < 760. {
+            items.remove(1);
+        }
+        let start = 20. + speed_w + 52.;
+        let end = w - 20.;
+        let pitch = ((end - start) / items.len() as f32).max(72.);
+        for (i, (label, value)) in items.iter().enumerate() {
+            let x = start + i as f32 * pitch;
+            text(f, x, 32., 10., *label, p.muted);
+            mono(f, x, 45., 12., value, p.text2);
+        }
+    }
+}
+
+/// 极简模式右上角窗口控制胶囊：[视图][—][□][×]。
+/// 常驻半透明（极简也不能没有关窗口/换模式的入口），悬停提亮。
+fn draw_minimal_controls(f: &mut Frame, hs: &mut Vec<Hit>, m: &Model, t: &Theme, w: f32) {
+    let p = tokens(t);
+    let (x, y, cw, ch) = minimal_controls_rect(w);
+    let hovered = m
+        .pointer
+        .is_some_and(|(px, py)| px >= x && px <= x + cw && py >= y && py <= y + ch);
+    round(
+        f,
+        x,
+        y,
+        cw,
+        ch,
+        9.,
+        alpha(p.surface, if hovered { 0.97 } else { 0.6 }),
+        Some(alpha(p.line, if hovered { 0.95 } else { 0.55 })),
+    );
+    let cells = [
+        ("view", Action::OpenMenuAt(x + 4., y + ch + 6.)),
+        ("min", Action::Minimize),
+        ("max", Action::Maximize),
+        ("close", Action::Exit),
+    ];
+    for (i, (kind, action)) in cells.into_iter().enumerate() {
+        let cx = x + 4. + i as f32 * 33.;
+        let cy = y + 4.;
+        let (cw2, ch2) = (33., ch - 8.);
+        let hot = m.pointer.is_some_and(|(px, py)| {
+            px >= cx && px < cx + cw2 && py >= cy && py < cy + ch2
+        });
+        if hot {
+            round(
+                f,
+                cx,
+                cy,
+                cw2,
+                ch2,
+                6.,
+                alpha(if kind == "close" { p.red } else { p.accent }, 0.14),
+                None,
+            );
+        }
+        let color = if hot {
+            if kind == "close" {
+                p.red
+            } else {
+                p.accent
+            }
+        } else {
+            p.text2
+        };
+        let mid = cy + ch2 / 2.;
+        match kind {
+            "view" => {
+                for k in 0..3 {
+                    let ly = mid - 5. + k as f32 * 5.;
+                    rect(f, cx + 11., ly, 11., 1.2, color);
+                    let kx = cx + 11. + if k == 1 { 6. } else { 2. };
+                    rect(f, kx, ly - 1.2, 2.4, 3.6, color);
+                }
+            }
+            "min" => rect(f, cx + 11., mid, 11., 1.2, color),
+            "max" => round(f, cx + 11., mid - 5., 11., 10., 2., [0.; 4], Some(color)),
+            _ => {
+                run(
+                    f,
+                    cx + cw2 / 2.,
+                    mid - 7.,
+                    13.,
+                    "×",
+                    color,
+                    FontFamily::Ui,
+                    Align::Center,
+                );
+            }
+        }
+        hs.push(Hit {
+            x: cx,
+            y: cy,
+            w: cw2,
+            h: ch2,
+            action,
+        });
+    }
+}
+/// 对照模式：上文章卡（对照）+ 分栏把手 + 下输入卡（实打字）。
+#[allow(clippy::too_many_arguments)]
+fn draw_split_body(
+    f: &mut Frame,
+    hs: &mut Vec<Hit>,
+    sess: &Session,
+    cfg: &Config,
+    m: &Model,
+    t: &Theme,
+    w: f32,
+    h: f32,
+    bw: f32,
+    fs: f32,
+    lh: f32,
+    lines: &[(usize, String, Vec<f32>)],
+    input_lines: &[(usize, String, Vec<f32>)],
+    anim: &mut Animation,
+) {
+    let p = tokens(t);
+    let single = sess.source == SessionSource::Single;
+    let (top, bottom) = body_region(cfg, m, w, h, single);
+    let g = split_geom(cfg, bw, fs, lh, w, top, bottom);
+    let spacing = cfg.letter_spacing.clamp(0., 12.);
+    anim.split_divider = if g.collapsed {
+        None
+    } else {
+        Some((g.x, g.divider_y, g.pane_w, SPLIT_GAP))
+    };
+    anim.input_line_h = g.line_h;
+    let word_hints = m.hints;
+    let hints_visible = word_hints && (cfg.hint_show_code || cfg.hint_show_rank);
+    let pos = sess.comparer.pos;
+    let inner_x = g.x + 12.;
+    if !g.collapsed {
+    // ── 文章对照卡 ─────────────────────────────────────────────────
+    round(
+        f,
+        g.x,
+        g.top,
+        g.pane_w,
+        g.article_h,
+        12.,
+        p.article_bg,
+        Some(alpha(p.line, 0.85)),
+    );
+    let rows = ((g.article_h - 20.) / lh).floor().max(1.) as usize;
+    let active = lines.iter().rposition(|l| l.0 <= pos).unwrap_or(0);
+    // 只有 ≥2 行时才留一行上下文；否则必须显示当前行（否则光标不可见）。
+    let context = if rows >= 2 { 1 } else { 0 };
+    let first = active
+        .saturating_sub(context)
+        .min(lines.len().saturating_sub(rows));
+    f.push(DrawCmd::PushClip {
+        x: g.x + 1.,
+        y: g.top + 1.,
+        w: g.pane_w - 2.,
+        h: (g.article_h - 2.).max(1.),
+    });
+    for (li, (offset, line_text, widths)) in lines.iter().enumerate().skip(first).take(rows) {
+        let yy = g.top + 10. + (li - first) as f32 * lh;
+        let mut spans = Vec::new();
+        let mut u16pos = 0u32;
+        for (j, ch) in line_text.chars().enumerate() {
+            let char_at = offset + j;
+            let state = sess.comparer.states.get(char_at);
+            let tint = (word_hints && cfg.hint_color_words)
+                .then(|| {
+                    let at = m
+                        .words
+                        .partition_point(|word| word.start + word.len <= char_at);
+                    let word = m.words.get(at).filter(|word| word.start <= char_at)?;
+                    hint_word_tint_for_rank(
+                        &p,
+                        &word.text,
+                        word.code.as_deref()?,
+                        word.rank,
+                        m.max_code_length,
+                        cfg.hint_rank_colors,
+                    )
+                })
+                .flatten();
+            let c = match state {
+                Some(CharState::Wrong) => p.red,
+                Some(CharState::Correct) => alpha(p.correct, 0.42),
+                _ => tint.unwrap_or(alpha(p.text2, 0.92)),
+            };
+            if char_at == pos {
+                let a = widths.get(j).copied().unwrap_or(0.);
+                let b = widths.get(j + 1).copied().unwrap_or(a + fs);
+                round(
+                    f,
+                    inner_x + a - 1.,
+                    yy + 2.,
+                    (b - a).max(4.) + 2.,
+                    fs + 4.,
+                    4.,
+                    alpha(p.accent, 0.10),
+                    Some(alpha(p.accent, 0.22)),
+                );
+            }
+            spans.push((u16pos, ch.len_utf16() as u32, c));
+            u16pos += ch.len_utf16() as u32;
+            if state == Some(&CharState::Wrong) {
+                let a = widths.get(j).copied().unwrap_or(0.);
+                let b = widths.get(j + 1).copied().unwrap_or(a + fs);
+                let mut px = inner_x + a + 3.;
+                while px < inner_x + b - 2. {
+                    rect(f, px, yy + fs + 3., 2., 1., p.red);
+                    px += 4.;
+                }
+            }
+        }
+        styled_line(f, inner_x, yy, bw, fs, line_text, spans, p.text, spacing, widths);
+        if word_hints {
+            for z in &m.words {
+                if z.start < *offset || z.start >= offset + line_text.chars().count() {
+                    continue;
+                }
+                let local = z.start - offset;
+                let wx = inner_x + widths.get(local).copied().unwrap_or(0.);
+                let ww = widths
+                    .get((local + z.len).min(widths.len() - 1))
+                    .copied()
+                    .unwrap_or(bw)
+                    - widths.get(local).copied().unwrap_or(0.);
+                if !z.text.chars().any(char::is_alphanumeric) {
+                    continue;
+                }
+                if let Some(code) = &z.code {
+                    let tint = cfg
+                        .hint_color_words
+                        .then(|| {
+                            hint_word_tint_for_rank(
+                                &p,
+                                &z.text,
+                                code,
+                                z.rank,
+                                m.max_code_length,
+                                cfg.hint_rank_colors,
+                            )
+                        })
+                        .flatten();
+                    if crate::analysis::is_multi_word(&z.text) {
+                        let underline = tint
+                            .map(|color| alpha(color, 0.62))
+                            .unwrap_or(p.hint_underline);
+                        word_bracket(f, wx, yy, ww, fs, underline);
+                    }
+                    let hint_size = cfg.hint_font_size;
+                    let shown_code = if cfg.hint_show_code {
+                        code.as_str()
+                    } else {
+                        ""
+                    };
+                    let rank = if cfg.hint_show_rank && z.rank > 1 {
+                        z.rank.to_string()
+                    } else {
+                        String::new()
+                    };
+                    let rank_in_code_row = rank.is_empty() || !cfg.hint_rank_corner;
+                    let hint_advance = hint_size * 0.6;
+                    let code_width = shown_code.chars().count() as f32 * hint_advance;
+                    let rank_size = hint_size * 0.78;
+                    let rank_width = if rank_in_code_row {
+                        rank.chars().count() as f32 * rank_size * 0.6
+                    } else {
+                        0.
+                    };
+                    let code_rank_gap = if code_width > 0. && rank_width > 0. {
+                        2.
+                    } else {
+                        0.
+                    };
+                    let hx = wx + (ww - code_width - code_rank_gap - rank_width).max(0.) / 2.;
+                    if !shown_code.is_empty() {
+                        mono(
+                            f,
+                            hx,
+                            yy + fs + word_bracket_offset(fs) + 5.,
+                            hint_size,
+                            shown_code,
+                            alpha(tint.unwrap_or(p.hint_code), 1.),
+                        );
+                    }
+                    if !rank.is_empty() {
+                        let rank_color = if cfg.hint_rank_colors {
+                            tint.unwrap_or(p.hint_badge)
+                        } else {
+                            p.hint_badge
+                        };
+                        if cfg.hint_rank_corner {
+                            let corner_size = (fs * 0.52).max(9.);
+                            let corner_w = rank.chars().count() as f32 * corner_size * 0.6;
+                            rank_digit(
+                                f,
+                                cfg,
+                                wx + ww - corner_w - 1.,
+                                yy - corner_size * 0.38,
+                                corner_size,
+                                &rank,
+                                rank_color,
+                            );
+                        } else {
+                            rank_digit(
+                                f,
+                                cfg,
+                                hx + code_width + code_rank_gap,
+                                yy + fs + word_bracket_offset(fs) + 1.,
+                                rank_size,
+                                &rank,
+                                rank_color,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        let _ = hints_visible;
+    }
+    f.push(DrawCmd::PopClip);
+
+    // ── 分栏把手：hover/拖动时提亮 ─────────────────────────────────
+    let divider_hot = m.pointer.is_some_and(|(px, py)| {
+        px >= g.x && px <= g.x + g.pane_w && py >= g.divider_y && py < g.divider_y + SPLIT_GAP
+    });
+    round(
+        f,
+        (w - 40.) / 2.,
+        g.divider_y + SPLIT_GAP / 2. - 2.,
+        40.,
+        4.,
+        2.,
+        if divider_hot {
+            p.accent
+        } else {
+            alpha(p.line2, 0.85)
+        },
+        None,
+    );
+    }
+
+    // ── 输入卡 ─────────────────────────────────────────────────────
+    let done = sess.phase == crate::session::Phase::Done;
+    let typing = sess.started_ms.is_some() && !m.paused && !done;
+    let border = if done {
+        alpha(p.green, 0.75)
+    } else if typing {
+        alpha(p.accent, 0.35)
+    } else {
+        p.line2
+    };
+    round(
+        f,
+        g.x,
+        g.input_y,
+        g.pane_w,
+        g.input_h,
+        12.,
+        p.bg2,
+        Some(border),
+    );
+    let pad_x = 12.;
+    let header_y = g.input_y + 8.;
+    text(f, g.x + pad_x, header_y + 1., 11., "输入", p.muted);
+    let count = sess.current_segment().text.chars().count();
+    mono(
+        f,
+        g.x + pad_x + 30.,
+        header_y,
+        11.,
+        format!("{pos} / {count} 字"),
+        alpha(p.accent, 0.85),
+    );
+    if done {
+        let speed = sess
+            .results
+            .get(sess.current_index())
+            .and_then(Option::as_ref)
+            .map(|r| r.speed)
+            .unwrap_or(0.);
+        right(
+            f,
+            g.x + g.pane_w - pad_x,
+            header_y + 1.,
+            11.,
+            format!("本段完成 · {speed:.1} 字/分"),
+            p.green,
+        );
+    } else if g.collapsed {
+        // 窗口太矮：文章对照区收起，输入卡独占（header 里说明原因）。
+        right(
+            f,
+            g.x + g.pane_w - pad_x,
+            header_y + 1.,
+            11.,
+            "对照区已收起 · 拉大窗口恢复",
+            p.muted,
+        );
+    }
+    line(
+        f,
+        g.x + pad_x,
+        g.input_y + 26.,
+        g.pane_w - 2. * pad_x,
+        alpha(p.line, 0.8),
+    );
+    let content_top = g.input_y + 30.;
+    let content_bottom = g.input_y + g.input_h - 8.;
+    // 框底常留一行空白：当前行固定在倒数第二行，文字行向上堆叠、超出后滚动。
+    let base_y = (content_bottom - g.line_h * 2.).max(content_top);
+    let capacity = (((content_bottom - g.line_h) - content_top) / g.line_h)
+        .floor()
+        .max(1.) as usize;
+    let rows = capacity.min(input_lines.len().max(1));
+    let first = input_lines.len().saturating_sub(rows);
+    let visible = input_lines.len().saturating_sub(first).min(rows);
+    let start_y = base_y - (visible.saturating_sub(1)) as f32 * g.line_h;
+    let text_inset = (g.line_h - fs) / 2.;
+    f.push(DrawCmd::PushClip {
+        x: g.x + 1.,
+        y: content_top - 2.,
+        w: g.pane_w - 2.,
+        h: (content_bottom - content_top + 4.).max(1.),
+    });
+    let mut caret_at = (inner_x, base_y + text_inset);
+    for (i, (offset, line_text, widths)) in input_lines.iter().enumerate().skip(first).take(rows) {
+        let yy = start_y + (i - first) as f32 * g.line_h + text_inset;
+        let mut spans = Vec::new();
+        let mut u16pos = 0u32;
+        for (j, ch) in line_text.chars().enumerate() {
+            let char_at = offset + j;
+            let c = match sess.comparer.states.get(char_at) {
+                Some(CharState::Wrong) => p.red,
+                _ => p.correct,
+            };
+            spans.push((u16pos, ch.len_utf16() as u32, c));
+            u16pos += ch.len_utf16() as u32;
+            if sess.comparer.states.get(char_at) == Some(&CharState::Wrong) {
+                let a = widths.get(j).copied().unwrap_or(0.);
+                let b = widths.get(j + 1).copied().unwrap_or(a + fs);
+                let mut px = inner_x + a + 3.;
+                while px < inner_x + b - 2. {
+                    rect(f, px, yy + fs + 3., 2., 1., p.red);
+                    px += 4.;
+                }
+            }
+        }
+        styled_line(
+            f,
+            inner_x,
+            yy,
+            bw,
+            fs,
+            line_text,
+            spans,
+            p.correct,
+            spacing,
+            widths,
+        );
+        if i == input_lines.len() - 1 {
+            let col = pos
+                .saturating_sub(*offset)
+                .min(widths.len().saturating_sub(1));
+            caret_at = (inner_x + widths.get(col).copied().unwrap_or(0.), yy);
+        }
+    }
+    let (caret_x, caret_y) = caret_at;
+    // 绘制光标（平滑跟随，与字贴模式同一套动效语义）。
+    let target = (caret_x, caret_y);
+    let caret = if m.reduced_motion || !cfg.smooth_caret {
+        target
+    } else {
+        let old = anim.caret.unwrap_or(target);
+        if (old.1 - target.1).abs() > g.line_h * 1.5 {
+            target
+        } else {
+            (
+                old.0 + (target.0 - old.0) * 0.55,
+                old.1 + (target.1 - old.1) * 0.55,
+            )
+        }
+    };
+    anim.caret = Some(caret);
+    let caret_color = if done { p.green } else { p.accent };
+    rect(f, caret.0 - 4., caret.1 + 3., 2., fs + 4., caret_color);
+    if !sess.preedit.is_empty() {
+        let pw = (sess.preedit.chars().count() as f32 * 9. + 12.).min(bw);
+        round(
+            f,
+            caret.0,
+            caret.1 + fs + 8.,
+            pw,
+            20.,
+            4.,
+            p.surface2,
+            Some(p.line),
+        );
+        mono(
+            f,
+            caret.0 + 5.,
+            caret.1 + fs + 11.,
+            11.,
+            elide(&sess.preedit, 24),
+            p.accent,
+        );
+    }
+    f.push(DrawCmd::PopClip);
+    // 完成态（极简）：输入卡内浮现完成摘要，不用底栏。
+    if done && cfg.minimal {
+        let record = sess
+            .results
+            .get(sess.current_index())
+            .and_then(Option::as_ref);
+        let summary = record
+            .map(|r| format!("本段完成  {:.1} 字/分 · 键准 {:.1}%", r.speed, r.accuracy))
+            .unwrap_or_else(|| "本段完成".into());
+        let pill_w = (ui_text_width(&summary, 13.) + 28.).min(g.pane_w - 24.);
+        let px = g.x + (g.pane_w - pill_w) / 2.;
+        let py = g.input_y + g.input_h / 2. - 16.;
+        round(
+            f,
+            px,
+            py,
+            pill_w,
+            32.,
+            9.,
+            alpha(p.surface, 0.96),
+            Some(alpha(p.green, 0.45)),
+        );
+        text(f, px + 14., py + 9., 13., summary, p.text);
+        text(
+            f,
+            px + 14.,
+            py + 40.,
+            11.,
+            &format!("Enter 下一段 · {} 重打", cfg.shortcut("restart")),
+            p.muted,
+        );
+    }
+    let _ = hs;
+}
+
+/// 兼容入口：不需要对照输入行的调用方（测试/旧示例）走这里。
 pub fn build(
     sess: &Session,
     cfg: &Config,
@@ -815,11 +1810,106 @@ pub fn build(
     hs: &mut Vec<Hit>,
     lines: &[(usize, String, Vec<f32>)],
 ) -> Frame {
+    build_with_input(sess, cfg, t, m, w, h, now_ms, now, anim, hs, lines, &[])
+}
+
+/// 正文渲染主入口。`input_lines` = 用户已打字符的换行结果（对照模式输入卡用；
+/// 字贴模式忽略）。输入行由主程序用真实 Renderer::wrap_text 量出，这里只消费。
+#[allow(clippy::too_many_arguments)]
+pub fn build_with_input(
+    sess: &Session,
+    cfg: &Config,
+    t: &Theme,
+    m: &Model,
+    w: f32,
+    h: f32,
+    now_ms: u64,
+    now: f64,
+    anim: &mut Animation,
+    hs: &mut Vec<Hit>,
+    lines: &[(usize, String, Vec<f32>)],
+    input_lines: &[(usize, String, Vec<f32>)],
+) -> Frame {
+
     let mut f = Frame::new(w, h);
     hs.clear();
-    draw_chrome(&mut f, hs, sess, cfg, m, t, w, h);
+    draw_chrome(&mut f, hs, sess, cfg, m, t, w, h, now_ms);
     let p = tokens(t);
     if sess.current_segment().text.is_empty() {
+        if cfg.minimal {
+            f.push(DrawCmd::TextRun {
+                x: w / 2.,
+                y: 158.,
+                h: 22.,
+                text: "载入文章后开始跟打".into(),
+                color: p.text,
+                font: FontFamily::Ui,
+                align: Align::Center,
+            });
+            f.push(DrawCmd::TextRun {
+                x: w / 2.,
+                y: 196.,
+                h: FONT_HINT,
+                text: format!(
+                    "Ctrl+V 从剪贴板载入 · {} 在线取文 · {} 读取群文 · 右键打开视图菜单",
+                    cfg.shortcut("online"),
+                    cfg.shortcut("read_group")
+                ),
+                color: p.muted,
+                font: FontFamily::Ui,
+                align: Align::Center,
+            });
+            return f;
+        }
+        if cfg.display_mode.is_split() {
+            // 对照模式空态：两张占位卡说明「上对照、下输入」。
+            let (top, bottom) = body_region(cfg, m, w, h, false);
+            let (bw, fs, lh) = body_metrics(sess, cfg, w);
+            let g = split_geom(cfg, bw, fs, lh, w, top, bottom);
+            round(
+                &mut f,
+                g.x,
+                g.top,
+                g.pane_w,
+                g.article_h,
+                12.,
+                p.article_bg,
+                Some(alpha(p.line, 0.8)),
+            );
+            text(&mut f, g.x + 20., g.top + 16., 18., "载入文章后开始跟打", p.text);
+            text(
+                &mut f,
+                g.x + 20.,
+                g.top + 44.,
+                FONT_HINT,
+                &format!(
+                    "上方显示对照文章，下方输入框跟打。Ctrl+V 载入 · {} 在线取文 · {} 读取群文",
+                    cfg.shortcut("online"),
+                    cfg.shortcut("read_group")
+                ),
+                p.muted,
+            );
+            round(
+                &mut f,
+                g.x,
+                g.input_y,
+                g.pane_w,
+                g.input_h,
+                12.,
+                p.bg2,
+                Some(p.line2),
+            );
+            text(&mut f, g.x + 16., g.input_y + 10., 11., "输入", p.muted);
+            text(
+                &mut f,
+                g.x + 16.,
+                g.input_y + 34.,
+                15.,
+                "这里将显示你打出的字",
+                alpha(p.text2, 0.5),
+            );
+            return f;
+        }
         text(&mut f, 32., 136., 20., "载入文章后开始跟打", p.text);
         text(
             &mut f,
@@ -833,7 +1923,7 @@ pub fn build(
             crate::history::draw(&mut f, hs, sess, cfg, m, t, w, h);
         }
         if m.analysis_dock && m.modal == Modal::None {
-            crate::modals::draw_analysis_dock(&mut f, hs, m, sess, t, w, h);
+            crate::modals::draw_analysis_dock_for(&mut f, hs, m, sess, t, cfg, w, h);
         }
         return f;
     }
@@ -847,36 +1937,85 @@ pub fn build(
     let header = sess.header_stats(now_ms);
     let count = sess.current_segment().text.chars().count();
     let elapsed = header.elapsed_ms as f64 / 1000.;
-    let compact_analysis = m.analysis_dock && h < 700.;
-    let top = if compact_analysis {
-        100.
-    } else if single {
-        236.
-    } else {
-        208.
-    };
-    // 理论分析停靠面板打开时正文区让位；成绩面板是浮层，不改变正文高度。
-    let bottom = if m.analysis_dock {
-        crate::modals::analysis_dock_rect(w, h).1 - 8.
-    } else if m.ledger_open {
-        crate::history::panel_rect_for(m, w, h).1 - 8.
-    } else {
-        ledger_bar_y(h) - 8.
-    };
-    rect(
-        &mut f,
-        x - 12.,
-        top - 8.,
-        bw + 24.,
-        (bottom - top + 16.).max(1.),
-        p.article_bg,
-    );
-    if !compact_analysis {
+    let compact_analysis = !cfg.minimal && m.analysis_dock && h < 700.;
+    let minimal = cfg.minimal;
+    let split = cfg.display_mode.is_split();
+    let (top, bottom) = body_region(cfg, m, w, h, single);
+    anim.input_line_h = lh;
+    anim.split_divider = None;
+    // 【字间距 2026-11-13】> 0 时按“字宽 + 字距”重排文章/输入行；所有下游位置
+    //（着色、词提括线、光标、命中区）统一消费重排后的 widths。
+    let spacing = cfg.letter_spacing.clamp(0., 12.);
+    let lines_adj;
+    let input_adj;
+    let (lines, input_lines): (&[(usize, String, Vec<f32>)], &[(usize, String, Vec<f32>)]) =
+        if spacing > 0. {
+            lines_adj = flow_with_spacing(lines, spacing, bw);
+            input_adj = flow_with_spacing(input_lines, spacing, bw);
+            (&lines_adj, &input_adj)
+        } else {
+            (lines, input_lines)
+        };    if !minimal && !split {
+        rect(
+            &mut f,
+            x - 12.,
+            top - 8.,
+            bw + 24.,
+            (bottom - top + 16.).max(1.),
+            p.article_bg,
+        );
+    }
+    if !minimal && !compact_analysis {
+        // 对照模式 + 矮窗口（<560）：统计带压成一行，把高度让给文章/输入两栏。
+        if split && h < 560. {
+            let speed = format!("{:.1}", header.speed);
+            mono(&mut f, x, 108., 22., speed.clone(), p.accent);
+            let sw = ui_text_width(&speed, 22.);
+            text(&mut f, x + sw + 5., 114., 11., "字/分", p.muted);
+            let duration = format!("{:02}:{:04.1}", (elapsed / 60.) as u64, elapsed % 60.);
+            let progress = format!(
+                "第 {} / {} {} · {} / {} 字",
+                sess.index + 1,
+                sess.total_segments(),
+                if single { "组" } else { "段" },
+                pos,
+                count,
+            );
+            let progress = elide_width(
+                &progress,
+                (bw - sw - 52.).max(80.),
+                FONT_HINT,
+            );
+            right(&mut f, x + bw, 106., FONT_HINT, progress, p.text2);
+            let line = format!(
+                "击键 {:.2} · 码长 {:.2} · 键准 {:.1}% · 错字 {} · 用时 {duration}",
+                header.keys_per_sec, header.code_len, header.accuracy, header.wrong,
+            );
+            text(
+                &mut f,
+                x,
+                132.,
+                11.,
+                elide_width(&line, (bw - 8.).max(80.), 11.),
+                p.muted,
+            );
+            rect(&mut f, x, 145., bw, 2., p.line);
+            rect(
+                &mut f,
+                x,
+                145.,
+                bw * (pos as f32 / count.max(1) as f32).clamp(0., 1.),
+                2.,
+                p.accent,
+            );
+        } else {
         let speed = format!("{:.1}", header.speed);
         let speed_size = 30_f32.min(112. / (speed.len().max(1) as f32 * 0.6));
         mono(&mut f, x, 117., speed_size, speed.clone(), p.accent);
-        let speed_w = ui_text_width(&speed, speed_size);
-        text(&mut f, x + speed_w + 7., 132., 12., "字/分", p.muted);
+        // 速度只占固定槽位：单位右对齐到槽右缘、指标列从槽外起算 ——
+        // 速度位数变化（0.0 → 123.4）时整条统计带不会横跳。
+        let hero_w = 196.;
+        right(&mut f, x + hero_w - 6., 134., 13., "字/分", p.muted);
         let duration = format!("{:02}:{:04.1}", (elapsed / 60.) as u64, elapsed % 60.);
         let mut metrics = vec![
             ("击键/秒", format!("{:.2}", header.keys_per_sec)),
@@ -917,8 +2056,8 @@ pub fn build(
             })
             .unwrap_or_else(|| "—".into());
         metrics.push(("编码", next_code));
-        let metrics_x = x + (speed_w + 74.).max(196.);
-        let metrics_w = (bw - (metrics_x - x)).max(300.);
+        let metrics_x = x + hero_w;
+        let metrics_w = (bw - hero_w).max(300.);
         let pitch = (metrics_w / metrics.len() as f32).max(84.);
         for (i, (label, value)) in metrics.iter().enumerate() {
             let xx = metrics_x + i as f32 * pitch;
@@ -938,7 +2077,15 @@ pub fn build(
             x,
             164.,
             FONT_HINT,
-            elide_width(&progress, if w < 900. { bw - 116. } else { bw }, FONT_HINT),
+            elide_width(
+                &progress,
+                if w < 900. || (single && split) {
+                    bw - 116.
+                } else {
+                    bw
+                },
+                FONT_HINT,
+            ),
             p.muted,
         );
         rect(&mut f, x, 185., bw, 2., p.line);
@@ -951,11 +2098,17 @@ pub fn build(
             p.accent,
         );
         if single {
+            // 字贴模式字提开关在正文上方；对照模式挪到进度行右端，避免压文章卡。
+            let (cy, cx) = if split {
+                (158., x + bw - 98.)
+            } else {
+                (199., x)
+            };
             chip(
                 &mut f,
                 hs,
-                x,
-                199.,
+                cx,
+                cy,
                 98.,
                 if m.hints {
                     "字提 · 开"
@@ -967,8 +2120,27 @@ pub fn build(
                 m.hints,
             );
         }
+        }
     }
-    let active = lines.iter().rposition(|l| l.0 <= pos).unwrap_or(0);
+    if split {
+        draw_split_body(
+            &mut f,
+            hs,
+            sess,
+            cfg,
+            m,
+            t,
+            w,
+            h,
+            bw,
+            fs,
+            lh,
+            lines,
+            input_lines,
+            anim,
+        );
+    } else {
+        let active = lines.iter().rposition(|l| l.0 <= pos).unwrap_or(0);
     let rows = ((bottom - top) / lh).floor().max(1.) as usize;
     let first = if single {
         active
@@ -1078,15 +2250,7 @@ pub fn build(
                 }
             }
         }
-        f.push(DrawCmd::StyledLine {
-            x: xx + dx,
-            y: yy,
-            w: bw,
-            size: fs,
-            text: line_text.clone(),
-            spans,
-            color: p.text,
-        });
+        styled_line(&mut f, xx + dx, yy, bw, fs, line_text, spans, p.text, spacing, widths);
         if li == active {
             let ci = pos
                 .saturating_sub(*offset)
@@ -1228,21 +2392,23 @@ pub fn build(
                             let corner_size = (fs * 0.52).max(9.);
                             let corner_w =
                                 rank.chars().count() as f32 * corner_size * 0.6;
-                            mono(
+                            rank_digit(
                                 &mut f,
+                                cfg,
                                 wx + ww - corner_w - 1.,
                                 yy - corner_size * 0.38,
                                 corner_size,
-                                rank,
+                                &rank,
                                 rank_color,
                             );
                         } else {
-                            mono(
+                            rank_digit(
                                 &mut f,
+                                cfg,
                                 hx + code_width + code_rank_gap,
                                 yy + fs + word_bracket_offset(fs) + 1.,
                                 rank_size,
-                                rank,
+                                &rank,
                                 rank_color,
                             );
                         }
@@ -1252,14 +2418,68 @@ pub fn build(
         }
     }
     f.push(DrawCmd::PopClip);
-    if !(m.analysis_dock && h < 520.) {
+    }
+    // 极简模式没有底栏，但成绩面板/理论分析停靠面板仍是浮层，照样画。
+    if !(m.analysis_dock && !cfg.minimal && h < 520.) {
         crate::history::draw(&mut f, hs, sess, cfg, m, t, w, h);
     }
     if m.analysis_dock && m.modal == Modal::None {
-        crate::modals::draw_analysis_dock(&mut f, hs, m, sess, t, w, h);
+        crate::modals::draw_analysis_dock_for(&mut f, hs, m, sess, t, cfg, w, h);
+    }
+    // 极简字贴模式：本段完成时底部浮条（仍保留下一段/重打入口）。
+    if minimal && !split && sess.phase == crate::session::Phase::Done {
+        draw_minimal_done_bar(&mut f, hs, sess, t, w, h);
     }
     f
 }
+
+/// 极简模式 + 字贴：完成态底部浮条。对照模式的完成摘要画在输入卡里。
+fn draw_minimal_done_bar(
+    f: &mut Frame,
+    hs: &mut Vec<Hit>,
+    sess: &Session,
+    t: &Theme,
+    w: f32,
+    h: f32,
+) {
+    let p = tokens(t);
+    let record = sess
+        .results
+        .get(sess.current_index())
+        .and_then(Option::as_ref);
+    let summary = record
+        .map(|r| format!("本段完成  {:.1} 字/分 · 键准 {:.1}%", r.speed, r.accuracy))
+        .unwrap_or_else(|| "本段完成".into());
+    let has_next = sess.current_index() + 1 < sess.total_segments();
+    let bar_w = (ui_text_width(&summary, 14.) + 244.).min((w - 40.).max(260.));
+    let x = (w - bar_w) / 2.;
+    let y = (h - 60.).max(8.);
+    round(
+        f,
+        x,
+        y,
+        bar_w,
+        44.,
+        12.,
+        p.surface,
+        Some(alpha(p.accent, 0.35)),
+    );
+    text(
+        f,
+        x + 16.,
+        y + 14.,
+        14.,
+        elide_width(&summary, (bar_w - 220.).max(80.), 14.),
+        p.text2,
+    );
+    let mut bx = x + bar_w - 192.;
+    if has_next {
+        button(f, hs, bx, y + 6., 84., "下一段", Action::Next, t, true);
+        bx += 90.;
+    }
+    button(f, hs, bx, y + 6., 84., "重打", Action::Restart, t, !has_next);
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -1697,6 +2917,7 @@ mod tests {
                     &theme("墨玉"),
                     width,
                     480.,
+                    0,
                 );
                 let buttons: Vec<_> = hits.iter().filter(|h| h.y == 60.).collect();
                 assert!(buttons.iter().any(|h| h.action == Action::LoadClipboard));
@@ -1935,5 +3156,299 @@ mod tests {
             assert_eq!(hint_word_tint(&custom, "一码", "a", 4), Some(hex("9a8765")));
             assert_eq!(custom.word_colors[..5], legacy.word_colors[..5]);
         }
+    }
+
+    // ═══════════ 视图体系（2026-11-12）：极简模式 / 对照分栏 ═══════════
+
+    #[test]
+    fn letter_spacing_rewraps_without_losing_characters_and_draws_per_character() {
+        let (sess, model, mut cfg, lines) = fixture();
+        let spacing = 6.;
+        let wrapped = flow_with_spacing(&lines, spacing, 600.);
+        let original: usize = lines.iter().map(|(_, text, _)| text.chars().count()).sum();
+        let rewrapped: usize = wrapped.iter().map(|(_, text, _)| text.chars().count()).sum();
+        assert_eq!(original, rewrapped, "spacing must not drop characters");
+        assert!(wrapped.len() >= lines.len(), "spacing should only add lines");
+        // 带字距时逐字绘制：不再产生整行 StyledLine，但位置随字距右移。
+        cfg.letter_spacing = spacing;
+        let mut anim = Animation::default();
+        let mut hits = Vec::new();
+        let frame = build(
+            &sess,
+            &cfg,
+            &theme("墨玉"),
+            &model,
+            1280.,
+            800.,
+            0,
+            0.,
+            &mut anim,
+            &mut hits,
+            &lines,
+        );
+        let styled = frame
+            .cmds
+            .iter()
+            .filter(|c| matches!(c, DrawCmd::StyledLine { .. }))
+            .count();
+        assert_eq!(styled, 0, "spacing path draws per character");
+        let caret = anim.caret.expect("caret");
+        let (top, bottom) = body_region(&cfg, &model, 1280., 800., false);
+        assert!(caret.1 >= top && caret.1 < bottom);
+    }
+
+    #[test]
+    fn minimal_mode_keeps_the_ledger_as_an_overlay_without_the_bottom_bar() {
+        let (sess, model, mut cfg, lines) = fixture();
+        cfg.minimal = true;
+        let m = Model {
+            ledger_open: true,
+            ..Default::default()
+        };
+        let (top, bottom) = body_region(&cfg, &m, 1280., 800., false);
+        assert_eq!(top, minimal_top(&cfg));
+        assert!(bottom < 800. - 16., "ledger must shrink the minimal body");
+        let mut anim = Animation::default();
+        let mut hits = Vec::new();
+        let _ = build(
+            &sess,
+            &cfg,
+            &theme("墨玉"),
+            &m,
+            1280.,
+            800.,
+            0,
+            0.,
+            &mut anim,
+            &mut hits,
+            &lines,
+        );
+        // 极简模式没有摘要条，但面板表头仍可点收起。
+        assert!(hits.iter().any(|h| h.action == Action::ToggleLedger));
+        assert!(!hits.iter().any(|h| matches!(h.action, Action::Next)));
+    }
+    #[test]
+    fn minimal_mode_hides_all_chrome_and_starts_the_article_at_the_top_band() {
+        let (mut sess, model, mut cfg, lines) = fixture();
+        sess.comparer.pos = 2;
+        cfg.minimal = true;
+        let mut anim = Animation::default();
+        let mut hits = Vec::new();
+        let frame = build(
+            &sess,
+            &cfg,
+            &theme("墨玉"),
+            &model,
+            1280.,
+            800.,
+            0,
+            0.,
+            &mut anim,
+            &mut hits,
+            &lines,
+        );
+        // 极简不再画整套 chrome，但保留四个常驻动作与窗口控制（2026-11-13 用户要求）。
+        assert!(
+            !hits
+                .iter()
+                .any(|h| matches!(h.action, Action::LoadClipboard | Action::Restart | Action::Next)),
+            "minimal mode must not keep the full toolbar"
+        );
+        assert!(hits.iter().any(|h| h.action == Action::ToggleLedger));
+        assert!(hits.iter().any(|h| h.action == Action::ToggleAnalysis));
+        assert!(hits
+            .iter()
+            .any(|h| h.action == Action::Open(Modal::Groups)));
+        assert!(hits
+            .iter()
+            .any(|h| h.action == Action::Open(Modal::Online)));
+        assert!(hits.iter().any(|h| h.action == Action::Exit));
+        // 顶部静默带内绘制状态/指标，正文从 minimal_top 附近开始。
+        assert!(frame
+            .cmds
+            .iter()
+            .any(|c| matches!(c, DrawCmd::TextRun { y, .. } if *y < minimal_top(&cfg))));
+        let line_y = frame
+            .cmds
+            .iter()
+            .find_map(|c| match c {
+                DrawCmd::StyledLine { y, .. } => Some(*y),
+                _ => None,
+            })
+            .expect("article line");
+        assert!(
+            line_y >= minimal_top(&cfg) - 10. && line_y < minimal_top(&cfg) + 40.,
+            "article should begin under the minimal band, got {line_y}"
+        );
+        let (top, bottom) = body_region(&cfg, &model, 1280., 800., false);
+        assert_eq!(top, minimal_top(&cfg));
+        assert_eq!(bottom, 800. - 16.);
+    }
+
+    #[test]
+    fn split_mode_draws_two_panes_and_keeps_the_caret_inside_the_input_box() {
+        let (mut sess, model, mut cfg, lines) = fixture();
+        cfg.display_mode = gale_core::config::DisplayMode::Split;
+        sess.feed_input(
+            gale_core::compare::InputEvent::Commit {
+                chars: "甲乙".into(),
+            },
+            100,
+        );
+        let typed: String = sess.comparer.typed.iter().collect();
+        let input_lines = vec![(
+            0usize,
+            typed,
+            (0..=2).map(|i| i as f32 * 54.).collect::<Vec<f32>>(),
+        )];
+        let mut anim = Animation::default();
+        let mut hits = Vec::new();
+        let frame = build_with_input(
+            &sess,
+            &cfg,
+            &theme("墨玉"),
+            &model,
+            1280.,
+            800.,
+            0,
+            0.,
+            &mut anim,
+            &mut hits,
+            &lines,
+            &input_lines,
+        );
+        let (top, bottom) = body_region(&cfg, &model, 1280., 800., false);
+        let (bw, fs, base_lh) = body_metrics(&sess, &cfg, 1280.);
+        let lh = line_height_for_anchor(&cfg, fs, base_lh, true);
+        let g = split_geom(&cfg, bw, fs, lh, 1280., top, bottom);
+        assert!(!g.collapsed);
+        assert!(g.article_h > lh, "article pane shows at least one full line");
+        assert!(g.input_h > line_height_split(fs));
+        // 至少两条 StyledLine：文章对照行 + 输入卡里的实打字行。
+        let styled = frame
+            .cmds
+            .iter()
+            .filter(|c| matches!(c, DrawCmd::StyledLine { .. }))
+            .count();
+        assert!(styled >= 2, "expected article and input lines, got {styled}");
+        let (caret_x, caret_y) = anim.caret.expect("split caret");
+        assert!(
+            caret_y >= g.input_y && caret_y < g.input_y + g.input_h,
+            "caret must sit inside the input pane: caret=({caret_x},{caret_y}) pane=({},{}) h={}",
+            g.input_y,
+            g.input_y + g.input_h,
+            g.input_h
+        );
+        assert!(caret_x >= g.x && caret_x <= g.x + g.pane_w);
+        // 分栏把手命中区从 ui 层交给主循环做拖动。
+        assert!(anim.split_divider.is_some());
+    }
+
+    fn line_height_split(fs: f32) -> f32 {
+        (fs * 1.34).max(fs + 8.)
+    }
+
+    #[test]
+    fn split_mode_collapses_the_article_pane_before_it_crushes_the_input_box() {
+        let (sess, model, mut cfg, lines) = fixture();
+        cfg.display_mode = gale_core::config::DisplayMode::Split;
+        let (bw, fs, base_lh) = body_metrics(&sess, &cfg, 640.);
+        let lh = line_height_for_anchor(&cfg, fs, base_lh, false);
+        let (top, bottom) = body_region(&cfg, &model, 640., 420., false);
+        let g = split_geom(&cfg, bw, fs, lh, 640., top, bottom);
+        // 640×420 + 54 号字：文章卡放不下一整行时收起，输入卡独占正文带。
+        assert!(g.collapsed);
+        assert_eq!(g.article_h, 0.);
+        assert!(g.input_h >= (bottom - top) - 0.01);
+        // 80×60 常规窗口不收起。
+        let (top, bottom) = body_region(&cfg, &model, 800., 600., false);
+        let g = split_geom(&cfg, bw, fs, lh, 800., top, bottom);
+        assert!(!g.collapsed);
+    }
+
+    #[test]
+    fn split_article_height_snaps_to_whole_text_lines() {
+        let (sess, model, mut cfg, _) = fixture();
+        cfg.display_mode = gale_core::config::DisplayMode::Split;
+        let (bw, fs, base_lh) = body_metrics(&sess, &cfg, 1280.);
+        let lh = line_height_for_anchor(&cfg, fs, base_lh, false);
+        let (top, bottom) = body_region(&cfg, &model, 1280., 800., false);
+        let g = split_geom(&cfg, bw, fs, lh, 1280., top, bottom);
+        let rows = (g.article_h - 20.) / lh;
+        assert!(
+            (rows - rows.floor()).abs() < 0.36 || rows < 1.,
+            "article pane should end on a whole line, rows={rows}"
+        );
+    }
+
+    #[test]
+    fn minimal_top_band_shows_hud_and_keeps_window_controls_always_available() {
+        let (mut sess, model, mut cfg, lines) = fixture();
+        sess.comparer.pos = 3;
+        cfg.minimal = true;
+        assert_eq!(minimal_band_h(&cfg), 66.);
+        assert_eq!(minimal_top(&cfg), 74.);
+        let model_far = Model {
+            pointer: Some((120., 400.)),
+            hints: true,
+            ..Default::default()
+        };
+        let mut hits = Vec::new();
+        let frame = build(
+            &sess,
+            &cfg,
+            &theme("墨玉"),
+            &model_far,
+            1280.,
+            800.,
+            14_000,
+            14.,
+            &mut Animation::default(),
+            &mut hits,
+            &lines,
+        );
+        let has = |text: &str| {
+            frame
+                .cmds
+                .iter()
+                .any(|c| matches!(c, DrawCmd::TextRun { text: t, .. } if t == text))
+        };
+        // 数据行与常规统计带同指标：速度 + 击键/码长/键准/错字/用时/编码。
+        assert!(has("字/分"));
+        assert!(has("击键/秒"));
+        assert!(has("码长"));
+        assert!(has("键准"));
+        assert!(has("用时"));
+        assert!(has("编码"));
+        // 指针不在窗口控制区也保留四个动作与窗口控制入口。
+        assert!(hits.iter().any(|h| h.action == Action::Exit));
+        assert!(hits.iter().any(|h| h.action == Action::ToggleAnalysis));
+        // 悬停在控制胶囊上：控件提亮但数据行仍在（不再让位）。
+        let model_near = Model {
+            pointer: Some((1240., 20.)),
+            hints: true,
+            ..Default::default()
+        };
+        let mut hits = Vec::new();
+        let frame = build(
+            &sess,
+            &cfg,
+            &theme("墨玉"),
+            &model_near,
+            1280.,
+            800.,
+            14_000,
+            14.,
+            &mut Animation::default(),
+            &mut hits,
+            &lines,
+        );
+        assert!(hits.iter().any(|h| h.action == Action::Minimize));
+        assert!(hits.iter().any(|h| h.action == Action::Maximize));
+        assert!(hits.iter().any(|h| h.action == Action::Exit));
+        assert!(frame
+            .cmds
+            .iter()
+            .any(|c| matches!(c, DrawCmd::TextRun { text, .. } if text == "字/分")));
     }
 }

@@ -12,7 +12,7 @@ use crate::ui::{
     alpha, body_text, elide_width, line, mono, rect, right, round, text, tokens, ui_text_width,
     Palette,
 };
-use gale_core::config::Config;
+use gale_core::config::{Config, DisplayMode};
 use gale_core::scorecard::{format_score_template, SCORE_FIELDS, SCORE_PRESETS};
 use gale_core::theme::Theme;
 use gale_win::d2d::{Align, DrawCmd, FontFamily, Frame};
@@ -41,11 +41,14 @@ const T_TITLE: f32 = 16.;
 const T_LABEL: f32 = 15.;
 const T_NOTE: f32 = 13.;
 
-const PAGES: [(&str, &str); 4] = [
+/// 六页：2026-11-13 新增「快捷键」（录制式自设 + 恢复默认）。
+const PAGES: [(&str, &str); 6] = [
     ("词提", "提示开关、策略与配色"),
     ("成绩单", "自动复制与成绩单样式"),
     ("外观与颜色", "主题、排版、动效与配色"),
+    ("界面与显示", "对照模式、极简与窗口"),
     ("数据与关于", "存储位置与版本"),
+    ("快捷键", "录制按键、恢复默认"),
 ];
 
 const COLORS: &[(&str, &str, &str)] = &[
@@ -130,7 +133,7 @@ const DATA_CARD2_Y: f32 = 144.;
 // -------------------------------------------------------------------- 取值层
 
 fn tab(m: &Model) -> u8 {
-    m.field("pref_tab").parse::<u8>().unwrap_or(0).min(3)
+    m.field("pref_tab").parse::<u8>().unwrap_or(0).min(5)
 }
 fn enabled(m: &Model, key: &str, default: bool) -> bool {
     m.fields.get(key).map(|v| v == "true").unwrap_or(default)
@@ -176,7 +179,7 @@ pub(crate) fn sync_color_editor(m: &mut Model) {
     m.fields.insert("pref_color_hex".into(), hex);
 }
 pub(crate) fn select_page(m: &mut Model, page: u8) {
-    m.fields.insert("pref_tab".into(), page.min(3).to_string());
+    m.fields.insert("pref_tab".into(), page.min(5).to_string());
     refresh_page(m);
 }
 pub(crate) fn select_hint_view(m: &mut Model, view: &str) {
@@ -571,7 +574,16 @@ fn nav(f: &mut Frame, hs: &mut Vec<Hit>, m: &Model, t: &Theme, x: f32, y: f32) {
 
 // -------------------------------------------------------------------- 练习页
 
-fn practice_page(f: &mut Frame, hs: &mut Vec<Hit>, m: &Model, t: &Theme, x: f32, y: f32, w: f32) {
+fn practice_page(
+    f: &mut Frame,
+    hs: &mut Vec<Hit>,
+    m: &Model,
+    cfg: &Config,
+    t: &Theme,
+    x: f32,
+    y: f32,
+    w: f32,
+) {
     let p = tokens(t);
     page_title(f, x, y, w, "词提", "正文与 F10 按当前码表分析", &p);
     let choice_w = (w - 8.) / 2.;
@@ -745,49 +757,98 @@ fn practice_page(f: &mut Frame, hs: &mut Vec<Hit>, m: &Model, t: &Theme, x: f32,
         rect(f, x, strategy_y + 20., w, 30., alpha(p.bg, 0.35));
         rect(f, x, dynamic_y, w, PRACTICE_SWITCH_H, alpha(p.bg, 0.35));
     }
-    // 字号步进：数值 + − / + 一组 32 高按钮。
-    section_label(f, x, y + PRACTICE_SIZE_LABEL_Y, "提示字号", &p);
+    // 提示排版：字号 / 选重数字加粗 / 选重数字高低，三个控件共用一张卡横排。
+    section_label(f, x, y + PRACTICE_SIZE_LABEL_Y, "提示字号 · 选重数字样式", &p);
     let sy = y + PRACTICE_SIZE_Y;
     round(f, x, sy, w, PRACTICE_SIZE_H, 8., p.surface2, Some(p.line));
-    text(f, x + 16., sy + 8., T_LABEL, "编码与选重字号", p.text);
-    note(
+    let col_w = (w - 32.) / 3.;
+    let cols = [x + 16., x + 16. + col_w, x + 16. + col_w * 2.];
+    for cx in [cols[1] - 8., cols[2] - 8.] {
+        line(f, cx, sy + 9., 1., alpha(p.line, 0.9));
+    }
+    let label_w = 36.;
+    // ① 字号：[−] 14 [+]
+    text(f, cols[0], sy + 17., T_NOTE, "字号", p.text2);
+    step_button(
         f,
-        x + 16.,
-        sy + 31.,
-        w - 16. - 16. - 118.,
-        "范围 14–28，默认 14",
-        p.muted,
+        hs,
+        cols[0] + label_w,
+        sy + 8.,
+        "−",
+        crate::aux_marker("pref_step:hint_font_size:-1"),
+        t,
     );
-    right(
+    mono(
         f,
-        x + w - 16. - 84.,
-        sy + 15.,
-        20.,
+        cols[0] + label_w + 40.,
+        sy + 16.,
+        14.,
         format!("{:.0}", hint_size(m)),
         p.accent,
     );
     step_button(
         f,
         hs,
-        x + w - 16. - 72.,
-        sy + 12.,
-        "−",
-        crate::aux_marker("pref_step:hint_font_size:-1"),
-        t,
-    );
-    step_button(
-        f,
-        hs,
-        x + w - 16. - 32.,
-        sy + 12.,
+        cols[0] + label_w + 76.,
+        sy + 8.,
         "+",
         crate::aux_marker("pref_step:hint_font_size:1"),
         t,
     );
-    hint_preview(f, m, t, x, y + PRACTICE_PREVIEW_Y, w);
+    // ② 选重数字加粗：开关
+    text(f, cols[1], sy + 17., T_NOTE, "加粗", p.text2);
+    switch(
+        f,
+        hs,
+        cols[1] + label_w,
+        sy + 12.,
+        enabled(m, "hint_rank_bold", false),
+        crate::aux_marker("pref_toggle:hint_rank_bold"),
+        &p,
+    );
+    // ③ 选重数字高低：[−] +0 [+]
+    text(f, cols[2], sy + 17., T_NOTE, "高低", p.text2);
+    step_button(
+        f,
+        hs,
+        cols[2] + label_w,
+        sy + 8.,
+        "−",
+        crate::aux_marker("pref_step:hint_rank_offset:-1"),
+        t,
+    );
+    mono(
+        f,
+        cols[2] + label_w + 40.,
+        sy + 16.,
+        14.,
+        format!(
+            "{:+.0}",
+            m.field("hint_rank_offset").parse::<f32>().unwrap_or(0.)
+        ),
+        p.accent,
+    );
+    step_button(
+        f,
+        hs,
+        cols[2] + label_w + 84.,
+        sy + 8.,
+        "+",
+        crate::aux_marker("pref_step:hint_rank_offset:1"),
+        t,
+    );
+    hint_preview(f, m, cfg, t, x, y + PRACTICE_PREVIEW_Y, w);
 }
 
-fn hint_preview(f: &mut Frame, m: &Model, t: &Theme, x: f32, py: f32, w: f32) {
+fn hint_preview(
+    f: &mut Frame,
+    m: &Model,
+    cfg: &Config,
+    t: &Theme,
+    x: f32,
+    py: f32,
+    w: f32,
+) {
     let p = tokens(t);
     round(
         f,
@@ -829,7 +890,9 @@ fn hint_preview(f: &mut Frame, m: &Model, t: &Theme, x: f32, py: f32, w: f32) {
     let cell = (w - 32.) / examples.len() as f32;
     let size = hint_size(m).min((cell - 10.) / 3.);
     for (i, (word, code, rank, caption)) in examples.iter().enumerate() {
-        let sx = x + 16. + i as f32 * cell;
+        let word_w = word.chars().count() as f32 * 24.;
+        // 示例按词宽在格内水平居中，数字/编码也围绕它对齐（不再左边挤一坨）。
+        let sx = x + 16. + i as f32 * cell + ((cell - word_w) / 2.).max(0.);
         let tint = color_words
             .then(|| crate::ui::hint_word_tint_for_rank(&p, word, code, *rank, max_len, rank_mode))
             .flatten();
@@ -839,42 +902,49 @@ fn hint_preview(f: &mut Frame, m: &Model, t: &Theme, x: f32, py: f32, w: f32) {
                 f,
                 sx,
                 py + 42.,
-                word.chars().count() as f32 * 24.,
+                word_w,
                 24.,
                 tint.unwrap_or(p.hint_underline),
             );
         }
+        let code_w = if show_code {
+            code.chars().count() as f32 * size * 0.6
+        } else {
+            0.
+        };
         if show_code {
-            mono(f, sx, py + 81., size, *code, tint.unwrap_or(p.hint_code));
+            let cx = sx + ((word_w - code_w) / 2.).max(0.);
+            mono(f, cx, py + 81., size, *code, tint.unwrap_or(p.hint_code));
         }
         if show_rank && *rank > 1 {
-            // 【选重数字角标 2026-11-11】与正文渲染同口径：角标模式把
-            // 数字画到词右上角，否则跟在编码后面。
+            let rank_text = rank.to_string();
+            let rank_color = tint.unwrap_or(p.hint_badge);
             if enabled(m, "hint_rank_corner", false) {
+                // 角标：与正文同一 helper（加粗/高低实时生效），右上角对齐词宽。
                 let ds = 24. * 0.52;
-                let dw = rank.to_string().chars().count() as f32 * ds * 0.6;
-                let word_w = word.chars().count() as f32 * 24.;
-                mono(
+                let dw = rank_text.chars().count() as f32 * ds * 0.6;
+                crate::ui::rank_digit(
                     f,
+                    cfg,
                     sx + word_w - dw - 1.,
                     py + 42. - ds * 0.38,
                     ds,
-                    rank.to_string(),
-                    tint.unwrap_or(p.hint_badge),
+                    &rank_text,
+                    rank_color,
                 );
             } else {
-                let code_w = if show_code {
-                    code.chars().count() as f32 * size * 0.6
-                } else {
-                    0.
-                };
-                mono(
+                let rank_w = rank_text.chars().count() as f32 * size * 0.6;
+                let gap = if code_w > 0. { 2. } else { 0. };
+                let total = code_w + gap + rank_w;
+                let gx = sx + ((word_w - total) / 2.).max(0.);
+                crate::ui::rank_digit(
                     f,
-                    sx + code_w + 2.,
+                    cfg,
+                    gx + code_w + gap,
                     py + 77.,
                     size,
-                    rank.to_string(),
-                    tint.unwrap_or(p.hint_badge),
+                    &rank_text,
+                    rank_color,
                 );
             }
         }
@@ -949,7 +1019,7 @@ fn score_page(f: &mut Frame, hs: &mut Vec<Hit>, m: &Model, t: &Theme, x: f32, y:
     .enumerate()
     {
         let cx = x + i as f32 * (core_w + 8.);
-        round(f, cx, y + 50., core_w, 60., 7., p.surface2, Some(p.line));
+        round(f, cx, y + 50., core_w, 66., 7., p.surface2, Some(p.line));
         text(f, cx + 8., y + 58., T_NOTE, *label, p.muted);
         let value = m
             .latest
@@ -968,7 +1038,7 @@ fn score_page(f: &mut Frame, hs: &mut Vec<Hit>, m: &Model, t: &Theme, x: f32, y:
                 mono(
                     f,
                     cx + 8.,
-                    y + 78. + line as f32 * 16.,
+                    y + 80. + line as f32 * 16.,
                     fit,
                     value,
                     p.accent,
@@ -1007,7 +1077,7 @@ fn score_page(f: &mut Frame, hs: &mut Vec<Hit>, m: &Model, t: &Theme, x: f32, y:
         "完成当前段时复制成绩文本",
         true,
         4.,
-        21.,
+        23.,
     );
     toggle_row(
         f,
@@ -1023,7 +1093,7 @@ fn score_page(f: &mut Frame, hs: &mut Vec<Hit>, m: &Model, t: &Theme, x: f32, y:
         "绑定 QQ 群后，完成一段即自动发送晴兼容成绩单",
         true,
         4.,
-        21.,
+        23.,
     );
 
     section_label(f, x, y + 236., "成绩单样式", &p);
@@ -1259,12 +1329,329 @@ pub(super) fn draw(
     nav(f, hs, m, t, x, y);
     let (bx, by, bw) = (body_x(x), body_y(y), body_w(pw));
     match tab(m) {
-        0 => practice_page(f, hs, m, t, bx, by, bw),
+        0 => practice_page(f, hs, m, cfg, t, bx, by, bw),
         1 => score_page(f, hs, m, t, bx, by, bw),
         2 => appearance_page(f, hs, m, sess, cfg, t, bx, by, bw),
-        _ => data_page(f, hs, t, bx, by, bw),
+        3 => interface_page(f, hs, m, cfg, t, bx, by, bw),
+        4 => data_page(f, hs, t, bx, by, bw),
+        _ => shortcuts_page(f, hs, m, cfg, t, bx, by, bw),
     }
     footer(f, hs, t, x, y, pw, ph);
+}
+
+// -------------------------------------------------------------- 快捷键页
+
+/// 【快捷键 2026-11-13】一页录制式自设：点键位框→按新组合键；右上角恢复默认。
+fn shortcuts_page(f: &mut Frame, hs: &mut Vec<Hit>, m: &Model, cfg: &Config, t: &Theme, x: f32, y: f32, w: f32) {
+    let p = tokens(t);
+    page_title(
+        f,
+        x,
+        y,
+        w,
+        "快捷键",
+        "点键位后按下新组合键；录制中按 Esc 取消",
+        &p,
+    );
+    // 恢复默认（右上角）
+    let reset_w = 96.;
+    let reset_x = x + w - reset_w;
+    round(f, reset_x, y + 26., reset_w, 30., 8., p.bg2, Some(p.line2));
+    centered(f, reset_x + reset_w / 2., y + 33., T_NOTE, "恢复默认", p.text2);
+    hit_box(
+        hs,
+        reset_x,
+        y + 26.,
+        reset_w,
+        30.,
+        crate::aux_marker("pref_shortcut:reset"),
+    );
+    section_label(f, x, y + 32., "命令快捷键", &p);
+
+    let recording = m.field("pref_recording");
+    let cols = 2usize;
+    let gap = 12.;
+    let col_w = (w - gap) / cols as f32;
+    let row_h = 42.;
+    let top = y + 58.;
+    for (index, (id, label, _)) in gale_core::config::SHORTCUT_DEFAULTS.iter().enumerate() {
+        let col = index % cols;
+        let row = index / cols;
+        let cx = x + col as f32 * (col_w + gap);
+        let cy = top + row as f32 * row_h;
+        let chip_w = 132.;
+        let chip_h = 28.;
+        let chip_x = cx + col_w - chip_w;
+        let chip_y = cy + 2.;
+        text(f, cx, cy + 6., T_LABEL, *label, p.text2);
+        let active = recording == *id;
+        round(
+            f,
+            chip_x,
+            chip_y,
+            chip_w,
+            chip_h,
+            7.,
+            if active { p.accent } else { p.bg2 },
+            Some(if active { p.accent } else { p.line2 }),
+        );
+        let shown = if active {
+            "按下组合键…".to_string()
+        } else {
+            cfg.shortcut(id)
+        };
+        centered(
+            f,
+            chip_x + chip_w / 2.,
+            chip_y + 6.,
+            14.,
+            &shown,
+            if active { p.bg } else { p.text },
+        );
+        hit_box(
+            hs,
+            chip_x,
+            chip_y,
+            chip_w,
+            chip_h,
+            crate::aux_marker(&format!("pref_shortcut:record:{id}")),
+        );
+    }
+    let rows = gale_core::config::SHORTCUT_DEFAULTS.len().div_ceil(cols) as f32;
+    let note_y = top + rows * row_h + 12.;
+    note(
+        f,
+        x,
+        note_y,
+        w,
+        "Enter / 空格 / Ctrl+V / Ctrl+Z / Ctrl+Y 是打字与编辑固定键，不参与自设；",
+        p.muted,
+    );
+    note(
+        f,
+        x,
+        note_y + 20.,
+        w,
+        "快捷键需为 F1–F24 或包含 Ctrl / Alt，重复会提示占用。",
+        p.muted,
+    );
+}
+
+// -------------------------------------------------------------- 界面与显示页
+
+/// 迷你模式预览：字贴=满窗正文；对照=上文章块 + 下输入框。
+fn mode_preview(f: &mut Frame, p: &Palette, x: f32, y: f32, w: f32, h: f32, mode: DisplayMode) {
+    round(f, x, y, w, h, 6., p.bg, Some(p.line));
+    rect(f, x + 6., y + 6., w - 12., 3., p.line2);
+    match mode {
+        DisplayMode::Copybook => {
+            for i in 0..3 {
+                let lw = w - 16. - if i == 1 { 12. } else { 0. };
+                rect(
+                    f,
+                    x + 8.,
+                    y + 16. + i as f32 * 9.,
+                    lw,
+                    3.,
+                    if i == 0 { p.accent } else { p.text2 },
+                );
+            }
+        }
+        DisplayMode::Split => {
+            for i in 0..2 {
+                rect(f, x + 8., y + 15. + i as f32 * 7., w - 16., 3., p.text2);
+            }
+            round(
+                f,
+                x + 6.,
+                y + 31.,
+                w - 12.,
+                h - 37.,
+                4.,
+                p.bg2,
+                Some(p.line2),
+            );
+            rect(f, x + 10., y + 36., 10., 2.5, p.accent);
+        }
+    }
+}
+
+fn interface_page(
+    f: &mut Frame,
+    hs: &mut Vec<Hit>,
+    m: &Model,
+    cfg: &Config,
+    t: &Theme,
+    x: f32,
+    y: f32,
+    w: f32,
+) {
+    let p = tokens(t);
+    page_title(f, x, y, w, "界面与显示", "字贴 / 对照双模式、极简与窗口", &p);
+    // 模式二选一卡片（带迷你预览，选中 accent 描边 + 勾）
+    let card_w = (w - 10.) / 2.;
+    let cards_y = y + 30.;
+    for (i, (mode, title, desc)) in [
+        (DisplayMode::Copybook, "字贴模式", "发文区直接跟打，光标逐字推进"),
+        (DisplayMode::Split, "对照模式", "上方文章对照，下方输入框跟打"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let cx = x + i as f32 * (card_w + 10.);
+        let selected = cfg.display_mode == mode;
+        round(
+            f,
+            cx,
+            cards_y,
+            card_w,
+            118.,
+            10.,
+            if selected {
+                alpha(p.accent, 0.07)
+            } else {
+                p.surface2
+            },
+            Some(if selected {
+                alpha(p.accent, 0.6)
+            } else {
+                p.line
+            }),
+        );
+        text(
+            f,
+            cx + 16.,
+            cards_y + 14.,
+            T_LABEL,
+            title,
+            if selected { p.accent } else { p.text },
+        );
+        note(
+            f,
+            cx + 16.,
+            cards_y + 36.,
+            (card_w - 130.).max(60.),
+            desc,
+            p.muted,
+        );
+        mode_preview(f, &p, cx + card_w - 100., cards_y + 56., 84., 50., mode);
+        if selected {
+            round(f, cx + card_w - 28., cards_y + 12., 16., 16., 8., p.accent, None);
+            text(f, cx + card_w - 25., cards_y + 12.5, 11., "✓", p.bg);
+        }
+        hit_box(
+            hs,
+            cx,
+            cards_y,
+            card_w,
+            118.,
+            crate::aux_marker(&format!("pref_mode:{}", mode.as_str())),
+        );
+    }
+    // 极简模式（两种正文模式通用）
+    let s1 = cards_y + 138.;
+    round(f, x, s1, w, 52., 8., p.surface2, Some(p.line));
+    toggle_row(
+        f,
+        hs,
+        m,
+        t,
+        x,
+        s1,
+        w,
+        52.,
+        "minimal",
+        "极简模式",
+        "隐藏标题栏、工具栏、统计带与底栏，正文满窗（F11）",
+        false,
+        8.,
+        28.,
+    );
+    let s2 = s1 + 60.;
+    round(f, x, s2, w, 52., 8., p.surface2, Some(p.line));
+    toggle_row(
+        f,
+        hs,
+        m,
+        t,
+        x,
+        s2,
+        w,
+        52.,
+        "minimal_hud",
+        "极简数据条",
+        "极简模式顶部显示速度、键准与进度；关闭后只剩正文",
+        true,
+        8.,
+        28.,
+    );
+    let s3 = s2 + 60.;
+    round(f, x, s3, w, 52., 8., p.surface2, Some(p.line));
+    toggle_row(
+        f,
+        hs,
+        m,
+        t,
+        x,
+        s3,
+        w,
+        52.,
+        "always_on_top",
+        "窗口置顶",
+        "跟打时保持在其它窗口之上（右键菜单也可切换）",
+        false,
+        8.,
+        28.,
+    );
+    // 对照模式分栏比例
+    let s4 = s3 + 60.;
+    round(f, x, s4, w, 76., 8., p.surface2, Some(p.line));
+    text(f, x + 16., s4 + 19., T_LABEL, "对照模式文章区高度", p.text);
+    // 步进按钮与百分比同一行右对齐：[-] 58% [+]
+    let group_w = 32. + 6. + 40. + 6. + 32.;
+    let gx = x + w - 16. - group_w;
+    step_button(
+        f,
+        hs,
+        gx,
+        s4 + 10.,
+        "−",
+        crate::aux_marker("pref_step:split_ratio:-1"),
+        t,
+    );
+    centered(
+        f,
+        gx + 34. + 20.,
+        s4 + 19.,
+        14.,
+        &format!("{:.0}%", cfg.split_ratio * 100.),
+        p.accent,
+    );
+    step_button(
+        f,
+        hs,
+        gx + 80.,
+        s4 + 10.,
+        "+",
+        crate::aux_marker("pref_step:split_ratio:1"),
+        t,
+    );
+    note(
+        f,
+        x + 16.,
+        s4 + 32.,
+        (w - 32. - group_w - 16.).max(80.),
+        "直接在窗口里上下拖动中间把手也可以调整；其余高度留给输入框",
+        p.muted,
+    );
+    note(
+        f,
+        x,
+        s4 + 92.,
+        w,
+        "右键任意处打开「视图」菜单 · F11 / Ctrl+Shift+M 极简 · F12 / Ctrl+Shift+T 切换对照。",
+        p.muted,
+    );
 }
 
 /// 外观与颜色页：原 F7 外观 + 原「颜色与提示」合并。
@@ -1376,46 +1763,90 @@ fn appearance_page(
         Action::FontDefault,
         t,
     );
-    let typography_w = (w - 24.) / 2.;
-    for (row, (name, value, minus, plus)) in [
+    // 排版：字号 / 行距 / 字间距。宽窗口三列；窄窗口两列 + 字间距独占一行，
+    // 标签与数值同一左轴、步进按钮贴右缘，避免窄列里文字压按钮。
+    // 三列需要每列 ≥224px：字号标签+数值+两个 32px 按钮才互不挤。
+    let three = (w - 32.) / 3. >= 224.;
+    let typography_w = if three { (w - 32.) / 3. } else { (w - 24.) / 2. };
+    let mut typo = vec![
         (
-            "字号 10–100",
+            "字号 10–100".to_string(),
             format!("{:.0} px", cfg.font_size),
             Action::Font(-2),
             Action::Font(2),
         ),
         (
-            "行距",
+            "行距".to_string(),
             format!("{:.2}", 1. + cfg.line_gap),
             Action::LineHeight(-1),
             Action::LineHeight(1),
         ),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let rx = x + row as f32 * (typography_w + 24.);
+    ];
+    if three {
+        typo.push((
+            "字间距".to_string(),
+            format!("{:.0} px", cfg.letter_spacing),
+            crate::aux_marker("pref_step:letter_spacing:-1"),
+            crate::aux_marker("pref_step:letter_spacing:1"),
+        ));
+    }
+    let pitch = if three { 16. } else { 24. };
+    for (row, (name, value, minus, plus)) in typo.into_iter().enumerate() {
+        let rx = x + row as f32 * (typography_w + pitch);
         let ry = y + 178.;
-        if typography_w < 220. {
-            // At 640px the column is 156px wide: stack label and value in
-            // its left 76px, leaving the two buttons their full width.
-            text(f, rx, ry, T_NOTE, name, p.text2);
-            mono(f, rx, ry + 17., 14., value, p.text);
+        if three {
+            text(f, rx, ry + 8., T_NOTE, &name, p.text2);
+            mono(f, rx + typography_w - 140., ry + 8., 14., &value, p.text);
         } else {
-            text(f, rx, ry + 8., T_NOTE, name, p.text2);
-            mono(f, rx + typography_w - 132., ry + 8., 14., value, p.text);
+            // 窄列：标签在上、数值在下（左轴对齐），按钮贴右缘不压字。
+            text(f, rx, ry, T_NOTE, &name, p.text2);
+            mono(f, rx, ry + 17., 14., &value, p.text);
         }
         step_button(f, hs, rx + typography_w - 76., ry, "−", minus, t);
         step_button(f, hs, rx + typography_w - 36., ry, "+", plus, t);
     }
-    section_label(f, x, y + 216., "动效强度", &p);
+    let dy = if three {
+        0.
+    } else {
+        // 窄窗口：字间距独占一行，插在两列排版行下方。
+        let ry = y + 212.;
+        text(f, x, ry + 8., T_NOTE, "字间距", p.text2);
+        right(
+            f,
+            x + typography_w - 84.,
+            ry + 8.,
+            14.,
+            format!("{:.0} px", cfg.letter_spacing),
+            p.text,
+        );
+        step_button(
+            f,
+            hs,
+            x + typography_w - 76.,
+            ry,
+            "−",
+            crate::aux_marker("pref_step:letter_spacing:-1"),
+            t,
+        );
+        step_button(
+            f,
+            hs,
+            x + typography_w - 36.,
+            ry,
+            "+",
+            crate::aux_marker("pref_step:letter_spacing:1"),
+            t,
+        );
+        46.
+    };
+    section_label(f, x, y + 216. + dy, "动效强度", &p);
     let motion_w = (w - 3. * 8.) / 4.;
     for (i, name) in ["关闭", "轻柔", "标准", "丰富"].iter().enumerate() {
         seg_button(
             f,
             hs,
             x + i as f32 * (motion_w + 8.),
-            y + 238.,
+            y + 238. + dy,
             motion_w,
             30.,
             name,
@@ -1424,11 +1855,11 @@ fn appearance_page(
             &p,
         );
     }
-    line(f, x, y + 278., w, p.line);
-    section_label(f, x, y + 290., "跟打区背景与三态配色", &p);
-    color_controls(f, hs, m, t, x, y, w);
+    line(f, x, y + 278. + dy, w, p.line);
+    section_label(f, x, y + 290. + dy, "跟打区背景与三态配色", &p);
+    color_controls(f, hs, m, t, x, y + dy, w);
     // 三态预览（紧凑）
-    let py = y + 568.;
+    let py = y + 568. + dy;
     round(f, x, py, w, 48., 8., p.article_bg, Some(p.line));
     text(f, x + 12., py + 5., T_NOTE, "跟打区三态预览", p.text2);
     for (i, (label, color, bg)) in [
@@ -1925,7 +2356,7 @@ mod tests {
 
     #[test]
     fn content_height_is_fixed_so_the_panel_never_jumps_between_pages() {
-        for tab in 0..=4u8 {
+        for tab in 0..=5u8 {
             let m = preference_model(tab);
             assert_eq!(content_height(&m, 960.), CONTENT_HEIGHT);
             assert_eq!(panel_for_model(&m, 800., 600.).3, CONTENT_HEIGHT);
@@ -1940,12 +2371,19 @@ mod tests {
     }
 
     #[test]
-    fn preference_tabs_are_clamped_to_the_fourth_page() {
+    fn preference_tabs_are_clamped_to_the_sixth_page() {
         let mut m = preference_model(0);
         m.fields.insert("pref_tab".into(), "9".into());
-        assert_eq!(tab(&m), 3);
+        assert_eq!(tab(&m), 5);
         let hs = hit_targets(&m, 1280., 800.);
-        assert!(hs.iter().any(|h| h.action == Action::Folder));
+        assert!(hs
+            .iter()
+            .any(|h| h.action == crate::aux_marker("pref_shortcut:reset")));
+        // 数据与关于页仍是第 5 个（下标 4），Folder 入口保留。
+        let data = preference_model(4);
+        assert!(hit_targets(&data, 1280., 800.)
+            .iter()
+            .any(|h| h.action == Action::Folder));
         m.fields.insert("pref_tab".into(), "x".into());
         assert_eq!(tab(&m), 0);
     }
@@ -1958,11 +2396,14 @@ mod tests {
         assert!(568. + 48. <= BODY_VISIBLE_800 - 12.);
         assert!(PRACTICE_PREVIEW_Y + PRACTICE_PREVIEW_H <= BODY_VISIBLE_800);
         assert!(DATA_CARD2_Y + DATA_CARD_H <= BODY_VISIBLE_800);
+        // 界面与显示页末端：分栏比例卡 348+76，底部提示 ~440+13。
+        assert!(453. <= BODY_VISIBLE_800 - 12.);
         // 800×600 靠滚动可达：任何一页都不超过滚动上限。
         for end in [
             PRACTICE_PREVIEW_Y + PRACTICE_PREVIEW_H,
             SCORE_PREVIEW_Y + SCORE_PREVIEW_H,
             568. + 48.,
+            453.,
             DATA_CARD2_Y + DATA_CARD_H,
         ] {
             assert!(end <= BODY_BUDGET);
@@ -1972,7 +2413,7 @@ mod tests {
     /// 800×600 首屏（body 可视 428px）必须能点到导航与每页的主控件。
     #[test]
     fn first_screen_fits_the_nav_and_each_page_main_control_at_800x600() {
-        for tab in 0..=3u8 {
+        for tab in 0..=5u8 {
             let m = preference_model(tab);
             let (x, y, pw, ph) = panel_for_model(&m, 800., 600.);
             let view = ph.min(600. - 48.);
@@ -1982,7 +2423,7 @@ mod tests {
                 hs.iter()
                     .any(|h| &h.action == a && h.y >= y && h.y + h.h <= visible_end)
             };
-            for i in 0..4 {
+            for i in 0..6 {
                 assert!(
                     inside(&hs, &crate::aux_marker(&format!("pref_tab:{i}"))),
                     "800×600 tab={tab}: 导航项 {i} 不在首屏"
@@ -2009,7 +2450,18 @@ mod tests {
                     Action::MotionLevel(2),
                     crate::aux_marker(&format!("pref_color_choose:{}", COLORS[0].0)),
                 ],
-                _ => vec![Action::Folder],
+                3 => vec![
+                    crate::aux_marker("pref_mode:split"),
+                    crate::aux_marker("pref_mode:copybook"),
+                    crate::aux_marker("pref_toggle:minimal"),
+                    crate::aux_marker("pref_step:split_ratio:1"),
+                ],
+                4 => vec![Action::Folder],
+                _ => vec![
+                    crate::aux_marker("pref_shortcut:reset"),
+                    crate::aux_marker("pref_shortcut:record:settings"),
+                    crate::aux_marker("pref_shortcut:record:analysis"),
+                ],
             };
             for a in anchors {
                 assert!(inside(&hs, &a), "800×600 tab={tab}: 主控件 {a:?} 不在首屏");
@@ -2021,9 +2473,9 @@ mod tests {
     #[test]
     fn preference_pages_expose_every_existing_action() {
         // 左侧导航在四页都常驻。
-        for tab in 0..=3u8 {
+        for tab in 0..=5u8 {
             let hs = hit_targets(&preference_model(tab), 1280., 800.);
-            for i in 0..4 {
+            for i in 0..6 {
                 assert!(hs
                     .iter()
                     .any(|h| h.action == crate::aux_marker(&format!("pref_tab:{i}"))));
@@ -2093,9 +2545,26 @@ mod tests {
                 .count(),
             0
         );
-        // 数据页：打开目录。
+        // 界面与显示页：双模式、极简、置顶与分栏比例。
         let hs = hit_targets(&preference_model(3), 1280., 800.);
+        for a in [
+            crate::aux_marker("pref_mode:copybook"),
+            crate::aux_marker("pref_mode:split"),
+            crate::aux_marker("pref_toggle:minimal"),
+            crate::aux_marker("pref_toggle:minimal_hud"),
+            crate::aux_marker("pref_toggle:always_on_top"),
+        ] {
+            assert!(hs.iter().any(|h| h.action == a), "界面页缺少 {a:?}");
+        }
+        for delta in ["-1", "1"] {
+            assert!(hs
+                .iter()
+                .any(|h| h.action == crate::aux_marker(&format!("pref_step:split_ratio:{delta}"))));
+        }
+        // 数据页：打开目录。
+        let hs = hit_targets(&preference_model(4), 1280., 800.);
         assert!(hs.iter().any(|h| h.action == Action::Folder));
+
     }
 
     #[test]
@@ -2131,7 +2600,7 @@ mod tests {
                 .insert("hint_rank_colors".into(), rank_mode.to_string());
             let mut f = Frame::new(w, BODY_BUDGET);
             let mut hs = Vec::new();
-            practice_page(&mut f, &mut hs, &m, &crate::ui::theme("墨玉"), 0., 0., w);
+            practice_page(&mut f, &mut hs, &m, &Config::default(), &crate::ui::theme("墨玉"), 0., 0., w);
             for (key, _, _) in page_colors(&m) {
                 let hit = hs
                     .iter()
@@ -2193,7 +2662,7 @@ mod tests {
         m.max_code_length = 4;
         let render = |m: &Model| {
             let mut f = Frame::new(640., 600.);
-            practice_page(&mut f, &mut Vec::new(), m, &t, 0., 0., 336.);
+            practice_page(&mut f, &mut Vec::new(), m, &Config::default(), &t, 0., 0., 336.);
             f
         };
         let body_color = |f: &Frame, word: &str| {
@@ -2216,9 +2685,10 @@ mod tests {
                 .filter_map(|cmd| match cmd {
                     DrawCmd::TextRun {
                         text,
+                        y,
                         font: FontFamily::Mono,
                         ..
-                    } => Some(text.clone()),
+                    } if *y > PRACTICE_PREVIEW_Y - 24. => Some(text.clone()),
                     _ => None,
                 })
                 .collect::<Vec<_>>()
@@ -2332,9 +2802,71 @@ mod tests {
         }
     }
 
+    /// 【2026-11-13】提示预览的选重数字必须实时跟随「高低/加粗」设置，
+    /// 且示例在格内水平居中（此前是写死高度、左对齐）。
+    #[test]
+    fn hint_preview_rank_digit_follows_offset_and_bold_settings() {
+        let mut m = preference_model(0);
+        m.hints = true;
+        m.fields.insert("hint_show_rank".into(), "true".into());
+        m.fields.insert("hint_show_code".into(), "true".into());
+        m.fields.insert("hint_rank_corner".into(), "false".into());
+        let render = |cfg: &Config, m: &Model| {
+            let mut f = Frame::new(960., 752.);
+            let mut hs = Vec::new();
+            practice_page(
+                &mut f,
+                &mut hs,
+                m,
+                cfg,
+                &crate::ui::theme("墨玉"),
+                0.,
+                0.,
+                960.,
+            );
+            f
+        };
+        let rank_y = |f: &Frame| {
+            f.cmds
+                .iter()
+                .find_map(|cmd| match cmd {
+                    DrawCmd::TextRun {
+                        text,
+                        y,
+                        font: FontFamily::Mono,
+                        ..
+                    } if text == "2" && *y > PRACTICE_PREVIEW_Y => Some(*y),
+                    _ => None,
+                })
+                .expect("preview rank digit")
+        };
+        let count_rank = |f: &Frame| {
+            f.cmds
+                .iter()
+                .filter(|c| {
+                    matches!(c, DrawCmd::TextRun { text, font: FontFamily::Mono, .. } if text == "2")
+                })
+                .count()
+        };
+        let mut cfg = Config::default();
+        cfg.hint_rank_offset = 0.;
+        let base = render(&cfg, &m);
+        cfg.hint_rank_offset = 8.;
+        let shifted = render(&cfg, &m);
+        assert!(
+            (rank_y(&shifted) - rank_y(&base) - 8.).abs() < 0.01,
+            "offset must move the digit live: {} -> {}",
+            rank_y(&base),
+            rank_y(&shifted)
+        );
+        assert_eq!(count_rank(&base), 1);
+        cfg.hint_rank_bold = true;
+        let bold = render(&cfg, &m);
+        assert_eq!(count_rank(&bold), 2, "bold draws an offset copy");
+    }
     #[test]
     fn preference_hit_targets_do_not_overlap_at_supported_sizes() {
-        for tab in 0..=4u8 {
+        for tab in 0..=5u8 {
             for (w, h) in [(1280., 800.), (800., 600.)] {
                 let hs = hit_targets(&preference_model(tab), w, h);
                 for (i, a) in hs.iter().enumerate() {

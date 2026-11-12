@@ -1,6 +1,7 @@
 //! 虎符跟打：真实 RichEdit/TSF 输入，原生 D2D 界面，后台联网。
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod analysis;
+mod ctxmenu;
 mod history;
 mod keyboard;
 mod modals;
@@ -13,7 +14,7 @@ mod skin;
 mod ui;
 mod uia_bridge;
 use gale_core::{
-    config::{Config, HintStrategy},
+    config::{Config, DisplayMode, HintStrategy},
     rules::{CleaningPreset, CleaningRule, TrainingMode},
     score::ScoreStore,
     wenlai::{Difficulty, FetchParams, WenlaiArticle},
@@ -34,7 +35,7 @@ use std::{
     sync::mpsc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, ReleaseCapture, VK_CONTROL};
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, ReleaseCapture, VK_CONTROL, VK_LBUTTON};
 use windows::Win32::{
     Foundation::{GetLastError, BOOL, ERROR_ALREADY_EXISTS, HWND, LPARAM, WPARAM},
     UI::WindowsAndMessaging::*,
@@ -79,6 +80,10 @@ enum AuxAction {
     AnalysisView,
     AnalysisCopy,
     AnalysisRetry,
+    /// 【快捷键 2026-11-13】录制某个动作的新组合键。
+    ShortcutRecord(String),
+    /// 恢复默认快捷键。
+    ShortcutReset,
     Preference(String),
     HistoryToggle,
     HistoryOpen(usize),
@@ -101,6 +106,10 @@ fn aux_action(a: &Action) -> Option<AuxAction> {
         "analysis_view" => AuxAction::AnalysisView,
         "analysis_copy" => AuxAction::AnalysisCopy,
         "analysis_retry" => AuxAction::AnalysisRetry,
+        "pref_shortcut:reset" => AuxAction::ShortcutReset,
+        _ if cmd.starts_with("pref_shortcut:record:") => AuxAction::ShortcutRecord(
+            cmd.strip_prefix("pref_shortcut:record:")?.to_string(),
+        ),
         _ if cmd.starts_with("analysis_font:") => AuxAction::AnalysisFont(
             cmd.strip_prefix("analysis_font:")?
                 .parse::<u8>()
@@ -121,6 +130,28 @@ fn aux_action(a: &Action) -> Option<AuxAction> {
 
 pub(crate) fn aux_marker(cmd: &str) -> Action {
     Action::Theme(format!("{AUX_PREFIX}{cmd}"))
+}
+
+/// 【快捷键 2026-11-13】动作 id → 命令键（与 `SHORTCUT_DEFAULTS` 一一对应）。
+fn shortcut_command(id: &str) -> Option<CommandKey> {
+    Some(match id {
+        "settings" => CommandKey::F1,
+        "post" => CommandKey::F2,
+        "appearance" => CommandKey::F7,
+        "analysis" => CommandKey::F10,
+        "restart" => CommandKey::F3,
+        "read_group" => CommandKey::F4,
+        "groups" => CommandKey::F5,
+        "online" => CommandKey::F8,
+        "rules" => CommandKey::F9,
+        "minimal" => CommandKey::F11,
+        "toggle_mode" => CommandKey::F12,
+        "menu" => CommandKey::MenuKey,
+        "prev_segment" => CommandKey::CtrlLeft,
+        "next_segment" => CommandKey::CtrlRight,
+        "load_clipboard_alt" => CommandKey::AltE,
+        _ => return None,
+    })
 }
 const PREFERENCE_COLORS: &[&str] = &[
     "跟打区背景色",
@@ -590,15 +621,66 @@ fn completed_segment_action(command: CommandKey, done: bool, modal: Modal) -> Op
 }
 
 /// Esc dismisses panels only; the active round and its clock stay untouched.
-fn escape_action(modal: Modal, ledger_open: bool, analysis_dock: bool) -> Option<Action> {
+fn escape_action(
+    modal: Modal,
+    ledger_open: bool,
+    analysis_dock: bool,
+    menu_open: bool,
+) -> Option<Action> {
     if modal != Modal::None {
         Some(Action::Close)
+    } else if menu_open {
+        Some(Action::CloseMenu)
     } else if ledger_open {
         Some(Action::ToggleLedger)
     } else if analysis_dock {
         Some(Action::ToggleAnalysis)
     } else {
         None
+    }
+}
+
+/// 【对照模式 2026-11-12】拖动分栏把手：指针 y → 文章区占比（0.35..=0.78）。
+/// 只在几何有效时改配置并请求重绘；松手后由主循环防抖落盘。
+fn drag_split_ratio(app: &mut App, pointer_y: f32) {
+    let sc = gale_win::window::dpi_scale();
+    let (cw, ch) = app.win.client_size();
+    let (lw, lh) = (cw as f32 / sc, ch as f32 / sc);
+    let single = app.sess.source == SessionSource::Single;
+    let (top, bottom) = ui::body_region(&app.cfg, &app.model, lw, lh, single);
+    let span = (bottom - top).max(80.);
+    let ratio = ((pointer_y - top) / span).clamp(0.35, 0.78);
+    if (app.cfg.split_ratio - ratio).abs() > 0.001 {
+        app.cfg.split_ratio = ratio;
+        app.layout_save_due = Some(app.ms() + 350);
+        gale_win::window::request_frame();
+    }
+}
+
+/// 成绩面板上沿把手（逻辑坐标）；面板收起或模态打开时没有。
+fn ledger_grip(app: &App) -> Option<(f32, f32, f32, f32)> {
+    let sc = gale_win::window::dpi_scale();
+    let (cw, ch) = app.win.client_size();
+    let (lw, lh) = (cw as f32 / sc, ch as f32 / sc);
+    crate::history::resize_grip_rect(&app.cfg, &app.model, lw, lh)
+}
+
+/// 【成绩面板 2026-11-13】拖动上沿：指针 y → 面板高度（记忆到配置，防抖落盘）。
+fn drag_ledger_height(app: &mut App, pointer_y: f32) {
+    let sc = gale_win::window::dpi_scale();
+    let (cw, ch) = app.win.client_size();
+    let (lw, lh) = (cw as f32 / sc, ch as f32 / sc);
+    let bottom = lh - crate::history::bottom_inset(&app.cfg);
+    let max_h = (lh - 140.).max(160.);
+    let height = (bottom - pointer_y + 2.).clamp(120., max_h);
+    if (app.cfg.ledger_panel_h - height).abs() > 0.5 {
+        app.cfg.ledger_panel_h = height;
+        app.model.ledger_scroll = app
+            .model
+            .ledger_scroll
+            .clamp(0., crate::history::scroll_max(&app.cfg, &app.model, lh));
+        app.layout_save_due = Some(app.ms() + 350);
+        gale_win::window::request_frame();
     }
 }
 
@@ -730,6 +812,16 @@ unsafe extern "system" fn collect_hufu_windows(hwnd: HWND, lparam: LPARAM) -> BO
 }
 pub fn timestamp_ms() -> u64 {
     unix_secs().saturating_mul(1000)
+}
+
+/// FNV-1a 文本哈希：对照模式输入行缓存键（长度相同但内容变了的退格/回改也能失效）。
+fn text_hash(s: &str) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for b in s.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
 }
 fn wake(hwnd: isize) {
     unsafe {
@@ -880,6 +972,26 @@ struct App {
     hits: Vec<modals::Hit>,
     /// 最近一次鼠标位置（逻辑坐标），用于悬停高亮。
     hover: Option<(f32, f32)>,
+    /// 【鼠标自动隐藏 2026-11-13】上一帧光标屏幕坐标（轮询判断“鼠标动了”）。
+    last_cursor_pos: (i32, i32),
+    /// 期望隐藏光标：键入置 true、鼠标活动/focus 丢失置 false。
+    /// 在主循环里每帧强制执行（输入法可能在隐藏期间把光标重新显示）。
+    cursor_want_hidden: bool,
+    /// 【对照模式 2026-11-12】用户已打字符的换行缓存（Renderer::wrap_text 实测）。
+    input_lines: Vec<(usize, String, Vec<f32>)>,
+    input_layout_key: (u64, u64, u64, u64),
+    /// 【视图菜单】上一帧菜单矩形（点击外部关闭用）。
+    menu_rect: Option<(f32, f32, f32, f32)>,
+    /// 【拖动】左键按下待判定（位置+时刻）：移动超阈值即转窗口拖动。
+    press: Option<(f32, f32, u64)>,
+    /// 【双击】上次单击（位置+时刻）：双击非控件区=最大化/还原。
+    last_click: Option<(f32, f32, u64)>,
+    /// 【对照模式】正在拖分栏把手。
+    split_drag: bool,
+    /// 【成绩面板】正在拖上沿调高度。
+    ledger_drag: bool,
+    /// 分栏比例等布局改动落盘防抖截止时刻。
+    layout_save_due: Option<u64>,
     /// Last time a snapshot-save error toast was shown (rate limit).
     save_toast_at: u64,
     anim: ui::Animation,
@@ -1100,6 +1212,16 @@ fn run() -> Result<(), String> {
         edit_epoch: u64::MAX,
         hits: Vec::new(),
         hover: None,
+        last_cursor_pos: (-1, -1),
+        cursor_want_hidden: false,
+        input_lines: Vec::new(),
+        input_layout_key: (0, 0, 0, 0),
+        menu_rect: None,
+        press: None,
+        last_click: None,
+        split_drag: false,
+        ledger_drag: false,
+        layout_save_due: None,
         save_toast_at: 0,
         anim: ui::Animation::default(),
         clock: Instant::now(),
@@ -1161,6 +1283,7 @@ fn run() -> Result<(), String> {
         .insert("online_auto_next".into(), app.online_auto_next.to_string());
     app.sync_preferences(true);
     app.sync_rule_model();
+    app.apply_shortcuts();
     if let Some(warning) = startup_warning {
         app.toast(warning);
     }
@@ -1181,6 +1304,10 @@ fn run() -> Result<(), String> {
         app.fetch_skin();
     }
     app.apply_style();
+    // 【视图体系】窗口置顶随配置恢复（右键菜单/设置页可切换）。
+    if app.cfg.always_on_top {
+        gale_win::window::set_topmost(app.win.hwnd(), true);
+    }
     app.host.show();
     app.host.focus();
     app.host.hide_caret();
@@ -1246,10 +1373,17 @@ fn run() -> Result<(), String> {
         // Esc 吞键门：有可关面板时跟打器才拦截 Esc；无面板时放行给
         // RichEdit/TSF（虎符空态 Esc 撤回在未组字时工作，见 input_host）。
         gale_win::input_host::set_esc_panel_open(
-            app.model.modal != Modal::None || app.model.ledger_open || app.model.analysis_dock,
+            app.model.modal != Modal::None
+                || app.model.ledger_open
+                || app.model.analysis_dock
+                || app.model.menu.is_some(),
         );
         let accept_host = app.model.modal == Modal::None && (focused || was_focused);
         was_focused = focused;
+        if !focused {
+            app.cursor_want_hidden = false;
+            gale_win::window::set_cursor_hidden(false);
+        }
         app.online_pending = app.online.as_ref().map(|o| o.pending_count()).unwrap_or(0);
         app.model.online_busy = app.online_pending > 0;
         let oldpos = app.sess.comparer.pos;
@@ -1271,7 +1405,35 @@ fn run() -> Result<(), String> {
         dispatched.apply_commit_causes(&mut app.sess, gale_win::input_host::drain_commit_causes());
         // 整改12：每帧取走击键时间戳队列（poll 之后、选重 20ms 配对已消费本帧
         // 击键），按热力图口径计入本段 VK 直方图；模态打开时只清队列不记账。
-        for (vk, _) in gale_win::input_host::drain_key_times(1024) {
+        let key_times = gale_win::input_host::drain_key_times(1024);
+        // 【鼠标自动隐藏 2026-11-13】窗口内一有键入就隐藏光标；鼠标一动恢复。
+        // 位置用 GetCursorPos 查询：指针常悬在 RichEdit 子窗上，主窗口收不到
+        // WM_MOUSEMOVE，不能依赖 hover 事件。
+        let cursor_in = gale_win::window::cursor_inside_client(app.win.hwnd());
+        if accept_host && !key_times.is_empty() && cursor_in {
+            // 【2026-11-13 修】这里必须真正调用 set_cursor_hidden(true)：只置
+            // want 标志、指望下一帧 enforce 去隐藏是错的——enforce 的语义是
+            // 「已隐藏但被系统重新显示时再压一次」，它看到 CURSOR_HIDDEN 还是
+            // false 就直接返回，于是光标从头到尾没被隐藏过（用户实测「完全不
+            // 消失」）。置 want 的同时立刻隐藏，之后每帧 enforce 兜外部重显示。
+            app.cursor_want_hidden = true;
+            gale_win::window::set_cursor_hidden(true);
+        }
+        // 轮询光标位置：任何位移（含子窗上的移动）都立即恢复显示。
+        let cursor_now = gale_win::window::cursor_screen_pos();
+        if cursor_now != app.last_cursor_pos {
+            app.last_cursor_pos = cursor_now;
+            app.cursor_want_hidden = false;
+            if gale_win::window::cursor_hidden() {
+                gale_win::window::set_cursor_hidden(false);
+            }
+        }
+        // 想要隐藏期间每帧守一次：输入法候选窗/子控件若把光标重新显示出来
+        // （用户实测会出现「按一下消失、再按一下又出来」），这一帧立刻再压下去。
+        if app.cursor_want_hidden {
+            gale_win::window::enforce_cursor_hidden();
+        }
+        for (vk, _) in key_times {
             if accept_host {
                 if let Some(k) = heatmap_vk(vk) {
                     *app.sess.vk_histogram.entry(k).or_insert(0) += 1;
@@ -1299,15 +1461,25 @@ fn run() -> Result<(), String> {
             } else {
                 app.anim.correct_at = seconds;
             }
+            // 开始打字自动收起视图菜单（菜单不挡操作）。
+            if app.model.menu.is_some() && app.sess.comparer.pos != oldpos {
+                app.model.menu = None;
+            }
             gale_win::window::request_frame();
         }
         app.refresh_dynamic_hints(now);
+        app.handle_shortcut_recording();
         for cmd in gale_win::input_host::drain_cmds() {
+            // 其它命令键一律先收起视图菜单；菜单键本身负责开菜单。
+            if cmd != CommandKey::MenuKey {
+                app.model.menu = None;
+            }
             let a = match cmd {
                 CommandKey::Escape => escape_action(
                     app.model.modal,
                     app.model.ledger_open,
                     app.model.analysis_dock,
+                    app.model.menu.is_some(),
                 ),
                 CommandKey::F1 => Some(Action::Open(Modal::Preferences)),
                 CommandKey::F7 => Some(Action::OpenAppearanceSettings),
@@ -1317,6 +1489,23 @@ fn run() -> Result<(), String> {
                 CommandKey::F5 => Some(Action::Open(Modal::Groups)),
                 CommandKey::F8 => Some(Action::Open(Modal::Online)),
                 CommandKey::F9 => Some(Action::Open(Modal::Rules)),
+                // 视图体系：F11 极简模式、F12 字贴/对照互换、菜单键开视图菜单。
+                CommandKey::F11 => Some(Action::ToggleMinimal),
+                CommandKey::F12 => Some(Action::ToggleDisplayMode),
+                CommandKey::MenuKey => {
+                    let sc = gale_win::window::dpi_scale();
+                    let (cw, ch) = app.win.client_size();
+                    let (lw, lh) = (cw as f32 / sc, ch as f32 / sc);
+                    let (mx, my) = app
+                        .anim
+                        .caret
+                        .map(|(cx, cy)| (cx + 24., cy + 12.))
+                        .unwrap_or((lw / 2., lh / 3.));
+                    Some(Action::OpenMenuAt(
+                        mx.clamp(8., (lw - 40.).max(8.)),
+                        my.clamp(8., (lh - 40.).max(8.)),
+                    ))
+                }
                 // F2 发送当前文章；本地载入只保留剪贴板，F6 不绑定功能。
                 CommandKey::F2 => Some(Action::PostArticle),
                 CommandKey::F6 | CommandKey::RetryResult => None,
@@ -1400,6 +1589,13 @@ fn run() -> Result<(), String> {
                 app.save_config();
             }
         }
+        // 【对照模式 2026-11-12】拖动分栏后防抖落盘比例。
+        if let Some(due) = app.layout_save_due {
+            if now >= due {
+                app.layout_save_due = None;
+                app.save_config();
+            }
+        }
         gale_win::input_host::set_round_done(app.sess.phase == Phase::Done);
         gale_win::input_host::set_result_key_target(
             (app.model.ledger_open && app.model.selected_history.is_some()).then_some(app.win.hwnd),
@@ -1407,43 +1603,179 @@ fn run() -> Result<(), String> {
         for e in gale_win::window::drain_mouse() {
             match e {
                 MouseEv::LDown { x, y } => {
+                    app.cursor_want_hidden = false;
+                    gale_win::window::set_cursor_hidden(false);
                     let xx = x as f32;
                     let yy = y as f32;
+                    // ① 视图菜单：点菜单项执行，点外面只收起菜单（不误触底层控件）。
+                    if app.model.menu.is_some() {
+                        let inside = app.menu_rect.is_some_and(|(mx, my, mw, mh)| {
+                            xx >= mx && xx <= mx + mw && yy >= my && yy <= my + mh
+                        });
+                        if inside {
+                            if let Some(a) = modals::hit(&app.hits, xx, yy) {
+                                if a != Action::None {
+                                    app.capture_fields();
+                                    // 字号/比例的步进按钮允许连点，菜单保持打开；
+                                    // 其余开关与模式切换执行后收起菜单，让变化看得见。
+                                    let keep_open =
+                                        matches!(a, Action::StepFont(_) | Action::StepSplit(_));
+                                    app.act(a, false);
+                                    if !keep_open {
+                                        app.model.menu = None;
+                                    }
+                                    gale_win::window::request_frame();
+                                }
+                            }
+                        } else {
+                            app.model.menu = None;
+                            gale_win::window::request_frame();
+                        }
+                        continue;
+                    }
+                    // ② 对照模式分栏把手：按住拖动改文章/输入区比例。
+                    if let Some((dx, dy, dw, dh)) = app.anim.split_divider {
+                        if xx >= dx && xx <= dx + dw && yy >= dy && yy <= dy + dh {
+                            app.split_drag = true;
+                            app.press = None;
+                            gale_win::window::request_frame();
+                            continue;
+                        }
+                    }
+                    // ②b 成绩面板上沿：按住拖动可把面板拖高拖低。
+                    if let Some((gx, gy, gw, gh)) = ledger_grip(&app) {
+                        if xx >= gx && xx <= gx + gw && yy >= gy && yy <= gy + gh {
+                            app.ledger_drag = true;
+                            app.press = None;
+                            gale_win::window::request_frame();
+                            continue;
+                        }
+                    }
+                    // ③ 控件命中（工具栏/统计/底栏/菜单/窗口按钮）。
                     if let Some(a) = modals::hit(&app.hits, xx, yy) {
                         if a == Action::None {
                             continue;
                         }
                         app.capture_fields();
+                        app.press = None;
                         app.act(a, false);
-                    } else if yy < 55. {
-                        unsafe {
-                            let _ = ReleaseCapture();
-                            let _ = SendMessageW(
-                                app.win.hwnd(),
-                                WM_NCLBUTTONDOWN,
-                                WPARAM(2),
-                                LPARAM(0),
-                            );
-                        }
-                    } else if app.model.modal == Modal::None {
-                        if app.model.ledger_open || app.model.analysis_dock {
-                            app.model.ledger_open = false;
-                            app.model.analysis_dock = false;
-                            gale_win::window::request_frame();
-                        }
-                        app.host.focus();
-                        app.host.hide_caret();
+                        continue;
                     }
+                    // ④ 空白/正文：单击=聚焦，按住拖动=移动窗口（任意模式、任意处）。
+                    app.capture_fields();
+                    app.press = Some((xx, yy, app.ms()));
+                    // 【2026-11-13】成绩面板点正文不再收起（常驻，直到手动收起/Esc）；
+                    // 理论分析停靠面板仍保留「点正文收起」的旧行为。
+                    if app.model.analysis_dock {
+                        app.model.analysis_dock = false;
+                        gale_win::window::request_frame();
+                    }
+                    app.host.focus();
+                    app.host.hide_caret();
                 }
                 MouseEv::Move { x, y } => {
+                    // 【2026-11-13 修】子窗/输入法窗口会产生「指针没动」的
+                    // WM_MOUSEMOVE，不能一收到就恢复光标（否则每键隐藏后立刻被
+                    // 抬回来，表现为完全看不见效果）。只有坐标真的变了才恢复。
                     let pos = Some((x as f32, y as f32));
                     if app.hover != pos {
                         app.hover = pos;
+                        app.model.pointer = pos;
+                        gale_win::window::request_frame();
+                        app.cursor_want_hidden = false;
+                        gale_win::window::set_cursor_hidden(false);
+                    }
+                    if app.split_drag {
+                        drag_split_ratio(&mut app, y as f32);
+                    } else if app.ledger_drag {
+                        drag_ledger_height(&mut app, y as f32);
+                    } else if let Some((px, py, _)) = app.press {
+                        let held = unsafe { GetKeyState(VK_LBUTTON.0 as i32) } < 0;
+                        let (mx, my) = (x as f32, y as f32);
+                        if held && (mx - px).abs() + (my - py).abs() > 4. {
+                            // 【任意处拖动 2026-11-12】移动超过 4DIP 才转窗口拖动，
+                            // 未移动的单击仍是聚焦/收起浮层（沿用原语义）。
+                            app.press = None;
+                            gale_win::window::set_nc_drag_active(true);
+                            unsafe {
+                                let _ = ReleaseCapture();
+                                let _ = SendMessageW(
+                                    app.win.hwnd(),
+                                    WM_NCLBUTTONDOWN,
+                                    WPARAM(2),
+                                    LPARAM(0),
+                                );
+                            }
+                            gale_win::window::set_nc_drag_active(false);
+                            app.host.reset_anchor();
+                            gale_win::window::request_frame();
+                        }
+                    }
+                }
+                MouseEv::Leave => {
+                    // 指针离开窗口：恢复光标并清 hover（隐藏只在窗口内有效）。
+                    // 进入子窗（打字热区）也会触发 WM_MOUSELEAVE，先用
+                    // GetCursorPos 确认真的在客户区外，否则不动隐藏状态。
+                    if !gale_win::window::cursor_inside_client(app.win.hwnd()) {
+                        app.cursor_want_hidden = false;
+                        gale_win::window::set_cursor_hidden(false);
+                    }
+                    if app.hover.take().is_some() {
+                        app.model.pointer = None;
                         gale_win::window::request_frame();
                     }
                 }
-                MouseEv::LUp { .. } => {}
+                MouseEv::LUp { x, y } => {
+                    if app.split_drag {
+                        app.split_drag = false;
+                        app.save_config();
+                        app.host.reset_anchor();
+                        gale_win::window::request_frame();
+                        continue;
+                    }
+                    if app.ledger_drag {
+                        app.ledger_drag = false;
+                        app.save_config();
+                        app.host.reset_anchor();
+                        gale_win::window::request_frame();
+                        continue;
+                    }
+                    let Some((_px, _py, _at)) = app.press.take() else {
+                        continue;
+                    };
+                    let (xx, yy) = (x as f32, y as f32);
+                    let now = app.ms();
+                    let double = app.last_click.is_some_and(|(lx, ly, lt)| {
+                        now.saturating_sub(lt) <= 450
+                            && (xx - lx).abs() < 4.
+                            && (yy - ly).abs() < 4.
+                    });
+                    // 标题带双击 = 最大化/还原（极简模式没有标题栏，用顶部静默带）。
+                    let title_like = if app.cfg.minimal { yy <= 44. } else { yy < 55. };
+                    if double && title_like {
+                        app.last_click = None;
+                        app.act(Action::Maximize, false);
+                    } else {
+                        app.last_click = Some((xx, yy, now));
+                    }
+                }
+                MouseEv::RDown { x, y } => {
+                    app.cursor_want_hidden = false;
+                    gale_win::window::set_cursor_hidden(false);
+                    // 模态面板内不抢右键；正文区右键打开窗口内自绘「视图」菜单
+                    //（系统右键菜单通道仍被输入宿主全拦，防作弊语义不变）。
+                    if app.model.modal != Modal::None {
+                        continue;
+                    }
+                    app.model.menu = Some(modals::CtxMenu {
+                        x: x as f32,
+                        y: y as f32,
+                    });
+                    gale_win::window::request_frame();
+                }
                 MouseEv::Wheel { delta, x, y } => {
+                    app.cursor_want_hidden = false;
+                    gale_win::window::set_cursor_hidden(false);
                     let sc = gale_win::window::dpi_scale();
                     let (cw, ch) = app.win.client_size();
                     let (lw, lh) = (cw as f32 / sc, ch as f32 / sc);
@@ -1451,7 +1783,7 @@ fn run() -> Result<(), String> {
                     let my = y as f32 / sc;
                     // 理论分析停靠面板：指针在面板内时滚分析内容。
                     if app.model.analysis_dock {
-                        let (ax, ay, aw, ah) = modals::analysis_dock_rect(lw, lh);
+                        let (ax, ay, aw, ah) = modals::analysis_dock_rect_for(&app.cfg, lw, lh);
                         if mx >= ax && mx <= ax + aw && my >= ay && my <= ay + ah {
                             let max = modals::analysis_scroll_max(&app.sess, &app.model, lw, lh);
                             app.model.analysis_dock_scroll = (app.model.analysis_dock_scroll
@@ -1463,9 +1795,9 @@ fn run() -> Result<(), String> {
                     }
                     // 成绩面板：指针在面板内时滚列表。
                     if app.model.ledger_open {
-                        let (px, py, pw, ph) = history::panel_rect_for(&app.model, lw, lh);
+                        let (px, py, pw, ph) = history::panel_rect_for(&app.cfg, &app.model, lw, lh);
                         if mx >= px && mx <= px + pw && my >= py && my <= py + ph {
-                            let max = history::scroll_max(&app.model, lh);
+                            let max = history::scroll_max(&app.cfg, &app.model, lh);
                             app.model.ledger_scroll = (app.model.ledger_scroll
                                 - delta as f32 / 120. * 64.)
                                 .clamp(0., max);
@@ -1473,7 +1805,21 @@ fn run() -> Result<(), String> {
                             continue;
                         }
                     }
-                    // Ctrl+滚轮 = 实时字号（10..=100，滚轮向上放大），不滚面板。
+                    // 理论分析弹窗：内容一页放不下时滚分析正文。
+                    if app.model.modal == Modal::Analysis {
+                        if let Some((_fs, total, body_h)) = modals::analysis_modal_fit_metrics(
+                            &app.sess, &app.model, lw, lh,
+                        ) {
+                            let max = (total - body_h).max(0.);
+                            if max > 0. {
+                                app.model.analysis_dock_scroll = (app.model.analysis_dock_scroll
+                                    - delta as f32 / 120. * 64.)
+                                    .clamp(0., max);
+                                gale_win::window::request_frame();
+                                continue;
+                            }
+                        }
+                    }                    // Ctrl+滚轮 = 实时字号（10..=100，滚轮向上放大），不滚面板。
                     if unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0 {
                         let step = (delta / 120).clamp(-1, 1);
                         if step != 0 {
@@ -1787,9 +2133,20 @@ impl App {
             ("hint_word_bg", self.cfg.hint_word_bg),
             ("score_auto_copy", self.cfg.score_auto_copy),
             ("auto_send_score", self.cfg.auto_send_score),
+            // 【视图体系 2026-11-12】F1 设置页「界面与显示」用同一 fields 通道。
+            ("minimal", self.cfg.minimal),
+            ("minimal_hud", self.cfg.minimal_hud),
+            ("always_on_top", self.cfg.always_on_top),
+            ("hint_rank_bold", self.cfg.hint_rank_bold),
         ] {
             self.model.fields.insert(key.into(), value.to_string());
         }
+        self.model
+            .fields
+            .insert("display_mode".into(), self.cfg.display_mode.as_str().into());
+        self.model
+            .fields
+            .insert("split_ratio".into(), format!("{:.0}", self.cfg.split_ratio * 100.));
         self.model.fields.insert(
             "hint_strategy".into(),
             self.cfg.hint_strategy.as_str().into(),
@@ -1801,6 +2158,10 @@ impl App {
         self.model.fields.insert(
             "hint_font_size".into(),
             format!("{:.0}", self.cfg.hint_font_size),
+        );
+        self.model.fields.insert(
+            "hint_rank_offset".into(),
+            format!("{:.0}", self.cfg.hint_rank_offset),
         );
         self.model
             .fields
@@ -1858,13 +2219,51 @@ impl App {
                     "hint_word_bg" => &mut self.cfg.hint_word_bg,
                     "score_auto_copy" => &mut self.cfg.score_auto_copy,
                     "auto_send_score" => &mut self.cfg.auto_send_score,
+                    // 【视图体系 2026-11-12】界面与显示页
+                    "minimal" => &mut self.cfg.minimal,
+                    "minimal_hud" => &mut self.cfg.minimal_hud,
+                    "always_on_top" => &mut self.cfg.always_on_top,
+                    "hint_rank_bold" => &mut self.cfg.hint_rank_bold,
                     _ => return,
                 };
                 *field = !*field;
+                if *key == "always_on_top" {
+                    gale_win::window::set_topmost(self.win.hwnd(), self.cfg.always_on_top);
+                }
+                if *key == "minimal" && self.cfg.minimal {
+                    self.model.ledger_open = false;
+                    self.model.selected_history = None;
+                    self.model.analysis_dock = false;
+                }
+                self.anim.caret = None;
+            }
+            ["pref_mode", mode] => {
+                self.cfg.display_mode = DisplayMode::from_str_lossy(mode);
+                self.anim.caret = None;
+                self.layout_key = (u64::MAX, 0, 0);
+                self.input_layout_key = (0, 0, 0, 0);
+            }
+            ["pref_step", "split_ratio", delta] => {
+                if let Ok(delta) = delta.parse::<f32>() {
+                    self.cfg.split_ratio = (self.cfg.split_ratio + delta * 0.02).clamp(0.35, 0.78);
+                }
             }
             ["pref_step", "hint_font_size", delta] => {
                 if let Ok(delta) = delta.parse::<f32>() {
                     self.cfg.hint_font_size = (self.cfg.hint_font_size + delta).clamp(14., 28.);
+                }
+            }
+            // 【2026-11-13】字间距 / 选重数字高低（界面与显示页）
+            ["pref_step", "letter_spacing", delta] => {
+                if let Ok(delta) = delta.parse::<f32>() {
+                    self.cfg.letter_spacing = (self.cfg.letter_spacing + delta).clamp(0., 12.);
+                    self.layout_key = (u64::MAX, 0, 0);
+                    self.input_layout_key = (0, 0, 0, 0);
+                }
+            }
+            ["pref_step", "hint_rank_offset", delta] => {
+                if let Ok(delta) = delta.parse::<f32>() {
+                    self.cfg.hint_rank_offset = (self.cfg.hint_rank_offset + delta).clamp(-12., 16.);
                 }
             }
             ["pref_tab", tab] => {
@@ -2124,6 +2523,7 @@ impl App {
             wake(hwnd);
         });
     }
+    /// 主窗口底部停靠面板（F10/菜单「理论分析」）。极简模式下也停靠，不退出极简。
     fn toggle_analysis_dock(&mut self) {
         if self.model.analysis_dock {
             self.model.analysis_dock = false;
@@ -2131,6 +2531,7 @@ impl App {
             return;
         }
         self.model.modal = Modal::None;
+        self.model.menu = None;
         self.model.ledger_open = false;
         self.model.selected_history = None;
         self.model.analysis_dock = true;
@@ -2229,7 +2630,7 @@ impl App {
         let (_, h) = self.win.client_size();
         let lh = h as f32 / sc;
         let offset = crate::history::record_offset(&self.model, index);
-        self.model.ledger_scroll = offset.min(crate::history::scroll_max(&self.model, lh));
+        self.model.ledger_scroll = offset.min(crate::history::scroll_max(&self.cfg, &self.model, lh));
         gale_win::window::request_frame();
     }
 
@@ -2249,7 +2650,7 @@ impl App {
                 let sc = gale_win::window::dpi_scale();
                 let (_, h) = self.win.client_size();
                 let lh = h as f32 / sc;
-                let cap = crate::history::scroll_max(&self.model, lh);
+                let cap = crate::history::scroll_max(&self.cfg, &self.model, lh);
                 self.model.ledger_scroll = (self.model.ledger_scroll + delta as f32).clamp(0., cap);
             }
             AuxAction::HistoryOpen(index) => {
@@ -2364,8 +2765,9 @@ impl App {
             AuxAction::AnalysisCopy => {
                 self.draw();
                 let sc = gale_win::window::dpi_scale();
-                let (w, h) = self.win.client_size();
-                let (x, y, pw, ph) = modals::analysis_dock_rect(w as f32 / sc, h as f32 / sc);
+                let (cw, ch) = self.win.client_size();
+                let (lw, lh) = (cw as f32 / sc, ch as f32 / sc);
+                let (x, y, pw, ph) = modals::analysis_dock_rect_for(&self.cfg, lw, lh);
                 let crop = Some((
                     (x * sc) as u32,
                     (y * sc) as u32,
@@ -2377,7 +2779,91 @@ impl App {
                     Err(error) => self.toast(error),
                 }
             }
+            AuxAction::ShortcutRecord(id) => {
+                self.model
+                    .fields
+                    .insert("pref_recording".into(), id);
+                gale_win::input_host::begin_shortcut_recording();
+                self.toast("按下新的组合键（Esc 取消）");
+                gale_win::window::request_frame();
+            }
+            AuxAction::ShortcutReset => {
+                gale_win::input_host::cancel_shortcut_recording();
+                self.model.fields.remove("pref_recording");
+                self.cfg.shortcuts.clear();
+                self.save_config();
+                self.apply_shortcuts();
+                self.toast("快捷键已恢复默认");
+                gale_win::window::request_frame();
+            }
         }
+    }
+
+    /// 把当前配置解析成 (组合键, 命令) 表装进输入宿主。
+    fn apply_shortcuts(&mut self) {
+        let mut entries = Vec::new();
+        for (id, _, _) in gale_core::config::SHORTCUT_DEFAULTS {
+            if let Some(command) = shortcut_command(id) {
+                let chord = self.cfg.shortcut(id);
+                if !chord.is_empty() {
+                    entries.push((chord, command));
+                }
+            }
+        }
+        gale_win::input_host::set_shortcuts(&entries);
+    }
+
+    /// 录制收尾：取到组合键就写入配置，取消/失焦就清掉录制态。
+    fn handle_shortcut_recording(&mut self) {
+        let recording = self.model.field("pref_recording");
+        if let Some(chord) = gale_win::input_host::take_recorded_shortcut() {
+            if !recording.is_empty() {
+                self.assign_shortcut(&recording, &chord);
+            }
+            self.model.fields.remove("pref_recording");
+            gale_win::window::request_frame();
+            return;
+        }
+        if recording.is_empty() {
+            return;
+        }
+        if !gale_win::input_host::shortcut_recording_active()
+            || self.model.modal != Modal::Preferences
+        {
+            gale_win::input_host::cancel_shortcut_recording();
+            self.model.fields.remove("pref_recording");
+            gale_win::window::request_frame();
+        }
+    }
+
+    /// 校验并保存一个新快捷键（F1–F24 或含 Ctrl/Alt；拒绝固定键与重复）。
+    fn assign_shortcut(&mut self, id: &str, chord: &str) {
+        let Some(spec) = gale_win::input_host::parse_chord(chord) else {
+            self.toast("这个组合键无法识别，换一个试试");
+            return;
+        };
+        let f_key = (0x70..=0x87).contains(&spec.vk);
+        if !(spec.ctrl || spec.alt || f_key) {
+            self.toast("快捷键需要 F1–F24 或包含 Ctrl / Alt");
+            return;
+        }
+        if gale_win::input_host::shortcut_reserved(chord) {
+            self.toast("这个键是打字/编辑固定键，不能占用");
+            return;
+        }
+        for (other, label, _) in gale_core::config::SHORTCUT_DEFAULTS {
+            if *other == id {
+                continue;
+            }
+            if self.cfg.shortcut(other).eq_ignore_ascii_case(chord) {
+                self.toast(format!("「{label}」已占用 {chord}，先改那一个"));
+                return;
+            }
+        }
+        self.cfg.shortcuts.insert(id.to_string(), chord.to_string());
+        self.save_config();
+        self.apply_shortcuts();
+        self.toast(format!("快捷键已设为 {chord}"));
     }
     /// 发文/发成绩会激活 QQ；发送结束（成功或失败）都切回跟打器。
     fn focus_trainer(&mut self) {
@@ -2461,6 +2947,8 @@ impl App {
     }
     fn open(&mut self, m: Modal) {
         self.capture_fields();
+        // 打开模态面板时收起视图菜单（关闭后不残影复现）。
+        self.model.menu = None;
         if m == Modal::Preferences {
             self.sync_preferences(true);
         }
@@ -2549,10 +3037,7 @@ impl App {
             .model
             .panel_scroll
             .clamp(0., (ph - (lh - 48.).min(ph)).max(0.));
-        let (bw, fs, base_lh) = ui::body_metrics(&self.sess, &self.cfg, lw);
-        let hints_visible =
-            self.model.hints && (self.cfg.hint_show_code || self.cfg.hint_show_rank);
-        let lheight = ui::line_height_for_anchor(&self.cfg, fs, base_lh, hints_visible);
+        let (bw, fs, _base_lh) = ui::body_metrics(&self.sess, &self.cfg, lw);
         let key = (self.generation, fs.to_bits(), bw.to_bits());
         if self.layout_key != key {
             self.layout = self
@@ -2573,18 +3058,40 @@ impl App {
                 self.layout = lines;
             }
         }
-        let mut f = ui::build(
+        // 【对照模式 2026-11-12】输入卡文字：用真实 DirectWrite 宽度换行，
+        // 缓存键 = 已打字符哈希 + 字号 + 正文宽 + 段号（退格/回改都会变）。
+        if self.cfg.display_mode.is_split() {
+            let typed: String = self.sess.comparer.typed.iter().collect();
+            let key = (
+                text_hash(&typed),
+                fs.to_bits() as u64,
+                bw.to_bits() as u64,
+                self.sess.index as u64,
+            );
+            if key != self.input_layout_key {
+                self.input_lines = if typed.is_empty() {
+                    Vec::new()
+                } else {
+                    self.renderer.wrap_text(&typed, fs, bw)
+                };
+                self.input_layout_key = key;
+            }
+        }
+        self.model.pointer = self.hover;
+        let now_ms = self.ms();
+        let mut f = ui::build_with_input(
             &self.sess,
             &self.cfg,
             &self.theme,
             &self.model,
             lw,
             lh,
-            self.ms(),
+            now_ms,
             now,
             &mut self.anim,
             &mut self.hits,
             &self.layout,
+            &self.input_lines,
         );
         modals::draw(
             &mut f,
@@ -2630,6 +3137,43 @@ impl App {
                 }
             }
         }
+        // 【视图菜单 2026-11-12】菜单画在所有面板与 hover 之上；矩形回存供点击外部关闭。
+        self.menu_rect = None;
+        if self.model.modal == Modal::None && self.model.menu.is_some() {
+            self.menu_rect = ctxmenu::draw(
+                &mut f,
+                &mut self.hits,
+                &self.cfg,
+                &self.model,
+                &self.theme,
+                lw,
+                lh,
+            );
+        }
+        // 光标提示：任意处可拖动（四向箭头）/ 分栏与成绩面板把手（上下）/ 控件上保持箭头。
+        let over_divider = self.anim.split_divider.is_some_and(|(dx, dy, dw, dh)| {
+            self.hover
+                .is_some_and(|(hx, hy)| hx >= dx && hx <= dx + dw && hy >= dy && hy <= dy + dh)
+        });
+        let over_grip = {
+            let sc = gale_win::window::dpi_scale();
+            let (cw, ch) = self.win.client_size();
+            let (lw, lh) = (cw as f32 / sc, ch as f32 / sc);
+            crate::history::resize_grip_rect(&self.cfg, &self.model, lw, lh).is_some_and(
+                |(gx, gy, gw, gh)| {
+                    self.hover
+                        .is_some_and(|(hx, hy)| hx >= gx && hx <= gx + gw && hy >= gy && hy <= gy + gh)
+                },
+            )
+        };
+        let hint = if self.model.menu.is_some() {
+            gale_win::window::CursorHint::Arrow
+        } else if self.split_drag || self.ledger_drag || over_divider || over_grip {
+            gale_win::window::CursorHint::ResizeNS
+        } else {
+            gale_win::window::CursorHint::Arrow
+        };
+        gale_win::window::set_cursor_hint(hint);
         if let Err(e) = self.renderer.draw_frame(&f) {
             self.toast(format!("绘制失败：{e}"));
         }
@@ -2638,9 +3182,12 @@ impl App {
             // Keep a visible, focused native TSF host at the painted caret.
             // It has a real client surface; text itself is drawn by DirectWrite.
             let (cx, cy) = self.anim.caret.unwrap_or((32., 270.));
+            let host_line_h = self.anim.input_line_h.max(1.);
+            let min_y = if self.cfg.minimal { 2. } else { 60. };
+            let max_y = (lh - if self.cfg.minimal { 2. } else { 50. }).max(min_y);
             self.host.place(
-                (cx.clamp(8., lw - 8.) * sc) as i32,
-                ((cy + fs).clamp(60., lh - 50.) * sc) as i32,
+                (cx.clamp(8., (lw - 8.).max(8.)) * sc) as i32,
+                ((cy + fs).clamp(min_y, max_y) * sc) as i32,
                 2,
                 2,
             );
@@ -2650,9 +3197,9 @@ impl App {
             // 光标矩形顶 = 行顶 + 5（ui.rs caret 绘制几何）。
             let dpi = (sc * 96.).round() as u32;
             let _ = self.host.set_anchor_from_caret(
-                cx.clamp(8., lw - 8.) * sc,
-                (cy + 5.).clamp(60., lh - 50.) * sc,
-                (lheight * sc).round() as i32,
+                cx.clamp(8., (lw - 8.).max(8.)) * sc,
+                (cy + 5.).clamp(min_y, max_y) * sc,
+                (host_line_h * sc).round() as i32,
                 dpi,
             );
             self.host.show();
@@ -2774,6 +3321,19 @@ impl App {
         self.model.max_code_length = status["max_code_length"].as_u64().unwrap_or(4) as usize;
         if let Some(reason) = status["hint_unavailable_reason"].as_str() {
             self.model.status = reason.into();
+            // 【可观测性 2026-11-13】词提被快照门限整段拒绝时，底部状态行会被
+            // 省略号截断，用户只会觉得「不出词提」。首次/变化时弹一次 toast。
+            if self.model.field("hint_unavailable_reason") != reason {
+                self.model
+                    .fields
+                    .insert("hint_unavailable_reason".into(), reason.into());
+                let hint = if reason.contains("用户词或调整过多") {
+                    format!("{reason}（可在当前方案里精简用户调整.txt 或用户码表后重试）")
+                } else {
+                    reason.to_string()
+                };
+                self.toast(hint);
+            }
         } else if self.model.status.starts_with("词库状态暂不可用") {
             self.model.status = format!(
                 "{} · {}",
@@ -3751,12 +4311,13 @@ impl App {
             Action::ToggleLedger => {
                 self.model.analysis_dock = false;
                 self.model.modal = Modal::None;
+                self.model.menu = None;
                 self.model.ledger_open = !self.model.ledger_open;
                 if self.model.ledger_open {
                     let sc = gale_win::window::dpi_scale();
                     let (_, h) = self.win.client_size();
                     let lh = h as f32 / sc;
-                    let cap = crate::history::scroll_max(&self.model, lh);
+                    let cap = crate::history::scroll_max(&self.cfg, &self.model, lh);
                     self.model.ledger_scroll = self.model.ledger_scroll.clamp(0., cap);
                 } else {
                     self.model.selected_history = None;
@@ -3764,6 +4325,87 @@ impl App {
                 gale_win::window::request_frame();
             }
             Action::ToggleAnalysis => self.toggle_analysis_dock(),
+            // ── 【视图体系 2026-11-12】 ────────────────────────────────
+            Action::SetDisplayMode(mode) => {
+                if self.cfg.display_mode != mode {
+                    self.cfg.display_mode = mode;
+                    self.anim.caret = None;
+                    self.layout_key = (u64::MAX, 0, 0);
+                    self.input_layout_key = (0, 0, 0, 0);
+                    self.save_config();
+                    self.toast(format!(
+                        "已切换到{}模式{}",
+                        mode.label(),
+                        if mode.is_split() { " · 可拖动中间把手调比例" } else { "" }
+                    ));
+                    gale_win::window::request_frame();
+                }
+            }
+            Action::ToggleDisplayMode => {
+                let next = if self.cfg.display_mode.is_split() {
+                    DisplayMode::Copybook
+                } else {
+                    DisplayMode::Split
+                };
+                self.act(Action::SetDisplayMode(next), confirmed);
+            }
+            Action::ToggleMinimal => {
+                self.cfg.minimal = !self.cfg.minimal;
+                if self.cfg.minimal {
+                    self.model.ledger_open = false;
+                    self.model.selected_history = None;
+                    self.model.analysis_dock = false;
+                }
+                self.anim.caret = None;
+                self.save_config();
+                self.toast(if self.cfg.minimal {
+                    "极简模式 · F11 退出 · 右键打开视图菜单"
+                } else {
+                    "已退出极简模式"
+                });
+                gale_win::window::request_frame();
+            }
+            Action::ToggleMinimalHud => {
+                self.cfg.minimal_hud = !self.cfg.minimal_hud;
+                self.save_config();
+                self.toast(if self.cfg.minimal_hud {
+                    "极简数据条 · 开"
+                } else {
+                    "极简数据条 · 关"
+                });
+                gale_win::window::request_frame();
+            }
+            Action::ToggleTopmost => {
+                self.cfg.always_on_top = !self.cfg.always_on_top;
+                gale_win::window::set_topmost(self.win.hwnd(), self.cfg.always_on_top);
+                self.save_config();
+                self.toast(if self.cfg.always_on_top {
+                    "窗口已置顶"
+                } else {
+                    "已取消置顶"
+                });
+                gale_win::window::request_frame();
+            }
+            Action::OpenMenuAt(x, y) => {
+                self.model.menu = Some(modals::CtxMenu { x, y });
+                gale_win::window::request_frame();
+            }
+            Action::CloseMenu => {
+                self.model.menu = None;
+                gale_win::window::request_frame();
+            }
+            Action::StepFont(delta) => {
+                self.cfg.font_size = (self.cfg.font_size + delta as f32).clamp(10., 100.);
+                self.apply_style();
+                self.font_save_due = Some(self.ms() + 800);
+                gale_win::window::request_frame();
+            }
+            Action::StepSplit(delta) => {
+                self.cfg.split_ratio =
+                    (self.cfg.split_ratio + delta as f32 * 0.02).clamp(0.35, 0.78);
+                self.layout_save_due = Some(self.ms() + 600);
+                gale_win::window::request_frame();
+            }
             Action::OpenAppearanceSettings => {
                 self.model.fields.insert("pref_tab".into(), "2".into());
                 self.open(Modal::Preferences);
@@ -5001,16 +5643,25 @@ mod persistence_tests {
     #[test]
     fn escape_only_dismisses_panels_and_leaves_the_round_running() {
         assert_eq!(
-            escape_action(Modal::Preferences, true, true),
+            escape_action(Modal::Preferences, true, true, false),
             Some(Action::Close)
         );
         assert_eq!(
-            escape_action(Modal::None, true, true),
+            escape_action(Modal::None, true, true, false),
             Some(Action::ToggleLedger)
         );
         assert_eq!(
-            escape_action(Modal::None, false, true),
+            escape_action(Modal::None, false, true, false),
             Some(Action::ToggleAnalysis)
+        );
+        // 视图菜单打开时 Esc 先收菜单（不关面板、不动计时）。
+        assert_eq!(
+            escape_action(Modal::None, false, false, true),
+            Some(Action::CloseMenu)
+        );
+        assert_eq!(
+            escape_action(Modal::None, true, true, true),
+            Some(Action::CloseMenu)
         );
         let mut sess = Session::new(100);
         sess.load_book("Esc", "甲乙");
@@ -5020,7 +5671,7 @@ mod persistence_tests {
             true,
             100,
         );
-        assert_eq!(escape_action(Modal::None, false, false), None);
+        assert_eq!(escape_action(Modal::None, false, false, false), None);
         assert_eq!(sess.phase, Phase::Typing);
         assert_eq!(sess.elapsed_ms(600), 500);
         assert!(!sess.is_paused());
@@ -5064,7 +5715,7 @@ mod persistence_tests {
             true,
             1200,
         );
-        assert_eq!(escape_action(Modal::None, false, false), None);
+        assert_eq!(escape_action(Modal::None, false, false, false), None);
         assert!(sess.is_paused());
         assert_eq!(sess.elapsed_ms(1900), 100);
         assert_eq!(sess.typed_len(), 1);

@@ -107,6 +107,12 @@ pub enum CommandKey {
     F8, // 单字练习
     F9,
     F10,       // 设置面板（jifeng1：F1/F10 都开设置）
+    /// 【2026-11-12 视图体系】极简模式开关。
+    F11,
+    /// 【2026-11-12 视图体系】字贴 / 对照模式互换。
+    F12,
+    /// 菜单键（VK_APPS）或 Shift+F10：在光标处打开窗口内自绘视图菜单。
+    MenuKey,
     Enter,     // 段末跳段
     Space,     // 段末跳段（组字中放行给输入法）
     CtrlLeft,  // 上一段
@@ -201,6 +207,220 @@ fn completion_command(
         _ => None,
     }
 }
+/// 【快捷键自设 2026-11-13】一个组合键：vk + 修饰键状态（不含左右区分）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChordSpec {
+    pub vk: u32,
+    pub ctrl: bool,
+    pub alt: bool,
+    pub shift: bool,
+}
+
+static SHORTCUTS: Mutex<Vec<(ChordSpec, CommandKey)>> = Mutex::new(Vec::new());
+static RECORDING: AtomicBool = AtomicBool::new(false);
+static RECORDED: Mutex<Option<String>> = Mutex::new(None);
+
+fn modifier_vk(vk: u32) -> bool {
+    matches!(vk, 0x10 | 0x11 | 0x12 | 0x5B | 0x5C | 0xA0..=0xA5)
+}
+
+fn key_vk(name: &str) -> Option<u32> {
+    let lower = name.trim().to_ascii_lowercase();
+    if let Some(rest) = lower.strip_prefix('f') {
+        if let Ok(n) = rest.parse::<u32>() {
+            if (1..=24).contains(&n) {
+                return Some(0x70 + (n - 1));
+            }
+        }
+    }
+    let mut chars = lower.chars();
+    if let (Some(ch), None) = (chars.next(), chars.next()) {
+        if ch.is_ascii_alphabetic() {
+            return Some(ch.to_ascii_uppercase() as u32);
+        }
+        if ch.is_ascii_digit() {
+            return Some(ch as u32);
+        }
+    }
+    Some(match lower.as_str() {
+        "esc" | "escape" => 0x1B,
+        "tab" => 0x09,
+        "space" => 0x20,
+        "enter" | "return" => 0x0D,
+        "backspace" | "back" => 0x08,
+        "insert" | "ins" => 0x2D,
+        "delete" | "del" => 0x2E,
+        "home" => 0x24,
+        "end" => 0x23,
+        "pageup" | "pgup" => 0x21,
+        "pagedown" | "pgdn" => 0x22,
+        "left" => 0x25,
+        "up" => 0x26,
+        "right" => 0x27,
+        "down" => 0x28,
+        "menu" | "apps" => 0x5D,
+        "-" | "minus" => 0xBD,
+        "=" | "equal" => 0xBB,
+        "[" | "lbrace" => 0xDB,
+        "]" | "rbrace" => 0xDD,
+        "\\" | "backslash" => 0xDC,
+        ";" | "semicolon" => 0xBA,
+        "'" | "quote" => 0xDE,
+        "," | "comma" => 0xBC,
+        "." | "period" => 0xBE,
+        "/" | "slash" => 0xBF,
+        "`" | "grave" => 0xC0,
+        _ => return None,
+    })
+}
+
+/// 解析 "Ctrl+Shift+O" / "F8" / "Menu" 这类组合键文本。
+pub fn parse_chord(text: &str) -> Option<ChordSpec> {
+    let mut ctrl = false;
+    let mut alt = false;
+    let mut shift = false;
+    let mut key: Option<u32> = None;
+    for part in text.split('+') {
+        let token = part.trim();
+        if token.is_empty() {
+            continue;
+        }
+        match token.to_ascii_lowercase().as_str() {
+            "ctrl" | "control" => ctrl = true,
+            "alt" => alt = true,
+            "shift" => shift = true,
+            _ => {
+                if key.is_some() {
+                    return None;
+                }
+                key = Some(key_vk(token)?);
+            }
+        }
+    }
+    Some(ChordSpec {
+        vk: key?,
+        ctrl,
+        alt,
+        shift,
+    })
+}
+
+/// 从虚拟键拼出录制文本（修饰键顺序固定 Ctrl+Alt+Shift+键）。
+fn chord_text(vk: u32, ctrl: bool, alt: bool, shift: bool) -> Option<String> {
+    if modifier_vk(vk) {
+        return None;
+    }
+    let name: String = match vk {
+        0x1B => "Esc".into(),
+        0x09 => "Tab".into(),
+        0x20 => "Space".into(),
+        0x0D => "Enter".into(),
+        0x08 => "Backspace".into(),
+        0x2D => "Insert".into(),
+        0x2E => "Delete".into(),
+        0x24 => "Home".into(),
+        0x23 => "End".into(),
+        0x21 => "PageUp".into(),
+        0x22 => "PageDown".into(),
+        0x25 => "Left".into(),
+        0x26 => "Up".into(),
+        0x27 => "Right".into(),
+        0x28 => "Down".into(),
+        0x5D => "Menu".into(),
+        0xBD => "-".into(),
+        0xBB => "=".into(),
+        0xDB => "[".into(),
+        0xDD => "]".into(),
+        0xDC => "\\".into(),
+        0xBA => ";".into(),
+        0xDE => "'".into(),
+        0xBC => ",".into(),
+        0xBE => ".".into(),
+        0xBF => "/".into(),
+        0xC0 => "`".into(),
+        _ => {
+            if (0x70..=0x87).contains(&vk) {
+                format!("F{}", vk - 0x70 + 1)
+            } else if (b'A' as u32..=b'Z' as u32).contains(&vk) {
+                ((vk as u8) as char).to_string()
+            } else if (b'0' as u32..=b'9' as u32).contains(&vk) {
+                ((vk as u8) as char).to_string()
+            } else {
+                return None;
+            }
+        }
+    };
+    let mut out = String::new();
+    if ctrl {
+        out.push_str("Ctrl+");
+    }
+    if alt {
+        out.push_str("Alt+");
+    }
+    if shift {
+        out.push_str("Shift+");
+    }
+    out.push_str(&name);
+    Some(out)
+}
+
+/// 安装快捷键表（由应用把配置解析成 (组合键文本, 命令) 后调用）。
+pub fn set_shortcuts(entries: &[(String, CommandKey)]) {
+    let mut table = Vec::new();
+    for (chord, command) in entries {
+        if let Some(spec) = parse_chord(chord) {
+            table.push((spec, *command));
+        }
+    }
+    if let Ok(mut stored) = SHORTCUTS.lock() {
+        *stored = table;
+    }
+}
+
+fn lookup_shortcut(vk: u32, ctrl: bool, alt: bool, shift: bool) -> Option<CommandKey> {
+    let table = SHORTCUTS.lock().ok()?;
+    table
+        .iter()
+        .find(|(spec, _)| spec.vk == vk && spec.ctrl == ctrl && spec.alt == alt && spec.shift == shift)
+        .map(|(_, command)| *command)
+}
+
+/// 进入快捷键录制：下一次非修饰键被记录，Esc 取消。
+pub fn begin_shortcut_recording() {
+    if let Ok(mut recorded) = RECORDED.lock() {
+        *recorded = None;
+    }
+    RECORDING.store(true, Ordering::Relaxed);
+}
+
+pub fn shortcut_recording_active() -> bool {
+    RECORDING.load(Ordering::Relaxed)
+}
+
+pub fn cancel_shortcut_recording() {
+    RECORDING.store(false, Ordering::Relaxed);
+    if let Ok(mut recorded) = RECORDED.lock() {
+        *recorded = None;
+    }
+}
+
+/// 取走录制结果（Some 时录制已结束）。
+pub fn take_recorded_shortcut() -> Option<String> {
+    let value = RECORDED.lock().ok().and_then(|mut slot| slot.take());
+    if value.is_some() {
+        RECORDING.store(false, Ordering::Relaxed);
+    }
+    value
+}
+
+/// 预设的固定键（不可被快捷键占用）。
+pub fn shortcut_reserved(chord: &str) -> bool {
+    matches!(
+        chord.trim().to_ascii_lowercase().as_str(),
+        "ctrl+v" | "ctrl+z" | "ctrl+y" | "enter" | "space" | "tab" | "esc"
+    )
+}
+
 /// Pretranslate shortcuts and count only physical typing keys. Returning true
 /// suppresses TranslateMessage too, preventing a command's WM_CHAR leaking ahead.
 pub fn capture_physical_key(msg: &windows::Win32::UI::WindowsAndMessaging::MSG) -> bool {
@@ -224,21 +444,41 @@ pub fn capture_physical_key(msg: &windows::Win32::UI::WindowsAndMessaging::MSG) 
     if ctrl && vk == 0x20 {
         return false;
     }
-    let function = match vk {
-        0x70 => Some(CommandKey::F1),
-        0x71 => Some(CommandKey::F2),
-        0x72 => Some(CommandKey::F3),
-        0x73 => Some(CommandKey::F4),
-        0x74 => Some(CommandKey::F5),
-        0x75 => Some(CommandKey::F6),
-        0x76 => Some(CommandKey::F7),
-        0x77 => Some(CommandKey::F8),
-        0x78 => Some(CommandKey::F9),
-        0x79 => Some(CommandKey::F10),
-        _ => None,
-    };
-    if let Some(k) = function.filter(|_| !composing) {
-        push_cmd(k);
+    let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) < 0 };
+    // 【快捷键自设 2026-11-13】录制优先：下一次非修饰键作为候选组合键，Esc 取消。
+    if RECORDING.load(Ordering::Relaxed) && !composing {
+        if modifier_vk(vk) {
+            return true;
+        }
+        if vk == 0x1B {
+            cancel_shortcut_recording();
+            crate::window::request_frame();
+            return true;
+        }
+        if let Some(chord) = chord_text(vk, ctrl, alt, shift) {
+            if let Ok(mut slot) = RECORDED.lock() {
+                *slot = Some(chord);
+            }
+            RECORDING.store(false, Ordering::Relaxed);
+        }
+        crate::window::request_frame();
+        return true;
+    }
+    // 自设快捷键表优先（默认表由应用在启动/改键后安装）。
+    if !composing {
+        if let Some(command) = lookup_shortcut(vk, ctrl, alt, shift) {
+            push_cmd(command);
+            return true;
+        }
+        // 兼容：Shift+F10 视同菜单键（防作弊口径不变，可被自设菜单键覆盖）。
+        if vk == 0x79 && shift {
+            push_cmd(CommandKey::MenuKey);
+            return true;
+        }
+    }
+    // Ctrl+V 是固定编辑键（不受自设表影响）：仍走载文动作。
+    if ctrl && vk == 0x56 && !composing {
+        push_cmd(CommandKey::LoadClipboard);
         return true;
     }
     if vk == 0x1b && !composing && ESC_PANEL_OPEN.load(Ordering::Relaxed) {
@@ -280,8 +520,7 @@ pub fn capture_physical_key(msg: &windows::Win32::UI::WindowsAndMessaging::MSG) 
     // Ctrl+←/→, Ctrl+V and Alt+E so the measured keyboard only shows real
     // typing keys. The 20 ms selection pairing shares this path.
     let repeat = (msg.lParam.0 as usize) & (1 << 30) != 0;
-    let product_shortcut = (ctrl && !composing && matches!(vk, 0x25 | 0x27 | 0x56))
-        || (alt && !composing && vk == 0x45);
+    let product_shortcut = ctrl || alt;
     let function_row = (0x70..=0x7b).contains(&vk);
     if !repeat && !product_shortcut && !function_row {
         note_key(
@@ -298,24 +537,14 @@ pub fn capture_physical_key(msg: &windows::Win32::UI::WindowsAndMessaging::MSG) 
         push_resume_key(physical_vk);
     }
     if ctrl && !composing {
-        match vk {
-            0x25 => push_cmd(CommandKey::CtrlLeft),
-            0x27 => push_cmd(CommandKey::CtrlRight),
-            0x56 => push_cmd(CommandKey::LoadClipboard),
-            // Native undo/redo must reach RichEdit through the message pump;
-            // relay_proc cannot handle a shortcut discarded before dispatch.
-            0x5A | 0x59 => {
-                push_resume_key(vk);
-                return false;
-            }
-            _ => {}
+        // 快捷键表已在上面消化；这里只保留 RichEdit 原生撤销/重做，其余吞掉防漏字。
+        if matches!(vk, 0x5A | 0x59) {
+            push_resume_key(vk);
+            return false;
         }
         return true;
     }
     if alt && !composing {
-        if vk == 0x45 {
-            push_cmd(CommandKey::AltE);
-        }
         return true;
     }
     if StatsEngine::is_stat_key(vk) {
@@ -807,6 +1036,32 @@ unsafe extern "system" fn relay_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
             }
             let ctrl = GetKeyState(VK_CONTROL.0 as i32) < 0;
             let alt = GetKeyState(VK_MENU.0 as i32) < 0;
+            let shift_here = GetKeyState(VK_SHIFT.0 as i32) < 0;
+            let (ch_imm, ch_ctf) = composing_channels(hwnd);
+            let composing = composing_verdict(ch_imm, ch_ctf);
+            // 快捷键录制（继电器路径兜底）：与泵路径同语义。
+            if RECORDING.load(Ordering::Relaxed) && !composing {
+                if modifier_vk(vk) {
+                    return LRESULT(0);
+                }
+                if vk == 0x1B {
+                    cancel_shortcut_recording();
+                    return LRESULT(0);
+                }
+                if let Some(chord) = chord_text(vk, ctrl, alt, shift_here) {
+                    if let Ok(mut slot) = RECORDED.lock() {
+                        *slot = Some(chord);
+                    }
+                    RECORDING.store(false, Ordering::Relaxed);
+                }
+                return LRESULT(0);
+            }
+            if !composing {
+                if let Some(command) = lookup_shortcut(vk, ctrl, alt, shift_here) {
+                    push_cmd(command);
+                    return LRESULT(0);
+                }
+            }
             if alt && (vk == 0x73 || vk == 0x20) {
                 return call_orig!();
             }
@@ -814,39 +1069,21 @@ unsafe extern "system" fn relay_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
                 return call_orig!();
             }
             if alt && !ctrl {
-                // Alt 系全吞防漏字（WM_SYSCHAR 双保险在下面）
-                if vk == 0x45 {
-                    push_cmd(CommandKey::AltE);
-                }
+                // Alt 系全吞防漏字（WM_SYSCHAR 双保险在下面）；具体动作走快捷键表。
                 return LRESULT(0);
             }
             if ctrl {
-                match vk {
-                    0x25 => {
-                        push_cmd(CommandKey::CtrlLeft);
-                        return LRESULT(0);
-                    }
-                    0x27 => {
-                        push_cmd(CommandKey::CtrlRight);
-                        return LRESULT(0);
-                    }
-                    0x56 => {
-                        push_cmd(CommandKey::LoadClipboard);
-                        return LRESULT(0);
-                    }
-                    // Ctrl+Z / Ctrl+Y are legitimate corrections. RichEdit
-                    // handles WM_UNDO/WM_REDO; the document diff below turns
-                    // the shrink into Backspace events for the comparer.
-                    0x5A | 0x59 => return call_orig!(),
-                    _ => return LRESULT(0), // 其余 Ctrl 组合吞（防粘贴/复制/全选）
+                // 快捷键表已消化 Ctrl 组合；Ctrl+V 固定载文、Z/Y 原生撤销/重做，其余吞掉。
+                if vk == 0x56 {
+                    push_cmd(CommandKey::LoadClipboard);
+                    return LRESULT(0);
                 }
+                if matches!(vk, 0x5A | 0x59) {
+                    return call_orig!();
+                }
+                return LRESULT(0);
             }
-            // 组字判定：双通道（IMM GCS_COMPSTR 或 EM_GETIMECOMPTEXT 任一非空）。
-            // 单查 IMM 通道会漏判纯 TSF 输入法（虎符）——CUAS 桥组字不一定反映
-            // 到 IMM HIMC → 提交键被吞 → 候选框亮着但上不了屏（用户实测症状）。
-            let (ch_imm, ch_ctf) = composing_channels(hwnd);
-            let composing = composing_verdict(ch_imm, ch_ctf);
-            if composing && (0x70..=0x79).contains(&vk) {
+            if composing && (0x70..=0x7b).contains(&vk) {
                 return call_orig!();
             }
             match vk {
@@ -857,46 +1094,7 @@ unsafe extern "system" fn relay_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
                 // 无面板时的空态 Esc 落 `_ => {}` 放行：RichEdit→TSF 键处理器，
                 // 虎符空态撤回（引擎就绪 + 有光标）时被 TIP 消费撤回上一段
                 // 上屏；撤回不可用时 RichEdit 对 Esc 无动作，等价于无功能。
-                0x70 => {
-                    push_cmd(CommandKey::F1);
-                    return LRESULT(0);
-                }
-                0x71 => {
-                    push_cmd(CommandKey::F2);
-                    return LRESULT(0);
-                }
-                0x72 => {
-                    push_cmd(CommandKey::F3);
-                    return LRESULT(0);
-                }
-                0x73 => {
-                    push_cmd(CommandKey::F4);
-                    return LRESULT(0);
-                }
-                0x74 => {
-                    push_cmd(CommandKey::F5);
-                    return LRESULT(0);
-                }
-                0x75 => {
-                    push_cmd(CommandKey::F6);
-                    return LRESULT(0);
-                }
-                0x76 => {
-                    push_cmd(CommandKey::F7);
-                    return LRESULT(0);
-                }
-                0x77 => {
-                    push_cmd(CommandKey::F8);
-                    return LRESULT(0);
-                }
-                0x78 => {
-                    push_cmd(CommandKey::F9);
-                    return LRESULT(0);
-                }
-                0x79 => {
-                    push_cmd(CommandKey::F10);
-                    return LRESULT(0);
-                }
+
                 0x0D => {
                     // 组字中：Enter 归输入法（确认上屏）放行；否则段末跳段命令
                     if !composing && ROUND_DONE.load(Ordering::Relaxed) {
@@ -925,6 +1123,19 @@ unsafe extern "system" fn relay_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
             if wp.0 as u32 == 0x5D {
                 return LRESULT(0);
             }
+        }
+        // 【鼠标自动隐藏 2026-11-13】指针盖在打字热区/子窗上时，鼠标消息到这里；
+        // 唤醒主循环轮询光标位置，才能做到「鼠标一动立即恢复显示」。
+        // 隐藏期：子窗的 WM_SETCURSOR 必须把光标按成空，否则 RichEdit 的
+        // I 形光标会盖掉主窗口的隐藏（当年「闪一下」的另一半原因）。
+        0x0020 => {
+            crate::window::request_frame();
+            if crate::window::hide_cursor_in_wm_setcursor() {
+                return LRESULT(1);
+            }
+        }
+        0x0200 | 0x00A0 | 0x0201 | 0x0202 | 0x0204 | 0x020A => {
+            crate::window::request_frame();
         }
         0x007B => return LRESULT(0), // WM_CONTEXTMENU：训练模式全拦（右键/VK_APPS/Shift+F10 的公共出口）
         0x0300 | 0x0301 | 0x0302 | 0x0303 => return LRESULT(0), // cut/copy/paste/clear are not training commits
@@ -2194,5 +2405,39 @@ mod tests {
         }
         set_selection_keys(&[]);
         let _ = drain_key_times(1024);
+    }
+
+    #[test]
+    fn shortcut_chords_parse_resolve_and_stay_reserved_safe() {
+        let f8 = parse_chord("F8").expect("F8 parses");
+        assert_eq!(f8.vk, 0x77);
+        assert!(!f8.ctrl && !f8.alt && !f8.shift);
+        let combo = parse_chord("ctrl+shift+o").expect("combo parses");
+        assert_eq!(
+            combo,
+            ChordSpec {
+                vk: 0x4F,
+                ctrl: true,
+                alt: false,
+                shift: true
+            }
+        );
+        let menu = parse_chord("Menu").expect("menu key parses");
+        assert_eq!(menu.vk, 0x5D);
+        assert!(parse_chord("Ctrl+").is_none());
+        assert!(parse_chord("NotAKey").is_none());
+        assert_eq!(
+            chord_text(0x4F, true, false, true).as_deref(),
+            Some("Ctrl+Shift+O")
+        );
+        assert_eq!(chord_text(0x77, false, false, false).as_deref(), Some("F8"));
+        assert!(chord_text(0x11, true, false, false).is_none());
+        assert!(shortcut_reserved("ctrl+v"));
+        assert!(shortcut_reserved("Space"));
+        assert!(!shortcut_reserved("Ctrl+Shift+O"));
+        set_shortcuts(&[("Ctrl+Shift+O".into(), CommandKey::F9)]);
+        assert_eq!(lookup_shortcut(0x4F, true, false, true), Some(CommandKey::F9));
+        assert_eq!(lookup_shortcut(0x4F, false, false, true), None);
+        set_shortcuts(&[]);
     }
 }

@@ -47,6 +47,11 @@ struct AdjustEntry {
 pub struct UserAdjust {
     /// 全部操作日志（文件时序：内嵌 → 旧用户词 → 用户调整）。
     log: Vec<AdjustEntry>,
+    /// 【词提快照 2026-11-13】按码分桶的日志下标（桶内保持文件时序，
+    /// 由此 pply() 只回放该码的子序列，语义与全量扫描严格等价）。
+    by_code: HashMap<String, Vec<usize>>,
+    /// 码 → {添加}/{置顶} 词集合：dded() 从 O(日志长度) 降到 O(1)。
+    added_by_code: HashMap<String, HashSet<String>>,
     /// 当前删除态集合（回放派生：{添加}/{置顶}/{加权} 隐含取消删除）
     removes: std::collections::HashSet<(String, String)>,
     /// 加权：码→词 → 权重（{加权}行第三列；缺省 1000）
@@ -168,7 +173,27 @@ impl UserAdjust {
                 pos,
             });
         }
+        adj.reindex();
         adj
+    }
+
+    /// 重建按码索引与 {添加}/{置顶} 集合。只在装载与少量写操作后调用，
+    /// 回放/查询路径只读索引。
+    fn reindex(&mut self) {
+        self.by_code.clear();
+        self.added_by_code.clear();
+        for (index, entry) in self.log.iter().enumerate() {
+            self.by_code
+                .entry(entry.code.clone())
+                .or_default()
+                .push(index);
+            if matches!(entry.op, AdjustOp::Add | AdjustOp::Pin) {
+                self.added_by_code
+                    .entry(entry.code.clone())
+                    .or_default()
+                    .insert(entry.word.clone());
+            }
+        }
     }
 
     pub fn load(path: &Path) -> std::io::Result<Self> {
@@ -209,6 +234,7 @@ impl UserAdjust {
         });
         // 置顶隐含取消删除
         self.removes.remove(&(code.to_string(), word.to_string()));
+        self.reindex();
     }
 
     pub fn add(&mut self, code: &str, word: &str) {
@@ -254,6 +280,7 @@ impl UserAdjust {
             });
             self.removes.remove(&(code.to_string(), w.clone()));
         }
+        self.reindex();
     }
 
     /// 带选重位加词（/jc 第三框 pN）。
@@ -266,6 +293,7 @@ impl UserAdjust {
             pos,
         });
         self.removes.remove(&(code.to_string(), word.to_string()));
+        self.reindex();
     }
 
     pub fn remove(&mut self, code: &str, word: &str) {
@@ -277,6 +305,7 @@ impl UserAdjust {
             pos: None,
         });
         self.removes.insert((code.to_string(), word.to_string()));
+        self.reindex();
     }
 
     /// 该 码→词 是否处于删除态（用户词分支过滤用：adjust.apply 只
@@ -292,11 +321,9 @@ impl UserAdjust {
     /// 本二次并入=「重复字」（真机快照实锤：front 后 [看了看 看了看
     /// 择]，第二个=用户词副本；合并点的 pinned 查重拦不住它）。
     pub fn added(&self, code: &str, word: &str) -> bool {
-        self.log.iter().any(|e| {
-            e.code == code
-                && e.word == word
-                && matches!(e.op, AdjustOp::Add | AdjustOp::Pin)
-        })
+        self.added_by_code
+            .get(code)
+            .is_some_and(|words| words.contains(word))
     }
 
     /// 全部 {添加} 日志的 (码, 词)（整句词图注入用——pN 词不再入
@@ -386,10 +413,11 @@ impl UserAdjust {
     /// 对重复行天然幂等（重演同一词）。
     pub fn apply(&self, code: &str, base: &[DictEntry]) -> Vec<DictEntry> {
         let mut out: Vec<DictEntry> = base.to_vec();
-        for e in &self.log {
-            if e.code != code {
-                continue;
-            }
+        let Some(indices) = self.by_code.get(code) else {
+            return out;
+        };
+        for &index in indices {
+            let e = &self.log[index];
             match e.op {
                 AdjustOp::Pin => {
                     if let Some(hit) = out.iter().position(|x| x.text == e.word) {
@@ -943,6 +971,45 @@ mod tests {
     }
 
     // 【虎爪内嵌兼容】空格/全角空格分隔 + 第三列日期（任意形态）忽略
+    /// 【2026-11-13】大用户调整日志：按码索引只回放该码子序列，结果与全量回放一致，
+    /// `added()` 走集合查询。回归此前「调整过多 → 整段跳过词提」的性能护栏。
+    #[test]
+    fn large_adjustment_log_replays_correctly_through_code_index() {
+        let mut lines = Vec::new();
+        for i in 0..3_000 {
+            let code = format!("c{}", i % 37);
+            lines.push(if i % 5 == 0 {
+                format!("{{置顶}}{code}\t甲{i}")
+            } else {
+                format!("{{添加}}{code}\t乙{i}\tp{}", i % 4 + 1)
+            });
+        }
+        lines.push("{删除}c13\t乙13".into());
+        let adj = UserAdjust::parse(&lines);
+        assert_eq!(adj.operation_count(), 3_001);
+
+        let base: Vec<DictEntry> = (0..3)
+            .map(|i| DictEntry::new("c13".to_string(), format!("原{i}"), i as u32))
+            .collect();
+        let out = adj.apply("c13", &base);
+        // 删除态的词不出现在回放结果里。
+        assert!(!out.iter().any(|e| e.text == "乙13"));
+        assert!(adj.removed("c13", "乙13"));
+        // 该码其余 {添加}pN 词与置顶词都在，且置顶词排在最前。
+        assert!(out.iter().any(|e| e.text == "甲50"));
+        assert!(out.iter().any(|e| e.text == "甲50" && e.pinned));
+        assert!(adj.added("c13", "甲50"));
+        assert!(adj.added("c13", "乙13"));
+        assert!(!adj.added("c13", "不存在"));
+        // 未涉及的码不受影响。
+        assert_eq!(adj.apply("zz", &base).len(), 3);
+
+        // 写操作后索引重建：再加一条 {删除} 后立刻反映。
+        let mut adj = adj;
+        adj.remove("c13", "甲50");
+        assert!(adj.removed("c13", "甲50"));
+        assert!(!adj.apply("c13", &base).iter().any(|e| e.text == "甲50"));
+    }
     #[test]
     fn parse_tigerclaw_embedded_lines() {
         let lines: Vec<String> = vec![

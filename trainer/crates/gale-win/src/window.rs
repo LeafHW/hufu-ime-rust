@@ -15,7 +15,7 @@
 use gale_core::config::Material;
 use std::sync::Mutex;
 use windows::core::w;
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
     DwmEnableBlurBehindWindow, DwmSetWindowAttribute, DWMWA_SYSTEMBACKDROP_TYPE, DWM_BB_BLURREGION,
     DWM_BB_ENABLE, DWM_BLURBEHIND,
@@ -24,15 +24,21 @@ use windows::Win32::Graphics::Gdi::{CreateRectRgn, DeleteObject, HRGN};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Ole::OleInitialize;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetClientRect, GetMessageW, KillTimer,
-    PeekMessageW, PostQuitMessage, RegisterClassW, SetForegroundWindow, SetTimer, ShowWindow,
-    TranslateMessage, CS_HREDRAW, CS_VREDRAW, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCLIENT,
-    HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, MSG, PM_REMOVE, SW_RESTORE, SW_SHOW,
-    WINDOW_EX_STYLE, WM_COMMAND, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE, WM_NCHITTEST, WM_PAINT, WM_QUIT,
-    WM_SETFOCUS, WM_SIZE, WM_TIMER, WNDCLASSW, WS_OVERLAPPEDWINDOW,
+    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetClientRect, GetCursorInfo, GetCursorPos,
+    GetMessageW,
+    KillTimer,
+    LoadCursorW, PeekMessageW, PostQuitMessage, RegisterClassW, SetCursor, SetForegroundWindow,
+    SetTimer, SetWindowPos, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, HTBOTTOM,
+    HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCLIENT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT,
+    CURSORINFO, CURSOR_SHOWING, HWND_NOTOPMOST, HWND_TOPMOST, IDC_ARROW, IDC_SIZENS, MSG, PM_REMOVE,
+    SW_RESTORE, SW_SHOW,
+    ShowCursor, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WINDOW_EX_STYLE, WM_COMMAND, WM_DESTROY, WM_DPICHANGED,
+    WM_ERASEBKGND, WM_GETMINMAXINFO, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_NCCALCSIZE, WM_NCHITTEST, WM_PAINT, WM_QUIT, WM_RBUTTONDOWN, WM_SETFOCUS, WM_SETCURSOR,
+    WM_SIZE, WM_TIMER, WNDCLASSW, WS_OVERLAPPEDWINDOW, HCURSOR,
 };
 use windows::Win32::UI::WindowsAndMessaging::{SM_CXPADDEDBORDER, SM_CXSIZEFRAME};
+use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TRACKMOUSEEVENT, TME_LEAVE};
 
 // ── DPI 感知（150% 缩放模糊根治，2026-10-08）──────────────────────────
 // gale 此前是 DPI-unaware 进程：窗口按 96-DPI 逻辑像素渲染，DWM 把整张
@@ -185,12 +191,141 @@ mod placement_tests {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum MouseEv {
     Move { x: i32, y: i32 },
+    /// 指针离开客户区（TrackMouseEvent/TME_LEAVE）：恢复光标显示。
+    Leave,
     LDown { x: i32, y: i32 },
     LUp { x: i32, y: i32 },
+    /// 右键按下：跟打器在窗口内自绘上下文菜单（不是系统菜单）。
+    RDown { x: i32, y: i32 },
     Wheel { delta: i32, x: i32, y: i32 },
 }
 
 static MOUSE_QUEUE: Mutex<Vec<MouseEv>> = Mutex::new(Vec::new());
+
+/// 光标提示（2026-11-12）：应用层每帧根据命中层设置，wndproc 在
+/// WM_SETCURSOR 里据此换系统光标——对照模式的分栏把手要有上下调整光标。
+/// 【2026-11-13】不再提供四向箭头：窗口任意处可拖动，但指针保持普通箭头。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CursorHint {
+    Arrow,
+    /// 分栏/成绩面板把手（上下调整）
+    ResizeNS,
+}
+
+static CURSOR_HINT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+pub fn set_cursor_hint(hint: CursorHint) {
+    let v = match hint {
+        CursorHint::Arrow => 0u8,
+        CursorHint::ResizeNS => 2u8,
+    };
+    CURSOR_HINT.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// WM_MOUSELEAVE 固定值（不同 windows crate 模块归类不一，按消息号使用）。
+const WM_MOUSELEAVE_MSG: u32 = 0x02A3;
+
+static TRACKING_MOUSE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// 【鼠标自动隐藏 2026-11-13】键入时隐藏光标、动鼠标即恢复。
+/// 用「WM_SETCURSOR 里 SetCursor(NULL)」实现，不碰 ShowCursor 的全局计数。
+static CURSOR_HIDDEN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// 【鼠标自动隐藏 2026-11-13】光标屏幕坐标：不依赖鼠标消息（指针常悬在
+/// RichEdit 子窗上，主窗口收不到 WM_MOUSEMOVE，无法靠事件知道位置）。
+pub fn cursor_screen_pos() -> (i32, i32) {
+    let mut p = POINT::default();
+    unsafe {
+        let _ = GetCursorPos(&mut p);
+    }
+    (p.x, p.y)
+}
+
+/// 光标是否落在主窗口客户区内（含打字热区这类子窗覆盖区域）。
+pub fn cursor_inside_client(hwnd: HWND) -> bool {
+    if hwnd.0.is_null() {
+        return false;
+    }
+    let (sx, sy) = cursor_screen_pos();
+    let mut p = POINT { x: sx, y: sy };
+    let mut rc = windows::Win32::Foundation::RECT::default();
+    unsafe {
+        let _ = windows::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut p);
+        let _ = GetClientRect(hwnd, &mut rc);
+    }
+    p.x >= 0 && p.y >= 0 && p.x < rc.right && p.y < rc.bottom
+}
+
+/// 【鼠标隐藏 2026-11-13】不做「状态相同就跳过」的短路：输入法候选窗/子控件
+/// 可能在隐藏期间调用 ShowCursor(TRUE) 把光标重新显示出来（表现为「按一下消失、
+/// 再按一下又出来」）。这里每次调用都重新压计数，主循环在想要隐藏期间每帧调用，
+/// 外部谁抬回来都会被下一次调用重新压下去。
+pub fn set_cursor_hidden(hide: bool) {
+    CURSOR_HIDDEN.store(hide, std::sync::atomic::Ordering::Relaxed);
+    unsafe {
+        if hide {
+            // 只在「系统认为光标可见」时压一次计数：每敲一个键都会调用本函数，
+            // 无条件 while 循环会把显示计数越压越低（-1 → -2 → …），恢复时虽能
+            // 补回来，但计数漂移期间任何外部 ShowCursor(TRUE) 都可能露出光标。
+            if cursor_visible() {
+                while ShowCursor(false) >= 0 {}
+            }
+            let _ = SetCursor(HCURSOR(core::ptr::null_mut()));
+        } else {
+            while ShowCursor(true) < 0 {}
+            if let Ok(cursor) = LoadCursorW(None, IDC_ARROW) {
+                SetCursor(cursor);
+            }
+        }
+    }
+}
+
+/// 系统真正的光标显示状态（ShowCursor 显示计数 >=0 且未被隐藏时 true）。
+fn cursor_visible() -> bool {
+    let mut info = CURSORINFO {
+        cbSize: std::mem::size_of::<CURSORINFO>() as u32,
+        ..Default::default()
+    };
+    unsafe {
+        if GetCursorInfo(&mut info).is_err() {
+            return true;
+        }
+    }
+    info.flags.0 & CURSOR_SHOWING.0 != 0
+}
+
+/// 【鼠标隐藏 2026-11-13】每帧调用的守门员：只有「真的又被显示出来」时才再压一次，
+/// 避免 ShowCursor 计数无限漂移；同时把光标按成空。
+pub fn enforce_cursor_hidden() {
+    if !CURSOR_HIDDEN.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    if cursor_visible() {
+        set_cursor_hidden(true);
+    } else {
+        unsafe {
+            let _ = SetCursor(HCURSOR(core::ptr::null_mut()));
+        }
+    }
+}
+
+/// 子控件（RichEdit 打字热区）的 WM_SETCURSOR 里调用：隐藏期一律压成空光标。
+pub fn hide_cursor_in_wm_setcursor() -> bool {
+    if !CURSOR_HIDDEN.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    unsafe {
+        let _ = SetCursor(HCURSOR(core::ptr::null_mut()));
+    }
+    true
+}
+
+#[allow(dead_code)]
+pub fn cursor_hidden() -> bool {
+    CURSOR_HIDDEN.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// 队列上限（防爆内存；主循环每帧 drain，正常远达不到）
 const MOUSE_QUEUE_MAX: usize = 256;
@@ -739,6 +874,8 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
         // Preserve focus loss relative to keys, including native reactivation
         // inside the same message-pump iteration.
         crate::input_host::note_focus_lost();
+        // 失焦时无论如何恢复光标（防止隐藏态卡住）。
+        set_cursor_hidden(false);
     }
     if msg == windows::Win32::UI::WindowsAndMessaging::WM_CLOSE {
         *NORMAL_BOUNDS.lock().unwrap_or_else(|e| e.into_inner()) = normal_window_bounds(hwnd);
@@ -762,10 +899,25 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
     let lx = |v: i32| ((v as f32) / sc + 0.5).floor() as i32;
     match msg {
         WM_MOUSEMOVE => {
+            // 只订阅一次 TME_LEAVE：指针离开客户区时恢复光标（隐藏只在窗内有效）。
+            if !TRACKING_MOUSE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                let mut track = TRACKMOUSEEVENT {
+                    cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                    dwFlags: TME_LEAVE,
+                    hwndTrack: hwnd,
+                    dwHoverTime: 0,
+                };
+                let _ = TrackMouseEvent(&mut track);
+            }
             let (x, y) = (lo16(lp.0 as u32) as i32, hi16(lp.0 as u32) as i32);
             push_mouse(MouseEv::Move { x: lx(x), y: lx(y) });
             // 拖动成行时唤醒主循环（空闲阻塞路径靠消息唤醒；MOUSE_QUEUE 是
             // 旁路观测，不经消息队列不会自动唤醒 wait_idle）
+            request_frame();
+        }
+        WM_MOUSELEAVE_MSG => {
+            TRACKING_MOUSE.store(false, std::sync::atomic::Ordering::Relaxed);
+            push_mouse(MouseEv::Leave);
             request_frame();
         }
         WM_LBUTTONDOWN => {
@@ -787,6 +939,12 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
         WM_LBUTTONUP => {
             let (x, y) = (lo16(lp.0 as u32) as i32, hi16(lp.0 as u32) as i32);
             push_mouse(MouseEv::LUp { x: lx(x), y: lx(y) });
+        }
+        // 右键：不弹系统菜单，交给应用层在窗口内自绘外观菜单。
+        WM_RBUTTONDOWN => {
+            let (x, y) = (lo16(lp.0 as u32) as i32, hi16(lp.0 as u32) as i32);
+            push_mouse(MouseEv::RDown { x: lx(x), y: lx(y) });
+            request_frame();
         }
         WM_MOUSEWHEEL => {
             // wParam 高 16 位是有符号滚轮增量；lParam 是屏幕坐标（换算客户区）
@@ -826,6 +984,28 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                 if windows::Win32::UI::WindowsAndMessaging::IsWindow(h).as_bool() {
                     let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(h);
                     return LRESULT(0);
+                }
+            }
+            DefWindowProcW(hwnd, msg, wp, lp)
+        }
+        // 光标：应用层每帧下发提示（0=默认/2=上下调整）；键入时隐藏（SetCursor(NULL)），
+        // 鼠标一动应用层会恢复，因此这里只需在隐藏态短路返回。
+        WM_SETCURSOR => {
+            let hit = lo16(lp.0 as u32) as u32;
+            if hit == HTCLIENT as u32 {
+                if CURSOR_HIDDEN.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _ = SetCursor(HCURSOR(core::ptr::null_mut()));
+                    return LRESULT(1);
+                }
+                let id = match CURSOR_HINT.load(std::sync::atomic::Ordering::Relaxed) {
+                    2 => Some(IDC_SIZENS),
+                    _ => None,
+                };
+                if let Some(id) = id {
+                    if let Ok(cursor) = LoadCursorW(None, id) {
+                        SetCursor(cursor);
+                        return LRESULT(1);
+                    }
                 }
             }
             DefWindowProcW(hwnd, msg, wp, lp)
@@ -1340,6 +1520,21 @@ pub static NC_DRAG_ACTIVE: std::sync::atomic::AtomicBool =
 /// 设置自定义拖动标志（进拖动循环前 true，出来后 false）。
 pub fn set_nc_drag_active(on: bool) {
     NC_DRAG_ACTIVE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 【窗口置顶 2026-11-12】右键菜单/设置页切换：始终在最前但不抢焦点。
+pub fn set_topmost(hwnd: HWND, on: bool) {
+    unsafe {
+        let _ = SetWindowPos(
+            hwnd,
+            if on { HWND_TOPMOST } else { HWND_NOTOPMOST },
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
+    }
 }
 
 #[cfg(test)]

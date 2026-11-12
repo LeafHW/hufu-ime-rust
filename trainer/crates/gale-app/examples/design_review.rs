@@ -34,10 +34,12 @@ pub fn aux_marker(cmd: &str) -> modals::Action {
 #[path = "../src/analysis.rs"]
 mod analysis;
 pub use analysis::{FullAnalysis, FullAnalysisEntry};
+#[path = "../src/ctxmenu.rs"]
+mod ctxmenu;
 
 use gale_core::{
     compare::InputEvent,
-    config::{Config, HintStrategy},
+    config::{Config, DisplayMode, HintStrategy},
     rules::{clean_body, CleaningPreset, CleaningRule, SessionRules, TrainingMode},
     score::ScoreRecord,
     segment::{ParsedGroupText, Segment},
@@ -712,14 +714,14 @@ fn main() -> Result<(), Box<dyn Error>> {
                     (number, number)
                 }
             };
-            if start < 1 || end > 90 || start > end {
-                return Err("screen filter must select numbers in 1..90".into());
+            if start < 1 || end > 117 || start > end {
+                return Err("screen filter must select numbers in 1..117".into());
             }
             selected.extend(start..=end);
         }
         selected
     } else {
-        (1..=90).collect()
+        (1..=117).collect()
     };
     std::fs::create_dir_all(&output)?;
     unsafe {
@@ -771,6 +773,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             | 74
             | 76
             | 81 => (640., 420.),
+            99 => (640., 420.),
+            111 => (1300., 900.),
+            95 => (800., 600.),
             26..=28 | 30 | 39 | 41..=47 | 51 | 54 | 56 | 59 | 60 | 71 | 82 => (800., 600.),
             _ => (WIDTH, HEIGHT),
         };
@@ -1168,10 +1173,93 @@ fn main() -> Result<(), Box<dyn Error>> {
                     _ => "90-bracket-boundaries-36-light-1280x800.bmp",
                 }
             }
+            // 【视图体系 2026-11-12】字贴/对照 × 极简 × 右键菜单 × 新设置页。
+            91..=117 => {
+                let split = matches!(screen, 91 | 92 | 95 | 97 | 99 | 102 | 111);
+                cfg.display_mode = if split {
+                    DisplayMode::Split
+                } else {
+                    DisplayMode::Copybook
+                };
+                cfg.minimal = matches!(screen, 92 | 93 | 96 | 97 | 101 | 102);
+                // 113：极简模式 + 底部理论分析停靠面板（不再退出极简）。
+                if screen == 113 {
+                    cfg.minimal = true;
+                    full_analysis_fixture(&mut sess);
+                    m.analysis_dock = true;
+                }
+                // 114：外观与颜色页（字号 / 行距 / 字间距 同排）。
+                if screen == 114 {
+                    theme_name = "宣纸";
+                    m.open(Modal::Preferences);
+                    m.fields.insert("pref_tab".into(), "2".into());
+                }
+                // 115：词提页（提示字号 / 选重数字加粗 / 高低 同一张卡）。
+                if screen == 115 {
+                    m.open(Modal::Preferences);
+                    m.fields.insert("pref_tab".into(), "0".into());
+                }
+                // 116：快捷键页（录制式自设 + 恢复默认）。
+                if screen == 116 {
+                    m.open(Modal::Preferences);
+                    m.fields.insert("pref_tab".into(), "5".into());
+                }
+                // 117：快捷键页录制态（某个键位显示“按下组合键…”）。
+                if screen == 117 {
+                    m.open(Modal::Preferences);
+                    m.fields.insert("pref_tab".into(), "5".into());
+                    m.fields
+                        .insert("pref_recording".into(), "analysis".into());
+                }
+                if screen == 111 {
+                    cfg.split_ratio = 0.52;
+                }
+                cfg.minimal_hud = screen != 97;
+                cfg.split_ratio = 0.58;
+                if screen == 96 {
+                    theme_name = "宣纸";
+                }
+                if matches!(screen, 94 | 100) {
+                    // 菜单 + 指针停在「极简模式」行（展示 hover 高亮）。
+                    m.menu = Some(modals::CtxMenu { x: 300., y: 168. });
+                    m.pointer = Some((330., 316.));
+                }
+                if matches!(screen, 101 | 102) {
+                    // 极简模式：指针停在右上角 → 窗口控制胶囊浮出。
+                    m.pointer = Some((1210., 20.));
+                }
+                if screen == 98 {
+                    m.open(Modal::Preferences);
+                    m.fields.insert("pref_tab".into(), "3".into());
+                }
+                if screen == 100 {
+                    theme_name = "宣纸";
+                }
+                match screen {
+                    91 => "91-split-traditional-dark-1280x800.bmp",
+                    92 => "92-split-minimal-dark-1280x800.bmp",
+                    93 => "93-copybook-minimal-dark-1280x800.bmp",
+                    94 => "94-view-context-menu-dark-1280x800.bmp",
+                    95 => "95-split-traditional-800x600.bmp",
+                    96 => "96-copybook-minimal-light-1280x800.bmp",
+                    97 => "97-split-minimal-no-hud-dark-1280x800.bmp",
+                    98 => "98-preferences-interface-dark-1280x800.bmp",
+                    99 => "99-split-traditional-640x420.bmp",
+                    100 => "100-view-context-menu-light-1280x800.bmp",
+                    101 => "101-copybook-minimal-controls-dark-1280x800.bmp",
+                    102 => "102-split-minimal-controls-dark-1280x800.bmp",
+                    111 => "111-split-traditional-1300x900.bmp",
+                    113 => "113-minimal-analysis-dock-dark-1280x800.bmp",
+                    114 => "114-preferences-appearance-light-1280x800.bmp",
+                    115 => "115-preferences-practice-hint-layout-dark-1280x800.bmp",
+                    116 => "116-preferences-shortcuts-dark-1280x800.bmp",
+                    _ => "117-preferences-shortcuts-recording-dark-1280x800.bmp",
+                }
+            }
             _ => unreachable!(),
         };
         if m.ledger_open {
-            m.ledger_scroll = m.ledger_scroll.min(crate::history::scroll_max(&m, height));
+            m.ledger_scroll = m.ledger_scroll.min(crate::history::scroll_max(&cfg, &m, height));
         }
         cfg.theme = theme_name.into();
         let single = matches!(&sess.source, session::SessionSource::Single);
@@ -1228,8 +1316,14 @@ fn main() -> Result<(), Box<dyn Error>> {
             correct_at: -100.,
             ..ui::Animation::default()
         };
+        let typed: String = sess.comparer.typed.iter().collect();
+        let input_lines = if cfg.display_mode.is_split() && !typed.is_empty() {
+            renderer.wrap_text(&typed, font_size, body_w)
+        } else {
+            Vec::new()
+        };
         let mut hits = Vec::new();
-        let mut frame = ui::build(
+        let mut frame = ui::build_with_input(
             &sess,
             &cfg,
             &theme,
@@ -1241,6 +1335,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             &mut animation,
             &mut hits,
             &lines,
+            &input_lines,
         );
         modals::draw(
             &mut frame,
@@ -1253,6 +1348,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             height,
             frame_now as f64 / 1000.,
         );
+        // 【视图体系 2026-11-12】右键菜单与产品同层：面板之后、渲染之前。
+        if m.modal == Modal::None && m.menu.is_some() {
+            ctxmenu::draw(&mut frame, &mut hits, &cfg, &m, &theme, width, height);
+        }
         paint_field_fixtures(&mut frame, &m, &theme, width, height);
         renderer.draw_frame(&frame)?;
         renderer

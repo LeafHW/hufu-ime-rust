@@ -215,14 +215,23 @@ fn snapshot(host: &Mutex<Host>) -> Result<(Schema, Config, bool, u64), SnapshotE
     ))
 }
 
+/// 用户词/调整快照门限：只防「快照大到让分析变慢」，不是语义上限。
+/// 2026-11-13：UserAdjust 加了按码索引后 apply/added 不再全量扫日志；
+/// 校验本身是 O(条目长度和) 的一次扫描（10MB 文本仍是毫秒级），因此放宽到
+/// 10 万条 / 10MB（实测 3.8k 条调整 + 3.1k 用户词的方案可直接出词提）。
+const SNAPSHOT_ENTRY_LIMIT: usize = 100_000;
+const SNAPSHOT_BYTES_LIMIT: usize = 10 * 1024 * 1024;
+
 fn validate_source_size(state: &Schema) -> Result<(), String> {
-    if state.user_dict.entries.len() > 2000
-        || state.user_dict.weights.len() > 2000
-        || state.user_dict.hidden.len() > 2000
-        || state.adjust.operation_count() > 2000
-        || state.adjust.weights.len() > 2000
+    if state.user_dict.entries.len() > SNAPSHOT_ENTRY_LIMIT
+        || state.user_dict.weights.len() > SNAPSHOT_ENTRY_LIMIT
+        || state.user_dict.hidden.len() > SNAPSHOT_ENTRY_LIMIT
+        || state.adjust.operation_count() > SNAPSHOT_ENTRY_LIMIT
+        || state.adjust.weights.len() > SNAPSHOT_ENTRY_LIMIT
     {
-        return Err("用户词或调整过多，已跳过词提以保持输入响应".into());
+        return Err(format!(
+            "用户词或调整过多（>{SNAPSHOT_ENTRY_LIMIT} 条），已跳过词提以保持输入响应；"
+        ));
     }
     let bytes = state
         .user_dict
@@ -247,8 +256,10 @@ fn validate_source_size(state: &Schema) -> Result<(), String> {
                 .map(|(c, t)| c.len().saturating_add(t.len()))
                 .sum::<usize>(),
         );
-    if bytes > 512 * 1024 {
-        return Err("用户词快照过大，已跳过词提".into());
+    if bytes > SNAPSHOT_BYTES_LIMIT {
+        return Err(format!(
+            "用户词快照过大（>{SNAPSHOT_BYTES_LIMIT} 字节），已跳过词提"
+        ));
     }
     Ok(())
 }
@@ -2024,9 +2035,10 @@ mod tests {
                 h.engine.config.trainer.enabled = !oversized_bytes;
             }
             let adjustments = if oversized_bytes {
-                format!("{{删除}}a\t{}\n", "甲".repeat(180_000))
+                format!("{{删除}}a\t{}\n", "甲".repeat(10_500_000))
             } else {
-                (0..2001).map(|i| format!("{{删除}}a{i}\t甲\n")).collect()
+                // 2026-11-13：快照门限 2,000 → 100,000（UserAdjust 加按码索引）。
+                (0..100_001).map(|i| format!("{{删除}}a{i}\t甲\n")).collect()
             };
             std::fs::write(schema_dir.join("用户调整.txt"), adjustments).unwrap();
             let key = source_key(&host.lock().unwrap());

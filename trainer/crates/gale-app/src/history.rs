@@ -19,33 +19,80 @@ const HEAD_H: f32 = 26.;
 /// 面板底部留白。
 const PAD_BOTTOM: f32 = 8.;
 
-fn visible_rows(m: &Model, h: f32) -> usize {
-    let max_h = (h * 0.55).max(180.);
-    let body = (max_h - BAR_H - HEAD_H - PAD_BOTTOM).max(ROW_H);
-    (body / ROW_H).floor().clamp(1., 7.) as usize
+/// 面板底边距离窗口底的距离：常规=状态行上方；极简模式没有状态行，贴底 12px。
+pub fn bottom_inset(cfg: &Config) -> f32 {
+    if cfg.minimal {
+        12.
+    } else {
+        STATUS_H + 8.
+    }
 }
 
-/// 展开后的面板高度（表头 + 可见行 + 底部留白），内容少时收短。
-pub fn panel_height(m: &Model, h: f32) -> f32 {
-    let rows = m.history.len().min(visible_rows(m, h)).max(1) as f32;
-    (BAR_H + HEAD_H + rows * ROW_H + PAD_BOTTOM).clamp(120., (h * 0.55).max(180.))
+fn visible_rows(cfg: &Config, m: &Model, h: f32) -> usize {
+    let ph = if cfg.ledger_panel_h > 0. {
+        cfg.ledger_panel_h
+    } else {
+        (h * 0.55).max(180.)
+    };
+    let body = (ph - BAR_H - HEAD_H - PAD_BOTTOM).max(ROW_H);
+    (body / ROW_H).floor().clamp(1., 14.) as usize
 }
 
-pub fn panel_rect_for(m: &Model, w: f32, h: f32) -> (f32, f32, f32, f32) {
-    let ph = panel_height(m, h);
+/// 展开后的面板高度：用户拖过就用记忆高度，否则按成绩条数自动收短。
+pub fn panel_height(cfg: &Config, m: &Model, h: f32) -> f32 {
+    if cfg.ledger_panel_h > 0. {
+        return cfg.ledger_panel_h.clamp(120., (h - 140.).max(160.));
+    }
+    let rows = m.history.len().min(visible_rows(cfg, m, h)).max(1) as f32;
+    (BAR_H + HEAD_H + rows * ROW_H + PAD_BOTTOM).clamp(120., (h - 140.).max(200.))
+}
+
+/// 【2026-11-13】成绩面板/摘要条的左右边界：对照模式下与两张卡对齐
+/// （非极简卡边 36px、极简 16px），字贴模式保持原 24px 内距。
+fn horizontal_bounds(cfg: &Config, w: f32) -> (f32, f32) {
+    if cfg.display_mode.is_split() {
+        let bw = if cfg.minimal {
+            (w - 56.).max(360.).min(1600.)
+        } else {
+            (w - 96.).max(360.).min(1600.)
+        };
+        (((w - bw) / 2.) - 12., bw + 24.)
+    } else {
+        (24., (w - 48.).max(320.))
+    }
+}
+
+pub fn panel_rect_for(cfg: &Config, m: &Model, w: f32, h: f32) -> (f32, f32, f32, f32) {
+    let ph = panel_height(cfg, m, h);
+    let bottom = h - bottom_inset(cfg);
+    let (x, pw) = horizontal_bounds(cfg, w);
+    (x, bottom - ph, pw, ph)
+}
+
+/// 面板上沿 8px 作为拖动把手（拖高拖低），主循环据此进入拖动。
+pub fn resize_grip_rect(
+    cfg: &Config,
+    m: &Model,
+    w: f32,
+    h: f32,
+) -> Option<(f32, f32, f32, f32)> {
+    if !m.ledger_open || m.modal != Modal::None {
+        return None;
+    }
+    let (x, y, pw, _) = panel_rect_for(cfg, m, w, h);
+    Some((x, y - 2., pw, 8.))
+}
+
+/// 收起状态下的摘要条（仅常规模式；极简模式不画底栏），横向与面板同界。
+pub fn bar_rect(cfg: &Config, w: f32, h: f32) -> (f32, f32, f32, f32) {
     let bottom = h - STATUS_H - 8.;
-    (24., bottom - ph, (w - 48.).max(320.), ph)
+    let (x, bw) = horizontal_bounds(cfg, w);
+    (x, bottom - BAR_H, bw.max(200.), BAR_H)
 }
 
-/// 收起状态下的摘要条。
-pub fn bar_rect(w: f32, h: f32) -> (f32, f32, f32, f32) {
-    let bottom = h - STATUS_H - 8.;
-    (24., bottom - BAR_H, (w - 48.).max(200.), BAR_H)
-}
-
-pub fn scroll_max(m: &Model, h: f32) -> f32 {
+pub fn scroll_max(cfg: &Config, m: &Model, h: f32) -> f32 {
     let rows = m.history.len() as f32;
-    let visible = visible_rows(m, h) as f32;
+    let visible = visible_rows(cfg, m, h) as f32;
     ((rows - visible).max(0.) * ROW_H).max(0.)
 }
 
@@ -58,7 +105,7 @@ pub fn draw(
     f: &mut Frame,
     hs: &mut Vec<Hit>,
     sess: &Session,
-    _cfg: &Config,
+    cfg: &Config,
     m: &Model,
     t: &Theme,
     w: f32,
@@ -68,9 +115,9 @@ pub fn draw(
         return;
     }
     if m.ledger_open {
-        draw_table(f, hs, sess, m, t, w, h);
-    } else {
-        draw_bar(f, hs, sess, m, t, w, h);
+        draw_table(f, hs, sess, cfg, m, t, w, h);
+    } else if !cfg.minimal {
+        draw_bar(f, hs, sess, cfg, m, t, w, h);
     }
 }
 
@@ -78,14 +125,17 @@ fn draw_bar(
     f: &mut Frame,
     hs: &mut Vec<Hit>,
     sess: &Session,
+    cfg: &Config,
     m: &Model,
     t: &Theme,
     w: f32,
     h: f32,
 ) {
     let p = tokens(t);
-    let (x, y, bw, bh) = bar_rect(w, h);
+    let (x, y, bw, bh) = bar_rect(cfg, w, h);
     if sess.phase == Phase::Done {
+        // 完成态与空闲态同一张底栏：同背景、同 14px 内距、同 1px 垂直基准。
+        round(f, x, y, bw, bh, 8., p.surface, Some(p.line));
         let record = sess
             .results
             .get(sess.current_index())
@@ -97,27 +147,27 @@ fn draw_bar(
         let controls_w = if has_next { 292. } else { 196. };
         text(
             f,
-            x,
-            y + 10.,
+            x + 14.,
+            y + 9.,
             14.,
             elide(
                 &summary,
-                ((bw - controls_w - 18.) / 14.).max(6.) as usize,
+                ((bw - controls_w - 46.) / 14.).max(6.) as usize,
             ),
             p.text2,
         );
-        let mut bx = w - 24. - controls_w;
+        let mut bx = x + bw - 14. - controls_w;
         if has_next {
-            button(f, hs, bx, y, 90., "下一段", Action::Next, t, true);
+            button(f, hs, bx, y + 2., 90., "下一段", Action::Next, t, true);
             bx += 96.;
         }
-        button(f, hs, bx, y, 82., "重打", Action::Restart, t, !has_next);
+        button(f, hs, bx, y + 2., 82., "重打", Action::Restart, t, !has_next);
         if let Some(idx) = m.history.len().checked_sub(1) {
             button(
                 f,
                 hs,
                 bx + 88.,
-                y,
+                y + 2.,
                 98.,
                 "查看成绩",
                 Action::SelectHistory(idx),
@@ -191,14 +241,26 @@ fn draw_table(
     f: &mut Frame,
     hs: &mut Vec<Hit>,
     sess: &Session,
+    cfg: &Config,
     m: &Model,
     t: &Theme,
     w: f32,
     h: f32,
 ) {
     let p = tokens(t);
-    let (x, y, pw, ph) = panel_rect_for(m, w, h);
+    let (x, y, pw, ph) = panel_rect_for(cfg, m, w, h);
     round(f, x, y, pw, ph, 10., p.surface, Some(p.line2));
+    // 上沿拖动把手：hover 时主程序把光标换成上下箭头，拖动改面板高度。
+    round(
+        f,
+        x + pw / 2. - 18.,
+        y + 3.,
+        36.,
+        4.,
+        2.,
+        alpha(p.line2, 0.9),
+        None,
+    );
     // 表头（可点收起）
     let done = sess.results.iter().flatten().count();
     let avg = if done == 0 {
@@ -265,7 +327,7 @@ fn draw_table(
         f.push(DrawCmd::TextRun {
             x: col_x[i] + col_w[i] - 6.,
             y: y + BAR_H + 5.,
-            h: 12.,
+            h: 13.,
             text: (*name).into(),
             color: p.muted,
             font: FontFamily::Ui,
@@ -275,7 +337,7 @@ fn draw_table(
     }
     let list_top = y + BAR_H + HEAD_H;
     let list_h = ph - BAR_H - HEAD_H - PAD_BOTTOM;
-    let max = scroll_max(m, h);
+    let max = scroll_max(cfg, m, h);
     let scroll = m.ledger_scroll.clamp(0., max);
     f.push(DrawCmd::PushClip {
         x,
@@ -288,7 +350,7 @@ fn draw_table(
         if row_y + ROW_H > list_top && row_y < list_top + list_h {
             let r = &m.history[idx];
             if idx + 1 == m.history.len() {
-                rect(f, x + 8., row_y, pw - 16., ROW_H, alpha(p.accent, 0.07));
+                rect(f, x + 16., row_y, pw - 32., ROW_H, alpha(p.accent, 0.07));
             }
             let cells = cell_text(r);
             for i in 0..9 {
@@ -342,4 +404,49 @@ fn fmt_speed(r: &ScoreRecord) -> String {
 fn duration(ms: u64) -> String {
     let secs = ms as f64 / 1000.;
     format!("{}:{:04.1}", (secs / 60.) as u64, secs % 60.)
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gale_core::config::DisplayMode;
+
+    /// 【2026-11-13】成绩面板/摘要条的左右边界必须与对照模式两张卡对齐：
+    /// 非极简 36px 包边、极简 16px；字贴模式保持 24px 内距。
+    #[test]
+    fn ledger_panel_aligns_with_split_cards_in_both_chrome_modes() {
+        let m = Model {
+            ledger_open: true,
+            ..Default::default()
+        };
+        let w = 1300.;
+        for minimal in [false, true] {
+            let mut cfg = Config::default();
+            cfg.display_mode = DisplayMode::Split;
+            cfg.minimal = minimal;
+            let (x, _, pw, _) = panel_rect_for(&cfg, &m, w, 800.);
+            let bw = if minimal {
+                (w - 56.).max(360.).min(1600.)
+            } else {
+                (w - 96.).max(360.).min(1600.)
+            };
+            let card_x = (w - bw) / 2. - 12.;
+            assert!((x - card_x).abs() < 0.01, "panel x {x} vs card {card_x}");
+            assert!((pw - (bw + 24.)).abs() < 0.01, "panel w {pw}");
+        }
+        let cfg = Config::default();
+        let (x, _, pw, _) = panel_rect_for(&cfg, &m, w, 800.);
+        assert_eq!(x, 24.);
+        assert_eq!(pw, w - 48.);
+        // 摘要条与面板同界
+        let (bx, _, bwidth, _) = bar_rect(&cfg, w, 800.);
+        assert_eq!(bx, 24.);
+        assert_eq!(bwidth, w - 48.);
+        let mut split = Config::default();
+        split.display_mode = DisplayMode::Split;
+        let (bx, _, bwidth, _) = bar_rect(&split, w, 800.);
+        assert_eq!(bx, 36.);
+        assert_eq!(bwidth, w - 72.);
+    }
 }
