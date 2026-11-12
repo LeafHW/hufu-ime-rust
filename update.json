@@ -1,19 +1,19 @@
 {
-    "latest":  "1.9.9.7",
+    "latest":  "1.9.9.8",
     "min":  "1.9.0",
-    "date":  "2026-11-12",
-    "name":  "HuFu 虎符输入法 v1.9.9.7",
+    "date":  "2026-11-13",
+    "name":  "HuFu 虎符输入法 v1.9.9.8",
     "page_url":  "https://www.hufuime.top/releases/",
-    "sha256":  "a0175125b5b16b619eacd02a6b4c7d7848621e10ac791d009d1f61ab0eb2e6b1",
-    "size":  27226220,
+    "sha256":  "8132fe21da2afddf99ca5cd7e71ef2d48b439aa3cfff296eacaaf4df1ff9902f",
+    "size":  27274200,
     "sources":  [
                     {
                         "name":  "Gitee",
-                        "url":  "https://gitee.com/leafHW/hufu-ime-rust/releases/download/v1.9.9.7/HuFuSetup-1.9.9.7.exe"
+                        "url":  "https://gitee.com/leafHW/hufu-ime-rust/releases/download/v1.9.9.8/HuFuSetup-1.9.9.8.exe"
                     },
                     {
                         "name":  "GitHub",
-                        "url":  "https://github.com/LeafHW/hufu-ime-rust/releases/download/v1.9.9.7/HuFuSetup-1.9.9.7.exe"
+                        "url":  "https://github.com/LeafHW/hufu-ime-rust/releases/download/v1.9.9.8/HuFuSetup-1.9.9.8.exe"
                     }
                 ]
 }
