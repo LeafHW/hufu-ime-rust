@@ -1062,7 +1062,9 @@ pub fn split_geom(
     let input_min = (24. + 16. + line_h).min(span * 0.6);
     let avail = (span - SPLIT_GAP).max(40.);
     let ratio = if cfg.split_ratio.is_finite() {
-        cfg.split_ratio.clamp(0.35, 0.78)
+        // 2026-11-13 用户拍板：不设人为限制，拖到哪里算哪里（0.15..=0.97，
+        // 下限只防把手粘到窗口顶，input_min/max_input 各自兜物理一行）。
+        cfg.split_ratio.clamp(0.15, 0.97)
     } else {
         0.58
     };
@@ -1083,9 +1085,11 @@ pub fn split_geom(
     let input_h = (avail * (1. - ratio)).clamp(input_min.min(max_input), max_input);
     let mut article_h = (avail - input_h).max(20.);
     // 整行吸附：多余高度让给输入卡，文章卡不会留一整块空白。
+    // 2026-11-13 用户二轮反馈：输入卡已被拖到一行附近（≤ input_min+一行）时不吸附——
+    // 反哺会把拖出来的高度吃回去甚至顶高，薄区拖到哪里算哪里；文章卡零头只是卡内留白。
     let rows = ((article_h - 20.) / lh).floor().max(1.);
     let snapped = rows * lh + 20.;
-    if article_h - snapped > lh * 0.35 {
+    if article_h - snapped > lh * 0.35 && input_h > input_min + line_h {
         article_h = snapped;
     }
     let divider_y = top + article_h;
@@ -3379,6 +3383,52 @@ mod tests {
             (rows - rows.floor()).abs() < 0.36 || rows < 1.,
             "article pane should end on a whole line, rows={rows}"
         );
+    }
+
+    #[test]
+    fn split_ratio_drag_lands_exactly_where_dropped() {
+        // 2026-11-13 用户二轮反馈：不设人为限制，拖到哪里算哪里。
+        // 两个吃高度的机制都要拆：①比例上限 0.78/0.9 → 0.97；②整行吸附的零头
+        // 反哺输入卡（薄区禁用）。断言：ratio 0.97 时输入卡 == 物理最小高
+        // （input_min = 卡头 24+16+一行，无吸附加成），且显著矮于 0.78；
+        // 极简/非极简同路径。
+        let (sess, model, mut cfg, _) = fixture();
+        cfg.display_mode = gale_core::config::DisplayMode::Split;
+        let (bw, fs, base_lh) = body_metrics(&sess, &cfg, 1280.);
+        let lh = line_height_for_anchor(&cfg, fs, base_lh, false);
+        let line_h = line_height_split(fs);
+        let (top, bottom) = body_region(&cfg, &model, 1280., 1400., false);
+        let span = bottom - top;
+        let input_min = (24. + 16. + line_h).min(span * 0.6);
+        cfg.split_ratio = 0.97;
+        let g97 = split_geom(&cfg, bw, fs, lh, 1280., top, bottom);
+        assert!(!g97.collapsed);
+        assert!(
+            (g97.input_h - input_min).abs() <= 0.5,
+            "thin-zone input must equal the physical one-line minimum \
+             (no snap inflation): got {} want {input_min}",
+            g97.input_h
+        );
+        assert!(g97.input_h >= line_h, "one typing line still fits");
+        assert!(g97.article_h >= lh, "article pane keeps at least one line");
+        cfg.split_ratio = 0.78;
+        let g78 = split_geom(&cfg, bw, fs, lh, 1280., top, bottom);
+        assert!(
+            g97.input_h < g78.input_h * 0.8,
+            "dragging to 0.97 must shrink well below the old 0.78 result: {} vs {}",
+            g97.input_h,
+            g78.input_h
+        );
+        // 极简模式同一几何路径：同样收敛到 input_min、不塌陷。
+        cfg.minimal = true;
+        cfg.split_ratio = 0.97;
+        let (top, bottom) = body_region(&cfg, &model, 1280., 1400., false);
+        let span = bottom - top;
+        let input_min = (24. + 16. + line_h).min(span * 0.6);
+        let g = split_geom(&cfg, bw, fs, lh, 1280., top, bottom);
+        assert!(!g.collapsed);
+        assert!((g.input_h - input_min).abs() <= 0.5);
+        assert!(g.input_h >= line_h);
     }
 
     #[test]

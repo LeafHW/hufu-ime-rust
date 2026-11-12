@@ -148,7 +148,8 @@ fn clamp_finite(value: String, fallback: f32, lo: f32, hi: f32) -> f32 {
 }
 fn split_ratio_clamped(value: f32) -> f32 {
     if value.is_finite() {
-        value.clamp(0.35, 0.78)
+        // 2026-11-13 用户拍板：不设人为限制，拖到哪里算哪里（0.15..=0.97）。
+        value.clamp(0.15, 0.97)
     } else {
         split_ratio_default()
     }
@@ -233,7 +234,7 @@ pub struct Config {
     /// 极简模式顶部静默数据条（速度/键准/进度）。关掉后极简只剩正文。
     #[serde(default = "yes")]
     pub minimal_hud: bool,
-    /// 对照模式中文章对照区高度占正文带的比例（其余给输入框）。拖动分栏把手改。
+    /// 对照模式中文章对照区高度占正文带的比例（其余给输入框）。拖动分栏把手改（0.15..=0.97，拖到哪里算哪里）。
     #[serde(default = "split_ratio_default")]
     pub split_ratio: f32,
     /// 窗口置顶（右键菜单/设置页可切换）。
@@ -998,7 +999,7 @@ mod tests {
         assert!((loaded.split_ratio - 0.7).abs() < 1e-6);
 
         let bad = Config::from_toml_text("split_ratio = 9\ndisplay_mode = \"weird\"").unwrap();
-        assert!((bad.split_ratio - 0.78).abs() < 1e-6);
+        assert!((bad.split_ratio - 0.97).abs() < 1e-6);
         assert_eq!(bad.display_mode, DisplayMode::Copybook);
         assert_eq!(
             Config::from_toml_text("split_ratio = NaN")

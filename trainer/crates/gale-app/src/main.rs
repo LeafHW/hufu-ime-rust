@@ -640,7 +640,7 @@ fn escape_action(
     }
 }
 
-/// 【对照模式 2026-11-12】拖动分栏把手：指针 y → 文章区占比（0.35..=0.78）。
+/// 【对照模式 2026-11-12】拖动分栏把手：指针 y → 文章区占比（0.15..=0.97）。
 /// 只在几何有效时改配置并请求重绘；松手后由主循环防抖落盘。
 fn drag_split_ratio(app: &mut App, pointer_y: f32) {
     let sc = gale_win::window::dpi_scale();
@@ -649,7 +649,8 @@ fn drag_split_ratio(app: &mut App, pointer_y: f32) {
     let single = app.sess.source == SessionSource::Single;
     let (top, bottom) = ui::body_region(&app.cfg, &app.model, lw, lh, single);
     let span = (bottom - top).max(80.);
-    let ratio = ((pointer_y - top) / span).clamp(0.35, 0.78);
+    // 2026-11-13 用户拍板：不设人为限制，拖到哪里算哪里（几何层 input_min 兜物理一行）。
+    let ratio = ((pointer_y - top) / span).clamp(0.15, 0.97);
     if (app.cfg.split_ratio - ratio).abs() > 0.001 {
         app.cfg.split_ratio = ratio;
         app.layout_save_due = Some(app.ms() + 350);
@@ -2245,7 +2246,7 @@ impl App {
             }
             ["pref_step", "split_ratio", delta] => {
                 if let Ok(delta) = delta.parse::<f32>() {
-                    self.cfg.split_ratio = (self.cfg.split_ratio + delta * 0.02).clamp(0.35, 0.78);
+                    self.cfg.split_ratio = (self.cfg.split_ratio + delta * 0.02).clamp(0.15, 0.97);
                 }
             }
             ["pref_step", "hint_font_size", delta] => {
@@ -4402,7 +4403,7 @@ impl App {
             }
             Action::StepSplit(delta) => {
                 self.cfg.split_ratio =
-                    (self.cfg.split_ratio + delta as f32 * 0.02).clamp(0.35, 0.78);
+                    (self.cfg.split_ratio + delta as f32 * 0.02).clamp(0.15, 0.97);
                 self.layout_save_due = Some(self.ms() + 600);
                 gale_win::window::request_frame();
             }
