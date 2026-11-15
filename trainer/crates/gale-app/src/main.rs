@@ -3010,6 +3010,15 @@ impl App {
                 self.cfg
                     .color_overrides
                     .insert((*key).into(), format!("{r:02x}{g:02x}{b:02x}"));
+                // 【用户反馈 2026-11-16】重启装配会做 ≥3.0:1 可读性保底；
+                // 选色时当场做同一套保底并落盘保底后的值，所见即所得，
+                // 不再出现"选完深红、重启变淡粉"的静默漂移。
+                if let Some(hex) = ui::harmonize_key_hex(&mut self.theme, &self.cfg.color_overrides, key)
+                {
+                    self.cfg.color_overrides.insert((*key).into(), hex.clone());
+                    self.toast(&format!("对比度过低，已调亮为 {hex} 并保存"));
+                }
+                self.save_config();
                 self.apply_style();
             }
             ["pref_score_preset", id] => {

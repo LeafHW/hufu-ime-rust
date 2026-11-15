@@ -805,6 +805,24 @@ pub fn harmonize(
     fixed
 }
 
+/// 【用户反馈 2026-11-16】选色与重启装配对称化：调色盘选完深色当场生效，
+/// 重启后却被 harmonize 抬亮——看起来像"颜色被改回去了"。
+/// 此包装对**单个**覆盖键当场做与重启装配完全相同的保底，被抬亮时返回
+/// 保底后的 hex（小写无 #），调用方写回 color_overrides 落盘，所见即所得。
+pub fn harmonize_key_hex(
+    t: &mut Theme,
+    overrides: &std::collections::BTreeMap<String, String>,
+    key: &str,
+) -> Option<String> {
+    let base = interface_bg(t);
+    let card = t.get("次级背景色");
+    if !lift_to_readable(t, overrides, key, 3.0, card, base) {
+        return None;
+    }
+    let c = t.get(key);
+    Some(format!("{:02x}{:02x}{:02x}", c.0, c.1, c.2))
+}
+
 fn lift_to_readable(
     t: &mut Theme,
     overrides: &std::collections::BTreeMap<String, String>,
@@ -5477,6 +5495,33 @@ mod tests {
         assert!(cr(t.get("未打文字色"), card) >= 3.0, "未打文字色在文章卡上不可读");
         assert!(cr(t.get("未打文字色"), field) >= 3.0, "未打文字色在输入卡上不可读");
         assert!(cr(t.get("词提2选色"), card) >= 3.0, "词提 2 选色不可读");
+    }
+
+    #[test]
+    fn harmonize_key_hex_matches_restart_lift_and_reports_it() {
+        // 复刻 2026-11-16 现场：灰砖 + 词提2选色=2d0000（对 #4a4a4a 卡面仅
+        // 2.13:1）。选色时当场做与重启装配同一套保底，返回的 hex 必须在双底
+        // 上 ≥3.0 且不等于原值；达标的 3 选 c8b07a 原样保留（None）。
+        let mut o = std::collections::BTreeMap::new();
+        o.insert("词提2选色".to_string(), "2d0000".to_string());
+        o.insert("词提3选色".to_string(), "c8b07a".to_string());
+        let mut t = theme("灰砖");
+        t.set("词提2选色", Color::from_hex_no_hash("2d0000").unwrap());
+        t.set("词提3选色", Color::from_hex_no_hash("c8b07a").unwrap());
+        let lifted = harmonize_key_hex(&mut t, &o, "词提2选色")
+            .expect("深红在灰砖上不可读，应被抬亮并返回新值");
+        assert_ne!(lifted, "2d0000");
+        let lc = Color::from_hex_no_hash(&lifted).unwrap();
+        let cr = gale_core::theme::contrast_ratio;
+        let card = t.get("次级背景色");
+        let field = interface_bg(&t);
+        assert!(cr(lc, card) >= 3.0, "抬亮后的色在文章卡上要可读");
+        assert!(cr(lc, field) >= 3.0, "抬亮后的色在输入卡上要可读");
+        assert_eq!(
+            harmonize_key_hex(&mut t, &o, "词提3选色"),
+            None,
+            "达标色不动"
+        );
     }
 
     #[test]
