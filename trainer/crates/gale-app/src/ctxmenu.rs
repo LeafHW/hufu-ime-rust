@@ -25,12 +25,13 @@ const T_LABEL: f32 = 14.;
 const T_NOTE: f32 = 12.;
 
 /// 内置主题的快捷色点（与 `ui::theme` 的 accent 同源；绘制时取真值）。
-const THEMES: [(&str, &str); 5] = [
+const THEMES: [(&str, &str); 6] = [
     ("default", "墨玉"),
     ("宣纸", "宣纸"),
     ("夜巡", "夜巡"),
     ("朱砂", "朱砂"),
     ("青瓷", "青瓷"),
+    ("灰砖", "灰砖"),
 ];
 
 fn theme_label(name: &str) -> &'static str {
@@ -128,14 +129,7 @@ pub fn draw(
 
     // ── 头部：标题 + Esc 提示 ─────────────────────────────────────────
     text(f, rect_x + 4., cursor + 2., T_TITLE, "视图", p.text);
-    right(
-        f,
-        x + MENU_W - 16.,
-        cursor + 4.,
-        11.,
-        "Esc 关闭",
-        p.muted,
-    );
+    right(f, x + MENU_W - 16., cursor + 4., 11., "Esc 关闭", p.muted);
     cursor += h_header + 4.;
 
     // ── 显示 ─────────────────────────────────────────────────────────
@@ -188,14 +182,7 @@ pub fn draw(
             None,
         );
     }
-    text(
-        f,
-        rect_x + 6.,
-        cursor + 6.,
-        T_LABEL,
-        "极简模式",
-        p.text,
-    );
+    text(f, rect_x + 6., cursor + 6., T_LABEL, "极简模式", p.text);
     if !compact {
         mono(
             f,
@@ -372,36 +359,55 @@ pub fn draw(
         &p,
     );
     cursor += h_chips;
-    let chip_w2 = (rect_w - 6.) / 2.;
+    // ── 数据条 / 置顶 / 键位热力图：三枚等宽 chip。
+    // 【热力图入口恢复 2026-11-14】Modal::Heatmap（实际按键热力图，整改12）
+    // 原入口在单段结算弹窗（f4750826），弹窗退役（248358de）后成死功能；
+    // 恢复到右键菜单行三，走既有 aux_marker("show_heatmap") 通道
+    // （无数据时 show_heatmap 会 toast 提示而非弹空图）。
+    let chip_w3 = (rect_w - 2. * 6.) / 3.;
     toggle_chip(
         f,
         hs,
         rect_x,
         cursor + 2.,
-        chip_w2,
+        chip_w3,
         h_chips - 4.,
         if cfg.minimal_hud {
-            "数据条 · 开"
+            "数据条 开"
         } else {
-            "数据条 · 关"
+            "数据条 关"
         },
         cfg.minimal_hud,
         Action::ToggleMinimalHud,
-        hovered(rect_x, cursor, chip_w2, h_chips),
+        hovered(rect_x, cursor, chip_w3, h_chips),
         !cfg.minimal,
         &p,
     );
     toggle_chip(
         f,
         hs,
-        rect_x + chip_w2 + 6.,
+        rect_x + chip_w3 + 6.,
         cursor + 2.,
-        chip_w2,
+        chip_w3,
         h_chips - 4.,
         "窗口置顶",
         cfg.always_on_top,
         Action::ToggleTopmost,
-        hovered(rect_x + chip_w2 + 6., cursor, chip_w2, h_chips),
+        hovered(rect_x + chip_w3 + 6., cursor, chip_w3, h_chips),
+        false,
+        &p,
+    );
+    toggle_chip(
+        f,
+        hs,
+        rect_x + 2. * (chip_w3 + 6.),
+        cursor + 2.,
+        chip_w3,
+        h_chips - 4.,
+        "键位热力图",
+        false,
+        crate::aux_marker("show_heatmap"),
+        hovered(rect_x + 2. * (chip_w3 + 6.), cursor, chip_w3, h_chips),
         false,
         &p,
     );
@@ -536,24 +542,10 @@ fn segment(
             p.muted,
         );
     }
-    hs.push(Hit {
-        x,
-        y,
-        w,
-        h,
-        action,
-    });
+    hs.push(Hit { x, y, w, h, action });
 }
 
-fn switch(
-    f: &mut Frame,
-    hs: &mut Vec<Hit>,
-    x: f32,
-    y: f32,
-    on: bool,
-    action: Action,
-    p: &Palette,
-) {
+fn switch(f: &mut Frame, hs: &mut Vec<Hit>, x: f32, y: f32, on: bool, action: Action, p: &Palette) {
     let (w, h) = (40., 22.);
     round(
         f,
@@ -576,13 +568,7 @@ fn switch(
         if on { p.bg } else { p.muted },
         None,
     );
-    hs.push(Hit {
-        x,
-        y,
-        w,
-        h,
-        action,
-    });
+    hs.push(Hit { x, y, w, h, action });
 }
 
 fn step_button(
@@ -602,10 +588,21 @@ fn step_button(
         28.,
         26.,
         7.,
-        if hot { alpha(p.accent, 0.16) } else { p.surface2 },
+        if hot {
+            alpha(p.accent, 0.16)
+        } else {
+            p.surface2
+        },
         Some(if hot { alpha(p.accent, 0.5) } else { p.line }),
     );
-    text_center(f, x + 14., y + 4., 15., label, if hot { p.accent } else { p.text2 });
+    text_center(
+        f,
+        x + 14.,
+        y + 4.,
+        15.,
+        label,
+        if hot { p.accent } else { p.text2 },
+    );
     hs.push(Hit {
         x,
         y,
@@ -651,7 +648,11 @@ fn round_dot_chip(
         w,
         h,
         7.,
-        if selected { alpha(p.accent, 0.10) } else { [0.; 4] },
+        if selected {
+            alpha(p.accent, 0.10)
+        } else {
+            [0.; 4]
+        },
         Some(stroke),
     );
 }
@@ -715,13 +716,7 @@ fn toggle_chip(
         },
     );
     f.push(DrawCmd::PopClip);
-    hs.push(Hit {
-        x,
-        y,
-        w,
-        h,
-        action,
-    });
+    hs.push(Hit { x, y, w, h, action });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -786,13 +781,7 @@ fn footer_button(
             p.muted,
         );
     }
-    hs.push(Hit {
-        x,
-        y,
-        w,
-        h,
-        action,
-    });
+    hs.push(Hit { x, y, w, h, action });
 }
 
 #[cfg(test)]
@@ -836,6 +825,8 @@ mod tests {
                 Action::ToggleLedger,
                 Action::ToggleMinimalHud,
                 Action::ToggleTopmost,
+                // 【热力图入口恢复 2026-11-14】右键菜单必须可达实际按键热力图。
+                crate::aux_marker("show_heatmap"),
                 Action::Open(Modal::Preferences),
                 Action::Open(Modal::More),
                 Action::Exit,

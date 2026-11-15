@@ -5,18 +5,11 @@
 //! deliberately never used as application data.
 use crate::{
     modals::{Action, FieldSpec, Hit, Modal, Model},
-    session::{Phase, Session},
+    session::Session,
     ui::*,
 };
-use gale_core::{
-    compare::{CharState, TimingEvent},
-    config::Config,
-    rules::TrainingMode,
-    score::{race_badge, ScoreRecord, VALID_MIN_CHARS},
-    theme::Theme,
-};
+use gale_core::{config::Config, theme::Theme};
 use gale_win::d2d::{DrawCmd, Frame};
-use std::collections::BTreeMap;
 
 type Ink = [f32; 4];
 
@@ -289,36 +282,37 @@ fn login_visible(m: &Model) -> bool {
     (!m.online_authenticated || m.online_expired) && m.online_login_expanded
 }
 
+const ONLINE_FORM_TOP: f32 = 124.;
+const ONLINE_FORM_ROW: f32 = 44.;
+const ONLINE_FORM_LABEL: f32 = 88.;
+const ONLINE_CHARS_Y: f32 = 230.;
+
 fn online_form(pw: f32) -> (f32, f32) {
-    let w = (pw - 180.).min(620.).max(220.);
+    let w = (pw - 40.).min(620.).max(220.);
     ((pw - w) / 2., w)
 }
 
 fn field_shell(f: &mut Frame, x: f32, y: f32, w: f32, label: &str, t: &Theme) {
     let p = tokens(t);
-    text(f, x, y - 21., 13., label, p.muted);
+    text(f, x, y - 21., 15., label, p.muted);
     round(f, x - 1., y - 1., w + 2., 40., 7., p.bg2, Some(p.line2));
 }
 
 pub(crate) fn content_height_online(m: &Model) -> f32 {
-    if !m.online_authenticated && !m.online_login_expanded {
-        340.
-    } else if login_visible(m) {
-        700.
+    if login_visible(m) {
+        if m.online_register_mode {
+            480.
+        } else {
+            420.
+        }
+    } else if m.online_authenticated && !m.online_expired {
+        440.
     } else {
-        680.
+        280.
     }
 }
 
-fn online_status_strip(
-    f: &mut Frame,
-    x: f32,
-    y: f32,
-    w: f32,
-    text_value: &str,
-    t: &Theme,
-    bad: bool,
-) {
+fn online_status_strip(f: &mut Frame, x: f32, y: f32, w: f32, value: &str, t: &Theme, bad: bool) {
     let p = tokens(t);
     let color = if bad { p.red } else { p.muted };
     round(
@@ -332,7 +326,22 @@ fn online_status_strip(
         Some(alpha(color, 0.28)),
     );
     rect(f, x, y + 7., 3., 20., color);
-    clipped_text(f, x + 12., y + 9., w - 20., 13., text_value, color);
+    clipped_text(f, x + 12., y + 8., w - 24., 15., value, color);
+}
+
+fn online_field(f: &mut Frame, x: f32, y: f32, w: f32, label: &str, t: &Theme) {
+    let p = tokens(t);
+    text(f, x, y + 10., 15., label, p.muted);
+    round(
+        f,
+        x + ONLINE_FORM_LABEL - 1.,
+        y - 1.,
+        w - ONLINE_FORM_LABEL + 2.,
+        40.,
+        7.,
+        p.bg2,
+        Some(p.line2),
+    );
 }
 
 fn draw_online(
@@ -356,120 +365,64 @@ fn draw_online(
         pw,
         "◎",
         "在线发文",
-        "选择文章后直接载入跟打区",
-        "F8",
+        "按分类、难度与字数取文",
+        // 【审计 I04】弹层快捷键跟用户配置，不再写死 F8。
+        &crate::modals::hint_key(cfg, Some("online"), "F8"),
     );
-    let ix = x + 24.;
-    let iw = pw - 48.;
+    let (fx, fw) = online_form(pw);
+    let ix = x + fx;
     let active = m.online_authenticated && !m.online_expired;
-    let login = login_visible(m);
-    // 账号条：头像 + 名称/服务 + 右侧动作；未登录且表单收起时不画，
-    // 避免和下方「未登录」提示卡重复。
-    if active || login || m.online_expired {
-    let ay = y + 78.;
-    card(f, ix, ay, iw, 54., t);
-    round(
-        f,
-        ix + 12.,
-        ay + 10.,
-        34.,
-        34.,
-        17.,
-        if active {
-            alpha(p.accent, 0.16)
-        } else {
-            p.bg2
-        },
-        Some(if active { alpha(p.accent, 0.35) } else { p.line }),
-    );
-    let initial = m
-        .online_account
-        .chars()
-        .next()
-        .map(|c| c.to_string())
-        .unwrap_or_else(|| if active { "已".into() } else { "?".into() });
-    text(
-        f,
-        ix + 22.,
-        ay + 17.,
-        16.,
-        initial,
-        if active { p.accent } else { p.muted },
-    );
-    let name = if m.online_account.is_empty() {
-        if active { "已登录" } else { "未登录" }
-    } else {
-        &m.online_account
-    };
-    clipped_text(f, ix + 58., ay + 9., iw - 300., 15., name, p.text);
-    let sub = if m.online_expired {
-        "登录已过期 · 当前文章已保留"
-    } else if active {
-        &cfg.wenlai_domain
-    } else {
-        "登录后可同步分类、按难度取文"
-    };
-    clipped_text(f, ix + 58., ay + 31., iw - 300., 12., sub, p.muted);
-    if m.online_expired {
-        let bw = 86.;
-        round(
-            f,
-            ix + iw - 140. - bw,
-            ay + 17.,
-            bw,
-            20.,
-            10.,
-            alpha(p.accent, 0.16),
-            Some(alpha(p.accent, 0.4)),
-        );
-        text(f, ix + iw - 140. - bw + 9., ay + 19., 11., "登录已过期", p.accent);
-    }
-    if active {
-        action(
+    if login_visible(m) {
+        for (i, (label, register)) in [("登录", false), ("注册账号", true)]
+            .into_iter()
+            .enumerate()
+        {
+            chip(
+                f,
+                hs,
+                ix + i as f32 * 124.,
+                y + 76.,
+                116.,
+                label,
+                m.online_register_mode == register,
+                if m.online_register_mode == register {
+                    Action::None
+                } else {
+                    crate::aux_marker("online_register")
+                },
+                t,
+            );
+        }
+        link(
             f,
             hs,
-            ix + iw - 128.,
-            ay + 11.,
-            116.,
-            "退出登录",
-            Action::OnlineLogout,
-            t,
-            false,
-        );
-    } else {
-        action(
-            f,
-            hs,
-            ix + iw - 128.,
-            ay + 11.,
-            116.,
-            if login { "收起账号" } else { "登录 / 注册" },
+            ix + fw - 92.,
+            y + 76.,
+            92.,
+            "收起账号",
             Action::OnlineAccount,
             t,
-            false,
         );
-    }
-    }
-    if login {
-        let (fx, fw) = online_form(pw);
-        let fx = x + fx;
-        text(
-            f,
-            fx,
-            y + 146.,
-            16.,
-            if m.online_register_mode {
-                "注册账号"
-            } else {
-                "登录"
-            },
-            p.text,
-        );
+        online_field(f, ix, y + ONLINE_FORM_TOP, fw, "用户名", t);
+        online_field(f, ix, y + ONLINE_FORM_TOP + ONLINE_FORM_ROW, fw, "密码", t);
         if m.online_register_mode {
-            field_shell(f, fx, y + 194., fw, "用户名", t);
-            field_shell(f, fx, y + 258., fw, "密码 · 不保存", t);
-            field_shell(f, fx, y + 322., fw, "邮箱", t);
-            field_shell(f, fx, y + 386., fw - 158., "邮箱验证码", t);
+            online_field(
+                f,
+                ix,
+                y + ONLINE_FORM_TOP + 2. * ONLINE_FORM_ROW,
+                fw,
+                "邮箱",
+                t,
+            );
+            online_field(
+                f,
+                ix,
+                y + ONLINE_FORM_TOP + 3. * ONLINE_FORM_ROW,
+                fw - 140.,
+                "验证码",
+                t,
+            );
+            let code_y = y + ONLINE_FORM_TOP + 3. * ONLINE_FORM_ROW;
             let label = if m.online_code_wait > 0 {
                 format!("重发 {} 秒", m.online_code_wait)
             } else {
@@ -478,9 +431,9 @@ fn draw_online(
             action(
                 f,
                 hs,
-                fx + fw - 148.,
-                y + 388.,
-                148.,
+                ix + fw - 130.,
+                code_y,
+                130.,
                 &label,
                 if m.online_code_wait > 0 {
                     Action::None
@@ -490,20 +443,21 @@ fn draw_online(
                 t,
                 false,
             );
-            text(
+            clipped_text(
                 f,
-                fx,
-                y + 436.,
-                13.,
-                "验证码 60 秒可获取一次；注册成功后自动登录。",
+                ix,
+                y + 304.,
+                fw,
+                15.,
+                "密码不保存；验证码每 60 秒可获取一次。",
                 p.muted,
             );
             action(
                 f,
                 hs,
-                fx,
-                y + 460.,
-                180.,
+                ix,
+                y + 330.,
+                160.,
                 "注册并登录",
                 crate::aux_marker("online_reg_submit"),
                 t,
@@ -512,79 +466,102 @@ fn draw_online(
             link(
                 f,
                 hs,
-                fx + 196.,
-                y + 460.,
+                ix + 176.,
+                y + 330.,
                 140.,
                 "‹ 返回登录",
                 crate::aux_marker("online_register"),
                 t,
             );
-            if !m.online_status.is_empty() {
-                let bad = ["失败", "错误", "频繁", "过期", "无效", "不"]
-                    .iter()
-                    .any(|word| m.online_status.contains(word));
-                online_status_strip(f, fx, y + 512., fw, &m.online_status, t, bad);
-            }
         } else {
-            field_shell(f, fx, y + 194., fw, "用户名", t);
-            field_shell(f, fx, y + 258., fw, "密码 · 不保存", t);
-            field_shell(f, fx, y + 322., fw, "服务地址 · HTTPS", t);
+            online_field(
+                f,
+                ix,
+                y + ONLINE_FORM_TOP + 2. * ONLINE_FORM_ROW,
+                fw,
+                "服务地址",
+                t,
+            );
             action(
                 f,
                 hs,
-                fx,
-                y + 374.,
-                160.,
+                ix,
+                y + 266.,
+                148.,
                 "登录",
                 Action::OnlineLogin,
                 t,
                 true,
             );
-            link(
+            clipped_text(
                 f,
-                hs,
-                fx + 180.,
-                y + 374.,
-                160.,
-                "没有账号？注册",
-                crate::aux_marker("online_register"),
-                t,
-            );
-            text(
-                f,
-                fx,
-                y + 422.,
-                13.,
-                "登录后自动收起账号表单；切换服务地址后需要重新登录。",
+                ix + 164.,
+                y + 276.,
+                fw - 164.,
+                15.,
+                "HTTPS · 密码不保存",
                 p.muted,
             );
-            if !m.online_status.is_empty() {
-                let bad = ["失败", "错误", "频繁", "过期", "无效", "不"]
-                    .iter()
-                    .any(|word| m.online_status.contains(word));
-                online_status_strip(f, fx, y + 466., fw, &m.online_status, t, bad);
-            }
+        }
+        if !m.online_status.is_empty() {
+            let bad = ["失败", "错误", "频繁", "过期", "无效", "不"]
+                .iter()
+                .any(|word| m.online_status.contains(word));
+            online_status_strip(
+                f,
+                ix,
+                y + if m.online_register_mode { 378. } else { 314. },
+                fw,
+                &m.online_status,
+                t,
+                bad,
+            );
         }
     } else if active {
-        // 取文页：分类 / 难度 / 字数 / 取文动作 / 当前文章。
-        let top = y + 148.;
-        text(f, ix, top, 16., "取文", p.text);
-        right(
+        // One compact account row; all article controls remain visible together.
+        card(f, ix, y + 74., fw, 46., t);
+        let name = if m.online_account.is_empty() {
+            "已登录"
+        } else {
+            &m.online_account
+        };
+        clipped_text(f, ix + 12., y + 81., fw - 144., 15., name, p.text);
+        clipped_text(
             f,
-            ix + iw,
-            top + 2.,
-            12.,
-            "取文后直接进入跟打区",
+            ix + 12.,
+            y + 101.,
+            fw - 144.,
+            15.,
+            &cfg.wenlai_domain,
             p.muted,
         );
-        text(f, ix, y + 182., 13., "分类", p.muted);
-        let cap = ((iw - 90.) / 132.).floor().max(1.) as usize;
+        action(
+            f,
+            hs,
+            ix + fw - 116.,
+            y + 79.,
+            104.,
+            "退出登录",
+            Action::OnlineLogout,
+            t,
+            false,
+        );
+        text(f, ix, y + 146., 15., "分类", p.muted);
+        let cx = ix + 48.;
+        let cw = fw - 48.;
+        let more_w = if m.online_categories.len() > 4 {
+            70.
+        } else {
+            0.
+        };
+        let cap = ((cw - more_w + 8.) / 88.).floor().max(1.) as usize;
         let selected = m
             .online_category
             .min(m.online_categories.len().saturating_sub(1));
         let start = selected.saturating_add(1).saturating_sub(cap);
         let visible = m.online_categories.len().min(cap);
-        let bw = ((iw - 90.) / visible.max(1) as f32 - 8.).min(140.);
+        let bw = ((cw - more_w - 8. * visible.saturating_sub(1) as f32) / visible.max(1) as f32)
+            .min(140.);
         for (j, (idx, (_, name))) in m
             .online_categories
             .iter()
@@ -596,37 +573,40 @@ fn draw_online(
             chip(
                 f,
                 hs,
-                ix + j as f32 * (bw + 8.),
-                y + 200.,
+                cx + j as f32 * (bw + 8.),
+                y + 136.,
                 bw,
-                &elide(name, (bw / 14.).floor().max(1.) as usize),
+                &elide_width(name, bw - 14., 15.),
                 idx == m.online_category,
                 Action::OnlineCategory(idx),
                 t,
             );
         }
         if m.online_categories.is_empty() {
-            text(f, ix, y + 210., 13., "分类加载中…", p.muted);
+            text(f, cx, y + 146., 15., "分类加载中…", p.muted);
         } else if m.online_categories.len() > cap {
             link(
                 f,
                 hs,
-                ix + iw - 74.,
-                y + 200.,
-                74.,
+                ix + fw - 66.,
+                y + 136.,
+                66.,
                 "更多 ›",
                 Action::OnlineCategory((selected + 1) % m.online_categories.len()),
                 t,
             );
         }
-        text(f, ix, y + 252., 13., "难度", p.muted);
-        let dw = ((iw - 40.) / 6. - 8.).min(120.);
-        for (i, name) in ["淼", "水", "易", "普", "难", "虐"].into_iter().enumerate() {
+        text(f, ix, y + 190., 15., "难度", p.muted);
+        let dw = (cw - 6. * 6.) / 7.;
+        for (i, name) in ["淼", "水", "易", "普", "难", "虐", "随机"]
+            .into_iter()
+            .enumerate()
+        {
             chip(
                 f,
                 hs,
-                ix + i as f32 * (dw + 8.),
-                y + 270.,
+                cx + i as f32 * (dw + 6.),
+                y + 180.,
                 dw,
                 name,
                 m.online_difficulty == i,
@@ -634,29 +614,52 @@ fn draw_online(
                 t,
             );
         }
-        text(f, ix, y + 322., 13., "取文字数", p.muted);
-        round(f, ix - 1., y + 342., 112., 40., 7., p.bg2, Some(p.line2));
+        text(f, ix, y + ONLINE_CHARS_Y + 10., 15., "字数", p.muted);
+        round(
+            f,
+            cx - 1.,
+            y + ONLINE_CHARS_Y - 1.,
+            94.,
+            40.,
+            7.,
+            p.bg2,
+            Some(p.line2),
+        );
         toggle(
             f,
             hs,
-            ix + 136.,
-            y + 354.,
+            cx + 108.,
+            y + ONLINE_CHARS_Y + 11.,
             m.online_strict,
             Action::OnlineStrict,
             t,
         );
-        text(f, ix + 172., y + 352., 13., "精确字数", p.muted);
+        text(
+            f,
+            cx + 144.,
+            y + ONLINE_CHARS_Y + 10.,
+            15.,
+            "精确字数",
+            p.muted,
+        );
         toggle(
             f,
             hs,
-            ix + 286.,
-            y + 354.,
+            cx + 250.,
+            y + ONLINE_CHARS_Y + 11.,
             m.field("online_auto_next") != "false",
             crate::aux_marker("online_auto_next"),
             t,
         );
-        text(f, ix + 322., y + 352., 13., "自动下一段", p.muted);
-        let aw = ((iw - 24.) / 3.).min(180.);
+        text(
+            f,
+            cx + 286.,
+            y + ONLINE_CHARS_Y + 10.,
+            15.,
+            "自动换文",
+            p.muted,
+        );
+        let aw = (fw - 16.) / 3.;
         for (i, (name, dir)) in [("上一段", -1), ("随机取文", 0), ("下一段", 1)]
             .into_iter()
             .enumerate()
@@ -664,8 +667,8 @@ fn draw_online(
             action(
                 f,
                 hs,
-                ix + i as f32 * (aw + 12.),
-                y + 396.,
+                ix + i as f32 * (aw + 8.),
+                y + 284.,
                 aw,
                 name,
                 Action::OnlineFetch(dir),
@@ -673,45 +676,49 @@ fn draw_online(
                 dir == 0,
             );
         }
-        let status_text = if m.online_busy {
+        let status = if m.online_busy {
             "正在取文，当前文章已保留…"
         } else if !m.online_status.is_empty() {
             &m.online_status
         } else {
-            "按「随机取文」开始；已登录身份会用于同步分类与书架。"
+            "取文后直接载入；上 / 下一段也随机换文。"
         };
-        let bad = m.online_status.contains("失败")
-            || m.online_status.contains("过期")
-            || m.online_status.contains("错误")
-            || m.online_status.contains("频繁");
-        round(f, ix + 4., y + 470., 4., 4., 2., if bad { p.red } else { p.muted }, None);
-        clipped_text(
-            f,
-            ix + 14.,
-            y + 464.,
-            iw - 20.,
-            13.,
-            status_text,
-            if bad { p.red } else { p.muted },
-        );
+        let bad = ["失败", "过期", "错误", "频繁"]
+            .iter()
+            .any(|word| status.contains(word));
+        online_status_strip(f, ix, y + 332., fw, status, t, bad);
     } else {
-        // 未登录且表单收起：一屏一处说明 + 登录入口，不再重复账号条。
-        let cy = y + 104.;
-        card(f, ix, cy, iw, 150., t);
-        text(f, ix + 22., cy + 20., 18., "登录后在线取文", p.text);
+        card(f, ix, y + 78., fw, 126., t);
         text(
             f,
-            ix + 22.,
-            cy + 52.,
-            13.,
-            "登录后可同步分类、按难度取文；令牌只保存在本机，不保存密码。",
+            ix + 16.,
+            y + 92.,
+            18.,
+            if m.online_expired {
+                "登录已过期"
+            } else {
+                "登录后在线取文"
+            },
+            p.text,
+        );
+        clipped_text(
+            f,
+            ix + 16.,
+            y + 122.,
+            fw - 32.,
+            15.,
+            if m.online_expired {
+                "当前文章已保留，重新登录即可继续。"
+            } else {
+                "选择分类、难度和字数，取文后直接跟打。"
+            },
             p.muted,
         );
         action(
             f,
             hs,
-            ix + 22.,
-            cy + 86.,
+            ix + 16.,
+            y + 154.,
             168.,
             "登录 / 注册",
             Action::OnlineAccount,
@@ -720,19 +727,20 @@ fn draw_online(
         );
     }
     line(f, x + 16., y + ph - 62., pw - 32., p.line);
-    text(
+    clipped_text(
         f,
         ix,
         y + ph - 39.,
-        13.,
-        "取文后直接进入跟打区 · 登录不保存密码",
+        fw - 132.,
+        15.,
+        "取文后直接跟打",
         p.muted,
     );
     action(
         f,
         hs,
-        x + pw - 136.,
-        y + ph - 52.,
+        x + pw - 132.,
+        y + ph - 50.,
         112.,
         "返回跟打",
         Action::Close,
@@ -742,13 +750,32 @@ fn draw_online(
 }
 
 fn rules_side(pw: f32) -> f32 {
-    (pw * 0.27).clamp(210., 280.)
+    (pw * 0.24).clamp(176., 220.)
+}
+
+fn rules_options_extra(pw: f32) -> f32 {
+    if pw - rules_side(pw) - 32. >= 540. {
+        0.
+    } else {
+        44.
+    }
+}
+
+pub(crate) fn content_height_rules(pw: f32) -> f32 {
+    620. + rules_options_extra(pw)
 }
 
 fn rules_geometry(pw: f32, _ph: f32) -> (f32, f32, f32, f32, f32, f32) {
     let side = rules_side(pw);
     let rw = pw - side - 32.;
-    (side, rw, 16., 452., 274., (rw - 44.) / 2.)
+    (
+        side,
+        rw,
+        16.,
+        326. + rules_options_extra(pw),
+        166.,
+        (rw - 44.) / 2.,
+    )
 }
 fn result_paragraph(
     f: &mut Frame,
@@ -830,6 +857,10 @@ fn draw_rules(
         "保留原文；预览确认后再应用",
         "F9",
     );
+    // Narrow layouts add an option row beyond the fixed panel's body. Keep
+    // every body command in one section so fit_panel scrolls the quote controls
+    // with the content instead of mistaking them for the fixed footer.
+    clip(f, x + 1., y + 62., pw - 2., content_height_rules(pw) - 124.);
     let (side, rw, _, test_y, test_h, cw) = rules_geometry(pw, ph);
     text(
         f,
@@ -842,15 +873,17 @@ fn draw_rules(
     link(
         f,
         hs,
-        x + side - 90.,
+        x + side - 58.,
         y + 76.,
-        76.,
-        "恢复内置",
+        44.,
+        "重置",
         Action::RuleReset,
         t,
     );
     let offset = (m.scroll as usize).min(m.rules.len().saturating_sub(1));
     let list_rows = 8;
+    // 【紧凑 2026-11-14】行高 62→48：8 行列表从 496 收到 384，
+    // 仍保留 toggle + 名称 + 类型两行文字的可读密度。
     for (j, (idx, (name, on, content, _, _))) in m
         .rules
         .iter()
@@ -859,26 +892,26 @@ fn draw_rules(
         .take(list_rows)
         .enumerate()
     {
-        let yy = y + 126. + j as f32 * 62.;
+        let yy = y + 106. + j as f32 * 44.;
         if idx == m.rule_selected {
             round(
                 f,
                 x + 10.,
-                yy - 5.,
+                yy - 4.,
                 side - 20.,
-                54.,
+                44.,
                 6.,
                 p.surface2,
                 Some(p.line),
             );
         }
-        toggle(f, hs, x + 18., yy + 15., *on, Action::RuleToggle(idx), t);
-        clipped_text(f, x + 58., yy + 5., side - 72., 14., name, p.text2);
+        toggle(f, hs, x + 18., yy + 10., *on, Action::RuleToggle(idx), t);
+        clipped_text(f, x + 58., yy + 2., side - 72., 14., name, p.text2);
         text(
             f,
             x + 58.,
-            yy + 29.,
-            14.,
+            yy + 24.,
+            12.,
             if *content {
                 "内容级"
             } else if cfg
@@ -897,11 +930,11 @@ fn draw_rules(
             x: x + 54.,
             y: yy - 4.,
             w: side - 66.,
-            h: 54.,
+            h: 44.,
             action: Action::RuleSelect(idx),
         });
     }
-    let add_y = y + 126. + list_rows.min(m.rules.len().saturating_sub(offset)) as f32 * 62.;
+    let add_y = y + 106. + list_rows.min(m.rules.len().saturating_sub(offset)) as f32 * 44.;
     action(
         f,
         hs,
@@ -926,7 +959,7 @@ fn draw_rules(
             f,
             hs,
             x + 12. + i as f32 * (bw + 8.),
-            y + 690.,
+            y + 510.,
             bw,
             label,
             false,
@@ -934,39 +967,41 @@ fn draw_rules(
             t,
         );
     }
-    paragraph(
-        f,
-        x + 16.,
-        y + 748.,
-        side - 32.,
-        78.,
-        14.,
-        24.,
-        "从上到下执行，关闭的规则跳过。\n可预览清洗结果，确认后应用。",
-        p.muted,
-    );
     let rx = x + side + 16.;
-    card(f, rx, y + 82., rw, 354., t);
-    text(f, rx + 16., y + 96., 18., "规则编辑", p.text2);
-    for (yy, label) in [(148., "名称"), (216., "正则表达式"), (284., "替换文本")] {
-        field_shell(f, rx + 16., y + yy, rw - 32., label, t);
+    let extra = rules_options_extra(pw);
+    card(f, rx, y + 74., rw, 244. + extra, t);
+    text(f, rx + 16., y + 88., 18., "规则编辑", p.text2);
+    for (yy, label) in [(124., "名称"), (168., "正则表达式"), (212., "替换文本")] {
+        text(f, rx + 16., y + yy + 10., 15., label, p.muted);
+        round(
+            f,
+            rx + 104. - 1.,
+            y + yy - 1.,
+            rw - 120. + 2.,
+            38.,
+            7.,
+            p.bg2,
+            Some(p.line2),
+        );
     }
     clipped_text(
         f,
         rx + 16.,
-        y + 328.,
+        y + 256.,
         rw - 32.,
-        14.,
-        "捕获组替换用 $1；不支持反向引用与环视。",
+        15.,
+        "捕获组用 $1；不支持反向引用与环视。",
         p.muted,
     );
-    text(f, rx + 16., y + 360., 14., "范围", p.muted);
+    let scope_y = y + 278.;
+    let scope_chip = ((rw - 80.) / 2.).min(102.);
+    text(f, rx + 16., scope_y + 10., 15., "范围", p.muted);
     chip(
         f,
         hs,
         rx + 58.,
-        y + 354.,
-        92.,
+        scope_y,
+        scope_chip,
         "仅本次",
         !m.rule_save_preset,
         if m.rule_save_preset {
@@ -979,9 +1014,9 @@ fn draw_rules(
     chip(
         f,
         hs,
-        rx + 158.,
-        y + 354.,
-        106.,
+        rx + 66. + scope_chip,
+        scope_y,
+        scope_chip,
         "保存预设",
         m.rule_save_preset,
         if m.rule_save_preset {
@@ -996,12 +1031,18 @@ fn draw_rules(
         .rules
         .get(m.rule_selected)
         .is_some_and(|r| r.safe);
-    text(f, rx + 16., y + 402., 14., "级别", p.muted);
+    let hx = if extra > 0. {
+        rx + 16.
+    } else {
+        rx + 16. + (rw - 32.) / 2. + 8.
+    };
+    let level_y = scope_y + extra;
+    text(f, hx, level_y + 10., 15., "级别", p.muted);
     chip(
         f,
         hs,
-        rx + 58.,
-        y + 396.,
+        hx + 42.,
+        level_y,
         70.,
         "安全",
         safe,
@@ -1015,8 +1056,8 @@ fn draw_rules(
     chip(
         f,
         hs,
-        rx + 136.,
-        y + 396.,
+        hx + 120.,
+        level_y,
         82.,
         "内容级",
         !safe,
@@ -1027,11 +1068,13 @@ fn draw_rules(
         },
         t,
     );
+    // 【审计 I06】规则保存的结果在这里留成状态行。
+    crate::modals::save_status_line(f, rx + rw - 288., y + 90., 150., &m.save, t);
     action(
         f,
         hs,
         rx + rw - 122.,
-        y + 88.,
+        y + 80.,
         106.,
         "保存规则",
         Action::RuleSave,
@@ -1064,20 +1107,20 @@ fn draw_rules(
         Action::RuleTest,
         t,
     );
-    let col_y = ty + 66.;
-    let col_h = test_h - 96.;
+    let col_y = ty + 50.;
+    let col_h = test_h - 78.;
     round(f, rx + 12., col_y, cw, col_h, 6., p.bg2, Some(p.line));
     round(f, rx + 32. + cw, col_y, cw, col_h, 6., p.bg2, Some(p.line));
-    text(f, rx + 20., col_y + 12., 14., "原文 · 可编辑", p.muted);
-    text(f, rx + 40. + cw, col_y + 12., 14., "替换后", p.muted);
+    text(f, rx + 20., col_y + 10., 14., "原文 · 可编辑", p.muted);
+    text(f, rx + 40. + cw, col_y + 10., 14., "替换后", p.muted);
     let available = !m.rule_test_source.is_empty() || !m.rule_preview.is_empty() || m.rule_hits > 0;
     if !m.rule_error.is_empty() {
         paragraph(
             f,
             rx + 40. + cw,
-            col_y + 44.,
+            col_y + 30.,
             cw - 16.,
-            col_h - 52.,
+            col_h - 38.,
             14.,
             24.,
             &m.rule_error,
@@ -1087,9 +1130,9 @@ fn draw_rules(
         paragraph(
             f,
             rx + 40. + cw,
-            col_y + 44.,
+            col_y + 30.,
             cw - 16.,
-            col_h - 52.,
+            col_h - 38.,
             14.,
             24.,
             "点击「预览整组」查看替换结果。",
@@ -1099,9 +1142,9 @@ fn draw_rules(
         paragraph(
             f,
             rx + 40. + cw,
-            col_y + 44.,
+            col_y + 30.,
             cw - 16.,
-            col_h - 52.,
+            col_h - 38.,
             14.,
             24.,
             "替换后为空文本。",
@@ -1111,9 +1154,9 @@ fn draw_rules(
         result_paragraph(
             f,
             rx + 40. + cw,
-            col_y + 44.,
+            col_y + 30.,
             cw - 16.,
-            col_h - 52.,
+            col_h - 38.,
             &m.rule_test_source,
             &m.rule_preview,
             t,
@@ -1132,14 +1175,15 @@ fn draw_rules(
         },
         p.muted,
     );
-    let qy = y + 738.;
-    card(f, rx, qy, rw, 86., t);
-    text(f, rx + 16., qy + 12., 18., "引号宽松比对", p.text2);
+    // 【紧凑 2026-11-14】引号卡 86→54：标题行与三组开关同行。
+    let qy = y + 500. + extra;
+    card(f, rx, qy, rw, 54., t);
+    text(f, rx + 16., qy + 7., 18., "引号宽松比对", p.text2);
     toggle(
         f,
         hs,
         rx + rw - 48.,
-        qy + 17.,
+        qy + 12.,
         m.quote_relaxed,
         Action::QuoteToggle,
         t,
@@ -1158,13 +1202,14 @@ fn draw_rules(
             f,
             hs,
             xx,
-            qy + 56.,
+            qy + 30.,
             on && m.quote_relaxed,
             Action::QuoteClass(i as u8),
             t,
         );
-        text(f, xx + 34., qy + 56., 14., label, p.muted);
+        text(f, xx + 34., qy + 30., 15., label, p.muted);
     }
+    end_clip(f);
     line(f, x + 16., y + ph - 62., pw - 32., p.line);
     let buttons = [
         ("还原原文", Action::RuleRestore, false),
@@ -1206,35 +1251,85 @@ pub fn fields(m: &Model, x: f32, y: f32, pw: f32, ph: f32) -> Vec<FieldSpec> {
     match m.modal {
         Modal::Online if login_visible(m) => {
             let (fx, fw) = online_form(pw);
-            let fx = x + fx;
-            add("username", fx, y + 196., fw, 38., false, false);
-            add("password", fx, y + 260., fw, 38., false, true);
+            let fx = x + fx + ONLINE_FORM_LABEL;
+            let input_w = fw - ONLINE_FORM_LABEL;
+            add(
+                "username",
+                fx,
+                y + ONLINE_FORM_TOP,
+                input_w,
+                38.,
+                false,
+                false,
+            );
+            add(
+                "password",
+                fx,
+                y + ONLINE_FORM_TOP + ONLINE_FORM_ROW,
+                input_w,
+                38.,
+                false,
+                true,
+            );
             if m.online_register_mode {
-                add("reg_email", fx, y + 324., fw, 38., false, false);
-                add("reg_code", fx, y + 388., fw - 158., 38., false, false);
+                add(
+                    "reg_email",
+                    fx,
+                    y + ONLINE_FORM_TOP + 2. * ONLINE_FORM_ROW,
+                    input_w,
+                    38.,
+                    false,
+                    false,
+                );
+                add(
+                    "reg_code",
+                    fx,
+                    y + ONLINE_FORM_TOP + 3. * ONLINE_FORM_ROW,
+                    input_w - 140.,
+                    38.,
+                    false,
+                    false,
+                );
             } else {
-                add("server", fx, y + 324., fw, 38., false, false);
+                add(
+                    "server",
+                    fx,
+                    y + ONLINE_FORM_TOP + 2. * ONLINE_FORM_ROW,
+                    input_w,
+                    38.,
+                    false,
+                    false,
+                );
             }
         }
         Modal::Online if m.online_authenticated && !m.online_expired => {
-            add("online_chars", x + 24., y + 344., 108., 36., false, false);
+            let (fx, _) = online_form(pw);
+            add(
+                "online_chars",
+                x + fx + 48.,
+                y + ONLINE_CHARS_Y,
+                92.,
+                36.,
+                false,
+                false,
+            );
         }
         Modal::Rules => {
             let (side, rw, _, test_y, test_h, cw) = rules_geometry(pw, ph);
             let rx = x + side + 16.;
             for (id, yy) in [
-                ("rule_name", 148.),
-                ("rule_pattern", 216.),
-                ("rule_replacement", 284.),
+                ("rule_name", 124.),
+                ("rule_pattern", 168.),
+                ("rule_replacement", 212.),
             ] {
-                add(id, rx + 16., y + yy, rw - 32., 36., false, false);
+                add(id, rx + 104., y + yy, rw - 120., 36., false, false);
             }
             add(
                 "rule_test",
                 rx + 20.,
-                y + test_y + 110.,
+                y + test_y + 94.,
                 cw - 16.,
-                test_h - 148.,
+                test_h - 128.,
                 true,
                 false,
             );
@@ -1265,6 +1360,91 @@ pub fn draw(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn overlaps(a: (f32, f32, f32, f32), b: (f32, f32, f32, f32)) -> bool {
+        a.0 < b.0 + b.2 && a.0 + a.2 > b.0 && a.1 < b.1 + b.3 && a.1 + a.3 > b.1
+    }
+
+    #[test]
+    fn compact_online_editors_and_buttons_never_cover_each_other() {
+        let cfg = Config::default();
+        let theme = crate::ui::theme("墨玉");
+        for pw in [528., 560., 608., 880.] {
+            for state in 0..4 {
+                let mut m = Model::default();
+                m.modal = Modal::Online;
+                m.online_login_expanded = state == 1 || state == 2;
+                m.online_register_mode = state == 2;
+                m.online_authenticated = state == 3;
+                m.online_categories = ["古文", "诗词", "现代", "全部", "长分类名称"]
+                    .into_iter()
+                    .map(|s| (s.into(), s.into()))
+                    .collect();
+                let ph = content_height_online(&m);
+                let mut f = Frame::new(pw, ph);
+                let mut hs = Vec::new();
+                draw_online(&mut f, &mut hs, &m, &cfg, &theme, 0., 0., pw, ph);
+                for field in fields(&m, 0., 0., pw, ph) {
+                    assert!(field.x >= 20. && field.x + field.w <= pw - 20.);
+                    assert!(field.y >= 62. && field.y + field.h <= ph - 62.);
+                    for hit in &hs {
+                        assert!(
+                            !overlaps(
+                                (field.x, field.y, field.w, field.h),
+                                (hit.x, hit.y, hit.w, hit.h)
+                            ),
+                            "state={state} pw={pw}: field {} covers {:?}",
+                            field.id,
+                            hit.action
+                        );
+                    }
+                }
+                for hit in hs.iter().filter(|h| h.action != Action::Close) {
+                    assert!(
+                        hit.x >= 0. && hit.x + hit.w <= pw && hit.y + hit.h <= ph - 62.,
+                        "state={state} pw={pw}: {:?} outside body",
+                        hit.action
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn compact_cleaning_editors_and_actions_remain_inside_the_content() {
+        let cfg = Config::default();
+        let theme = crate::ui::theme("墨玉");
+        let mut m = Model::default();
+        m.modal = Modal::Rules;
+        for pw in [608., 720., 840., 1040.] {
+            let ph = content_height_rules(pw);
+            let mut f = Frame::new(pw, ph);
+            let mut hs = Vec::new();
+            draw_rules(&mut f, &mut hs, &m, &cfg, &theme, 0., 0., pw, ph);
+            for field in fields(&m, 0., 0., pw, ph) {
+                assert!(field.x >= 12. && field.x + field.w <= pw - 12.);
+                assert!(field.y >= 62. && field.y + field.h <= ph - 62.);
+                for hit in &hs {
+                    assert!(
+                        !overlaps(
+                            (field.x, field.y, field.w, field.h),
+                            (hit.x, hit.y, hit.w, hit.h)
+                        ),
+                        "pw={pw}: field {} covers {:?}",
+                        field.id,
+                        hit.action
+                    );
+                }
+            }
+            for hit in &hs {
+                assert!(
+                    hit.x >= 0. && hit.x + hit.w <= pw && hit.y + hit.h <= ph,
+                    "pw={pw}: {:?} outside panel",
+                    hit.action
+                );
+            }
+        }
+    }
+
     #[test]
     fn cleaning_fields_fit_both_comparison_columns() {
         for pw in [640., 880., 1040.] {
@@ -1275,7 +1455,8 @@ mod tests {
             let (side, rw, _, _, _, cw) = rules_geometry(pw, 900.);
             assert!(raw.x >= side && raw.x + raw.w <= side + 16. + 12. + cw);
             assert!(raw.w > 100. && rw > raw.w * 2.);
-            assert!(raw.y + raw.h < 726.);
+            // 【紧凑 2026-11-14】整页收到 680 高：测试输入框必须止步于引号卡上方。
+            assert!(raw.y + raw.h < 554.);
             assert!(fs.iter().all(|field| field.w > 100. && field.h >= 34.));
         }
     }
@@ -1377,8 +1558,8 @@ mod tests {
             let mut hs = Vec::new();
             draw_rules(&mut f, &mut hs, &m, &cfg, &t, 0., 0., 1040., 900.);
             let rx = rules_side(1040.) + 16.;
-            let local = crate::modals::hit(&hs, rx + 80., 372.);
-            let saved = crate::modals::hit(&hs, rx + 200., 372.);
+            let local = crate::modals::hit(&hs, rx + 80., 296.);
+            let saved = crate::modals::hit(&hs, rx + 200., 296.);
             assert_eq!(
                 local,
                 if persistent {

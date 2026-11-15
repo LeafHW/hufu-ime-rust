@@ -14,12 +14,28 @@
 
 use windows::core::Interface;
 use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
+    CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
 };
 use windows::Win32::UI::Accessibility::{
     CUIAutomation, IUIAutomation, IUIAutomation2, IUIAutomationCondition, IUIAutomationElement,
     TreeScope_Descendants, UIA_ControlTypePropertyId, UIA_TextControlTypeId,
 };
+
+struct ThreadUia {
+    client: Option<IUIAutomation>,
+    initialized: bool,
+}
+
+impl Drop for ThreadUia {
+    fn drop(&mut self) {
+        // Release the apartment-bound interface before balancing our own COM
+        // initialization (S_FALSE also increments the initialization count).
+        self.client.take();
+        if self.initialized {
+            unsafe { CoUninitialize() };
+        }
+    }
+}
 
 /// UIA 实例按线程各持一份（thread_local）：
 /// - 主循环线程：OleInitialize(STA) 已就位，CoInitializeEx(STA) 返回
@@ -32,10 +48,10 @@ use windows::Win32::UI::Accessibility::{
 ///   已先初始化。thread_local 让每线程走自己的套间，干净且无锁。
 fn uia() -> Option<IUIAutomation> {
     thread_local! {
-        static UIA: Option<IUIAutomation> = unsafe {
+        static UIA: ThreadUia = unsafe {
             // Err（含 RPC_E_CHANGED_MODE：线程已是别的套间模型）不致命——
             // COM 已初始化的线程照样能创建组件
-            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            let initialized = CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok();
             let value: Option<IUIAutomation> = CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER).ok();
             if let Some(u) = &value {
                 if let Ok(u2) = u.cast::<IUIAutomation2>() {
@@ -43,10 +59,10 @@ fn uia() -> Option<IUIAutomation> {
                     let _ = u2.SetTransactionTimeout(1500);
                 }
             }
-            value
+            ThreadUia { client: value, initialized }
         };
     }
-    UIA.with(|u| u.clone())
+    UIA.with(|u| u.client.clone())
 }
 
 /// QQ 主面板（HWND）的 UIA 根元素。

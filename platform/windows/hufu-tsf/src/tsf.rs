@@ -8855,39 +8855,146 @@ pub(crate) fn update_ui(shared: SharedRef, commit: String, state: serde_json::Va
         // 一切矩形归一成 0 高点，活插入符整链失效=Excel/WPS 表格首键
         // 错位的根因之一），现语义回归二十九修原意：点矩形让位查询锚、
         // 真插入符优先。
-        let live_caret = gui_caret_fallback().filter(|r| r.bottom - r.top > 2);
-        let caret = preview_anchor
-            .as_ref()
-            .and_then(|a| {
-                let x = a.get("x").and_then(|v| v.as_i64())? as i32;
-                let y = a.get("y").and_then(|v| v.as_i64())? as i32;
-                Some(RECT {
-                    left: x,
-                    top: y,
-                    right: x,
-                    bottom: y,
-                })
-            })
-            .or_else(|| {
-                // 【五十修→七十二修·光标单源】五十修曾禁虎魄走系统插
-                // 入符（当时锚=selection 行底，插入符行内，切换=「往上
-                // 面移」）。七十二修定稿：虎魄锚恒=GUITHREADINFO 插入符
-                //（光标跟随），first_show 与段内同源无切换。
-                // 【二十九修 2026-09-18】gui 插入符退化挡路修复：焦点
-                // 切换后首键 GUITHREADINFO 常给点矩形（右=左+2、上下
-                // 相等，无行高语义，AB 探针+trace 实锤 (111,436,113,
-                // 436)）——它 Some() 挡住 g.caret（GetTextExt 整行框）
-                // →首显锚错位→~140ms 后真锚到达再滑正=「切窗首键动
-                // 效卡」多版本根因。点矩形视为无值让位查询锚；有效
-                // 插入符（WPS/Qt 真光标线）行为不变仍优先。
-                if first_show_of_seg {
-                    live_caret.or(g.caret)
+        let trainer_host = host_is_trainer();
+        // 【七十六修 2026-11-14·训练器锚护栏】查询前把线程锁进物理坐标上下文，
+        // 免得 unaware 帧把 2×2 宿主读成虚拟化坐标（详细机理见 PhysDpiGuard）。
+        let _phys_guard = if trainer_host {
+            if trace_on() {
+                trace(&format!("qc: TRAINER 锚护栏 ctx={} → pmv2", dpi_ctx_tag()));
+            }
+            Some(PhysDpiGuard::new())
+        } else {
+            None
+        };
+        // 【七十四修 2026-11-14·训练器 2px 插入符放行】训练器的隐藏
+        // 2×2 宿主没有 RichEdit 行盒，GUITHREADINFO 给出的插入符通常
+        // 只有 2px 高；旧 filter 把它当退化点矩形丢掉，训练器实际
+        // 一直回落到 GetTextExt 的 3px 锚（归一成 8px 行高）。125%
+        // 下该锚与真实行盒不同坐标空间，候选因此被稳定锁放大成跳。
+        // 训练器宿主改用 2px 活插入符（物理屏幕坐标），其它宿主保持
+        // “点矩形让位查询锚”的原语义。
+        let live_caret = gui_caret_fallback().filter(|r| r.bottom - r.top > 2 || trainer_host);
+        // 【七十五修 2026-11-14·训练器锚=隐藏宿主窗】
+        // 125% 实测候选在 y≈250 与 y≈318 两处交替（差一行），比例约
+        // 1/1.25：一帧是逻辑锚、一帧是物理锚。训练器的隐藏 IME 宿主
+        // 本身就是 2×2 窗口，且每帧被主程序放到 caret_target 上——
+        // 直接取「焦点子窗的屏幕矩形」即可得到唯一、物理、无插值的
+        // 锚，彻底绕开 GUITHREADINFO/GetTextExt 两源。100% 下等价。
+        let trainer_focus = if trainer_host {
+            unsafe {
+                let mut gi = GUITHREADINFO {
+                    cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+                    ..Default::default()
+                };
+                if GetGUIThreadInfo(0, &mut gi).is_ok() && !gi.hwndFocus.0.is_null() {
+                    let mut fr = RECT::default();
+                    if GetWindowRect(gi.hwndFocus, &mut fr).is_ok()
+                        && fr.right > fr.left
+                        && fr.bottom > fr.top
+                    {
+                        Some(fr)
+                    } else {
+                        None
+                    }
                 } else {
-                    g.caret
+                    None
                 }
-            })
-            // 无查询值（首键瞬间）→ 编辑框位兜底（框=真实被点格）
-            .or(ed6);
+            }
+        } else {
+            None
+        };
+        if trainer_host && trace_on() {
+            trace(&format!(
+                "qc: TRAINER 锚源 ctx={} focus={} live={} g={}",
+                dpi_ctx_tag(),
+                rect_tag(trainer_focus),
+                rect_tag(live_caret),
+                rect_tag(g.caret)
+            ));
+        }
+        // 【七十六修·训练器锚缓存生效点】焦点宿主窗取到就刷新缓存；取不到时
+        // 用上一帧真值（≤1.5s）而不是其它来源——125% 下 getwindowrect 的
+        // 逻辑/物理两套坐标一旦混用就是整行 68px 跳。
+        let trainer_cached = if trainer_host {
+            let mut slot = LAST_TRAINER_ANCHOR.lock().ok();
+            if let Some(fr) = trainer_focus {
+                if let Some(s) = slot.as_deref_mut() {
+                    *s = Some((fr, std::time::Instant::now()));
+                }
+                None
+            } else {
+                slot.as_deref_mut()
+                    .and_then(|s| *s)
+                    .filter(|(_, at)| at.elapsed() < std::time::Duration::from_millis(1500))
+                    .map(|(r, _)| r)
+            }
+        } else {
+            None
+        };
+        // 【七十三修 2026-11-14·训练器锚单源】
+        // 跟打器在 125%+ 缩放下候选窗乱跳：此前的“单源”修法让 trainer
+        // 段内走 g.caret（隐藏 2×2 宿主的 GetTextExt），而 125% 下该查询
+        // 矩形与 GUITHREADINFO 插入符不在同一坐标空间，逐帧差异被候选窗
+        // 的 y 稳定锁放大成隔帧跳。训练器宿主改为**全程优先系统插入符**
+        //（GUITHREADINFO + ClientToScreen，物理屏幕坐标），并且不吃
+        // preview_anchor（那是主窗口预览态的推测点）。其它宿主保持原链。
+        let caret = (if trainer_host {
+            // 125%：训练器优先系统插入符（GUITHREADINFO，物理坐标）。
+            // 活插入符偶发缺失，此时回退查询锚；但隐藏 2×2 宿主的
+            // GetTextExt 在非 100% 下是逻辑坐标（125% 实测 250 vs 物理
+            // 318），直接混用会被候选窗放大成逐键上下跳。回退时按宿主
+            // DPI 归一到物理坐标，保证与 live_caret 同一坐标空间。
+            let g_phys = g.caret.map(|r| {
+                let fg = unsafe { GetForegroundWindow() };
+                let sc = unsafe {
+                    windows::Win32::UI::HiDpi::GetDpiForWindow(fg).max(96) as f32 / 96.0
+                };
+                if sc > 1.01 {
+                    RECT {
+                        left: (r.left as f32 * sc).round() as i32,
+                        top: (r.top as f32 * sc).round() as i32,
+                        right: (r.right as f32 * sc).round() as i32,
+                        bottom: (r.bottom as f32 * sc).round() as i32,
+                    }
+                } else {
+                    r
+                }
+            });
+            trainer_focus.or(trainer_cached).or(live_caret).or(g_phys)
+        } else {
+            preview_anchor
+                .as_ref()
+                .and_then(|a| {
+                    let x = a.get("x").and_then(|v| v.as_i64())? as i32;
+                    let y = a.get("y").and_then(|v| v.as_i64())? as i32;
+                    Some(RECT {
+                        left: x,
+                        top: y,
+                        right: x,
+                        bottom: y,
+                    })
+                })
+                .or_else(|| {
+                    // 【五十修→七十二修·光标单源】五十修曾禁虎魄走系统插
+                    // 入符（当时锚=selection 行底，插入符行内，切换=「往上
+                    // 面移」）。七十二修定稿：虎魄锚恒=GUITHREADINFO 插入符
+                    //（光标跟随），first_show 与段内同源无切换。
+                    // 【二十九修 2026-09-18】gui 插入符退化挡路修复：焦点
+                    // 切换后首键 GUITHREADINFO 常给点矩形（右=左+2、上下
+                    // 相等，无行高语义，AB 探针+trace 实锤 (111,436,113,
+                    // 436)）——它 Some() 挡住 g.caret（GetTextExt 整行框）
+                    // →首显锚错位→~140ms 后真锚到达再滑正=「切窗首键动
+                    // 效卡」多版本根因。点矩形视为无值让位查询锚；有效
+                    // 插入符（WPS/Qt 真光标线）行为不变仍优先。
+                    if first_show_of_seg {
+                        live_caret.or(g.caret)
+                    } else {
+                        g.caret
+                    }
+                })
+        })
+        // 无查询值（首键瞬间）→ 编辑框位兜底（框=真实被点格）
+        .or(ed6);
         // 框外旧值过滤：编辑态的查询值必然落在编辑框附近——框外远值
         //（>30px）是上一格滞留 → 钉到编辑框左（首键输入位）。
         let caret = match (&caret, &ed6) {
@@ -9874,6 +9981,24 @@ pub fn host_is_weixin() -> bool {
             .unwrap_or_default();
         let l = exe.to_lowercase();
         l == "weixin.exe" || l == "wechat.exe"
+    })
+}
+
+/// 宿主是否虎符跟打器（hufu-trainer.exe）。
+/// 【125% 锚漂移 2026-11-14】跟打器用隐藏 2×2 RichEdit 承载组字，候选锚
+/// 由该子窗的 GetTextExt 给出；但段首帧曾优先取 GUITHREADINFO 系统插入符，
+/// 两种矩形的行高语义不同（系统插入符=真行盒，GetTextExt=隐藏宿主 2px 框），
+/// 100% 缩放时两者落点几乎重合，125% 起每段首键候选先落一处、下一帧再跳到
+/// 另一处=用户实锤的「跟打器内候选乱跳」。此宿主首帧即与段内同源走 g.caret，
+/// 不再混用；其它宿主保持原锚链（WPS/Excel 的表格首键修复依赖 live_caret）。
+pub fn host_is_trainer() -> bool {
+    static T: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *T.get_or_init(|| {
+        let exe = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.file_name().map(|s| s.to_string_lossy().to_string()))
+            .unwrap_or_default();
+        exe.eq_ignore_ascii_case("hufu-trainer.exe")
     })
 }
 
@@ -10918,6 +11043,67 @@ fn focus_window_rect() -> Option<RECT> {
         None
     }
 }
+
+/// 【七十六修 2026-11-14·物理坐标护栏】GetWindowRect / ClientToScreen 的返回
+/// 值随「调用线程的 DPI 感知上下文」而变：unaware 线程拿到 96DPI 虚拟化坐标
+/// （125% 下 = 物理/1.25），per-monitor 线程拿到物理像素。训练器的锚查询有
+/// 两个触发源（按键帧走编辑器 UI 线程、60ms/定时重查帧走定时器线程），上下文
+/// 不一致时同一个 2×2 宿主的 rect 会在物理 (250,342) 与虚拟化 (200,274) 之间
+/// 逐帧翻，候选窗的 y 稳定锁再把它放大成整行 68px 上下跳（trace 实锤
+/// `cw2: GEO y=348` 与 `y=280` 交替）。护栏 = 查询期间强制 PER_MONITOR_AWARE_V2，
+/// 退出即恢复原上下文。
+struct PhysDpiGuard(windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT);
+
+impl PhysDpiGuard {
+    fn new() -> Self {
+        unsafe {
+            Self(windows::Win32::UI::HiDpi::SetThreadDpiAwarenessContext(
+                windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+            ))
+        }
+    }
+}
+
+impl Drop for PhysDpiGuard {
+    fn drop(&mut self) {
+        unsafe {
+            windows::Win32::UI::HiDpi::SetThreadDpiAwarenessContext(self.0);
+        }
+    }
+}
+
+/// 当前线程 DPI 感知上下文标签（unaware/system/pmv1/pmv2），仅供 trace 取证。
+fn dpi_ctx_tag() -> &'static str {
+    use windows::Win32::UI::HiDpi::*;
+    let c = unsafe { GetThreadDpiAwarenessContext() };
+    if c == DPI_AWARENESS_CONTEXT_UNAWARE {
+        "unaware"
+    } else if c == DPI_AWARENESS_CONTEXT_SYSTEM_AWARE {
+        "system"
+    } else if c == DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE {
+        "pmv1"
+    } else if c == DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 {
+        "pmv2"
+    } else if c == DPI_AWARENESS_CONTEXT_UNAWARE_GDISCALED {
+        "unaware-gdi"
+    } else {
+        "other"
+    }
+}
+
+/// RECT 选项的 trace 文本（`(l,t,r,b)` 或 `-`）。
+fn rect_tag(r: Option<RECT>) -> String {
+    match r {
+        Some(x) => format!("({},{},{},{})", x.left, x.top, x.right, x.bottom),
+        None => "-".to_string(),
+    }
+}
+
+/// 【七十六修·训练器锚缓存】只缓存「焦点宿主窗矩形」这一种（物理坐标）锚：
+/// 宿主取不到的个别帧沿用上一帧真值，绝不回落到其它坐标空间的来源，避免
+/// 125% 下逻辑/物理混用造成的整行跳动。1.5s 过期（换焦点/换行太久不回放）。
+static LAST_TRAINER_ANCHOR: std::sync::Mutex<Option<(RECT, std::time::Instant)>> =
+    std::sync::Mutex::new(None);
 
 fn excel6_anchor() -> Option<RECT> {
     unsafe {

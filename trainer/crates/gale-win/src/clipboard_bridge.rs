@@ -19,7 +19,10 @@ use windows::Win32::System::DataExchange::{
 use windows::Win32::System::Memory::{
     GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE,
 };
-use windows::Win32::System::Ole::{CF_DIB, CF_UNICODETEXT};
+use windows::Win32::Graphics::Gdi::{
+    CreateDIBitmap, GetDC, ReleaseDC, BITMAPINFO, CBM_INIT, DIB_RGB_COLORS, HBITMAP,
+};
+use windows::Win32::System::Ole::{CF_BITMAP, CF_DIB, CF_UNICODETEXT};
 
 /// 延迟恢复状态：写入前的用户文本 + 写入完成时的剪贴板序列号 + 恢复期限。
 /// 连续写入只保留**第一次**的快照（那时才是用户内容），期限顺延、序列号刷新。
@@ -193,13 +196,138 @@ pub unsafe fn write_text(s: &str) {
     let _ = try_write_text(s);
 }
 
+/// 【长截图 2026-11-15】把多张竖向切片（32bpp BI_RGB，行序 top-down 或 bottom-up
+/// 都认）拼成一张长图，输出 top-down（负 biHeight）；宽度必须一致。
+pub fn stitch_dibs_vertical(parts: &[Vec<u8>]) -> Result<Vec<u8>, String> {
+    let parse = |dib: &Vec<u8>| -> Result<(usize, i32, usize, u32), String> {
+        if dib.len() < 40 {
+            return Err("切片头长度不足".into());
+        }
+        let w = i32::from_le_bytes(dib[4..8].try_into().unwrap());
+        let h = i32::from_le_bytes(dib[8..12].try_into().unwrap());
+        let bpp = u16::from_le_bytes(dib[14..16].try_into().unwrap());
+        let rows = h.unsigned_abs() as usize;
+        let stride = (w as usize) * (bpp as usize / 8);
+        let need = 40 + stride * rows;
+        if bpp != 32 || w <= 0 || rows == 0 || dib.len() < need {
+            return Err("切片格式不是 32 位位图".into());
+        }
+        Ok((w as usize, h, rows, stride as u32))
+    };
+    let (width, _, _, stride) = parse(&parts[0])?;
+    let mut rows: Vec<&[u8]> = Vec::new();
+    for part in parts {
+        let (w, h, n, st) = parse(part)?;
+        if w != width || st != stride {
+            return Err("切片宽度不一致".into());
+        }
+        for i in 0..n {
+            let src = if h < 0 { i } else { n - 1 - i };
+            let start = 40 + src as usize * st as usize;
+            rows.push(&part[start..start + st as usize]);
+        }
+    }
+    let total = rows.len();
+    let mut out = vec![0u8; 40 + stride as usize * total];
+    out[..40].copy_from_slice(&parts[0][..40]);
+    let height = -(total as i32);
+    out[8..12].copy_from_slice(&height.to_le_bytes());
+    let size_image = (stride as usize * total) as u32;
+    out[20..24].copy_from_slice(&size_image.to_le_bytes());
+    for (i, row) in rows.iter().enumerate() {
+        let at = 40 + i * stride as usize;
+        out[at..at + stride as usize].copy_from_slice(row);
+    }
+    Ok(out)
+}
+
+/// 【截图复制 2026-11-15】把 32 位 BI_RGB DIB 转成 24 位再进剪贴板。
+/// QQ / 微信 等接收端对「32 位 + alpha」的 CF_DIB 处理不一致（常见现象是粘贴
+/// 出黑块、透明，或干脆不认），24 位无 alpha 是最保险的交换格式。
+pub(crate) fn dib_to_24(dib: &[u8]) -> Vec<u8> {
+    if dib.len() < 40 {
+        return dib.to_vec();
+    }
+    let bpp = u16::from_le_bytes([dib[14], dib[15]]);
+    let compression = u32::from_le_bytes([dib[16], dib[17], dib[18], dib[19]]);
+    if bpp != 32 || compression != 0 {
+        return dib.to_vec();
+    }
+    let width = i32::from_le_bytes([dib[4], dib[5], dib[6], dib[7]]);
+    let height = i32::from_le_bytes([dib[8], dib[9], dib[10], dib[11]]);
+    let (w, h) = (width.unsigned_abs() as usize, height.unsigned_abs() as usize);
+    if w == 0 || h == 0 {
+        return dib.to_vec();
+    }
+    let src_stride = w * 4;
+    let dst_stride = (w * 3 + 3) & !3;
+    if dib.len() < 40 + src_stride * h {
+        return dib.to_vec();
+    }
+    let mut out = vec![0u8; 40 + dst_stride * h];
+    out[..40].copy_from_slice(&dib[..40]);
+    out[14..16].copy_from_slice(&24u16.to_le_bytes());
+    out[20..24].copy_from_slice(&((dst_stride * h) as u32).to_le_bytes());
+    // 【截图复制 2026-11-15】CF_DIB 改成自底向上（正 biHeight）：
+    // QQ 桌面版对内联 GDI 路径的 top-down（负 biHeight）DIB 不认，
+    // 粘贴时直接没有图；浏览器（如 DSH 输入框）能读，所以只在这类客户端翻车。
+    let top_down = i32::from_le_bytes([dib[8], dib[9], dib[10], dib[11]]) < 0;
+    out[8..12].copy_from_slice(&(h as i32).to_le_bytes());
+    for row in 0..h {
+        let src_row = if top_down { h - 1 - row } else { row };
+        let src = 40 + src_row * src_stride;
+        let dst = 40 + row * dst_stride;
+        for col in 0..w {
+            out[dst + col * 3] = dib[src + col * 4];
+            out[dst + col * 3 + 1] = dib[src + col * 4 + 1];
+            out[dst + col * 3 + 2] = dib[src + col * 4 + 2];
+        }
+    }
+    out
+}
+
+/// 【截图复制 2026-11-15】再从同一份像素做一个 HBITMAP，供只认 CF_BITMAP 的
+/// 接收端（QQ 桌面版就是这种）粘贴。失败不影响 CF_DIB。
+fn dib_to_bitmap(dib: &[u8]) -> Option<HBITMAP> {
+    if dib.len() < 44 {
+        return None;
+    }
+    unsafe {
+        let header = std::ptr::read_unaligned(dib.as_ptr() as *const windows::Win32::Graphics::Gdi::BITMAPINFOHEADER);
+        let bmi = BITMAPINFO {
+            bmiHeader: header,
+            bmiColors: [Default::default()],
+        };
+        let hdc = GetDC(None);
+        if hdc.is_invalid() {
+            return None;
+        }
+        let bits = dib.as_ptr().add(40) as *const core::ffi::c_void;
+        let bitmap = CreateDIBitmap(hdc, Some(&bmi.bmiHeader), CBM_INIT as u32, Some(bits), Some(&bmi), DIB_RGB_COLORS);
+        let _ = ReleaseDC(None, hdc);
+        if bitmap.is_invalid() {
+            None
+        } else {
+            Some(bitmap)
+        }
+    }
+}
+
 /// Explicit image copy: keep the DIB until another clipboard write, without the
 /// temporary text bridge's delayed restoration. The caller supplies an owned
 /// BITMAPINFOHEADER + pixels buffer; Windows takes the HGLOBAL only on success.
+/// 【长截图 2026-11-15】把多张切片拼成一张长图后写剪贴板（内部先拼、再统一降 24 位）。
+pub fn write_long_dib(owner: isize, parts: &[Vec<u8>]) -> Result<(), String> {
+    let long = stitch_dibs_vertical(parts)?;
+    try_write_dib(owner, &long)
+}
+
 pub(crate) fn try_write_dib(owner: isize, dib: &[u8]) -> Result<(), String> {
     if owner == 0 || dib.len() < 40 || dib.len() > u32::MAX as usize {
         return Err("复制图像的数据或窗口无效".into());
     }
+    // 【截图复制】统一转 24 位无 alpha，兼容 QQ / 微信 的粘贴。
+    let dib = &dib_to_24(dib);
     let mut restore = RESTORE.lock().unwrap_or_else(|p| p.into_inner());
     unsafe {
         let h = GlobalAlloc(GMEM_MOVEABLE, dib.len())
@@ -221,6 +349,13 @@ pub(crate) fn try_write_dib(owner: isize, dib: &[u8]) -> Result<(), String> {
             let snap = snapshot_locked();
             let emptied = EmptyClipboard().is_ok();
             let copied = emptied && SetClipboardData(CF_DIB.0 as u32, HANDLE(h.0)).is_ok();
+            if copied {
+                // 【截图复制 2026-11-15】同时挂一份 CF_BITMAP：QQ 桌面版粘贴时
+                // 会先拿位图，只有 CF_DIB 时表现为「按了粘贴没反应」。
+                if let Some(bitmap) = dib_to_bitmap(dib) {
+                    let _ = SetClipboardData(CF_BITMAP.0 as u32, HANDLE(bitmap.0));
+                }
+            }
             let _ = CloseClipboard();
             if copied {
                 // System owns h. Cancel any earlier temporary text restoration.
@@ -297,11 +432,117 @@ pub unsafe fn try_write_text(s: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// 【长截图 2026-11-15】竖向切片按顺序拼接，行序混用 top-down/bottom-up 也要读对。
     #[test]
+    fn long_shots_stack_vertical_slices_in_order() {
+        let make = |rgb: [u8; 4], h: i32| {
+            let mut dib = vec![0u8; 40 + 4];
+            dib[4..8].copy_from_slice(&1i32.to_le_bytes());
+            dib[8..12].copy_from_slice(&h.to_le_bytes());
+            dib[14..16].copy_from_slice(&32u16.to_le_bytes());
+            dib[40..44].copy_from_slice(&rgb);
+            dib
+        };
+        let top = make([255, 0, 0, 255], -1);
+        let bottom_up = make([0, 0, 255, 255], 1);
+        let stitched = stitch_dibs_vertical(&[top, bottom_up]).unwrap();
+        let h = i32::from_le_bytes(stitched[8..12].try_into().unwrap());
+        assert_eq!(h, -2, "拼好后必须是 2 行 top-down");
+        assert_eq!(&stitched[40..44], &[255, 0, 0, 255]);
+        assert_eq!(&stitched[44..48], &[0, 0, 255, 255]);
+    }
+
+    /// 【截图复制】32 位 DIB 必须转成 24 位：字节数按 4 字节对齐、头字段同步，
+    /// 这是 QQ / 微信 能正常粘贴的关键。
+    #[test]
+    fn dib_is_downgraded_to_24_bits_for_chat_apps() {
+        const W: usize = 3;
+        const H: usize = 2;
+        let mut dib = vec![0u8; 40 + W * H * 4];
+        dib[0..4].copy_from_slice(&40u32.to_le_bytes());
+        dib[4..8].copy_from_slice(&(W as i32).to_le_bytes());
+        dib[8..12].copy_from_slice(&(-(H as i32)).to_le_bytes());
+        dib[12..14].copy_from_slice(&1u16.to_le_bytes());
+        dib[14..16].copy_from_slice(&32u16.to_le_bytes());
+        dib[20..24].copy_from_slice(&((W * H * 4) as u32).to_le_bytes());
+        for i in 0..W * H {
+            dib[40 + i * 4] = 0x11;
+            dib[40 + i * 4 + 1] = 0x22;
+            dib[40 + i * 4 + 2] = 0x33;
+            dib[40 + i * 4 + 3] = 0xff;
+        }
+        let out = super::dib_to_24(&dib);
+        let stride = (W * 3 + 3) & !3;
+        assert_eq!(out.len(), 40 + stride * H);
+        assert_eq!(u16::from_le_bytes([out[14], out[15]]), 24);
+        assert_eq!(
+            u32::from_le_bytes([out[20], out[21], out[22], out[23]]) as usize,
+            stride * H
+        );
+        assert_eq!(&out[40..43], &[0x11, 0x22, 0x33]);
+        assert_eq!(&out[40 + stride..40 + stride + 3], &[0x11, 0x22, 0x33]);
+    }
+
     fn utf16_roundtrip_data() {
         // 纯数据检查（不碰系统剪贴板，测试环境无桌面会话也可跑）
         let s = "-----第1段-----\n跟打测试";
         let ws: Vec<u16> = s.encode_utf16().collect();
         assert_eq!(String::from_utf16_lossy(&ws), s);
+    }
+
+    /// 真剪贴板回归：写入的 CF_DIB 必须能被系统读回。
+    /// 显式 `cargo test -p gale-win -- --ignored dib_lands_on_clipboard` 运行。
+    #[test]
+    #[ignore]
+    fn dib_lands_on_clipboard() {
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::System::DataExchange::*;
+        use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
+        use windows::Win32::System::Ole::CF_DIB;
+        use windows::Win32::UI::WindowsAndMessaging::GetDesktopWindow;
+
+        const W: u32 = 2;
+        const H: u32 = 2;
+        let mut dib = vec![0u8; 40 + (W * H * 4) as usize];
+        dib[0..4].copy_from_slice(&40u32.to_le_bytes());
+        dib[4..8].copy_from_slice(&(W as i32).to_le_bytes());
+        dib[8..12].copy_from_slice(&(-(H as i32)).to_le_bytes());
+        dib[12..14].copy_from_slice(&1u16.to_le_bytes());
+        dib[14..16].copy_from_slice(&32u16.to_le_bytes());
+        dib[20..24].copy_from_slice(&(W * H * 4).to_le_bytes());
+        // 4 个像素：红、绿、蓝、白（BGRA，top-down 顺序无关紧要）。
+        dib[40..44].copy_from_slice(&[0, 0, 255, 255]);
+        dib[44..48].copy_from_slice(&[0, 255, 0, 255]);
+        dib[48..52].copy_from_slice(&[255, 0, 0, 255]);
+        dib[52..56].copy_from_slice(&[255, 255, 255, 255]);
+
+        let owner = unsafe { GetDesktopWindow() };
+        super::try_write_dib(owner.0 as isize, &dib).expect("CF_DIB write should succeed");
+
+        unsafe {
+            let opened = OpenClipboard(owner).is_ok();
+            assert!(opened, "OpenClipboard should succeed after our own write");
+            assert!(IsClipboardFormatAvailable(CF_DIB.0 as u32).is_ok(), "CF_DIB missing");
+            // 【截图复制 2026-11-15】QQ 桌面版只认 CF_BITMAP，必须同时挂上。
+            assert!(
+                IsClipboardFormatAvailable(windows::Win32::System::Ole::CF_BITMAP.0 as u32).is_ok(),
+                "CF_BITMAP missing"
+            );
+            let h = GetClipboardData(CF_DIB.0 as u32).expect("CF_DIB data handle");
+            let p = GlobalLock(windows::Win32::Foundation::HGLOBAL(h.0));
+            assert!(!p.is_null());
+            let bytes = std::slice::from_raw_parts(p as *const u8, dib.len());
+            // 【截图复制 2026-11-15】落盘的是 24 位：头部如实、像素 BGRA→BGR。
+            // 【截图复制 2026-11-15】必须自底向上（正 biHeight），QQ 不认 top-down。
+            let height = i32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+            assert!(height > 0, "biHeight must be positive, got {height}");
+            assert_eq!(&bytes[0..4], &40u32.to_le_bytes());
+            assert_eq!(u16::from_le_bytes([bytes[14], bytes[15]]), 24);
+            assert_eq!(&bytes[40..43], &[255, 0, 0], "bottom-up 后首行应是原图末行");
+            let _ = GlobalUnlock(windows::Win32::Foundation::HGLOBAL(h.0));
+            let _ = CloseClipboard();
+        }
     }
 }

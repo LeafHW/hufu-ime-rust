@@ -4,7 +4,7 @@
 
 #![allow(non_snake_case)]
 
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU8, Ordering};
 use std::sync::Mutex;
 
 use gale_core::compare::InputEvent;
@@ -15,7 +15,7 @@ use windows::core::{w, Interface};
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, LoadLibraryW};
 use windows::Win32::UI::Controls::RichEdit::{
-    EM_GETTEXTEX, EM_GETTEXTLENGTHEX, EM_SETUNDOLIMIT, GETTEXTEX, GETTEXTLENGTHEX, GTL_NUMCHARS,
+    EM_EXLIMITTEXT, EM_GETTEXTEX, EM_GETTEXTLENGTHEX, EM_SETUNDOLIMIT, GETTEXTEX, GETTEXTLENGTHEX, GTL_NUMCHARS,
     GTL_PRECISE, GT_DEFAULT,
 };
 use windows::Win32::UI::Input::Ime::{
@@ -31,10 +31,11 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::TextServices::{ITfContextComposition, ITfRangeACP};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallWindowProcW, CreateWindowExW, DefWindowProcW, GetCaretPos, GetParent, HideCaret,
-    RegisterWindowMessageW, SendMessageW, SetPropW, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    GWLP_WNDPROC, SWP_NOZORDER, SW_HIDE, SW_SHOWNA, WINDOW_EX_STYLE, WM_CHAR, WM_KEYDOWN, WM_KEYUP,
-    WM_SYSCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP, WS_CHILD, WS_VISIBLE,
+    CallWindowProcW, CreateWindowExW, DefWindowProcW, GetCaretPos, GetClassNameW, GetParent,
+    HideCaret, IsWindow, RegisterWindowMessageW, SendMessageW, SetPropW, SetWindowLongPtrW,
+    SetWindowPos, ShowWindow, GWLP_WNDPROC, SWP_NOZORDER, SW_HIDE, SW_SHOWNA, WINDOW_EX_STYLE,
+    WM_CHAR,
+    WM_KEYDOWN, WM_KEYUP, WM_SYSCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP, WS_CHILD, WS_VISIBLE,
 };
 
 // ── RichEdit 常量（windows 0.58 未绑定的部分，手工定义，值与 SDK 一致）──
@@ -117,6 +118,8 @@ pub enum CommandKey {
     Space,     // 段末跳段（组字中放行给输入法）
     CtrlLeft,  // 上一段
     CtrlRight, // 下一段
+    CtrlO,     // 发文上一段
+    CtrlP,     // 发文下一段
     AltE,      // 载文（剪贴板群文，兼容疾风1代）
     LoadClipboard,
     CopyResult,
@@ -152,6 +155,12 @@ static KEY_TIMES: Mutex<Vec<(u32, u64)>> = Mutex::new(Vec::new());
 static COMMIT_KEY_HISTORY: Mutex<Vec<(u32, u64)>> = Mutex::new(Vec::new());
 static EXACT_SELECTION_SOURCE: AtomicBool = AtomicBool::new(false);
 static PHYSICAL_EVENTS: Mutex<Vec<HostEvent>> = Mutex::new(Vec::new());
+/// 【poll 短路 2026-11-14】relay 文档自上次 poll 后是否可能变化。置脏者：
+/// relay_proc 观察到的变更消息 + 父窗 WM_COMMAND/EN_UPDATE（建窗时已开
+/// ENM_UPDATE 掩码）。poll() 见 false 且非组字态且未到 250ms 强制重读点
+/// 时跳过 EM_GETTEXTEX 全量读（audit-heat #1：60fps 全文拷贝+归一化空转）。
+/// 初值 true：首次 poll 必读一次建立基线。
+static RELAY_TEXT_DIRTY: AtomicBool = AtomicBool::new(true);
 
 /// Called from the top-level window procedure even when focus leaves and
 /// returns within one native message-pump iteration.
@@ -173,6 +182,12 @@ static CTF_OK: AtomicBool = AtomicBool::new(true);
 /// Observe the queued physical key before TranslateMessage/TSF rewrites VK_PROCESSKEY.
 /// Only the real typing control contributes statistics; modal editors never do.
 static ROUND_DONE: AtomicBool = AtomicBool::new(false);
+/// While typing, hint keys belong to the application unless they are legitimate
+/// target input. Keep Enter/Space separate: group bodies may contain LF without
+/// any ASCII space. One atomic snapshot keeps both gates consistent.
+static TYPING_HINT_KEYS: AtomicU8 = AtomicU8::new(0);
+const HINT_ENTER: u8 = 1;
+const HINT_SPACE: u8 = 2;
 static RESULT_KEY_TARGET: AtomicIsize = AtomicIsize::new(0);
 /// 跟打器当前有 Esc 可关的面板（模态/账本/分析坞）时为 true。
 /// Esc 只在有面板可关时被跟打器吞下；无面板时必须放行——虎符的
@@ -184,6 +199,34 @@ pub fn set_esc_panel_open(open: bool) {
 }
 pub fn set_round_done(done: bool) {
     ROUND_DONE.store(done, Ordering::Relaxed);
+}
+/// Synchronize after each input pump. Only an expected LF admits Enter; ASCII
+/// spaces retain their article-level input policy. Composition always wins.
+pub fn set_round_typing(active: bool, enter_expected: bool, allow_space: bool) {
+    let hints = if active {
+        (if enter_expected { 0 } else { HINT_ENTER })
+            | (if allow_space { 0 } else { HINT_SPACE })
+    } else {
+        0
+    };
+    TYPING_HINT_KEYS.store(hints, Ordering::Relaxed);
+}
+
+fn typing_hint_command(
+    vk: u32,
+    hints: u8,
+    composing: bool,
+    ctrl: bool,
+    alt: bool,
+) -> Option<CommandKey> {
+    if composing || ctrl || alt {
+        return None;
+    }
+    match vk {
+        0x0d if hints & HINT_ENTER != 0 => Some(CommandKey::Enter),
+        0x20 if hints & HINT_SPACE != 0 => Some(CommandKey::Space),
+        _ => None,
+    }
 }
 /// Only the completed-segment panel may receive continuation keys on its
 /// container HWND. Native editors and confirmation panels keep their own keys.
@@ -385,6 +428,55 @@ fn lookup_shortcut(vk: u32, ctrl: bool, alt: bool, shift: bool) -> Option<Comman
         .map(|(_, command)| *command)
 }
 
+/// 【数值直输 2026-11-13】外观页数值编辑态：数字/小数/负号/全选/退格/回车/Esc 入队，
+/// 其余键一律吞掉（防编辑中误触快捷键）；由应用侧 drain_num_keys 消费。
+static NUM_EDIT: AtomicBool = AtomicBool::new(false);
+static NUM_KEYS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+pub fn set_num_edit(active: bool) {
+    NUM_EDIT.store(active, Ordering::Relaxed);
+    if !active {
+        if let Ok(mut keys) = NUM_KEYS.lock() {
+            keys.clear();
+        }
+    }
+}
+
+pub fn drain_num_keys() -> Vec<u32> {
+    let keys = NUM_KEYS.lock().ok().map(|mut k| std::mem::take(&mut *k));
+    if keys.as_deref().is_some_and(|k| !k.is_empty()) {
+        crate::window::request_frame();
+    }
+    keys.unwrap_or_default()
+}
+
+fn numeric_edit_key(vk: u32, ctrl: bool, alt: bool) -> bool {
+    if alt {
+        return false;
+    }
+    if ctrl {
+        return vk == 0x41; // Ctrl+A: replace the whole numeric value.
+    }
+    matches!(vk, 0x30..=0x39 | 0x60..=0x69 | 0xBE | 0x6E | 0xBD | 0x6D | 0x08 | 0x0D | 0x1B)
+}
+
+/// Both the message-pump and relay fallback must isolate numeric editing from
+/// typing/shortcuts. Keep native Alt+F4/Alt+Space/Ctrl+Space available as before.
+fn capture_numeric_edit(vk: u32, ctrl: bool, alt: bool, composing: bool) -> bool {
+    if !NUM_EDIT.load(Ordering::Relaxed) || composing
+        || (alt && matches!(vk, 0x73 | 0x20)) || (ctrl && vk == 0x20)
+    {
+        return false;
+    }
+    if numeric_edit_key(vk, ctrl, alt) {
+        if let Ok(mut keys) = NUM_KEYS.lock() {
+            keys.push(vk);
+        }
+    }
+    crate::window::request_frame();
+    true
+}
+
 /// 进入快捷键录制：下一次非修饰键被记录，Esc 取消。
 pub fn begin_shortcut_recording() {
     if let Ok(mut recorded) = RECORDED.lock() {
@@ -418,6 +510,38 @@ pub fn shortcut_reserved(chord: &str) -> bool {
     matches!(
         chord.trim().to_ascii_lowercase().as_str(),
         "ctrl+v" | "ctrl+z" | "ctrl+y" | "enter" | "space" | "tab" | "esc"
+    )
+}
+
+/// 焦点在表单里的原生输入框？（设置页的账号/昵称/数值、词库编辑等）
+/// 正文 RichEdit（relay）不算——那里的 Ctrl+V 本来就是「载入剪贴板文章」。
+/// 审计 I01：这些控件的 Ctrl+V 必须交给控件自己粘贴，不能被整成载文动作。
+fn is_form_edit(hwnd: isize) -> bool {
+    if hwnd == 0 || hwnd == relay_hwnd() {
+        return false;
+    }
+    let mut buffer = [0u16; 64];
+    let len = unsafe { GetClassNameW(HWND(hwnd as *mut _), &mut buffer) };
+    if len <= 0 {
+        return false;
+    }
+    form_edit_class(&String::from_utf16_lossy(&buffer[..len as usize]))
+}
+
+/// 纯类名判定（抽出来便于单测；Win32 调用见 is_form_edit）。
+fn form_edit_class(class: &str) -> bool {
+    matches!(
+        class,
+        "Edit"
+            | "RichEdit"
+            | "RICHEDIT"
+            | "RichEdit20A"
+            | "RichEdit20W"
+            | "RICHEDIT20W"
+            | "RichEdit50W"
+            | "RICHEDIT50W"
+            | "ComboBox"
+            | "ComboBoxEx32"
     )
 }
 
@@ -464,6 +588,11 @@ pub fn capture_physical_key(msg: &windows::Win32::UI::WindowsAndMessaging::MSG) 
         crate::window::request_frame();
         return true;
     }
+    // 【数值直输 2026-11-13】编辑态优先（与录制同级）：数字/小数点/退格/
+    // 回车/Esc 入队，修饰键与其它键静默吞掉，编辑期间不触发任何快捷键。
+    if capture_numeric_edit(vk, ctrl, alt, composing) {
+        return true;
+    }
     // 自设快捷键表优先（默认表由应用在启动/改键后安装）。
     if !composing {
         if let Some(command) = lookup_shortcut(vk, ctrl, alt, shift) {
@@ -476,8 +605,12 @@ pub fn capture_physical_key(msg: &windows::Win32::UI::WindowsAndMessaging::MSG) 
             return true;
         }
     }
-    // Ctrl+V 是固定编辑键（不受自设表影响）：仍走载文动作。
+    // Ctrl+V 是固定编辑键（不受自设表影响）：仍走载文动作；但焦点在表单原生
+    // 输入框时必须放行，否则会把正在填的账号/昵称/数值替换成整篇文章（审计 I01）。
     if ctrl && vk == 0x56 && !composing {
+        if is_form_edit(msg.hwnd.0 as isize) {
+            return false;
+        }
         push_cmd(CommandKey::LoadClipboard);
         return true;
     }
@@ -552,6 +685,19 @@ pub fn capture_physical_key(msg: &windows::Win32::UI::WindowsAndMessaging::MSG) 
             q.push(HostEvent::Composing(composing));
             q.push(HostEvent::Key { vk });
         }
+    }
+    // Preserve typing-state physical-key statistics, then stop a hint before
+    // TranslateMessage/TSF can turn it into a document character. The WndProc
+    // also applies this policy for direct native messages.
+    if let Some(command) = typing_hint_command(
+        vk,
+        TYPING_HINT_KEYS.load(Ordering::Relaxed),
+        composing,
+        ctrl,
+        alt,
+    ) {
+        push_cmd(command);
+        return true;
     }
     false
 }
@@ -930,6 +1076,25 @@ pub fn diag_log(s: &str) {
     input_log(s);
 }
 
+/// 【poll 短路 2026-11-14】主窗 WM_COMMAND 臂调用：relay 的 EN_UPDATE
+/// （HIWORD=0x0400，lParam=控件 hwnd）说明 RichEdit 文档刚变过 → 置脏，
+/// 让下一次 poll 走全量读。返回 true 表示已消费（调用方 LRESULT(0)）。
+/// 与 relay_proc 侧的消息观察互为双保险：即便 RichEdit 版本不投递
+/// EN_UPDATE，消息本身先到 relay_proc 也已置脏。
+pub fn note_relay_command(wp: WPARAM, lp: LPARAM) -> bool {
+    const EN_UPDATE: u32 = 0x0400;
+    let relay = RELAY_HWND.load(Ordering::Relaxed);
+    if relay != 0
+        && lp.0 as isize == relay
+        && ((wp.0 as u32) >> 16) == EN_UPDATE
+    {
+        RELAY_TEXT_DIRTY.store(true, Ordering::Relaxed);
+        true
+    } else {
+        false
+    }
+}
+
 unsafe extern "system" fn relay_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     let orig = ORIG_PROC.load(Ordering::Relaxed);
     macro_rules! call_orig {
@@ -960,6 +1125,18 @@ unsafe extern "system" fn relay_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
             }
         }
         return LRESULT(0);
+    }
+    // 【poll 短路 2026-11-14】凡是可能改动 relay 文档的消息，先置脏再走
+    // 原处理（不 early-return，语义零变化）。覆盖：字符/按键（含退格撤销
+    // 等键发起的编辑）、IME 组字三消息（RichEdit 行内组字=文档在变）、
+    // 程序化设文/替换/撤销/剪贴板系。与父窗 EN_UPDATE 双保险；250ms 强制
+    // 重读兜同长度原位替换等理论边角。
+    match msg {
+        0x000C | 0x00C2 | 0x00C7 | 0x0100 | 0x0102 | 0x0300 | 0x0302 | 0x0303 | 0x0304
+        | 0x0443 | 269 | 270 | 271 => {
+            RELAY_TEXT_DIRTY.store(true, Ordering::Relaxed)
+        }
+        _ => {}
     }
     // 诊断：IME 消息与按键全记录（正常路径零开销——env 未设时直接跳过）
     if input_log_enabled() {
@@ -1056,6 +1233,9 @@ unsafe extern "system" fn relay_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
                 }
                 return LRESULT(0);
             }
+            if capture_numeric_edit(vk, ctrl, alt, composing) {
+                return LRESULT(0);
+            }
             if !composing {
                 if let Some(command) = lookup_shortcut(vk, ctrl, alt, shift_here) {
                     push_cmd(command);
@@ -1096,16 +1276,24 @@ unsafe extern "system" fn relay_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
                 // 上屏；撤回不可用时 RichEdit 对 Esc 无动作，等价于无功能。
 
                 0x0D => {
-                    // 组字中：Enter 归输入法（确认上屏）放行；否则段末跳段命令
-                    if !composing && ROUND_DONE.load(Ordering::Relaxed) {
+                    // Composition owns Enter; expected group-text LF is native
+                    // input. Otherwise typing shows a hint, Done continues.
+                    if !composing
+                        && (ROUND_DONE.load(Ordering::Relaxed)
+                            || TYPING_HINT_KEYS.load(Ordering::Relaxed) & HINT_ENTER != 0)
+                    {
                         push_cmd(CommandKey::Enter);
                         return LRESULT(0);
                     }
                 }
                 0x09 => return LRESULT(0), // Tab
                 0x20 => {
-                    // 组字中：空格归输入法（选重/顶屏）放行；否则段末跳段命令
-                    if !composing && ROUND_DONE.load(Ordering::Relaxed) {
+                    // Composition owns Space; articles with ASCII spaces keep
+                    // native insertion, otherwise typing shows a hint.
+                    if !composing
+                        && (ROUND_DONE.load(Ordering::Relaxed)
+                            || TYPING_HINT_KEYS.load(Ordering::Relaxed) & HINT_SPACE != 0)
+                    {
                         push_cmd(CommandKey::Space);
                         return LRESULT(0);
                     }
@@ -1398,6 +1586,9 @@ pub struct InputHost {
     cancellation: CompositionCancellation,
     /// EM_SETEDITSTYLE(SES_USECTF) 是否成功（false = TSF 输入法可能不可用）
     ctf_ok: bool,
+    /// 【poll 短路 2026-11-14】上次全量 poll 的 tick_ms；脏标静默超过 250ms
+    /// 强制一次全量重读（兜 EN_UPDATE 缺投递/同长度原位替换等理论边角）。
+    last_full_poll_ms: u64,
 }
 
 #[derive(Default)]
@@ -1431,6 +1622,7 @@ impl InputHost {
                     last_preedit: String::new(),
                     cancellation: CompositionCancellation::default(),
                     ctf_ok: CTF_OK.load(Ordering::Relaxed),
+                    last_full_poll_ms: 0,
                 });
             }
             let hinstance = match GetModuleHandleW(None) {
@@ -1465,6 +1657,10 @@ impl InputHost {
             // EM_SETUNDOLIMIT 的 limit 在 wParam（lParam 恒 0）。使用 SDK
             // 常量，避免误发 0x435（EM_EXLIMITTEXT）而没有设置撤销容量。
             SendMessageW(hwnd, EM_SETUNDOLIMIT, WPARAM(100_000), LPARAM(0));
+            // Article loading accepts 100,000 Unicode scalars per paragraph.
+            // RichEdit's separate default input limit is only 32,767 UTF-16
+            // units; two units per scalar also covers supplementary characters.
+            SendMessageW(hwnd, EM_EXLIMITTEXT, WPARAM(0), LPARAM(200_000));
             // 显式开启 TSF 支持（RichEdit50W 默认开；显式设确保 CUAS→TSF 桥激活，
             // 纯 TSF 输入法（虎符）依赖此链路——architecture.md Mandate #1）。
             // 返回值校验（2026-11-08）：成功返回旧样式位（小非负值），失败为负
@@ -1490,6 +1686,9 @@ impl InputHost {
             let old = SetWindowLongPtrW(hwnd, GWLP_WNDPROC, relay_proc as *const () as isize);
             ORIG_PROC.store(old, Ordering::Relaxed);
             RELAY_HWND.store(hwnd.0 as isize, Ordering::Relaxed);
+            // 【poll 短路 2026-11-14】新建窗首帧必读一次（也可兜重建场景
+            // 下的旧脏标状态）。
+            RELAY_TEXT_DIRTY.store(true, Ordering::Relaxed);
             if input_outcome_message() != 0 {
                 // Only this typing control opts in; settings editors and other
                 // applications never receive the numeric outcome notification.
@@ -1512,6 +1711,7 @@ impl InputHost {
                 last_preedit: String::new(),
                 cancellation: CompositionCancellation::default(),
                 ctf_ok,
+                last_full_poll_ms: 0,
             })
         }
     }
@@ -1582,6 +1782,14 @@ impl InputHost {
     fn text_snapshot(&self) -> (Option<String>, String, bool) {
         unsafe {
             let hwnd = HWND(self.hwnd as *mut core::ffi::c_void);
+            // 【幽灵退格 2026-11-14】WM_CLOSE 会先于主循环退出同步销毁 relay
+            // （DefWindowProc→DestroyWindow），同一帧随后的 poll 对已销毁
+            // hwnd 读文档恒得空串，被 diff 成 Backspace xN 摧毁活回合数据。
+            // 已销毁/无效窗口 → 返回 None 走保守推迟路径（committed_text
+            // 兜底 last_text），不再产生任何 diff。
+            if hwnd.0.is_null() || !IsWindow(hwnd).as_bool() {
+                return (None, String::new(), false);
+            }
             let tsf = tsf_composition(hwnd);
             let full = document_utf16(hwnd);
             if tsf.active {
@@ -1622,6 +1830,24 @@ impl InputHost {
     /// 主循环每帧调用；不依赖通知消息也能推进（稳）。
     pub fn poll(&mut self) -> Vec<HostEvent> {
         let mut evs = Vec::new();
+        // 【poll 短路 2026-11-14】audit-heat #1：静默期（脏标为 false、非
+        // 组字态、距上次全量读 <250ms）跳过 EM_GETTEXTEX 全量拷贝 + tsf_
+        // composition COM 查询，空载时 60fps 的堆分配归零。物理键队列仍每
+        // 帧清空（暂停解除/焦点事件依赖它）。脏标置位者：relay_proc 的
+        // 变更消息观察 + 父窗 EN_UPDATE（双保险）；250ms 强制重读兜 EN_
+        // UPDATE 缺投递/同长度原位替换等理论边角。短路求值保证：不走快
+        // 路径时不消费脏标。
+        let now = query_tick_ms();
+        if !self.composing
+            && now.wrapping_sub(self.last_full_poll_ms) < 250
+            && !RELAY_TEXT_DIRTY.swap(false, Ordering::Relaxed)
+        {
+            if let Ok(mut q) = PHYSICAL_EVENTS.lock() {
+                evs.extend(q.drain(..));
+            }
+            return evs;
+        }
+        self.last_full_poll_ms = now;
         // 组字状态与 preedit
         let (committed, comp, now_composing) = self.text_snapshot();
         let unchanged = committed.as_deref() == Some(self.last_text.as_str());
@@ -1925,6 +2151,61 @@ mod tests {
     use super::*;
 
     #[test]
+    fn form_edit_class_covers_native_text_controls() {
+        // 审计 I01：这些原生输入框里的 Ctrl+V 必须留给控件自己粘贴。
+        for class in ["Edit", "RichEdit20W", "RICHEDIT50W", "ComboBox"] {
+            assert!(form_edit_class(class), "{class}");
+        }
+        for class in ["TrainerHost", "Static", "Button", ""] {
+            assert!(!form_edit_class(class), "{class}");
+        }
+    }
+
+    #[test]
+    fn typing_hint_keys_keep_newlines_spaces_and_ime_ownership_separate() {
+        for hints in [0, HINT_ENTER, HINT_SPACE, HINT_ENTER | HINT_SPACE] {
+            for (vk, bit, command) in [
+                (0x0d, HINT_ENTER, CommandKey::Enter),
+                (0x20, HINT_SPACE, CommandKey::Space),
+            ] {
+                assert_eq!(
+                    typing_hint_command(vk, hints, false, false, false),
+                    (hints & bit != 0).then_some(command),
+                );
+                for (composing, ctrl, alt) in [
+                    (true, false, false),
+                    (false, true, false),
+                    (false, false, true),
+                ] {
+                    assert_eq!(typing_hint_command(vk, hints, composing, ctrl, alt), None);
+                }
+            }
+            assert_eq!(typing_hint_command(0x41, hints, false, false, false), None);
+        }
+    }
+
+    #[test]
+    fn numeric_edit_routes_negative_values_and_select_all_without_shortcuts() {
+        set_num_edit(true);
+        let _ = drain_num_keys();
+        for vk in [0xBD, 0x6D, 0x31, 0xBE, 0x65] {
+            assert!(capture_numeric_edit(vk, false, false, false));
+        }
+        assert!(capture_numeric_edit(0x41, true, false, false));
+        // Product shortcuts and ordinary letters are consumed, never routed
+        // into the numeric value or the training RichEdit during editing.
+        for (vk, ctrl, alt) in [(0x70, false, false), (0x41, false, false), (0x56, true, false), (0x31, false, true)] {
+            assert!(capture_numeric_edit(vk, ctrl, alt, false));
+        }
+        assert_eq!(drain_num_keys(), [0xBD, 0x6D, 0x31, 0xBE, 0x65, 0x41]);
+        assert!(!capture_numeric_edit(0x73, false, true, false));
+        assert!(!capture_numeric_edit(0x20, true, false, false));
+        assert!(!capture_numeric_edit(0x08, false, false, true));
+        set_num_edit(false);
+        assert!(!capture_numeric_edit(0x31, false, false, false));
+    }
+
+    #[test]
     fn physical_keyboard_sides_and_numpad_enter_remain_distinct() {
         assert_eq!(physical_heatmap_vk(0x10, 0x2a << 16), 0xa0);
         assert_eq!(physical_heatmap_vk(0x10, 0x36 << 16), 0xa1);
@@ -1943,6 +2224,7 @@ mod tests {
             last_preedit: String::new(),
             cancellation: CompositionCancellation::default(),
             ctf_ok: true,
+            last_full_poll_ms: 0,
         };
         let evs = h.diff_events("你好");
         assert!(matches!(&evs[0], HostEvent::Commit(s) if s == "你好"));
@@ -1965,6 +2247,7 @@ mod tests {
             last_preedit: String::new(),
             cancellation: CompositionCancellation::default(),
             ctf_ok: true,
+            last_full_poll_ms: 0,
         };
         let ev = h.diff_events("甲🦊乙");
         assert_eq!(ev.len(), 3);
@@ -1983,6 +2266,7 @@ mod tests {
             last_preedit: String::new(),
             cancellation: CompositionCancellation::default(),
             ctf_ok: true,
+            last_full_poll_ms: 0,
         };
         let document: Vec<u16> = "j".encode_utf16().collect();
         let (committed, preedit) = split_composition(&document, &[0..1]).unwrap();

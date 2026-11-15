@@ -758,6 +758,24 @@ pub fn split_smart(raw: &str, target_chars: usize) -> Vec<Segment> {
     out
 }
 
+/// 【七轮】纯文本按原文段落切段：换行（含 CRLF 归并）是段落边界，
+/// 不按段长切碎、换行本身不进跟打目标——Enter 在跟打器里是"下一段"，
+/// 段内出现 \n 会卡死打字进程（m02334"复制进去只有86字"根因）。
+/// 空白段落跳过；段内首尾空白修剪；其余字符逐字保留（键数公平）。
+pub fn split_paragraphs(raw: &str) -> Vec<Segment> {
+    let normalized = crate::compare::normalize_newlines(raw);
+    normalized
+        .split('\n')
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .enumerate()
+        .map(|(i, l)| Segment {
+            mark: (i + 1).to_string(),
+            text: l.to_string(),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -789,6 +807,24 @@ mod tests {
             restore_shifted_body("－〃－，。！"),
             "，。，\u{ff0b}\u{3001}\u{ff00}"
         );
+    }
+
+    /// 【七轮】split_paragraphs：纯文本按原文段落切段，换行不进跟打目标。
+    #[test]
+    fn split_paragraphs_cuts_on_newlines_and_keeps_every_visible_char() {
+        let segs = split_paragraphs("第一段。\r\n\r\n  第二段，句中空白保留。 \r\n第三段。\r\n\r\n");
+        let texts: Vec<&str> = segs.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(texts, vec!["第一段。", "第二段，句中空白保留。", "第三段。"]);
+        assert_eq!(
+            segs.iter().map(|s| s.mark.as_str()).collect::<Vec<_>>(),
+            vec!["1", "2", "3"]
+        );
+        // 单行长文不切碎（不按段长切）；CRLF/CR 归并；全空输入给空集
+        let blob = "连续长文。".repeat(200);
+        assert_eq!(split_paragraphs(&blob).len(), 1);
+        assert_eq!(split_paragraphs(&blob)[0].text, blob);
+        assert!(split_paragraphs(" \r\n \n ").is_empty());
+        assert!(split_paragraphs("").is_empty());
     }
 
     #[test]

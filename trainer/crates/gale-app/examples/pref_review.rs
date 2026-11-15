@@ -1,4 +1,4 @@
-//! 开发期 F1 设置页布局 fixture：四页 × 1280×800 / 800×600。
+//! 开发期 F1 设置页布局 fixture：六页 × 1280×800 / 800×600 / 640×420。
 //!
 //! 运行（trainer 目录）：
 //! cargo run -p gale-app --example pref_review --target x86_64-pc-windows-gnu -- <输出目录>
@@ -93,6 +93,7 @@ fn seed_preferences(cfg: &Config, m: &mut Model, theme: &gale_core::theme::Theme
     for (key, value) in [
         ("hint_show_code", cfg.hint_show_code),
         ("hint_show_rank", cfg.hint_show_rank),
+        ("show_preedit", cfg.show_preedit),
         ("score_auto_copy", cfg.score_auto_copy),
         ("auto_send_score", false),
     ] {
@@ -100,6 +101,14 @@ fn seed_preferences(cfg: &Config, m: &mut Model, theme: &gale_core::theme::Theme
     }
     m.fields
         .insert("hint_font_size".into(), cfg.hint_font_size.to_string());
+    for (key, value) in [
+        ("hint_code_offset", cfg.hint_code_offset),
+        ("hint_rank_offset", cfg.hint_rank_offset),
+        ("preedit_font_size", cfg.preedit_font_size),
+        ("preedit_offset", cfg.preedit_offset),
+    ] {
+        m.fields.insert(key.into(), value.to_string());
+    }
     m.fields.insert(
         "score_fields".into(),
         "segment,speed,key_accuracy,character_accuracy,code_len,keys,wrong,backspaces,select_count,retype_count,chars,time"
@@ -147,7 +156,7 @@ fn paint_field_fixtures(
     height: f32,
 ) {
     let p = ui::tokens(t);
-    for field in modals::fields(m, width, height) {
+    for field in modals::fields(m, width, height, None) {
         if field.h <= 0. || field.w <= 0. {
             continue;
         }
@@ -202,19 +211,27 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut manifest = Vec::new();
     let mut shots: Vec<(f32, f32, u8, f32, &str)> = Vec::new();
     for (width, height) in [(WIDTH, HEIGHT), (800., 600.)] {
-        for tab in 0..=3u8 {
+        for tab in 0..=5u8 {
             shots.push((width, height, tab, 0., ""));
         }
     }
-    for tab in [1u8, 2] {
-        // 800×600 下 200px 是 main.rs 允许的最大面板滚动量（752−600+48），
-        // 用它验证模板区/预览卡整段可达。
-        shots.push((800., 600., tab, 200., "-scrolled"));
+    for (width, height) in [(WIDTH, HEIGHT), (800., 600.)] {
+        for tab in 0..=5u8 {
+            // 紧凑面板在大屏也可能需要滚动，不能只验首屏。
+            shots.push((width, height, tab, 10_000., "-scrolled"));
+        }
     }
-    for tab in [1u8, 2] {
+    for tab in 0..=5u8 {
         // 640×420 是最小窗，design_review 也会出；这里先确认 F1 不破版。
         shots.push((640., 420., tab, 0., ""));
+        shots.push((640., 420., tab, 10_000., "-scrolled"));
     }
+    shots.push((WIDTH, HEIGHT, 0, 230., "-hint-large"));
+    shots.push((640., 420., 0, 10_000., "-hint-large"));
+    shots.push((WIDTH, HEIGHT, 3, 0., "-preedit-custom"));
+    shots.push((WIDTH, HEIGHT, 3, 0., "-preedit-large"));
+    shots.push((640., 420., 3, 0., "-preedit-large"));
+    shots.push((WIDTH, HEIGHT, 3, 0., "-preedit-hidden"));
     for (width, height, tab, scroll, suffix) in shots {
         {
             let mut sess = article_session();
@@ -226,8 +243,20 @@ fn main() -> Result<(), Box<dyn Error>> {
                 ..Config::default()
             };
             cfg.theme = "墨玉".into();
+            if suffix == "-hint-large" {
+                cfg.hint_font_size = 100.;
+                cfg.hint_code_offset = 18.;
+                cfg.hint_rank_offset = -6.;
+            }
+            if suffix == "-preedit-custom" {
+                cfg.preedit_font_size = 26.;
+                cfg.preedit_offset = -8.;
+            }
+            if suffix == "-preedit-large" { cfg.preedit_font_size = 100.; }
+            if suffix == "-preedit-hidden" { cfg.show_preedit = false; }
             let theme = ui::theme("墨玉");
             let mut m = Model::default();
+            m.hints = true;
             m.open(Modal::Preferences);
             m.fields.insert("pref_tab".into(), tab.to_string());
             m.latest = Some(latest_score());
@@ -239,7 +268,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 height as u32,
                 suffix
             );
-            m.panel_scroll = scroll;
+            m.panel_scroll = scroll.min(modals::panel_scroll_max(&m, width, height, height));
             renderer.resize_lossy(width as u32, height as u32);
             let (body_w, font_size, _) = ui::body_metrics(&sess, &cfg, width);
             let lines = renderer.wrap_text(&sess.current_segment().text, font_size, body_w);
@@ -272,13 +301,15 @@ fn main() -> Result<(), Box<dyn Error>> {
                 width,
                 height,
                 NOW_MS as f64 / 1000.,
+                false,
+                None,
             );
             paint_field_fixtures(&mut frame, &m, &theme, width, height);
             renderer.draw_frame(&frame)?;
             renderer
                 .save_bmp(&output.join(&name))
                 .map_err(std::io::Error::other)?;
-            let field_manifest: Vec<_> = modals::fields(&m, width, height)
+            let field_manifest: Vec<_> = modals::fields(&m, width, height, None)
                 .into_iter()
                 .map(|field| {
                     serde_json::json!({
@@ -293,7 +324,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                 "tab_name": tab_name(tab),
                 "file": name,
                 "logical_size": [width, height],
-                "panel_scroll": scroll,
+                "panel_scroll": m.panel_scroll,
+                "show_preedit":cfg.show_preedit,
+                "preedit_font_size":cfg.preedit_font_size,
+                "preedit_offset":cfg.preedit_offset,
                 "panel": modals::panel_for_model(&m, width, height),
                 "native_fields": field_manifest,
                 "hits": hits.len(),
@@ -308,7 +342,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             "kind": "development-layout-fixture",
             "dpi": 96,
             "screens": manifest,
-            "notice": "F1 设置四页在 1280×800 与 800×600 下的真实 Frame/D2D 布局；原生编辑框样本值由 D2D 按 FieldSpec 绘制，不验证 TSF 输入。"
+            "notice": "F1 设置六页在 1280×800、800×600 与 640×420 下的真实 Frame/D2D 布局，含顶端/滚动到底及键入提示开关、100px字号；原生编辑框样本值由 D2D 按 FieldSpec 绘制，不验证 TSF 输入。"
         }))?,
     )?;
     Ok(())
@@ -319,6 +353,8 @@ fn tab_name(tab: u8) -> &'static str {
         0 => "practice",
         1 => "score",
         2 => "colors",
-        _ => "data",
+        3 => "interface",
+        4 => "data",
+        _ => "shortcuts",
     }
 }

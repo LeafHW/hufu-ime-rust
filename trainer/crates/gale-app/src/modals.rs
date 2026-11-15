@@ -77,6 +77,11 @@ pub enum Action {
     Restart,
     Previous,
     Next,
+    /// 【末字 2026-11-14】打字未完成（含末字有误）按 Enter/Space：给出明确
+    /// 反馈而非静默无动作（此前换行/空格被写进 relay 无任何提示）。
+    RoundStuckHint,
+    /// 【载文守卫 2026-11-14】ConfirmYes 的载文重入臂（confirmed 语义）。
+    ProceedLoad,
     CopyScore,
     CopyRace,
     SelectHistory(usize),
@@ -172,6 +177,11 @@ pub struct Model {
     pub hints: bool,
     pub reduced_motion: bool,
     pub paused: bool,
+    /// 【二级页拖动 2026-11-14】面板相对居中位的偏移（逻辑 DIP）。
+    /// 拖动只改这个值，`panel_for_model` 统一夹回窗口内，保证标题栏至少留一条可抓。
+    pub modal_shift: (f32, f32),
+    /// 【独立二级窗 2026-11-14】主帧跳过理论分析 dock（由 overlay 画）。
+    pub skip_analysis_dock: bool,
     pub status: String,
     pub words: Vec<HintWord>,
     /// 【下一个字编码 2026-11-12】与当前分析文本逐字对齐的单字码表；
@@ -211,6 +221,10 @@ pub struct Model {
     pub rule_test_source: String,
     pub rule_hits: usize,
     pub rule_error: String,
+    /// 【审计 I06】最近一次保存的可见状态：`未改动` / `已保存 HH:MM` / `保存失败：原因`。
+    /// 弹层只读它画常驻状态行（不再只靠瞬间 toast）；写入方是主窗口的保存链路
+    /// （main.rs 的 `Bg::Saved` / `Action::RuleSave`，接线点见报告）。
+    pub save: SaveStatus,
     pub quote_relaxed: bool,
     pub fields: BTreeMap<String, String>,
     pub latest: Option<ScoreRecord>,
@@ -250,6 +264,8 @@ impl Model {
         self.modal = m;
         self.scroll = 0.;
         self.panel_scroll = 0.;
+        // 每次打开回到居中位；同一面板内切 tab 不重置。
+        self.modal_shift = (0., 0.);
         self.modal_epoch += 1;
     }
     pub fn toast(&mut self, s: impl Into<String>, n: f64) {
@@ -257,6 +273,24 @@ impl Model {
     }
     pub fn field(&self, id: &str) -> String {
         self.fields.get(id).cloned().unwrap_or_default()
+    }
+    /// 【审计 I06】记录「已保存 HH:MM」。`now_unix` 由调用方（主循环，帧里本来就有
+    /// `now`）传入，避免本模块自己去取系统时间而破坏绘制期的纯函数性质。
+    /// 文案在这一刻生成并缓存，之后逐帧绘制不再重算，状态行不会抖。
+    #[allow(dead_code)] // 等待主窗口保存链路接线（见报告「未做到的部分」）
+    pub fn mark_saved(&mut self, now_unix: u64) {
+        self.save = SaveStatus::saved(now_unix);
+    }
+    /// 【审计 I06】记录「保存失败：原因」。失败原因常来自 io 错误原文，可能带换行，
+    /// 由 `SaveStatus::failed` 统一压成单行。
+    #[allow(dead_code)] // 等待主窗口保存链路接线（见报告「未做到的部分」）
+    pub fn mark_save_failed(&mut self, reason: &str) {
+        self.save = SaveStatus::failed(reason);
+    }
+    /// 【审计 I06】回到「未改动」：打开弹层、或改动的基线已被重新载入时调用。
+    #[allow(dead_code)] // 等待主窗口保存链路接线（见报告「未做到的部分」）
+    pub fn reset_save_status(&mut self) {
+        self.save = SaveStatus::unchanged();
     }
 }
 pub struct FieldSpec {
@@ -273,14 +307,17 @@ pub const PANEL_FOOT: f32 = 62.;
 
 pub fn panel(m: Modal, w: f32, h: f32) -> (f32, f32, f32, f32) {
     let (ideal_w, ph): (f32, f32) = match m {
-        Modal::Online => (920., 740.),
-        Modal::Preferences => (960., 760.),
-        Modal::Groups => (720., 520.),
-        Modal::More => (640., 460.),
-        Modal::Rules => (1040., 900.),
-        Modal::Confirm => (560., 300.),
-        Modal::Heatmap => (1040., 620.),
-        Modal::Analysis => (1460., 1000.),
+        Modal::Online => (560., 480.),
+        Modal::Preferences => (840., 660.),
+        Modal::Groups => (520., 470.),
+        Modal::More => (560., 320.),
+        // 【紧凑 2026-11-14】Rules 重排完成：列表行 62→48、编辑卡 282、
+        // 测试卡 184、引号卡 54，整页按 680 紧凑排——常规窗口（客户高 ≥680）
+        // 内不再溢出，overlay 也不会再被 fit_to_work 推出主窗。
+        Modal::Rules => (840., 620.),
+        Modal::Confirm => (460., 260.),
+        Modal::Heatmap => (860., 480.),
+        Modal::Analysis => (980., 660.),
         _ => (880., 596.),
     };
     let ph = if matches!(
@@ -297,14 +334,41 @@ pub fn panel(m: Modal, w: f32, h: f32) -> (f32, f32, f32, f32) {
 }
 /// Field placement and panel rendering must use the same tab-dependent bounds.
 pub fn panel_for_model(m: &Model, w: f32, h: f32) -> (f32, f32, f32, f32) {
+    let (x, y, pw, ph) = panel_base(m, w, h);
+    let (dx, dy) = m.modal_shift;
+    // 至少留 160px 宽 + 标题栏高在窗口内，拖出去也还能抓回来。
+    let x = (x + dx).clamp(120. - pw, w - 120.);
+    let y = (y + dy).clamp(16., (h - 70.).max(16.));
+    (x, y, pw, ph)
+}
+
+/// 【拖动范围 2026-11-14】overlay 独立窗定位专用：panel_base + modal_shift
+/// **不做主窗内钳制**——二级窗是顶层窗，允许整体进入主窗上方/左右侧的屏幕
+/// 区域；越界收敛交给 overlay::fit_to_work（按屏幕工作区钳制）。主窗内钳制
+/// 曾把 800 高面板的 py 钉死在 [16, h-70]，而 overlay 需伸到主窗顶以上才能
+/// 落进工作区 → 垂直拖动完全死锁（只能停在屏幕底缘）。
+pub fn panel_for_model_free(m: &Model, w: f32, h: f32) -> (f32, f32, f32, f32) {
+    let (x, y, pw, ph) = panel_base(m, w, h);
+    let (dx, dy) = m.modal_shift;
+    (x + dx, y + dy, pw, ph)
+}
+
+/// 未叠加拖动偏移的理想居中位（拖动夹取与“复位”用）。
+pub fn panel_base(m: &Model, w: f32, h: f32) -> (f32, f32, f32, f32) {
     let (x, _y, pw, ph) = panel(m.modal, w, h);
     if m.modal == Modal::Groups {
-        let rows = m.groups.len().clamp(2, 8) as f32;
-        let ph = (62. + 48. + rows * 44. + 96.).clamp(320., 520.);
+        let rows = m.groups.len().clamp(2, 6) as f32;
+        let ph = (206. + rows * 44.)
+            .clamp(294., 470.)
+            .min(panel_view(470., h));
         return (x, ((h - panel_view(ph, h)) / 2.).max(16.), pw, ph);
     }
     if m.modal == Modal::Online {
         let ph = crate::secondary_panels::content_height_online(m).min(ph);
+        return (x, ((h - panel_view(ph, h)) / 2.).max(16.), pw, ph);
+    }
+    if m.modal == Modal::Rules {
+        let ph = crate::secondary_panels::content_height_rules(pw);
         return (x, ((h - panel_view(ph, h)) / 2.).max(16.), pw, ph);
     }
     let y = _y;
@@ -317,21 +381,28 @@ pub fn panel_for_model(m: &Model, w: f32, h: f32) -> (f32, f32, f32, f32) {
 fn panel_view(ph: f32, h: f32) -> f32 {
     ph.min((h - 48.).max(PANEL_HEAD + PANEL_FOOT + 48.))
 }
-pub fn fields(m: &Model, w: f32, h: f32) -> Vec<FieldSpec> {
-    let (x, y, pw, ph) = panel_for_model(m, w, h);
+pub fn fields(m: &Model, w: f32, h: f32, pin: Option<(f32, f32)>) -> Vec<FieldSpec> {
+    // 【拖动分割 2026-11-14】pin=Some：overlay 独立窗模式，帧内面板钉死在
+    // 留白角（窗口定位已含 modal_shift，帧内再叠会把原生控件挪到窗外）。
+    let (bx, by, pw, ph) = panel_for_model(m, w, h);
+    let (x, y) = pin.unwrap_or((bx, by));
     let mut v = match m.modal {
         Modal::Online | Modal::Rules => crate::secondary_panels::fields(m, x, y, pw, ph),
         Modal::Preferences => preferences::fields(m, x, y, pw, ph),
         _ => Vec::new(),
     };
-    clip_native_fields(&mut v, m, w, h);
+    clip_native_fields(&mut v, m, w, h, pin);
     v
 }
-fn clip_native_fields(v: &mut [FieldSpec], m: &Model, w: f32, h: f32) {
-    let (x, y, pw, ph) = panel_for_model(m, w, h);
+fn clip_native_fields(v: &mut [FieldSpec], m: &Model, w: f32, h: f32, pin: Option<(f32, f32)>) {
+    let (bx, by, pw, ph) = panel_for_model(m, w, h);
+    let (x, y) = pin.unwrap_or((bx, by));
     let top = y + PANEL_HEAD;
     let bottom = y + panel_view(ph, h) - PANEL_FOOT;
-    let scroll = m.panel_scroll.clamp(0., (ph - panel_view(ph, h)).max(0.));
+    let content = modal_content_height(m, pw).max(ph);
+    let scroll = m
+        .panel_scroll
+        .clamp(0., (content - panel_view(ph, h)).max(0.));
     for z in v {
         z.y -= scroll;
         let end = (z.y + z.h).min(bottom);
@@ -344,14 +415,15 @@ fn clip_native_fields(v: &mut [FieldSpec], m: &Model, w: f32, h: f32) {
 }
 
 /// 原生下拉随设置页滚动，部分越出正文时隐藏，避免覆盖固定页头/页脚。
-pub fn font_picker(m: &Model, w: f32, h: f32) -> Option<FieldSpec> {
+pub fn font_picker(m: &Model, w: f32, h: f32, pin: Option<(f32, f32)>) -> Option<FieldSpec> {
     if m.modal != Modal::Preferences {
         return None;
     }
-    let (x, y, pw, _) = panel_for_model(m, w, h);
+    let (bx, by, pw, _) = panel_for_model(m, w, h);
+    let (x, y) = pin.unwrap_or((bx, by));
     let mut field = preferences::font_picker(m, x, y, pw)?;
     let height = field.h;
-    clip_native_fields(std::slice::from_mut(&mut field), m, w, h);
+    clip_native_fields(std::slice::from_mut(&mut field), m, w, h, pin);
     (field.h >= height && field.w > 0.).then_some(field)
 }
 fn command_y(c: &DrawCmd) -> Option<f32> {
@@ -364,6 +436,19 @@ fn command_y(c: &DrawCmd) -> Option<f32> {
         | DrawCmd::StyledLine { y, .. }
         | DrawCmd::PushClip { y, .. }
         | DrawCmd::Glyphs { y, .. } => Some(*y),
+        DrawCmd::PopClip | DrawCmd::BlurBackdrop { .. } => None,
+    }
+}
+fn command_x(c: &DrawCmd) -> Option<f32> {
+    match c {
+        DrawCmd::Rect { x, .. }
+        | DrawCmd::RoundRect { x, .. }
+        | DrawCmd::Line { x, .. }
+        | DrawCmd::Text { x, .. }
+        | DrawCmd::TextRun { x, .. }
+        | DrawCmd::StyledLine { x, .. }
+        | DrawCmd::PushClip { x, .. }
+        | DrawCmd::Glyphs { x, .. } => Some(*x),
         DrawCmd::PopClip | DrawCmd::BlurBackdrop { .. } => None,
     }
 }
@@ -394,6 +479,7 @@ fn fit_panel(
     scroll: f32,
     sticky: f32,
     content: f32,
+    fixed_left: f32,
 ) {
     // `sticky` keeps a band just below the header (for example the preference
     // tabs) out of the scrolling body so a scrolled panel never shows a
@@ -410,7 +496,7 @@ fn fit_panel(
     };
     let scroll = scroll.clamp(0., scroll_range);
     let old = f.cmds.split_off(start);
-    let mut body_clip = false;
+    let mut viewport_clip = None;
     let mut original_clips = Vec::new();
     for (i, mut c) in old.into_iter().enumerate() {
         if i == 0 {
@@ -425,7 +511,13 @@ fn fit_panel(
         } else {
             original_clips.last().copied().unwrap_or_else(|| {
                 let cy = command_y(&c).unwrap_or(y);
-                if cy >= body_end {
+                if fixed_left > 0.
+                    && cy >= body_top
+                    && cy < body_end
+                    && command_x(&c).is_some_and(|cx| cx <= x + fixed_left)
+                {
+                    3
+                } else if cy >= body_end {
                     2
                 } else if cy >= body_top {
                     1
@@ -434,18 +526,25 @@ fn fit_panel(
                 }
             })
         };
-        if body_clip && section != 1 {
+        let clip_section = matches!(section, 1 | 3).then_some(section);
+        if viewport_clip.is_some() && viewport_clip != clip_section {
             f.push(DrawCmd::PopClip);
-            body_clip = false;
+            viewport_clip = None;
         }
-        if !body_clip && section == 1 {
+        if viewport_clip.is_none() && clip_section.is_some() {
+            let inset = if section == 1 { fixed_left } else { 0. };
+            let width = if section == 3 {
+                fixed_left
+            } else {
+                pw - fixed_left - 2.
+            };
             f.push(DrawCmd::PushClip {
-                x: x + 1.,
+                x: x + 1. + inset,
                 y: body_top,
-                w: pw - 2.,
+                w: width,
                 h: (visible_end - body_top).max(1.),
             });
-            body_clip = true;
+            viewport_clip = clip_section;
         }
         if matches!(c, DrawCmd::PushClip { .. }) {
             original_clips.push(section);
@@ -462,13 +561,25 @@ fn fit_panel(
         );
         f.push(c);
     }
-    if body_clip {
+    if viewport_clip.is_some() {
         f.push(DrawCmd::PopClip);
     }
     for z in hits.iter_mut() {
         if z.action == Action::None && z.x == x && z.y == y && z.w == pw {
             z.h = view;
-        } else if z.y >= body_top && z.y < body_end {
+        } else if fixed_left > 0. && z.x < x + fixed_left && z.y >= body_top {
+            let right = (z.x + z.w).min(x + fixed_left);
+            let bottom = (z.y + z.h).min(visible_end);
+            z.x = z.x.max(x);
+            z.w = (right - z.x).max(0.);
+            z.y = z.y.max(body_top);
+            z.h = (bottom - z.y).max(0.);
+        } else if (fixed_left > 0.
+            && z.x >= x + fixed_left
+            && z.y >= body_top
+            && z.action != Action::Close)
+            || (z.y >= body_top && z.y < body_end)
+        {
             z.y -= scroll;
             let right = (z.x + z.w).min(x + pw);
             let bottom = (z.y + z.h).min(visible_end);
@@ -685,34 +796,158 @@ fn icon(f: &mut Frame, kind: &str, x: f32, y: f32, size: f32, color: [f32; 4]) {
         }
     }
 }
-fn header_keycap(f: &mut Frame, x: f32, y: f32, key: &str, t: &Theme) {
-    if key.is_empty() {
-        return;
+/// 【审计 I04】关闭类提示用的是固定键：Esc 在 `gale_win::input_host::shortcut_reserved`
+/// 里被保留、`SHORTCUT_DEFAULTS` 也没有对应 id，用户改不了，所以弹层照实显示 "Esc"。
+const KEY_CLOSE: &str = "Esc";
+
+/// 【审计 I04】把配置里的组合键规范成界面写法（与 `gale_win::input_host::chord_text`
+/// 的录制格式对齐：修饰键固定 Ctrl+Alt+Shift、F 键写作 "F8"、单字母大写）。
+/// 理由：手改过 config.toml（例如写成 "ctrl+shift+o"）时弹层不能显示小写残样；
+/// 该函数对已规范的字符串幂等，因此与主窗口 toast「原样显示 chord」的结果始终一致。
+pub(crate) fn display_chord(text: &str) -> String {
+    let mut ctrl = false;
+    let mut alt = false;
+    let mut shift = false;
+    let mut key: Option<String> = None;
+    for part in text.trim().split('+') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        match part.to_ascii_lowercase().as_str() {
+            "ctrl" | "control" => ctrl = true,
+            "alt" => alt = true,
+            "shift" => shift = true,
+            _ => key = Some(normalize_key_name(part)),
+        }
     }
-    let p = tokens(t);
-    round(f, x, y, 36., 28., 6., p.surface2, Some(p.line2));
-    mono(f, x + 7., y + 4., 15., key, p.muted);
+    let mut out = String::new();
+    for (on, name) in [(ctrl, "Ctrl"), (alt, "Alt"), (shift, "Shift")] {
+        if on {
+            out.push_str(name);
+            out.push('+');
+        }
+    }
+    match key {
+        Some(key) => out + &key,
+        // 只有修饰键（正常录制不会产生）：原样返回，别显示成空串把键帽吞掉。
+        None => text.trim().to_string(),
+    }
 }
-fn panel_header(f: &mut Frame, hs: &mut Vec<Hit>, m: Modal, x: f32, y: f32, pw: f32, t: &Theme) {
-    let p = tokens(t);
-    let (icon_name, title, desc, key) = match m {
-        Modal::More => ("folder", "更多", "工具、设置与数据", ""),
-        Modal::Groups => ("group", "选择群聊", "选中后读取群文或发送成绩", "F5"),
+
+/// 【审计 I04】单个键名的界面写法。不认识的键名保持原样——宁可显示配置原文，
+/// 也不要猜一个可能是错的键名。
+fn normalize_key_name(part: &str) -> String {
+    let lower = part.to_ascii_lowercase();
+    match lower.as_str() {
+        "left" => "Left".into(),
+        "right" => "Right".into(),
+        "up" => "Up".into(),
+        "down" => "Down".into(),
+        "enter" => "Enter".into(),
+        "space" => "Space".into(),
+        "tab" => "Tab".into(),
+        "esc" => "Esc".into(),
+        "menu" | "apps" => "Menu".into(),
+        _ => {
+            // F1..F24（range pattern 不支持 &str，这里显式解析）。
+            if let Some(n) = lower.strip_prefix('f').and_then(|n| n.parse::<u8>().ok()) {
+                if (1..=24).contains(&n) {
+                    return lower.to_ascii_uppercase();
+                }
+            }
+            if lower.chars().count() == 1 {
+                lower.to_ascii_uppercase()
+            } else {
+                part.to_string()
+            }
+        }
+    }
+}
+
+/// 【审计 I04】弹层提示要显示的键位。
+///
+/// 审计问题：底部/标题栏的快捷键原先写死默认值（"F5"/"F1"），用户改过快捷键之后
+/// 提示与实际不符。键位来源是 `Config::shortcut(id)`（gale-core/src/config.rs:418：
+/// 用户自设优先，缺省回落 `SHORTCUT_DEFAULTS`；未知 id 返回空串），主窗口
+/// `apply_shortcuts` 用的正是同一份表，所以这里显示的就是真正生效的键。
+/// `id = None` 表示固定键（Esc / Ctrl+V 载文等不可改键），照 `fallback` 显示；
+/// `fallback` 只在配置查不到（旧档 / 未知 id）时兜底，行为不倒退。
+pub(crate) fn hint_key(cfg: &Config, id: Option<&str>, fallback: &str) -> String {
+    match id {
+        None => fallback.to_string(),
+        Some(id) => {
+            let chord = cfg.shortcut(id);
+            if chord.trim().is_empty() {
+                fallback.to_string()
+            } else {
+                display_chord(&chord)
+            }
+        }
+    }
+}
+
+/// 【审计 I04】标题栏文案与键帽（纯逻辑，便于单测）。
+/// 键位全部经 `hint_key` 解析：Groups 用 "groups"、Preferences 用 "settings"，
+/// Heatmap/Confirm 的 Esc 是固定键。
+fn header_parts(cfg: &Config, m: Modal) -> (&'static str, &'static str, &'static str, String) {
+    match m {
+        Modal::More => ("folder", "更多", "工具、设置与数据", String::new()),
+        Modal::Groups => (
+            "group",
+            "选择群聊",
+            "选中后读取群文或发送成绩",
+            hint_key(cfg, Some("groups"), "F5"),
+        ),
         Modal::Preferences => (
             "palette",
             "跟打器设置",
             "练习、成绩、外观、界面与数据、快捷键",
-            "F1",
+            hint_key(cfg, Some("settings"), "F1"),
         ),
         Modal::Heatmap => (
             "keyboard",
             "本段按键热力图",
             "当前段每个按键的按下次数 · 滚轮关闭",
-            "Esc",
+            hint_key(cfg, None, KEY_CLOSE),
         ),
-        Modal::Confirm => ("!", "确认操作", "当前练习的内容将发生改变", "Esc"),
-        _ => ("", "", "", ""),
-    };
+        Modal::Confirm => (
+            "!",
+            "确认操作",
+            "当前练习的内容将发生改变",
+            hint_key(cfg, None, KEY_CLOSE),
+        ),
+        _ => ("", "", "", String::new()),
+    }
+}
+
+/// 【审计 I04】标题栏键帽：右端锚定、宽度随键名自适应。
+/// 旧版固定 36×28 且从 `x + pw - 104` 起画，只够 "F5"/"Esc"；用户把键改成
+/// "Ctrl+Shift+O" 这类长组合时文字会溢出圆角盒、压到右侧关闭按钮。
+fn header_keycap(f: &mut Frame, right: f32, y: f32, key: &str, t: &Theme) {
+    if key.is_empty() {
+        return;
+    }
+    let p = tokens(t);
+    let w = (ui_text_width(key, 15.) + 16.).max(36.);
+    round(f, right - w, y, w, 28., 6., p.surface2, Some(p.line2));
+    mono(f, right - w + 8., y + 4., 15., key, p.muted);
+}
+#[allow(clippy::too_many_arguments)]
+fn panel_header(
+    f: &mut Frame,
+    hs: &mut Vec<Hit>,
+    m: Modal,
+    // 【审计 I04】新增 cfg：标题栏键帽要按当前配置显示。这是私有函数，圆括号里
+    // 唯一的调用点就在本文件的 `draw`（它本来就收 `&Config`），不涉及公开签名。
+    cfg: &Config,
+    x: f32,
+    y: f32,
+    pw: f32,
+    t: &Theme,
+) {
+    let p = tokens(t);
+    let (icon_name, title, desc, key) = header_parts(cfg, m);
     round(
         f,
         x + 20.,
@@ -726,7 +961,10 @@ fn panel_header(f: &mut Frame, hs: &mut Vec<Hit>, m: Modal, x: f32, y: f32, pw: 
     icon(f, icon_name, x + 27., y + 22., 18., p.accent);
     text(f, x + 62., y + 10., 20., title, p.text);
     text(f, x + 62., y + 38., 15., desc, p.muted);
-    header_keycap(f, x + pw - 104., y + 17., key, t);
+    // 【审计 I04】键帽右端锚定在关闭按钮左侧（x + pw - 66），宽度按键名自适应：
+    // 旧版锚点固定在 x + pw - 104、盒宽固定 36，用户把键改成组合键后文字会溢出
+    // 键帽压到 "×" 上；右锚定后长键名只会向左生长，右侧间距恒定。
+    header_keycap(f, x + pw - 66., y + 17., &key, t);
     text(f, x + pw - 52., y + 13., 25., "×", p.muted);
     hit_box(hs, x + pw - 58., y + 10., 42., 42., Action::Close);
     line(f, x, y + PANEL_HEAD - 1., pw, p.line);
@@ -743,6 +981,140 @@ fn footer(f: &mut Frame, x: f32, y: f32, pw: f32, ph: f32, t: &Theme) {
     );
     line(f, x, y + ph - PANEL_FOOT, pw, p.line);
 }
+
+// ─── 【审计 I06】弹层里的「保存状态」三态与常驻状态行 ───────────────────────────
+// 审计问题：设置是即时保存的，失败只在瞬间 toast 里闪一下（main.rs 里对
+// `Bg::Saved` 失败还做了 30s 节流，连闪都不一定闪），用户关掉提示后无法确认
+// 这次改动到底有没有落盘。要求：在弹窗涉及保存的区域显示稳定的
+// `未改动` / `已保存 HH:MM` / `保存失败：<原因>` 状态行，用次级文字色、失败用打错色，
+// 并且只在状态变化时更新文案，不许每帧抖动重排。
+//
+// 做法：把结果收敛成 `SaveStatus`（kind + 已渲染好的单行文案）。**文案在状态切换的
+// 那一瞬间生成并缓存**（时钟串只取一次），逐帧绘制只读缓存文本：不取系统时间、
+// 不换行、锚点与基线是常量，所以相邻帧之间不会抖动，也不会触发重排。
+// 数据来源（接线点，当前不在本文件权限内）：main.rs 的 `Bg::Saved` 成功/失败分支、
+// `Action::RuleSave` 成功分支与 secondary_panels 的在线发文/规则面板。
+
+/// 【审计 I06】保存状态的三态，决定显示用哪种颜色。
+#[allow(dead_code)] // Saved 目前只由接线点（main.rs）构造；测试里三种态都会用到
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SaveKind {
+    /// 未改动：打开面板后还没有待落盘的修改。
+    #[default]
+    Unchanged,
+    /// 最近一次保存已成功落盘。
+    Saved,
+    /// 最近一次保存失败。
+    Failed,
+}
+
+/// 【审计 I06】保存状态行：状态 + 已渲染好的单行文案。
+#[allow(dead_code)] // 接线点尚未落地（见报告「未做到的部分」）
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SaveStatus {
+    kind: SaveKind,
+    /// 状态切换时生成一次；逐帧绘制只读它——这是「不抖动」的关键。
+    text: String,
+}
+
+impl Default for SaveStatus {
+    fn default() -> Self {
+        Self::unchanged()
+    }
+}
+
+#[allow(dead_code)] // 接线点尚未落地（见报告「未做到的部分」）
+impl SaveStatus {
+    /// 「未改动」：面板刚打开、没有任何待落盘改动时显示。
+    pub fn unchanged() -> Self {
+        Self {
+            kind: SaveKind::Unchanged,
+            text: "未改动".to_string(),
+        }
+    }
+    /// 「已保存 HH:MM」：`unix_secs` 是落盘时刻的 unix 秒（东八区显示）。
+    pub fn saved(unix_secs: u64) -> Self {
+        Self {
+            kind: SaveKind::Saved,
+            text: format!("已保存 {}", clock_hhmm(unix_secs)),
+        }
+    }
+    /// 「保存失败：原因」：原因来自写盘错误原文，先压成单行再显示。
+    pub fn failed(reason: &str) -> Self {
+        Self {
+            kind: SaveKind::Failed,
+            text: format!("保存失败：{}", one_line(reason)),
+        }
+    }
+    pub fn kind(&self) -> SaveKind {
+        self.kind
+    }
+    /// 已缓存的状态文案（零拷贝取用）。
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+    pub fn is_failed(&self) -> bool {
+        self.kind == SaveKind::Failed
+    }
+    pub fn is_unchanged(&self) -> bool {
+        self.kind == SaveKind::Unchanged
+    }
+}
+
+/// 【审计 I06】unix 秒 → 东八区 "HH:MM"。没有 chrono，沿用
+/// `gale_core::score::unix_to_date` 的「+8h 偏移」约定（跟打器用户群全部为中国时区），
+/// 保证状态行的时间与成绩/日志里显示的日期口径一致（纯函数，便于单测）。
+pub fn clock_hhmm(unix_secs: u64) -> String {
+    let secs = (unix_secs + 8 * 3600) % 86_400;
+    format!("{:02}:{:02}", secs / 3600, secs % 3600 / 60)
+}
+
+/// 【审计 I06】把写盘错误压成单行：状态行只有一行固定高度，错误原文里的换行/制表符
+/// 会把文本块撑高、把底栏挤走（审计明确要求「不要每帧抖动重排」）。顺带限长，
+/// 超长路径只保留前 96 个字 + 省略号。
+fn one_line(s: &str) -> String {
+    let mut out = String::new();
+    for c in s.chars() {
+        // 换行/制表符统一成空格，连续空白只留一个。
+        let c = if c.is_whitespace() { ' ' } else { c };
+        if c == ' ' && (out.is_empty() || out.ends_with(' ')) {
+            continue;
+        }
+        out.push(c);
+    }
+    let out = out.trim_end().to_string();
+    if out.is_empty() {
+        return "未知原因".to_string();
+    }
+    match out.char_indices().nth(96) {
+        Some((i, _)) => format!("{}…", &out[..i]),
+        None => out,
+    }
+}
+
+/// 【审计 I06】在固定锚点、固定高度里画状态行：三态只换字，不换位置、不换行；
+/// 超出槽宽的部分裁切（PushClip），不会顶到右侧按钮。失败用打错色（`p.red`），
+/// 其余用次级文字色（`p.muted`）——颜色全部来自 `tokens(t)`，无新增色值。
+pub(crate) fn save_status_line(f: &mut Frame, x: f32, y: f32, w: f32, st: &SaveStatus, t: &Theme) {
+    if w <= 8. {
+        return;
+    }
+    let p = tokens(t);
+    let c = if st.is_failed() { p.red } else { p.muted };
+    f.push(DrawCmd::PushClip {
+        x,
+        y: y - 2.,
+        w,
+        h: 22.,
+    });
+    text(f, x, y, FONT_HINT, st.text(), c);
+    f.push(DrawCmd::PopClip);
+}
+
+pub fn groups_visible_rows(ph: f32) -> usize {
+    ((ph - 206.) / 44.).floor().max(1.) as usize
+}
+
 fn draw_groups(
     f: &mut Frame,
     hs: &mut Vec<Hit>,
@@ -762,7 +1134,7 @@ fn draw_groups(
     let list_top = y + 110.;
     let list_bottom = y + ph - 96.;
     let row_pitch = 44.;
-    let rows = (((list_bottom - list_top) / row_pitch).floor() as usize).max(1);
+    let rows = groups_visible_rows(ph);
     text(
         f,
         left,
@@ -904,25 +1276,31 @@ fn draw_groups(
     if cfg.auto_send_score {
         text(f, left + 3., cb_y - 2., 14., "✓", p.bg);
     }
-    text(
-        f,
-        left + 28.,
-        cb_y - 1.,
-        FONT_HINT,
-        "打完一段自动发成绩",
-        p.text2,
+    text(f, left + 28., cb_y - 1., FONT_HINT, "自动发成绩", p.text2);
+    text(f, left + 28., cb_y + 22., 13., "校验目标群后发送", p.muted);
+    hit_box(
+        hs,
+        left,
+        cb_y - 6.,
+        (list_w - 222.).max(0.),
+        46.,
+        Action::ToggleAutoSend,
     );
-    text(
-        f,
-        left + 28.,
-        cb_y + 22.,
-        13.,
-        "发送前会校验目标群",
-        p.muted,
-    );
-    hit_box(hs, left, cb_y - 6., 250., 46., Action::ToggleAutoSend);
     let read_x = right_x - 128.;
     let post_x = read_x - 86.;
+    // 【审计 I06】常驻保存状态行，画在本面板唯一会落盘控件（自动发成绩 / 群绑定）
+    // 的说明文字右侧、同一基线上：旧版写盘结果只在瞬间 toast 里闪一下
+    // （main.rs 对 `Bg::Saved` 失败还做了 30s 节流），用户无从确认是否落盘。
+    // 锚点、基线与槽宽都是常量，状态变化只换字，不会每帧抖动重排；
+    // 数据源 `m.save` 由主窗口保存链路写入（接线点见报告）。
+    save_status_line(
+        f,
+        left + 128.,
+        cb_y + 22.,
+        (post_x - 8. - (left + 128.)).max(0.),
+        &m.save,
+        t,
+    );
     if m.bound.and_then(|i| m.groups.get(i)).is_some() {
         btn(
             f,
@@ -973,13 +1351,15 @@ fn draw_more(
             "重打本段".into(),
             "从头开始当前段".into(),
             Action::Restart,
-            cfg.shortcut("restart"),
+            // 【审计 I04】统一走 hint_key：与标题栏同一套格式化（手改配置的小写
+            // 组合键也会显示成 "Ctrl+Shift+O"），配置缺项时回退默认键。
+            hint_key(cfg, Some("restart"), "F3"),
         ),
         (
             "选择群聊".into(),
             "绑定或取消 QQ 群".into(),
             Action::Open(Modal::Groups),
-            cfg.shortcut("groups"),
+            hint_key(cfg, Some("groups"), "F5"),
         ),
     ];
     if sess.source != crate::session::SessionSource::Single
@@ -989,7 +1369,7 @@ fn draw_more(
             "发送当前文章".into(),
             "按晴发文格式发到目标群".into(),
             Action::PostArticle,
-            cfg.shortcut("post"),
+            hint_key(cfg, Some("post"), "F2"),
         ));
     }
     let right_items: Vec<(String, String, Action, String)> = vec![
@@ -997,13 +1377,13 @@ fn draw_more(
             "跟打器设置".into(),
             "词提、成绩单与配色".into(),
             Action::Open(Modal::Preferences),
-            cfg.shortcut("settings"),
+            hint_key(cfg, Some("settings"), "F1"),
         ),
         (
             "清洗规则".into(),
             "正则清洗、原文与结果预览".into(),
             Action::Open(Modal::Rules),
-            cfg.shortcut("rules"),
+            hint_key(cfg, Some("rules"), "F9"),
         ),
         (
             "打开数据目录".into(),
@@ -1137,13 +1517,12 @@ pub(super) fn appearance_preview(
         return;
     }
     let fs = (cfg.font_size / 2.).clamp(14., 32.);
-    let hint_fs = cfg.hint_font_size.max(14.);
+    let hint_fs = cfg.hint_font_size.clamp(10., 100.);
     let hints_visible = m.hints;
-    let lh = if hints_visible {
-        (fs * (1. + cfg.line_gap) + 9.).max(fs + hint_fs + 11.)
-    } else {
-        fs * (1. + cfg.line_gap) + 9.
-    };
+    // 与实际正文同口径：行高 = fs*(1+line_gap)，词提不再额外预留提示带。
+    // （2026-11-14 审计：旧版这里 +9 且 hints 时 max(fs+hint_fs+11)，
+    // 比真实渲染松，预览看到的两行间距与跟打区不一致。）
+    let lh = fs * (1. + cfg.line_gap).clamp(0.10, 3.0);
     let word_colors: Vec<_> = m
         .words
         .iter()
@@ -1252,34 +1631,44 @@ pub(super) fn appearance_preview(
                     let xx = x + (word.start - offset) as f32 * fs;
                     let hint_size = hint_fs;
                     if cfg.hint_show_code {
-                        mono(f, xx, yy + fs + 5., hint_size, code, c);
+                        // 【词提下行 r3 2026-11-14】预览与正文同口径：编码画在
+                        // 括线校准位之下 +2（fs+offset+2）。
+                        mono(
+                            f,
+                            xx,
+                            crate::ui::hint_code_y(cfg, yy, fs),
+                            hint_size,
+                            code,
+                            c,
+                        );
                     }
                     if cfg.hint_show_rank && word.rank > 1 {
                         // 【选重数字角标 2026-11-11】与正文同口径。
                         if cfg.hint_rank_corner {
                             let ds = (fs * 0.52).max(9.);
-                            let dw =
-                                word.rank.to_string().chars().count() as f32 * ds * 0.6;
+                            let dw = word.rank.to_string().chars().count() as f32 * ds * 0.6;
                             let word_w = word.len as f32 * fs;
-                            mono(
+                            crate::ui::rank_digit(
                                 f,
+                                cfg,
                                 xx + word_w - dw - 1.,
-                                yy - ds * 0.38,
+                                yy + fs - ds * 0.62,
                                 ds,
-                                word.rank.to_string(),
+                                &word.rank.to_string(),
                                 c,
                             );
                         } else {
-                            mono(
+                            crate::ui::rank_digit(
                                 f,
+                                cfg,
                                 xx + if cfg.hint_show_code {
                                     code.chars().count() as f32 * hint_size * 0.6
                                 } else {
                                     0.
                                 },
-                                yy + fs + 2.,
+                                crate::ui::hint_code_y(cfg, yy, fs),
                                 hint_size,
-                                word.rank.to_string(),
+                                &word.rank.to_string(),
                                 c,
                             );
                         }
@@ -1363,7 +1752,7 @@ fn draw_heatmap(
         true,
     );
 }
-fn analysis_font(m: &Model) -> f32 {
+pub(crate) fn analysis_font(m: &Model) -> f32 {
     m.field("analysis_font")
         .parse::<f32>()
         .ok()
@@ -1466,6 +1855,49 @@ fn analysis_blocks(fa: &crate::FullAnalysis, m: &Model, width: f32) -> (Vec<Anal
 }
 
 /// 指定字号的排版：弹窗按一页容纳整篇文章时会把字号逐级调小。
+/// 【长截图 2026-11-15】整篇要分几屏才画得完（每屏多留 4px 拼接余量）。
+/// 【长截图 2026-11-15】把整篇按页切开，并把页边界对齐到行顶，
+/// 免得每页底部切掉半行、拼起来出现重影。返回 (起始偏移, 页高)。
+pub fn analysis_page_slices(
+    fa: &crate::FullAnalysis,
+    m: &Model,
+    width: f32,
+    fs: f32,
+    body_h: f32,
+) -> Vec<(f32, f32)> {
+    let (blocks, total) = analysis_blocks_at(fa, m, width, fs);
+    let mut tops: Vec<f32> = blocks.iter().map(|b| b.y).collect();
+    tops.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    tops.dedup_by(|a, b| (*a - *b).abs() < 0.5);
+    let limit = (body_h - 4.).max(60.);
+    let mut out: Vec<(f32, f32)> = Vec::new();
+    let mut start = 0f32;
+    while start < total - 0.5 {
+        let mut end = (start + limit).min(total);
+        if end < total {
+            if let Some(top) = tops.iter().rev().find(|t| **t <= end && **t > start + 1.) {
+                end = *top;
+            }
+        }
+        out.push((start, end - start));
+        start = end;
+    }
+    if out.is_empty() {
+        out.push((0., total.max(1.)));
+    }
+    out
+}
+
+pub fn analysis_long_pages(total: f32, body_h: f32) -> usize {
+    let page = (body_h - 4.).max(60.);
+    ((total / page).ceil() as usize).max(1)
+}
+
+/// 【长截图 2026-11-15】按指定字号量出整篇内容高度（不含面板头/摘要）。
+pub fn analysis_total_at(fa: &crate::FullAnalysis, m: &Model, width: f32, fs: f32) -> f32 {
+    analysis_blocks_at(fa, m, width, fs).1
+}
+
 fn analysis_blocks_at(
     fa: &crate::FullAnalysis,
     m: &Model,
@@ -1607,7 +2039,8 @@ pub fn analysis_dock_height(h: f32) -> f32 {
 }
 pub fn analysis_dock_rect(w: f32, h: f32) -> (f32, f32, f32, f32) {
     analysis_dock_rect_for(&Config::default(), w, h)
-}/// 极简模式没有状态行/成绩栏：停靠面板贴底 12px（正文仍让位）。
+}
+/// 极简模式没有状态行/成绩栏：停靠面板贴底 12px（正文仍让位）。
 pub fn analysis_dock_rect_for(cfg: &Config, w: f32, h: f32) -> (f32, f32, f32, f32) {
     let dh = analysis_dock_height(h);
     let bottom = if cfg.minimal {
@@ -1617,7 +2050,23 @@ pub fn analysis_dock_rect_for(cfg: &Config, w: f32, h: f32) -> (f32, f32, f32, f
     } else {
         crate::ui::ledger_bar_y(h) - 8.
     };
-    (24., bottom - dh, (w - 48.).max(220.), dh)
+    let pw = (w - 48.).clamp(220., 960.);
+    ((w - pw) / 2., bottom - dh, pw, dh)
+}
+/// A dock must show both the word and its code without taking more article space.
+/// The controller can promote it to the independent analysis window when this
+/// returns false. This decision uses only stable view settings, including while
+/// the full-article analysis is still loading.
+pub(crate) fn analysis_dock_fits(m: &Model, cfg: &Config, w: f32, h: f32) -> bool {
+    let (_, _, pw, dh) = analysis_dock_rect_for(cfg, w, h);
+    let body_h = (dh - 96.).max(24.);
+    let required = if analysis_is_heatmap(m) {
+        160.
+    } else {
+        let (_, _, line_h, key_gap, key_line_h) = analysis_metrics(m);
+        line_h + key_gap + key_line_h + 4.
+    };
+    pw >= 592. && body_h >= required
 }
 fn analysis_chip(
     f: &mut Frame,
@@ -1636,7 +2085,7 @@ fn analysis_chip(
         x,
         y,
         w,
-        26.,
+        30.,
         6.,
         if on {
             alpha(p.accent, 0.12)
@@ -1648,7 +2097,7 @@ fn analysis_chip(
     text(
         f,
         x + 9.,
-        y + 5.,
+        y + 7.,
         13.,
         label,
         if on { p.accent } else { p.text2 },
@@ -1657,7 +2106,7 @@ fn analysis_chip(
         x,
         y,
         w,
-        h: 26.,
+        h: 30.,
         action,
     });
 }
@@ -1672,13 +2121,13 @@ fn analysis_icon_button(
     t: &Theme,
 ) {
     let p = tokens(t);
-    round(f, x, y, s, 26., 6., p.surface2, Some(p.line));
-    text(f, x + s / 2. - 5., y + 4., 15., label, p.text2);
+    round(f, x, y, s, 30., 6., p.surface2, Some(p.line));
+    text(f, x + s / 2. - 5., y + 6., 15., label, p.text2);
     hs.push(Hit {
         x,
         y,
         w: s,
-        h: 26.,
+        h: 30.,
         action,
     });
 }
@@ -1714,8 +2163,10 @@ pub(crate) fn draw_analysis_dock_for(
     let close_x = x + pw - 44.;
     let view_w = 74.;
     let view_x = close_x - 8. - view_w;
+    let copy_w = 82.;
+    let copy_x = view_x - 10. - copy_w;
     let auto_w = 92.;
-    let auto_x = view_x - 10. - auto_w;
+    let auto_x = copy_x - 10. - auto_w;
     let plus_x = auto_x - 10. - 26.;
     let minus_x = plus_x - 4. - 30. - 26.;
     text(f, x + 20., y + 13., 16., "理论码长分析", p.text);
@@ -1740,6 +2191,18 @@ pub(crate) fn draw_analysis_dock_for(
     }
     // 右侧控制：字号 − n + · 四码首选 · 视图 · 关闭
     analysis_icon_button(f, hs, close_x, y + 8., 26., "×", Action::ToggleAnalysis, t);
+    // 截图复制：点一下把当前理论分析面板截图写入剪贴板（用户 2026-11-14 需求）。
+    analysis_chip(
+        f,
+        hs,
+        copy_x,
+        y + 8.,
+        copy_w,
+        "截图复制",
+        crate::aux_marker("analysis_copy"),
+        t,
+        false,
+    );
     analysis_chip(
         f,
         hs,
@@ -1969,33 +2432,71 @@ pub(crate) fn draw_analysis_dock_for(
         }
     }
 }
-/// 一页适配：从 24px 逐级缩小字号，直到整篇文章的理论词条块塞进弹窗可视区。
-fn analysis_fit(
+/// The independent window preserves the chosen font and scrolls long articles.
+fn analysis_modal_layout(
     fa: &crate::FullAnalysis,
     m: &Model,
     width: f32,
     height: f32,
 ) -> (f32, Vec<AnalysisBlock>, f32) {
-    let mut fs = 24.;
-    loop {
-        let (blocks, total) = analysis_blocks_at(fa, m, width, fs);
-        if total <= height || fs <= 8.5 {
-            return (fs, blocks, total);
-        }
-        fs -= 0.5;
-    }
+    let fs = analysis_effective_font(fa, m, width, height);
+    let (blocks, total) = analysis_blocks_at(fa, m, width, fs);
+    (fs, blocks, total)
 }
 
-/// 理论分析弹窗的正文几何：header 112 + 正文 + footer 44。
-fn analysis_modal_body_geom(x: f32, y: f32, pw: f32, ph: f32) -> (f32, f32, f32, f32) {
+/// 【2026-11-15】整页分析按画布自动配字号：文字少就放大铺满，文字多就缩小保证整篇放得下。
+/// 用户点过「字号 −/+」后写 analysis_font_manual，改用其手动值，不再自动缩放。
+fn analysis_effective_font(
+    fa: &crate::FullAnalysis,
+    m: &Model,
+    width: f32,
+    height: f32,
+) -> f32 {
+    if m.fields.contains_key("analysis_font_manual") {
+        return analysis_font(m);
+    }
+    analysis_fit_font(fa, m, width, height)
+}
+
+/// 从 64 往下找到第一个「整篇高度不超过视口」的字号（二分+回退，最多 6 次布局）。
+pub(crate) fn analysis_fit_font(
+    fa: &crate::FullAnalysis,
+    m: &Model,
+    width: f32,
+    height: f32,
+) -> f32 {
+    // 【长截图 2026-11-15】自动铺满要有可读下限：小于 14 已无法辨读，
+    // 长文宁可滚动，复制图片那条路会按可读字号分页拼成长图。
+    let mut lo = 14f32;
+    let mut hi = 64f32;
+    let mut best = 14f32;
+    for _ in 0..6 {
+        let mid = ((lo + hi) * 0.5).round();
+        let (_, total) = analysis_blocks_at(fa, m, width, mid);
+        if total <= height {
+            best = mid;
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+        if hi - lo <= 1. {
+            break;
+        }
+    }
+    best.clamp(14., 64.)
+}
+
+/// Shared two-row toolbar, summary, scrollable body, and footer.
+pub(crate) fn analysis_modal_body_geom(x: f32, y: f32, pw: f32, ph: f32) -> (f32, f32, f32, f32) {
     let body_w = (pw - 48.).max(200.);
     let body_x = x + 24.;
-    let body_y = y + 112.;
-    let body_h = (ph - 112. - 44.).max(120.);
+    let header_h = 152.;
+    let body_y = y + header_h;
+    let body_h = (ph - header_h - 44.).max(80.);
     (body_x, body_y, body_w, body_h)
 }
 
-/// 弹窗一页适配结果：字号、内容总高、可视高。主循环滚轮用。
+/// Chosen font size, total content height, and viewport height for wheel scrolling.
 pub fn analysis_modal_fit_metrics(
     sess: &Session,
     m: &Model,
@@ -2005,18 +2506,12 @@ pub fn analysis_modal_fit_metrics(
     let fa = sess.full_analysis.as_ref()?;
     let (x, y, pw, ph) = panel_for_model(m, w, h);
     let (_, _, body_w, body_h) = analysis_modal_body_geom(x, y, pw, ph);
-    let (fs, _, total) = analysis_fit(fa, m, body_w, body_h);
+    let (fs, _, total) = analysis_modal_layout(fa, m, body_w, body_h);
     Some((fs, total, body_h))
 }
 
-/// 复制图片时重绘的整页帧（窗口底色 + 弹窗内容，无遮罩）。
-pub fn analysis_modal_frame(
-    m: &Model,
-    sess: &Session,
-    t: &Theme,
-    w: f32,
-    h: f32,
-) -> Frame {
+/// Copy the current analysis viewport without the modal backdrop.
+pub fn analysis_modal_frame(m: &Model, sess: &Session, t: &Theme, w: f32, h: f32) -> Frame {
     let mut f = Frame::new(w, h);
     let p = tokens(t);
     rect(&mut f, 0., 0., w, h, p.bg);
@@ -2123,7 +2618,7 @@ fn draw_analysis_blocks(
     drawn_bottom
 }
 
-/// 理论码长分析弹窗：整篇文章一页显示 + 复制图片（2026-11-13 取代底部停靠面板）。
+/// Independent analysis window with readable text, scrolling, and viewport copy.
 fn draw_analysis_modal(
     f: &mut Frame,
     hs: &mut Vec<Hit>,
@@ -2138,13 +2633,30 @@ fn draw_analysis_modal(
     let p = tokens(t);
     let auto4 = analysis_auto4(m);
     let heatmap = analysis_is_heatmap(m);
+    // 【2026-11-15】头部字号读数与正文用同一个有效字号（未手动指定时是自动铺满值）。
+    let (_, _, fit_w, fit_h) = analysis_modal_body_geom(x, y, pw, ph);
+    let fs = match &sess.full_analysis {
+        Some(fa) => analysis_effective_font(fa, m, fit_w, fit_h),
+        None => analysis_font(m),
+    };
+    let action_y = y + 54.;
+    let summary_y = y + 100.;
+    let close_x = x + pw - 24. - 30.;
+    let copy_w = 96.;
+    let copy_x = x + pw - 24. - copy_w;
+    let view_w = 76.;
+    let view_x = copy_x - 10. - view_w;
+    let auto_w = 90.;
+    let auto_x = view_x - 10. - auto_w;
     // ── 头部：标题 + 词库标记 + 右侧操作 ───────────────────────────
     text(f, x + 24., y + 20., 18., "理论码长分析", p.text);
     let title_w = crate::ui::ui_text_width("理论码长分析", 18.);
     if let Some(fa) = &sess.full_analysis {
         if !fa.schema.is_empty() {
-            let chip_w = (crate::ui::ui_text_width(&fa.schema, 11.) + 18.).min(260.);
             let cx = x + 24. + title_w + 12.;
+            let right = close_x - 12.;
+            let chip_w = (crate::ui::ui_text_width(&fa.schema, 11.) + 18.)
+                .min((right - cx).clamp(18., 260.));
             round(
                 f,
                 cx,
@@ -2161,23 +2673,35 @@ fn draw_analysis_modal(
                 w: chip_w - 18.,
                 h: 16.,
             });
-            text(f, cx + 9., y + 25., 11., elide_width(&fa.schema, chip_w - 18., 11.), p.muted);
+            text(
+                f,
+                cx + 9.,
+                y + 25.,
+                11.,
+                elide_width(&fa.schema, chip_w - 18., 11.),
+                p.muted,
+            );
             f.push(DrawCmd::PopClip);
         }
     }
-    let close_x = x + pw - 24. - 30.;
-    let copy_w = 96.;
-    let copy_x = close_x - 12. - copy_w;
-    let view_w = 76.;
-    let view_x = copy_x - 10. - view_w;
-    let auto_w = 90.;
-    let auto_x = view_x - 10. - auto_w;
     analysis_icon_button(f, hs, close_x, y + 15., 30., "×", Action::Close, t);
-    btn(
+    text(f, x + 24., action_y + 7., 13., "字号", p.muted);
+    let minus_x = x + 62.;
+    let plus_x = minus_x + 60.;
+    analysis_icon_button(
+        f, hs, minus_x, action_y, 26., "−",
+        crate::aux_marker(&format!("analysis_font:{}", (fs as i32 - 1).clamp(12, 36))), t,
+    );
+    mono(f, minus_x + 30., action_y + 5., 13., format!("{fs:.0}"), p.text2);
+    analysis_icon_button(
+        f, hs, plus_x, action_y, 26., "+",
+        crate::aux_marker(&format!("analysis_font:{}", (fs as i32 + 1).clamp(12, 36))), t,
+    );
+    analysis_chip(
         f,
         hs,
         copy_x,
-        y + 14.,
+        action_y,
         copy_w,
         "复制图片",
         crate::aux_marker("analysis_copy"),
@@ -2188,7 +2712,7 @@ fn draw_analysis_modal(
         f,
         hs,
         view_x,
-        y + 14.,
+        action_y,
         view_w,
         if heatmap { "全文编码" } else { "热力图" },
         crate::aux_marker("analysis_view"),
@@ -2199,7 +2723,7 @@ fn draw_analysis_modal(
         f,
         hs,
         auto_x,
-        y + 14.,
+        action_y,
         auto_w,
         "四码首选",
         crate::aux_marker("analysis_auto4"),
@@ -2221,11 +2745,11 @@ fn draw_analysis_modal(
         let pitch = (inner / 5.).max(96.);
         for (i, (label, value)) in items.iter().enumerate() {
             let sx = x + 24. + i as f32 * pitch;
-            text(f, sx, y + 60., 11., *label, p.muted);
+            text(f, sx, summary_y, 11., *label, p.muted);
             mono(
                 f,
                 sx,
-                y + 75.,
+                summary_y + 15.,
                 17.,
                 value,
                 if i == 3 && summary.missing_chars > 0 {
@@ -2238,7 +2762,7 @@ fn draw_analysis_modal(
         summary_slot = 5;
     }
     let _ = summary_slot;
-    line(f, x + 24., y + 104., pw - 48., p.line);
+    line(f, x + 24., summary_y + 44., pw - 48., p.line);
     // ── 正文 ───────────────────────────────────────────────────────
     let (body_x, body_y, body_w, body_h) = analysis_modal_body_geom(x, y, pw, ph);
     if let Some(fa) = &sess.full_analysis {
@@ -2261,7 +2785,7 @@ fn draw_analysis_modal(
             );
             f.push(DrawCmd::PopClip);
         } else {
-            let (fs, blocks, total_h) = analysis_fit(fa, m, body_w, body_h);
+            let (fs, blocks, total_h) = analysis_modal_layout(fa, m, body_w, body_h);
             let max = (total_h - body_h).max(0.);
             let scroll = m.analysis_dock_scroll.clamp(0., max);
             draw_analysis_blocks(
@@ -2269,7 +2793,14 @@ fn draw_analysis_modal(
             );
             if max > 0. {
                 let thumb = (body_h * body_h / total_h).clamp(18., body_h);
-                rect(f, body_x + body_w + 4., body_y, 5., body_h, alpha(p.text, 0.07));
+                rect(
+                    f,
+                    body_x + body_w + 4.,
+                    body_y,
+                    5.,
+                    body_h,
+                    alpha(p.text, 0.07),
+                );
                 rect(
                     f,
                     body_x + body_w + 4.,
@@ -2289,9 +2820,9 @@ fn draw_analysis_modal(
                 y + ph - 30.,
                 11.,
                 if max > 0. {
-                    "滚轮可滚动 · 复制图片自动适配一页"
+                    "滚轮可滚动 · 截图复制当前画面"
                 } else {
-                    "已适配一页显示"
+                    "截图复制当前画面"
                 },
                 p.muted,
             );
@@ -2354,11 +2885,19 @@ fn draw_analysis_modal(
 
 fn modal_content_height(m: &Model, pw: f32) -> f32 {
     match m.modal {
-        Modal::Preferences => preferences::content_height(m, pw),
+        Modal::Preferences => preferences::scroll_content_height(m, pw),
         Modal::Online => crate::secondary_panels::content_height_online(m),
-        Modal::Rules => 900.,
+        Modal::Rules => crate::secondary_panels::content_height_rules(pw),
         _ => 0.,
     }
+}
+
+/// 输入滚轮与绘制共用内容高度，字号预览超过固定面板时也能滚到末尾。
+pub fn panel_scroll_max(m: &Model, w: f32, h: f32, viewport_h: f32) -> f32 {
+    let (_, _, pw, ph) = panel_for_model(m, w, h);
+    let content = modal_content_height(m, pw);
+    let full_height = if content > 0. { content } else { ph };
+    (full_height - panel_view(ph, viewport_h)).max(0.)
 }
 
 pub fn draw(
@@ -2371,20 +2910,41 @@ pub fn draw(
     w: f32,
     h: f32,
     now: f64,
+    // 【独立窗】overlay 模式下窗口本身就只有面板大小：整窗遮罩与「点外面关闭」
+    // 的命中都不该画/不该压，否则会在窗口边缘留一圈黑色描边，并把面板的
+    // 命中表挤到窗口外。主窗模式仍照旧画全屏遮罩。
+    backdrop: bool,
+    // 【拖动分割 2026-11-14】Some((px,py))＝overlay 独立窗模式：帧内面板钉死在
+    // 该原点（＝留白角）。窗口定位（main.rs set_rect(fit_to_work(panel±margin))）
+    // 已含 modal_shift；帧内若经 panel_for_model 再叠一次 shift，面板会被画到
+    // 窗外遭裁切——即用户报告的「拖出范围后二级窗口被分割/消失」。主窗模式
+    // 传 None 保持旧语义（shift 只叠加一次）。
+    pin: Option<(f32, f32)>,
 ) {
     let p = tokens(t);
     if m.modal != Modal::None {
-        let (x, y, pw, ph) = panel_for_model(m, w, h);
+        let (bx, by, pw, ph) = panel_for_model(m, w, h);
+        let (x, y) = pin.unwrap_or((bx, by));
         hs.clear();
-        f.push(DrawCmd::BlurBackdrop { radius: 7. });
-        rect(f, 0., 0., w, h, [0., 0., 0., 0.72]);
-        hs.push(Hit {
-            x: 0.,
-            y: 0.,
-            w,
-            h,
-            action: Action::Close,
-        });
+        if backdrop {
+            f.push(DrawCmd::BlurBackdrop { radius: 7. });
+            rect(f, 0., 0., w, h, [0., 0., 0., 0.72]);
+        }
+        // 命中铺满整帧仅主窗遮罩模式：点面板外＝关闭（与点遮罩一致）。
+        // 【看不见的区域 2026-11-14】overlay 独立窗模式下这圈透明留白是
+        // 「整窗可拖区」的一部分（main.rs LBUTTONDOWN 按帧矩形判定拖动），
+        // 若在这里压 Close 命中，按住留白边缘会被当成控件（on_control=true）
+        // 直接把面板点关——实测 CLICK hit=(整帧) Close 即此。故 overlay 模式
+        // 不压整帧 Close，留白与正文空白统一走拖动分支。
+        if backdrop {
+            hs.push(Hit {
+                x: 0.,
+                y: 0.,
+                w,
+                h,
+                action: Action::Close,
+            });
+        }
         let command_start = f.cmds.len();
         round(f, x, y, pw, ph, 16., p.surface, Some(p.line2));
         hs.push(Hit {
@@ -2395,7 +2955,8 @@ pub fn draw(
             action: Action::None,
         });
         if !matches!(m.modal, Modal::Online | Modal::Rules | Modal::Analysis) {
-            panel_header(f, hs, m.modal, x, y, pw, t);
+            // 【审计 I04】把 cfg 传下去：标题栏键帽按当前键位显示，不再写死 F5/F1。
+            panel_header(f, hs, m.modal, cfg, x, y, pw, t);
         }
         match m.modal {
             Modal::More => draw_more(f, hs, cfg, m, sess, t, x, y, pw, ph),
@@ -2444,27 +3005,43 @@ pub fn draw(
             }
             _ => {}
         }
-        fit_panel(
-            f,
-            hs,
-            command_start,
-            x,
-            y,
-            pw,
-            ph,
-            panel_view(ph, h),
-            m.panel_scroll,
-            0.,
-            modal_content_height(m, pw),
-        );
+        // Analysis owns its complete viewport and scrolling, with a 44-DIP
+        // footer. Applying the generic 62-DIP footer clip would cut off the
+        // keyboard's bottom row and the last visible code row.
+        if m.modal != Modal::Analysis {
+            fit_panel(
+                f,
+                hs,
+                command_start,
+                x,
+                y,
+                pw,
+                ph,
+                panel_view(ph, h),
+                m.panel_scroll,
+                0.,
+                modal_content_height(m, pw),
+                if m.modal == Modal::Preferences {
+                    preferences::NAV_W
+                } else {
+                    0.
+                },
+            );
+        }
     }
+    draw_toast(f, m, t, (0., 0., w, h), now);
+}
+
+pub fn draw_toast(f: &mut Frame, m: &Model, t: &Theme, bounds: (f32, f32, f32, f32), now: f64) {
+    let p = tokens(t);
+    let (x, y, w, h) = bounds;
     if let Some((msg, at)) = &m.toast {
         if now - at < 3.6 {
-            let tw = (msg.chars().count() as f32 * 13. + 36.).min(w - 40.);
+            let tw = (ui_text_width(msg, FONT_HINT) + 36.).min(w - 40.);
             round(
                 f,
-                (w - tw) / 2.,
-                h - 100.,
+                x + (w - tw) / 2.,
+                y + (h - 70.).max(8.),
                 tw,
                 40.,
                 9.,
@@ -2473,10 +3050,10 @@ pub fn draw(
             );
             text(
                 f,
-                (w - tw) / 2. + 16.,
-                h - 89.,
+                x + (w - tw) / 2. + 16.,
+                y + (h - 59.).max(19.),
                 FONT_HINT,
-                elide(msg, ((tw - 32.) / FONT_HINT) as usize),
+                elide_width(msg, tw - 32., FONT_HINT),
                 p.text,
             );
         }
@@ -2533,10 +3110,12 @@ mod tests {
         m.open(Modal::Analysis);
         let (fs, total, body_h) = analysis_modal_fit_metrics(&s, &m, 1280., 800.)
             .expect("analysis metrics");
-        assert!(fs <= 24. && fs >= 8., "fit font size {fs}");
+        // 【长截图 2026-11-15】自动字号有 14 的可读下限：短文一屏放下；
+        // 长文缩到 14 仍放不下就改为滚动（复制图片会分页拼成长图）。
+        assert!(fs <= 24. && fs >= 14., "fit font size {fs}");
         assert!(
-            total <= body_h + 0.5,
-            "one-page fit: content {total} vs body {body_h}"
+            total <= body_h + 0.5 || fs <= 14.001,
+            "one-page fit or readable floor: content {total} vs body {body_h} at {fs}"
         );
         // 弹窗绘制：标题、汇总、复制图片、整篇词条都在，并且没有遮罩后仍是自绘面板。
         let t = crate::ui::theme("墨玉");
@@ -2925,12 +3504,18 @@ mod tests {
                 _ => None,
             })
             .unwrap();
+        let current = crate::ui::current_input_style(&theme).0;
         for (i, word) in words.iter().enumerate() {
             // …… 是多字词，带一码按 One 档着色（2026-11-12 含标点词对齐）
-            let expected = match word.text.as_str() {
-                "……" => p.word_colors[5],
-                _ if i < 6 => p.word_colors[i],
-                _ => p.text2,
+            let expected = if word.start == 0 {
+                // 【审计 V12】正文首格就是当前输入位，它是独立的一层
+                current
+            } else {
+                match word.text.as_str() {
+                    "……" => p.word_colors[5],
+                    _ if i < 6 => p.word_colors[i],
+                    _ => p.text2,
+                }
             };
             assert_eq!(spans[word.start].2, expected, "article {}", word.text);
         }
@@ -3074,11 +3659,18 @@ mod tests {
                     _ => None,
                 })
                 .unwrap();
+            let current = crate::ui::current_input_style(&t).0;
             for (i, word) in words.iter().enumerate() {
-                let expected = if i < 10 {
+                let tint = if i < 10 {
                     p.hint_rank_colors[i]
                 } else {
                     p.text2
+                };
+                let expected = if word.start == 0 {
+                    // 【审计 V12】当前输入位是独立一层，不再靠词提档位色
+                    current
+                } else {
+                    tint
                 };
                 assert_eq!(
                     spans[word.start].2, expected,
@@ -3087,11 +3679,11 @@ mod tests {
                 );
                 if i < 10 {
                     assert!(frame.cmds.iter().any(|cmd| matches!(cmd,
-                        DrawCmd::TextRun { text, color, font: gale_win::d2d::FontFamily::Mono, .. } if Some(text.as_str()) == word.code.as_deref() && *color == expected
+                        DrawCmd::TextRun { text, color, font: gale_win::d2d::FontFamily::Mono, .. } if Some(text.as_str()) == word.code.as_deref() && *color == tint
                     )), "{name} code {}", word.text);
                     if word.rank > 1 {
                         assert!(frame.cmds.iter().any(|cmd| matches!(cmd,
-                            DrawCmd::TextRun { text, color, font: gale_win::d2d::FontFamily::Mono, .. } if text == &word.rank.to_string() && *color == expected
+                            DrawCmd::TextRun { text, color, font: gale_win::d2d::FontFamily::Mono, .. } if text == &word.rank.to_string() && *color == tint
                         )), "{name} rank {}", word.rank);
                     }
                 }
@@ -3150,6 +3742,8 @@ mod tests {
             let mut typed = sess.clone();
             typed.comparer.states[0] = gale_core::compare::CharState::Correct;
             typed.comparer.states[1] = gale_core::compare::CharState::Wrong;
+            // 【审计 V12】光标跟着已上屏字数走：已打过的字不再是「当前输入位」
+            typed.comparer.pos = 2;
             let frame = crate::ui::build(
                 &typed,
                 &cfg,
@@ -3247,7 +3841,7 @@ mod tests {
                 m.bound = bound;
                 let mut frame = Frame::new(w, h);
                 let mut hits = Vec::new();
-                draw(&mut frame, &mut hits, &m, &s, &cfg, &t, w, h, 0.);
+                draw(&mut frame, &mut hits, &m, &s, &cfg, &t, w, h, 0., false, None);
                 for action in [Action::ReadGroup, Action::PostArticle] {
                     let hit = hits.iter().find(|hit| hit.action == action);
                     assert_eq!(hit.is_some(), bound == Some(0));
@@ -3284,7 +3878,7 @@ mod tests {
                 };
                 let mut frame = Frame::new(w, h);
                 let mut hits = Vec::new();
-                draw(&mut frame, &mut hits, &m, &s, &cfg, &t, w, h, 0.);
+                draw(&mut frame, &mut hits, &m, &s, &cfg, &t, w, h, 0., false, None);
                 for action in [
                     Action::Restart,
                     Action::Open(Modal::Groups),
@@ -3325,7 +3919,7 @@ mod tests {
         let mut m = Model::default();
         m.open(Modal::Rules);
         m.panel_scroll = 288.;
-        for field in fields(&m, 640., 420.) {
+        for field in fields(&m, 640., 420., None) {
             assert!(field.h >= 0.);
             assert!(field.y >= 0.);
             if field.h > 0. {
@@ -3354,7 +3948,7 @@ mod tests {
             action: Action::Close,
         }];
         fit_panel(
-            &mut f, &mut hits, 0, 16., 24., 608., 596., 372., 100., 0., 0.,
+            &mut f, &mut hits, 0, 16., 24., 608., 596., 372., 100., 0., 0., 0.,
         );
         let mut depth = 0;
         for c in &f.cmds {
@@ -3369,5 +3963,32 @@ mod tests {
         }
         assert_eq!(depth, 0);
         assert!(hits[0].y + hits[0].h <= 420.);
+    }
+    /// 【长截图 2026-11-15】分页数：装得下就是 1 屏，装不下按屏高向上取整。
+    #[test]
+    fn long_shot_pages_round_up_by_viewport() {
+        // page = (400 - 4) = 396：恰满一屏算 1 屏，超出就进位。
+        assert_eq!(super::analysis_long_pages(100., 400.), 1);
+        assert_eq!(super::analysis_long_pages(396., 400.), 1);
+        assert_eq!(super::analysis_long_pages(396.5, 400.), 2);
+        assert_eq!(super::analysis_long_pages(1_200., 400.), 4);
+        assert_eq!(super::analysis_long_pages(0., 400.), 1);
+        // 视口过矮时 page 夹到 60 下限，避免除零。
+        assert_eq!(super::analysis_long_pages(120., 10.), 2);
+    }
+
+    /// 【长截图 2026-11-15】自动铺满：短文放大、长文缩到可读下限 14 后改为滚动。
+    #[test]
+    fn auto_fit_keeps_a_readable_floor_for_long_articles() {
+        let short = analysis_session(8);
+        let long = analysis_session(400);
+        let m = Model::default();
+        let fa_short = short.full_analysis.clone().unwrap();
+        let fa_long = long.full_analysis.clone().unwrap();
+        let small = super::analysis_fit_font(&fa_short, &m, 560., 360.);
+        let big = super::analysis_fit_font(&fa_long, &m, 560., 360.);
+        assert!(small >= 14. && big >= 14.);
+        assert!(super::analysis_fit_font(&fa_short, &m, 1200., 760.) >= small);
+        assert_eq!(super::analysis_fit_font(&fa_long, &m, 320., 120.), 14.);
     }
 }

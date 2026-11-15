@@ -12,6 +12,27 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 ///（main.rs apply_style 的宿主样式包装），加任何字段都会破坏外部构造。
 static PLACE_RECTS: Mutex<Option<HashMap<isize, (i32, i32, i32, i32)>>> = Mutex::new(None);
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct EditStyle {
+    background: u32,
+    foreground: u32,
+    height: i32,
+    dpi: u32,
+}
+
+// Like placement, styling is requested by every drawn frame. RichEdit treats
+// EM_SETCHARFORMAT as a document change even when its values are unchanged.
+// Keep the cache outside NativeEdit for the borrowed host wrapper described above.
+static STYLES: Mutex<Option<HashMap<isize, EditStyle>>> = Mutex::new(None);
+
+fn forget_style(hwnd: isize) {
+    if let Ok(mut cache) = STYLES.lock() {
+        if let Some(styles) = cache.as_mut() {
+            styles.remove(&hwnd);
+        }
+    }
+}
+
 pub struct NativeEdit {
     pub hwnd: isize,
 }
@@ -68,6 +89,9 @@ impl NativeEdit {
         }
     }
     pub fn set_text(&self, text: &str) {
+        // Replacing the document may reset its character format. The next
+        // style request must apply to this content, even with the same theme.
+        forget_style(self.hwnd);
         unsafe {
             let mut b: Vec<u16> = text.encode_utf16().collect();
             b.push(0);
@@ -123,6 +147,13 @@ impl NativeEdit {
         }
     }
     pub fn hide(&self) {
+        // place() also shows the control. Its next same-size call must not be
+        // skipped after this explicit hide.
+        if let Ok(mut cache) = PLACE_RECTS.lock() {
+            if let Some(rects) = cache.as_mut() {
+                rects.remove(&self.hwnd);
+            }
+        }
         unsafe {
             let _ = ShowWindow(HWND(self.hwnd as *mut _), SW_HIDE);
         }
@@ -138,8 +169,31 @@ impl NativeEdit {
             let rgb = |c: [f32; 4]| -> u32 {
                 (c[0] * 255.) as u32 | ((c[1] * 255.) as u32) << 8 | ((c[2] * 255.) as u32) << 16
             };
+            let style = EditStyle {
+                background: rgb(bg),
+                foreground: rgb(fg),
+                height: (size * 15.) as i32,
+                dpi: crate::window::dpi_scale().to_bits(),
+            };
+            let unchanged = STYLES
+                .lock()
+                .map(|mut cache| {
+                    let styles = cache.get_or_insert_with(HashMap::new);
+                    if styles.get(&self.hwnd) == Some(&style) {
+                        true
+                    } else {
+                        styles.insert(self.hwnd, style);
+                        false
+                    }
+                })
+                .unwrap_or(false);
+            if unchanged {
+                return;
+            }
+            // Release the cache lock before synchronous RichEdit messages:
+            // they can notify the parent and re-enter its window procedure.
             let h = HWND(self.hwnd as *mut _);
-            SendMessageW(h, 1091, WPARAM(0), LPARAM(rgb(bg) as isize));
+            SendMessageW(h, 1091, WPARAM(0), LPARAM(style.background as isize));
             #[repr(C)]
             struct Format {
                 cb: u32,
@@ -156,9 +210,9 @@ impl NativeEdit {
                 cb: std::mem::size_of::<Format>() as u32,
                 mask: 0xE0000000,
                 effects: 0,
-                height: (size * 15.) as i32,
+                height: style.height,
                 offset: 0,
-                color: rgb(fg),
+                color: style.foreground,
                 charset: 1,
                 pitch: 0,
                 face: [0; 32],
@@ -166,8 +220,11 @@ impl NativeEdit {
             for (dst, ch) in f.face.iter_mut().zip("Microsoft YaHei UI".encode_utf16()) {
                 *dst = ch;
             }
-            SendMessageW(h, 1092, WPARAM(4), LPARAM(&mut f as *mut _ as isize));
-            SendMessageW(h, 1092, WPARAM(0), LPARAM(&mut f as *mut _ as isize));
+            let all = SendMessageW(h, 1092, WPARAM(4), LPARAM(&mut f as *mut _ as isize));
+            let default = SendMessageW(h, 1092, WPARAM(0), LPARAM(&mut f as *mut _ as isize));
+            if all.0 == 0 || default.0 == 0 {
+                forget_style(self.hwnd);
+            }
         }
     }
 }
@@ -185,6 +242,7 @@ impl Drop for NativeEdit {
                 map.remove(&self.hwnd);
             }
         }
+        forget_style(self.hwnd);
     }
 }
 
@@ -198,5 +256,150 @@ pub fn reduced_motion() -> bool {
             SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
         );
         !enabled.as_bool() || GetSystemMetrics(SM_REMOTESESSION) != 0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    thread_local! {
+        static EDIT_PROC: Cell<WNDPROC> = const { Cell::new(None) };
+        static PARENT_PROC: Cell<WNDPROC> = const { Cell::new(None) };
+        static STYLE_MESSAGES: Cell<usize> = const { Cell::new(0) };
+        static UPDATE_NOTIFICATIONS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    unsafe extern "system" fn edit_proc(
+        hwnd: HWND,
+        msg: u32,
+        wp: WPARAM,
+        lp: LPARAM,
+    ) -> windows::Win32::Foundation::LRESULT {
+        if matches!(msg, 1091 | 1092) {
+            STYLE_MESSAGES.with(|count| count.set(count.get() + 1));
+        }
+        EDIT_PROC.with(|original| CallWindowProcW(original.get(), hwnd, msg, wp, lp))
+    }
+
+    unsafe extern "system" fn parent_proc(
+        hwnd: HWND,
+        msg: u32,
+        wp: WPARAM,
+        lp: LPARAM,
+    ) -> windows::Win32::Foundation::LRESULT {
+        if msg == WM_COMMAND && (wp.0 >> 16) as u32 == EN_UPDATE {
+            UPDATE_NOTIFICATIONS.with(|count| count.set(count.get() + 1));
+        }
+        PARENT_PROC.with(|original| CallWindowProcW(original.get(), hwnd, msg, wp, lp))
+    }
+
+    struct TestParent(HWND);
+    impl Drop for TestParent {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = DestroyWindow(self.0);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a Windows desktop; creates only a hidden private test window"]
+    fn unchanged_frames_do_not_restyle_editors_and_hidden_fields_reappear() {
+        unsafe {
+            let parent = TestParent(
+                CreateWindowExW(
+                    WINDOW_EX_STYLE(0),
+                    w!("STATIC"),
+                    w!("Editor style test"),
+                    WS_OVERLAPPEDWINDOW,
+                    0,
+                    0,
+                    600,
+                    400,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap(),
+            );
+            PARENT_PROC.with(|original| {
+                original.set(std::mem::transmute::<isize, WNDPROC>(SetWindowLongPtrW(
+                    parent.0,
+                    GWLP_WNDPROC,
+                    parent_proc as *const () as isize,
+                )))
+            });
+            let edit = NativeEdit::new(parent.0 .0 as isize, true, false).unwrap();
+            let hwnd = HWND(edit.hwnd as *mut _);
+            EDIT_PROC.with(|original| {
+                original.set(std::mem::transmute::<isize, WNDPROC>(SetWindowLongPtrW(
+                    hwnd,
+                    GWLP_WNDPROC,
+                    edit_proc as *const () as isize,
+                )))
+            });
+            // Request native update notifications as the real parent does.
+            SendMessageW(hwnd, 0x445, WPARAM(0), LPARAM(0x0004_0000)); // EM_SETEVENTMASK / ENM_UPDATE
+            STYLE_MESSAGES.with(|count| count.set(0));
+            UPDATE_NOTIFICATIONS.with(|count| count.set(0));
+            let background = [0.1, 0.12, 0.15, 1.];
+            let foreground = [0.9, 0.91, 0.92, 1.];
+            edit.set_text("第一行\r\n第二行");
+            edit.style(background, foreground, 16.);
+            assert_eq!(STYLE_MESSAGES.with(Cell::get), 3);
+            let notifications = UPDATE_NOTIFICATIONS.with(Cell::get);
+            // An idle panel may redraw many times. None may mutate RichEdit
+            // formatting or feed another EN_UPDATE back into the frame loop.
+            for _ in 0..120 {
+                edit.style(background, foreground, 16.);
+            }
+            assert_eq!(STYLE_MESSAGES.with(Cell::get), 3);
+            assert_eq!(UPDATE_NOTIFICATIONS.with(Cell::get), notifications);
+
+            edit.style(background, [1., 1., 1., 1.], 16.);
+            edit.style(background, [1., 1., 1., 1.], 18.);
+            assert_eq!(
+                STYLE_MESSAGES.with(Cell::get),
+                9,
+                "color and size edits still apply immediately"
+            );
+            edit.set_text("替换后的正文");
+            edit.style(background, [1., 1., 1., 1.], 18.);
+            assert_eq!(
+                STYLE_MESSAGES.with(Cell::get),
+                12,
+                "replacing text invalidates its style"
+            );
+            assert_eq!(edit.text(), "替换后的正文");
+
+            edit.place(20., 30., 300., 120.);
+            assert_ne!(GetWindowLongW(hwnd, GWL_STYLE) as u32 & WS_VISIBLE.0, 0);
+            edit.hide();
+            assert_eq!(GetWindowLongW(hwnd, GWL_STYLE) as u32 & WS_VISIBLE.0, 0);
+            edit.place(20., 30., 300., 120.);
+            assert_ne!(
+                GetWindowLongW(hwnd, GWL_STYLE) as u32 & WS_VISIBLE.0,
+                0,
+                "the same cached rectangle must show an explicitly hidden editor"
+            );
+
+            let handle = edit.hwnd;
+            drop(edit);
+            assert!(!PLACE_RECTS
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .contains_key(&handle));
+            assert!(!STYLES
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .contains_key(&handle));
+        }
     }
 }

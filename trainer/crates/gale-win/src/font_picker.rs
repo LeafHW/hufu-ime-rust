@@ -1,9 +1,10 @@
 //! 外观页内的系统字体下拉。字体与字号独立选择，不打开 ChooseFont 对话框。
-use windows::core::w;
+use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     CreateFontW, DeleteObject, CLEARTYPE_QUALITY, DEFAULT_CHARSET, FW_NORMAL, HFONT, HGDIOBJ,
 };
+use windows::Win32::UI::Controls::SetWindowTheme;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 const CONTROL_ID: usize = 0x6f01;
@@ -78,7 +79,22 @@ impl NativeFontPicker {
         Ok(())
     }
 
+    /// 【审计 V04】原生 COMBOBOX 默认走亮白经典外观，压在深色面板上像贴了张白纸。
+    /// 深色主题下改用系统暗色主题（Win10 1809+ 支持，老系统自动退回原样）。
+    pub fn set_dark(&mut self, dark: bool) {
+        let scheme = if dark { w!("DarkMode_CFD") } else { w!("") };
+        unsafe {
+            let _ = SetWindowTheme(self.hwnd, scheme, PCWSTR::null());
+        }
+    }
+
     pub fn take_selection(&mut self) -> Option<String> {
+        // ★退出路径：主窗销毁会连带销毁 COMBOBOX。对已销毁的 HWND 发
+        // CB_GETCURSEL 返回 0，若直接当成用户选择就会命中第 0 项「默认」，
+        // 把用户已选的字体清空（改字体→打开外观页→退出，重启回默认的根因）。
+        if !unsafe { IsWindow(self.hwnd).as_bool() } {
+            return None;
+        }
         let index = unsafe { SendMessageW(self.hwnd, CB_GETCURSEL, WPARAM(0), LPARAM(0)) }.0;
         if index < 0 || index as usize == self.selected {
             return None;
@@ -152,6 +168,29 @@ mod tests {
         assert!(names.windows(2).all(|pair| pair[0].to_lowercase() < pair[1].to_lowercase()));
         for name in names {
             assert_eq!(crate::d2d::resolved_cjk_family(&name), name);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a Windows desktop; creates only a hidden private test window"]
+    fn destroyed_picker_never_reports_default_font() {
+        struct TestParent(HWND);
+        impl Drop for TestParent {
+            fn drop(&mut self) {
+                unsafe { let _ = DestroyWindow(self.0); }
+            }
+        }
+        unsafe {
+            let parent = TestParent(CreateWindowExW(
+                WINDOW_EX_STYLE(0), w!("STATIC"), w!("Font picker teardown test"),
+                WS_OVERLAPPEDWINDOW, 0, 0, 600, 400, None, None, None, None,
+            ).unwrap());
+            let mut picker = NativeFontPicker::new(parent.0.0 as isize, "").unwrap();
+            picker.set_current("__hufu_destroy_probe__").unwrap();
+            // 主窗销毁时子 COMBOBOX 一并销毁；对失效 HWND 的 CB_GETCURSEL
+            // 返回 0，不得被误读成「用户选了默认字体」。
+            let _ = DestroyWindow(parent.0);
+            assert_eq!(picker.take_selection(), None);
         }
     }
 

@@ -23,6 +23,7 @@ use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, ReleaseCapture, SetCapture,
 };
+use windows::Win32::UI::HiDpi::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::Interface;
 use windows_core::PCWSTR;
@@ -3317,6 +3318,29 @@ pub extern "system" fn hufu_test_d2d_stats() -> i32 {
 
 /// 建候选窗 HWND（类注册幂等；恢复链重建窗口与 new() 同款式样）。
 unsafe fn create_cand2_hwnd(ex: u32, owner: HWND) -> Option<HWND> {
+    // 【125% 候选乱跳根因】候选窗必须在与宿主相同的 DPI 感知上下文里创建。
+    // 之前 TSF UI 线程默认是 DPI-unaware，Windows 会把 HuFuCandWin2 当成
+    // 96DPI 窗口做坐标虚拟化：锚点本是物理像素，SetWindowPos 时又被系统
+    // 乘一次 scale，125% 下离原点越远偏移越大。这里显式对齐前台窗口的
+    // awareness context（训练器是 Per-Monitor V2），创建完再恢复线程上下文。
+    let host = {
+        let fg = GetForegroundWindow();
+        if fg.0.is_null() {
+            owner
+        } else {
+            fg
+        }
+    };
+    let prev_ctx = if host.0.is_null() {
+        None
+    } else {
+        let ctx = GetWindowDpiAwarenessContext(host);
+        if ctx.is_invalid() {
+            None
+        } else {
+            Some(SetThreadDpiAwarenessContext(ctx))
+        }
+    };
     let class: Vec<u16> = "HuFuCandWin2\0".encode_utf16().collect();
     let wc = WNDCLASSW {
         lpfnWndProc: Some(cand2_wndproc),
@@ -3342,6 +3366,9 @@ unsafe fn create_cand2_hwnd(ex: u32, owner: HWND) -> Option<HWND> {
         None,
     )
     .unwrap_or_default();
+    if let Some(prev) = prev_ctx {
+        SetThreadDpiAwarenessContext(prev);
+    }
     if hwnd.0.is_null() {
         None
     } else {
@@ -3386,6 +3413,14 @@ impl CandidateWindowV2 {
         // 动画驱动起臂/收臂时成对 begin/end（见 anim_boost_arm/disarm）。
         // 【特效退役 2026-09-22】ensure_thread(上屏特效线程预热)撤除
         unsafe {
+            // 与宿主同 DPI 感知上下文创建（125% 乱跳根因，见 create_cand2_hwnd 注释）。
+            let host = GetForegroundWindow();
+            let prev_ctx = if host.0.is_null() {
+                None
+            } else {
+                let ctx = GetWindowDpiAwarenessContext(host);
+                if ctx.is_invalid() { None } else { Some(SetThreadDpiAwarenessContext(ctx)) }
+            };
             let class: Vec<u16> = "HuFuCandWin2\0".encode_utf16().collect();
             let wc = WNDCLASSW {
                 lpfnWndProc: Some(cand2_wndproc),
@@ -3417,6 +3452,9 @@ impl CandidateWindowV2 {
                 None,
             )
             .unwrap_or_default();
+            if let Some(prev) = prev_ctx {
+                SetThreadDpiAwarenessContext(prev);
+            }
             CREATE_WINDOW_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if hwnd.0.is_null() {
                 note_create_fail(None);
@@ -3613,6 +3651,13 @@ impl CandidateWindowV2 {
                 WS_EX_TOOLWINDOW.0 | WS_EX_TOPMOST.0 | WS_EX_NOACTIVATE.0 | WS_EX_LAYERED.0,
             );
             let owner_hwnd = owner.unwrap_or(HWND(std::ptr::null_mut()));
+            // 与宿主同 DPI 感知上下文创建（125% 乱跳根因）。
+            let prev_ctx = if owner_hwnd.0.is_null() {
+                None
+            } else {
+                let ctx = GetWindowDpiAwarenessContext(owner_hwnd);
+                if ctx.is_invalid() { None } else { Some(SetThreadDpiAwarenessContext(ctx)) }
+            };
             let hwnd = CreateWindowExW(
                 ex,
                 PCWSTR(class.as_ptr()),
@@ -3628,6 +3673,9 @@ impl CandidateWindowV2 {
                 None,
             )
             .unwrap_or_default();
+            if let Some(prev) = prev_ctx {
+                SetThreadDpiAwarenessContext(prev);
+            }
             CREATE_WINDOW_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if hwnd.0.is_null() {
                 note_create_fail(None);
@@ -4895,6 +4943,22 @@ impl CandidateWindowV2 {
         // 要的是去回弹不是去形变；线性化已根除回弹），默认开，
         // 皮肤 layout.size_morph=0 显式关。
         self.size_morph = layout_f(skin, "size_morph", 1.0) > 0.5;
+        // 【2026-11-14 撤回】此前的「跟打器零形变 + 位置瞬跳」是为绕开
+        // 锚点坐标空间混用（unaware 线程取到 96-DPI 虚拟化矩形）而加的
+        // 临时手段，真因已在 tsf.rs 用 PhysDpiGuard 归一物理坐标修掉。
+        // 动效必须完全按皮肤/设置走：形变与位置动画一律恢复。
+        // 【2026-11-14 动效取证】上一轮 trace 里 pos_ms=0 而 size_ms=110，
+        // 与「skin 无 pos_ms → 缺省 75」不符；打一行原始取值确认来源。
+        if crate::tsf::trace_on() && crate::tsf::host_is_trainer() {
+            crate::tsf::trace(&format!(
+                "cw2: ANIM anim_on={anim_on} spd={anim_spd:.2} pos={} size={} skin_pos={:.1} skin_size={:.1} morph={}",
+                self.pos_ms,
+                self.size_ms,
+                layout_f(skin, "pos_ms", -1.0),
+                layout_f(skin, "size_ms", -1.0),
+                self.size_morph
+            ));
+        }
         // 【虎娘对齐·首显滑动 2026-09-18】非整句组段首显：server 方案门
         // 控（first_show_slide，缺键=不滑）+ 渲染点注入的每键宽
         // （first_show_unit）。起点不靠注入坐标——四修：注入帧的
@@ -8337,7 +8401,16 @@ impl CandidateWindowV2 {
                         //（下方放不下）锚定边=底边（y=锚行−h−4），本帧
                         // 模式记入 above_flip_last（y 锁分解 + 主 SWP
                         // 形变钉锚两处消费；tick 复渲帧锚缺失时沿用）。
-                        let flipped_now = !(below + hpx <= vy + vh);
+                        // 【跟打器·固定向下排 2026-11-13】跟打器正文行距大、
+                        // 候选常有两行高，下方判据在换行时会触发上翻，用户
+                        // 看到候选整块跳上一行。跟打器内固定向下排（用户明确
+                        // 要求「候选还是在字的下方」），底部放不下时只贴屏幕
+                        // 底，不改锚定边；位置动画照常走设置。
+                        let flipped_now = if crate::tsf::host_is_trainer() {
+                            false
+                        } else {
+                            !(below + hpx <= vy + vh)
+                        };
                         self.above_flip_last.set(flipped_now);
                         let y = if flipped_now {
                             (above_base - hpx - 4 - cy).max(vy)
@@ -8816,6 +8889,9 @@ impl CandidateWindowV2 {
                 // 口边缘直角切断（面板/边框/阴影一起切=「变窄出直角」
                 // 的根源；变低同）。按轴取 max(eased,target)：增轴=target
                 // （零位移），减轴=eased（窗缘恒=壳缘）。命中盒按目标。
+                // 【2026-11-14 撤回】跟打器不再走「零形变 snap」特例——形变
+                // 一律按 size_ms/size_morph 设置走（真因已由锚坐标空间归一
+                // 修掉，不再需要用关动画来掩盖跳动）。
                 let apply = match self.size_anim {
                     Some((f, t, t0)) => {
                         let e = size_ease(f, t, t0.elapsed().as_millis() as u32, self.size_anim_dur.get().max(1));
@@ -8833,6 +8909,12 @@ impl CandidateWindowV2 {
                     x - (shadow_m * dpi_scale) as i32,
                     y - (shadow_m * dpi_scale) as i32,
                 );
+                if crate::tsf::trace_on() && crate::tsf::host_is_trainer() {
+                    crate::tsf::trace(&format!(
+                        "cw2: GEO x={x} y={y} tx={tx} ty={ty} was={was_visible} pos_ms={} size_ms={}",
+                        self.pos_ms, self.size_ms
+                    ));
+                }
                 let chase = crate::tsf::chase_on();
                 // 【三十四修·chase 实验通道】旗标文件即开即关（无需重启
                 // 宿主，下次首显生效）。语义=「窗口永远追赶光标」：目标=
@@ -9068,6 +9150,8 @@ impl CandidateWindowV2 {
                 }
                 // 【三十四修·chase】chase 生效时窗口停/起在 live_pos（当前
                 // 实位或首显起点），由 tick 逐步逼近目标；非 chase 走原插值。
+                // 【2026-11-14 撤回】不再对跟打器跳过位移动画：锚坐标空间
+                // 已在 tsf.rs 统一为物理坐标，候选可以照常按 pos_ms 平滑跟随。
                 let (px, py) = if chase && self.chase_target.is_some() && self.pos_ms > 0 {
                     self.live_pos.get()
                 } else {
@@ -10411,6 +10495,8 @@ unsafe fn fade_tick_shared(hwnd: HWND) {
                     rendered_this_tick = true;
                 }
             }
+            // 【2026-11-14 撤回】此前跟打器清 chase 动画态是为了绕开锚坐标
+            // 抖动；真因已修，动画恢复由 show()/pos_ms 正常驱动。
             // 【三十六修·TL 补 chase 步进】chase 臂发在 show() 无线程
             // 区分（TL 实例同样被置 target/清 pos_anim），主 tick 有步进
             // 而本分支没有 → 开 chase 旗标时词框窗冻结在起点、timer 因

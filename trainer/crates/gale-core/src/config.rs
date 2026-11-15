@@ -125,12 +125,14 @@ pub const SHORTCUT_DEFAULTS: &[(&str, &str, &str)] = &[
     ("read_group", "读取群文", "F4"),
     ("groups", "选群", "F5"),
     ("online", "在线发文", "F8"),
+    ("online_prev", "发文上一段", "Ctrl+O"),
+    ("online_next", "发文下一段", "Ctrl+P"),
     ("rules", "群/规则", "F9"),
     ("minimal", "极简模式", "F11"),
     ("toggle_mode", "字贴 / 对照", "F12"),
     ("menu", "视图菜单", "Menu"),
-    ("prev_segment", "上一段", "Ctrl+Left"),
-    ("next_segment", "下一段", "Ctrl+Right"),
+    ("prev_segment", "群文上一段", "Ctrl+Left"),
+    ("next_segment", "群文下一段", "Ctrl+Right"),
     ("load_clipboard_alt", "载文（备用键）", "Alt+E"),
 ];
 
@@ -182,7 +184,7 @@ pub struct Config {
     pub hint_show_code: bool,
     #[serde(default = "yes")]
     pub hint_show_rank: bool,
-    /// 【选重数字角标 2026-11-11】数字显示在词的右上角；关闭时随编码行。
+    /// 【选重数字角标 2026-11-11】数字显示在词的右下角；关闭时随编码行。
     #[serde(default)]
     pub hint_rank_corner: bool,
     #[serde(default = "yes")]
@@ -200,6 +202,17 @@ pub struct Config {
     pub hint_word_bg: bool,
     #[serde(default = "hint_font_default")]
     pub hint_font_size: f32,
+    /// 词提编码行的垂直偏移（DIP，正下负上）；不改变括线与正文行距。
+    #[serde(default)]
+    pub hint_code_offset: f32,
+    /// 正在键入的编码独立于码表词提提示，显示在文字上方。
+    #[serde(default = "yes")]
+    pub show_preedit: bool,
+    #[serde(default = "hint_font_default")]
+    pub preedit_font_size: f32,
+    /// 键入编码的垂直偏移（DIP，正下负上）。
+    #[serde(default)]
+    pub preedit_offset: f32,
     /// 【选重数字 2026-11-13】角标加粗：有些屏/字号下数字太细看不清。
     #[serde(default)]
     pub hint_rank_bold: bool,
@@ -267,6 +280,14 @@ pub struct Config {
     /// 今日字数记忆（date+chars）
     pub today: String,
     pub today_chars: u64,
+    /// 练字记录：按本地日期（YYYY-MM-DD）累计**实际敲入**的字数。
+    /// 与成绩库的 `today_chars` 不是同一口径：这里按每次上屏字符计数，
+    /// 不要求整段完成，也不按文章字数结算。
+    #[serde(default)]
+    pub practice_days: BTreeMap<String, u64>,
+    /// 练字总字数（独立累计；日表只保留最近 PRACTICE_KEEP_DAYS 天）。
+    #[serde(default)]
+    pub practice_total: u64,
     // ── 疾风1代动效开关（typing_view.rs 同名能力，默认全开） ──
     /// 平滑光标
     pub smooth_caret: bool,
@@ -280,13 +301,33 @@ pub struct Config {
     pub pop_on_correct: bool,
     /// 打错抖动
     pub shake_on_wrong: bool,
-    /// 行距（行高的额外倍数）
+    /// 行距（行高的额外倍数，可为负：0.10..=3.00 倍行高；四轮放开下限）。
+    /// 【五轮】行距全权决定行进——编码/选重提示带放不下时自动不画，
+    /// 不再反向撑高行距；默认 1.0（72px@36 号恰好容纳词提带）。
     pub line_gap: f32,
     /// 段末自动跳段延迟（ms，0=手动）
     pub auto_next_delay_ms: u32,
     /// 文来（晴发文系统）账号占位——本期只存不连
     pub wenlai_username: String,
     pub wenlai_domain: String,
+}
+
+/// 练字记录日表最多保留 400 天（只裁日键，`practice_total` 一直累计）。
+pub const PRACTICE_KEEP_DAYS: usize = 400;
+
+/// 配置里的练字日期只接受 `YYYY-MM-DD`；月份/日期做基本范围校验。
+fn is_practice_date(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.len() != 10 || b[4] != b'-' || b[7] != b'-' {
+        return false;
+    }
+    let digits = |r: std::ops::Range<usize>| b[r].iter().all(u8::is_ascii_digit);
+    if !digits(0..4) || !digits(5..7) || !digits(8..10) {
+        return false;
+    }
+    let month = (b[5] - b'0') * 10 + (b[6] - b'0');
+    let day = (b[8] - b'0') * 10 + (b[9] - b'0');
+    (1..=12).contains(&month) && (1..=31).contains(&day)
 }
 
 fn yes() -> bool {
@@ -327,6 +368,10 @@ impl Default for Config {
             hint_underline: false,
             hint_word_bg: false,
             hint_font_size: 14.,
+            hint_code_offset: 0.,
+            show_preedit: true,
+            preedit_font_size: 14.,
+            preedit_offset: 0.,
             hint_rank_bold: false,
             hint_rank_offset: 0.,
             letter_spacing: 0.,
@@ -352,13 +397,15 @@ impl Default for Config {
             color_overrides: BTreeMap::new(),
             today: String::new(),
             today_chars: 0,
+            practice_days: BTreeMap::new(),
+            practice_total: 0,
             smooth_caret: true,
             caret_speed: 12.0,
             caret_blink: true,
             focus_dim: true,
             pop_on_correct: true,
             shake_on_wrong: true,
-            line_gap: 0.66,
+            line_gap: 0.5,
             auto_next_delay_ms: 0,
             wenlai_username: String::new(),
             wenlai_domain: "https://qingfawen.fcxxz.com/".into(),
@@ -381,7 +428,50 @@ impl Config {
                     .map(|(_, _, chord)| (*chord).to_string())
             })
             .unwrap_or_default()
-    }    fn read_saved(path: &Path) -> GaleResult<Self> {
+    }
+
+    /// 把一天实际敲入的字数累加进练字记录。`chars == 0` 或日期非法时不写。
+    /// 返回是否有变化（调用方据此决定是否标 dirty / 保存）。
+    pub fn practice_record(&mut self, date: &str, chars: u64) -> bool {
+        if chars == 0 || !is_practice_date(date) {
+            return false;
+        }
+        let entry = self.practice_days.entry(date.to_string()).or_insert(0);
+        *entry = entry.saturating_add(chars);
+        self.practice_total = self.practice_total.saturating_add(chars);
+        self.practice_prune();
+        true
+    }
+
+    /// 练字日表只保留最近 [`PRACTICE_KEEP_DAYS`] 个日期键（总字数不清零）。
+    pub fn practice_prune(&mut self) {
+        while self.practice_days.len() > PRACTICE_KEEP_DAYS {
+            let Some(oldest) = self.practice_days.keys().next().cloned() else {
+                break;
+            };
+            self.practice_days.remove(&oldest);
+        }
+    }
+
+    /// 截止日期（含）之后的练字字数合计。日期为 `YYYY-MM-DD`，可直接字典序比较。
+    pub fn practice_sum_since(&self, cutoff: &str) -> u64 {
+        self.practice_days
+            .range(cutoff.to_string()..)
+            .map(|(_, n)| *n)
+            .sum()
+    }
+
+    /// 云同步合并：日字数逐日取 max、总字数取 max，避免旧 profile 盖掉本机新记录。
+    pub fn merge_practice_max(&mut self, other: &Config) {
+        for (date, chars) in &other.practice_days {
+            let entry = self.practice_days.entry(date.clone()).or_insert(0);
+            *entry = (*entry).max(*chars);
+        }
+        self.practice_total = self.practice_total.max(other.practice_total);
+        self.practice_prune();
+    }
+
+    fn read_saved(path: &Path) -> GaleResult<Self> {
         use std::io::Read;
         let mut text = String::new();
         std::fs::File::open(path)?
@@ -400,7 +490,15 @@ impl Config {
         if path.try_exists()? {
             match Self::read_saved(path) {
                 Ok(cfg) => Ok(cfg),
-                Err(primary) => Self::read_saved(&backup).or(Err(primary)),
+                // 【审计 C05】主文件被截断时，恢复链要覆盖 .recover 与各进程的
+                // .bak-<pid>/ .tmp-<pid>，不能只看固定 .bak。
+                Err(primary) => match crate::score::read_with_recovery(path) {
+                    Some(bytes) => match std::str::from_utf8(&bytes) {
+                        Ok(text) => Self::from_toml_text(text),
+                        Err(_) => Err(primary),
+                    },
+                    None => Self::read_saved(&backup).or(Err(primary)),
+                },
             }
         } else if backup.try_exists()? {
             Self::read_saved(&backup)
@@ -459,9 +557,16 @@ impl Config {
                 .ok()
                 .filter(|v| v.is_finite())
                 .unwrap_or(14.)
-                .clamp(14., 28.),
+                // 七轮：上限 28→100（用户不设人为上限）；下限 14→10
+                .clamp(10., 100.),
+            hint_code_offset: clamp_finite(get("hint_code_offset", "0"), 0., -100., 100.),
+            show_preedit: get("show_preedit", "true") == "true",
+            preedit_font_size: clamp_finite(
+                get("preedit_font_size", &get("hint_font_size", "14")), 14., 10., 100.,
+            ),
+            preedit_offset: clamp_finite(get("preedit_offset", "0"), 0., -100., 100.),
             hint_rank_bold: get("hint_rank_bold", "false") == "true",
-            hint_rank_offset: clamp_finite(get("hint_rank_offset", "0"), 0., -12., 16.),
+            hint_rank_offset: clamp_finite(get("hint_rank_offset", "0"), 0., -100., 100.),
             letter_spacing: clamp_finite(get("letter_spacing", "0"), 0., 0., 12.),
             ledger_panel_h: clamp_finite(get("ledger_panel_h", "0"), 0., 0., 900.),
             shortcuts: {
@@ -518,6 +623,17 @@ impl Config {
                 .collect(),
             today: get("today", &d.today),
             today_chars: get("today_chars", "0").parse().unwrap_or(0),
+            practice_days: map
+                .iter()
+                .filter_map(|(k, v)| {
+                    let date = k.strip_prefix("practice_day_")?;
+                    if !is_practice_date(date) {
+                        return None;
+                    }
+                    v.trim().parse::<u64>().ok().map(|n| (date.to_string(), n))
+                })
+                .collect(),
+            practice_total: get("practice_total", "0").parse().unwrap_or(0),
             smooth_caret: get("smooth_caret", "true") == "true",
             caret_speed: get("caret_speed", &d.caret_speed.to_string())
                 .parse()
@@ -567,7 +683,8 @@ impl Config {
             cfg.win_w = 1280;
             cfg.win_h = 800;
             cfg.font_size = 36.0;
-            cfg.line_gap = 0.66;
+            // 行距全权决定行进后，默认 0.5（=半个字号，字高的一半）。
+            cfg.line_gap = 0.5;
         }
         cfg.opacity = cfg.opacity.clamp(10, 100);
         cfg.seg_chars = cfg.seg_chars.clamp(10, 1000);
@@ -577,7 +694,8 @@ impl Config {
             d.font_size
         };
         cfg.line_gap = if cfg.line_gap.is_finite() {
-            cfg.line_gap.clamp(0.0, 2.0)
+            // 2026-11-13 四轮：允许负值压缩行距（用户要「最低 0.1」），下限 -0.90=0.10 倍行高。
+            cfg.line_gap.clamp(-0.90, 2.0)
         } else {
             d.line_gap
         };
@@ -623,6 +741,10 @@ impl Config {
             m.insert(key.into(), value.to_string());
         }
         m.insert("hint_font_size".into(), self.hint_font_size.to_string());
+        m.insert("hint_code_offset".into(), self.hint_code_offset.to_string());
+        m.insert("show_preedit".into(), self.show_preedit.to_string());
+        m.insert("preedit_font_size".into(), self.preedit_font_size.to_string());
+        m.insert("preedit_offset".into(), self.preedit_offset.to_string());
         m.insert("hint_rank_bold".into(), self.hint_rank_bold.to_string());
         m.insert("hint_rank_offset".into(), self.hint_rank_offset.to_string());
         m.insert("letter_spacing".into(), self.letter_spacing.to_string());
@@ -666,6 +788,12 @@ impl Config {
         }
         m.insert("today".into(), self.today.clone());
         m.insert("today_chars".into(), self.today_chars.to_string());
+        for (date, chars) in &self.practice_days {
+            if is_practice_date(date) {
+                m.insert(format!("practice_day_{date}"), chars.to_string());
+            }
+        }
+        m.insert("practice_total".into(), self.practice_total.to_string());
         m.insert(
             "smooth_caret".into(),
             (if self.smooth_caret { "true" } else { "false" }).into(),
@@ -759,7 +887,7 @@ mod tests {
         let old = "win_w = 1100\nwin_h = 680\nfont_size = 64\nline_gap = 0.22\n";
         let cfg = Config::from_toml_text(old).unwrap();
         assert_eq!((cfg.win_w, cfg.win_h, cfg.font_size), (1280, 800, 36.));
-        assert!((cfg.line_gap - 0.66).abs() < 0.001);
+        assert!((cfg.line_gap - 0.5).abs() < 0.001);
         let custom =
             Config::from_toml_text(&old.replace("font_size = 64", "font_size = 48")).unwrap();
         assert_eq!(custom.font_size, 48.);
@@ -784,6 +912,53 @@ mod tests {
     }
 
     #[test]
+    fn practice_days_roundtrip_prune_and_merge_by_max() {
+        let mut cfg = Config::default();
+        assert!(cfg.practice_record("2026-11-13", 120));
+        assert!(cfg.practice_record("2026-11-13", 30));
+        assert!(cfg.practice_record("2026-11-12", 80));
+        assert!(!cfg.practice_record("2026-11-13", 0));
+        assert!(!cfg.practice_record("bad-date", 1));
+        assert_eq!(cfg.practice_days.get("2026-11-13"), Some(&150));
+        assert_eq!(cfg.practice_total, 230);
+        assert_eq!(cfg.practice_sum_since("2026-11-12"), 230);
+        assert_eq!(cfg.practice_sum_since("2026-11-13"), 150);
+
+        let text = cfg.to_toml_text();
+        let loaded = Config::from_toml_text(&text).unwrap();
+        assert_eq!(loaded.practice_days, cfg.practice_days);
+        assert_eq!(loaded.practice_total, 230);
+        // 未知/坏掉的日期键不进入日表。
+        let bad = Config::from_toml_text("practice_day_2026-13-40 = 9\n").unwrap();
+        assert!(bad.practice_days.is_empty());
+
+        // 超过 400 个日键时修剪最旧日期，总字数保持累计值。
+        let mut many = Config::default();
+        let base = 20_000u32; // 2024-10-04 起 401 天
+        for i in 0..401u32 {
+            let date = crate::score::unix_to_date(u64::from(base + i) * 86_400);
+            many.practice_record(&date, 1);
+        }
+        assert_eq!(many.practice_days.len(), PRACTICE_KEEP_DAYS);
+        assert_eq!(many.practice_total, 401);
+
+        // 云同步：逐日 max、总计 max，不接受旧 profile 把当天字数改小。
+        let mut local = Config::default();
+        local.practice_record("2026-11-13", 300);
+        local.practice_record("2026-11-12", 100);
+        local.practice_total = 400;
+        let mut remote = Config::default();
+        remote.practice_record("2026-11-13", 120);
+        remote.practice_record("2026-11-11", 50);
+        remote.practice_total = 170;
+        local.merge_practice_max(&remote);
+        assert_eq!(local.practice_days.get("2026-11-13"), Some(&300));
+        assert_eq!(local.practice_days.get("2026-11-12"), Some(&100));
+        assert_eq!(local.practice_days.get("2026-11-11"), Some(&50));
+        assert_eq!(local.practice_total, 400);
+    }
+
+    #[test]
     fn parse_legacy_and_bad_values() {
         // 老配置缺字段 → 默认值补齐；坏数字 → 回退默认
         let cfg = Config::from_toml_text("win_x = abc\ntheme = \"松烟\"\n").unwrap();
@@ -800,7 +975,8 @@ mod tests {
     fn quiet_room_design_defaults() {
         let d = Config::default();
         assert_eq!(d.font_size, 36.0);
-        assert_eq!(d.line_gap, 0.66);
+        // 行距默认 = 半个字号（字高的一半）。
+        assert_eq!(d.line_gap, 0.5);
         assert_eq!(d.caret_speed, 12.0);
         assert_eq!(d.auto_next_delay_ms, 0);
     }
@@ -836,7 +1012,7 @@ mod tests {
         assert_eq!(cfg.win_x, 100); // 显式写的生效
         assert_eq!(cfg.font_size, 30.0); // 显式写的生效（用户改过就尊重）
                                          // 缺的字段全部落新默认
-        assert_eq!(cfg.line_gap, 0.66);
+        assert_eq!(cfg.line_gap, 0.5);
         assert_eq!(cfg.caret_speed, 12.0);
         assert_eq!(cfg.auto_next_delay_ms, 0);
         // 空文件 = 全默认
@@ -877,6 +1053,9 @@ mod tests {
         .unwrap();
         assert!(c.font_size.is_finite() && c.line_gap.is_finite() && c.caret_speed.is_finite());
         assert_eq!(c.win_w, 640);
+        // 2026-11-13 四轮：line_gap 放开负值下限 -0.90（= 0.10 倍行高）。
+        let n = Config::from_toml_text("line_gap = -0.95\n").unwrap();
+        assert!((n.line_gap - -0.90).abs() < 0.001, "下限夹到 -0.90");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1055,10 +1234,10 @@ mod tests {
         assert!((loaded.ledger_panel_h - 320.).abs() < 1e-4);
 
         let bad = Config::from_toml_text(
-            "hint_rank_offset = 99\nletter_spacing = -5\nledger_panel_h = 9999",
+            "hint_rank_offset = 999\nletter_spacing = -5\nledger_panel_h = 9999",
         )
         .unwrap();
-        assert_eq!(bad.hint_rank_offset, 16.);
+        assert_eq!(bad.hint_rank_offset, 100.);
         assert_eq!(bad.letter_spacing, 0.);
         assert_eq!(bad.ledger_panel_h, 900.);
         assert_eq!(
@@ -1067,6 +1246,30 @@ mod tests {
                 .letter_spacing,
             0.
         );
+    }
+
+    #[test]
+    fn code_hint_and_typed_code_settings_migrate_and_persist_independently() {
+        let legacy = Config::from_toml_text("hint_font_size = 38").unwrap();
+        assert!(legacy.show_preedit);
+        assert_eq!(legacy.preedit_font_size, 38., "旧配置延续原键入编码字号");
+        assert_eq!(legacy.hint_code_offset, 0.);
+        let mut cfg = legacy;
+        cfg.hint_font_size = 64.;
+        cfg.hint_code_offset = -24.;
+        cfg.show_preedit = false;
+        cfg.preedit_font_size = 22.;
+        cfg.preedit_offset = 18.;
+        let loaded = Config::from_toml_text(&cfg.to_toml_text()).unwrap();
+        assert_eq!(loaded.hint_font_size, 64.);
+        assert_eq!(loaded.hint_code_offset, -24.);
+        assert!(!loaded.show_preedit);
+        assert_eq!(loaded.preedit_font_size, 22.);
+        assert_eq!(loaded.preedit_offset, 18.);
+        let bad = Config::from_toml_text("hint_code_offset = NaN\npreedit_font_size = inf\npreedit_offset = 999").unwrap();
+        assert_eq!(bad.hint_code_offset, 0.);
+        assert_eq!(bad.preedit_font_size, 14.);
+        assert_eq!(bad.preedit_offset, 100.);
     }
 
 
@@ -1094,7 +1297,20 @@ mod tests {
             Config::from_toml_text("hint_font_size = 99")
                 .unwrap()
                 .hint_font_size,
-            28.
+            99.
+        );
+        // 七轮：下限 10（原 14），越界值夹回
+        assert_eq!(
+            Config::from_toml_text("hint_font_size = 2")
+                .unwrap()
+                .hint_font_size,
+            10.
+        );
+        assert_eq!(
+            Config::from_toml_text("hint_font_size = 120")
+                .unwrap()
+                .hint_font_size,
+            100.
         );
     }
 }
@@ -1119,6 +1335,8 @@ mod shortcut_config_tests {
     fn shortcuts_default_inherit_and_roundtrip() {
         let cfg = Config::default();
         assert_eq!(cfg.shortcut("online"), "F8");
+        assert_eq!(cfg.shortcut("online_prev"), "Ctrl+O");
+        assert_eq!(cfg.shortcut("online_next"), "Ctrl+P");
         assert_eq!(cfg.shortcut("minimal"), "F11");
         assert_eq!(cfg.shortcut("unknown-id"), "");
 

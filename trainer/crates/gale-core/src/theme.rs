@@ -176,6 +176,13 @@ impl Theme {
             "词提角标色" => self.get("打错色"),
             "词提下划线色" => self.get("强调色"),
             "词提底色" => HINT_BG_NONE,
+            // 未打文字色缺键时与实际渲染保持同一条回退链（Palette::pending 走
+            // 次级文字色）。否则设置页色块拿到 c8c8c8 兜底、正文却可能取到次级文字色，
+            // 两边颜色对不上（2026-11-14 色块陈旧问题的一部分）。
+            "未打文字色" => self.get("次级文字色"),
+            // 【审计 V01】强调色上的前景色：按亮度在两个极值里挑对比更高的一侧。
+            // 以前主按钮文字硬编码 #211A10，宣纸只有 4.24:1、青瓷 3.75:1，都不达 AA。
+            "强调前景色" => self.on_accent(self.get("强调色")),
             _ => Color::rgb(200, 200, 200),
         }
     }
@@ -200,11 +207,68 @@ impl Theme {
         let m = |v: u8| (v as f32 + (255.0 - v as f32) * f).clamp(0.0, 255.0) as u8;
         Color::rgb(m(c.0), m(c.1), m(c.2))
     }
+
+    /// 【审计 V01】强调色上的文字色：在纯黑与近白之间取对比更高的一侧。
+    /// 以前主按钮文字硬编码 #211A10：宣纸强调色 #A8741A 只有 4.24:1、
+    /// 青瓷 #4F7F6A 只有 3.75:1，都不达 WCAG AA 的 4.5:1；纯黑对这两个色
+    /// 分别是 5.0:1 与 4.7:1，所以按亮度选端点即可稳定达标。
+    fn on_accent(&self, accent: Color) -> Color {
+        const INK: Color = Color(0, 0, 0, 255);
+        const PAPER: Color = Color(0xff, 0xfd, 0xf8, 255);
+        if contrast_ratio(INK, accent) >= contrast_ratio(PAPER, accent) {
+            INK
+        } else {
+            PAPER
+        }
+    }
+}
+
+/// 【审计 V01/V02】相对亮度（WCAG 2.1 定义），用于挑前景色与校验对比度。
+pub fn relative_luminance(c: Color) -> f64 {
+    fn channel(v: u8) -> f64 {
+        let s = v as f64 / 255.0;
+        if s <= 0.039_28 {
+            s / 12.92
+        } else {
+            ((s + 0.055) / 1.055).powf(2.4)
+        }
+    }
+    0.2126 * channel(c.0) + 0.7152 * channel(c.1) + 0.0722 * channel(c.2)
+}
+
+/// 【用户反馈 2026-11-15】按比例把 a 调向 b（只动 RGB，alpha 保留 a 的）。
+/// 用户手改颜色后对比度崩掉时，用它把颜色拉回可读区间。
+pub fn mix(a: Color, b: Color, f: f32) -> Color {
+    let f = f.clamp(0.0, 1.0);
+    let ch = |x: u8, y: u8| {
+        (x as f32 + (y as f32 - x as f32) * f).round().clamp(0.0, 255.0) as u8
+    };
+    Color(ch(a.0, b.0), ch(a.1, b.1), ch(a.2, b.2), a.3)
+}
+
+/// 两色对比度（1.0–21.0）：正文需 ≥4.5，大字/图形需 ≥3.0。
+pub fn contrast_ratio(a: Color, b: Color) -> f64 {
+    let (la, lb) = (relative_luminance(a), relative_luminance(b));
+    let (hi, lo) = if la > lb { (la, lb) } else { (lb, la) };
+    (hi + 0.05) / (lo + 0.05)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 【审计 V01】强调前景色对内置浅色主题必须达 4.5:1（V01 三类不达标配色）。
+    #[test]
+    fn accent_foreground_clears_four_and_a_half() {
+        for hex in ["a8741a", "4f7f6a", "e7b75c", "2f6f8f", "9c3242"] {
+            let mut t = Theme::parse_file("probe", "");
+            let accent = Color::from_hex_no_hash(hex).unwrap();
+            t.set("强调色", accent);
+            let ink = t.get("强调前景色");
+            let ratio = contrast_ratio(ink, accent);
+            assert!(ratio >= 4.5, "强调色 {hex} 上的前景色只有 {ratio:.2}:1");
+        }
+    }
 
     #[test]
     fn parse_sunny_theme() {

@@ -2233,26 +2233,6 @@ fn main() -> std::process::ExitCode {
 }
 
 unsafe fn real_main() -> i32 {
-    // 【2026-11-09 排障】boot 探针：exe 旁固定路径、无任何依赖的最早心跳。
-    // 若 server 拉起的实例连这行都不写 → 进程死于 Rust main 之前（加载器/
-    // AV/策略），排查方向完全不同。正常启动也写（一行开销换确定性）。
-    {
-        let boot = exe_dir().join("hufu-settings-boot.log");
-        let mut st = SYSTEMTIME::default();
-        GetLocalTime(&mut st);
-        let cwd = std::env::current_dir()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|e| format!("<{e}>"));
-        let line = format!(
-            "[{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}] boot pid={} ppid=unknown cwd={}\r\n",
-            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
-            std::process::id(),
-            cwd
-        );
-        if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&boot) {
-            let _ = f.write_all(line.as_bytes());
-        }
-    }
     let exe_dir = exe_dir();
     let mut args = parse_args(&exe_dir);
 
@@ -2261,15 +2241,6 @@ unsafe fn real_main() -> i32 {
     }
     let user_data = absolutize(&args.user_data);
     if let Err(err) = fs::create_dir_all(&user_data) {
-        // 【2026-11-09 排障】return 2 前也写一份到 exe 旁 boot 日志——
-        // 此前该错误只写 args.log，若该路径本身异常则取证全灭。
-        {
-            let boot = exe_dir.join("hufu-settings-boot.log");
-            let line = format!("create user data dir FAILED: {err} (target={})\r\n", user_data.display());
-            if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&boot) {
-                let _ = f.write_all(line.as_bytes());
-            }
-        }
         log_line(
             &args.log,
             &format!("failed to create user data dir {}: {err}", user_data.display()),

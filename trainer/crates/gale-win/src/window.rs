@@ -909,7 +909,7 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                 };
                 let _ = TrackMouseEvent(&mut track);
             }
-            let (x, y) = (lo16(lp.0 as u32) as i32, hi16(lp.0 as u32) as i32);
+            let (x, y) = (lo16(lp.0 as u32) as i16 as i32, hi16(lp.0 as u32) as i16 as i32);
             push_mouse(MouseEv::Move { x: lx(x), y: lx(y) });
             // 拖动成行时唤醒主循环（空闲阻塞路径靠消息唤醒；MOUSE_QUEUE 是
             // 旁路观测，不经消息队列不会自动唤醒 wait_idle）
@@ -921,7 +921,7 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             request_frame();
         }
         WM_LBUTTONDOWN => {
-            let (x, y) = (lo16(lp.0 as u32) as i32, hi16(lp.0 as u32) as i32);
+            let (x, y) = (lo16(lp.0 as u32) as i16 as i32, hi16(lp.0 as u32) as i16 as i32);
             // ★ NOACTIVATE 窗口点击抢键盘焦点（2026-10-06）：系统不给
             //   WS_EX_NOACTIVATE 窗口做鼠标激活——别的程序拿到焦点后点回
             //   跟打器，键盘/输入法仍归别人 = "点不进来打不了字"。
@@ -937,12 +937,12 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             push_mouse(MouseEv::LDown { x: lx(x), y: lx(y) });
         }
         WM_LBUTTONUP => {
-            let (x, y) = (lo16(lp.0 as u32) as i32, hi16(lp.0 as u32) as i32);
+            let (x, y) = (lo16(lp.0 as u32) as i16 as i32, hi16(lp.0 as u32) as i16 as i32);
             push_mouse(MouseEv::LUp { x: lx(x), y: lx(y) });
         }
         // 右键：不弹系统菜单，交给应用层在窗口内自绘外观菜单。
         WM_RBUTTONDOWN => {
-            let (x, y) = (lo16(lp.0 as u32) as i32, hi16(lp.0 as u32) as i32);
+            let (x, y) = (lo16(lp.0 as u32) as i16 as i32, hi16(lp.0 as u32) as i16 as i32);
             push_mouse(MouseEv::RDown { x: lx(x), y: lx(y) });
             request_frame();
         }
@@ -950,8 +950,10 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             // wParam 高 16 位是有符号滚轮增量；lParam 是屏幕坐标（换算客户区）
             let delta = ((wp.0 as u32) >> 16) as i16 as i32;
             let mut p = windows::Win32::Foundation::POINT {
-                x: lo16(lp.0 as u32) as i32,
-                y: hi16(lp.0 as u32) as i32,
+                // 【命中 2026-11-14】i16 符号扩展：overlay 转发的滚轮坐标可能落在
+                // 主窗客户区原点上方/左侧（负值），u16 as i32 会展开成 65420 丢命中。
+                x: lo16(lp.0 as u32) as i16 as i32,
+                y: hi16(lp.0 as u32) as i16 as i32,
             };
             let _ = windows::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut p);
             push_mouse(MouseEv::Wheel {
@@ -971,6 +973,9 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             request_frame();
             LRESULT(0)
         }
+        // 【poll 短路 2026-11-14】relay RichEdit 的 EN_UPDATE（文档变化）：
+        // 置脏即可，下一次 poll 自会全量重读；无需其他处理。
+        WM_COMMAND if crate::input_host::note_relay_command(wp, lp) => LRESULT(0),
         WM_SETFOCUS => {
             // 焦点归还：主窗口只在 RichEdit 宿主不存在（启动前/销毁后）时
             // 持有焦点；模态面板打开时（set_focus_relay(false)）
@@ -1172,10 +1177,15 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                     // ★ scale 只认窗口真值（伪造消息参数会把 scale 改飞：
                     // 实测被改成 2.71 → 拖动锚点错乱 → 窗口自动变大）
                     refresh_window_dpi(hwnd);
-                } else if std::env::var("GALE_VERBOSE").as_deref() == Ok("1") {
-                    eprintln!(
-                        "[dpi] 拒绝可疑矩形 rect=({l},{t},{r},{b}) expect≈({exp_w:.0}x{exp_h:.0}) size_ok={size_ok} pos_ok={pos_ok}"
-                    );
+                } else {
+                    // 【DPI 2026-11-14】拒绝可疑建议矩形时也只按窗口真值重读
+                    // scale（与上方注释承诺一致：不动几何，但 scale 保持真实）。
+                    refresh_window_dpi(hwnd);
+                    if std::env::var("GALE_VERBOSE").as_deref() == Ok("1") {
+                        eprintln!(
+                            "[dpi] 拒绝可疑矩形 rect=({l},{t},{r},{b}) expect≈({exp_w:.0}x{exp_h:.0}) size_ok={size_ok} pos_ok={pos_ok}"
+                        );
+                    }
                 }
             }
             // UI 布局是逻辑坐标系（尺寸不变），但物理交换链变了 → 请求重帧
@@ -1439,13 +1449,14 @@ pub fn pump_messages_once() -> bool {
     }
 }
 
-/// 启动帧计时器（USER_TIMER_MINIMUM≈10ms；返回计时器 id）
-pub fn start_frame_timer(hwnd: isize) -> usize {
+/// 启动帧计时器（interval_ms=16 动画全速；50 慢速待机——打字静止期降帧
+/// 【降帧 2026-11-14】返回计时器 id）
+pub fn start_frame_timer(hwnd: isize, interval_ms: u32) -> usize {
     unsafe {
         let id = SetTimer(
             HWND(hwnd as *mut core::ffi::c_void),
             FRAME_TIMER_ID,
-            16,
+            interval_ms,
             None,
         );
         id as usize
@@ -1492,17 +1503,19 @@ pub fn has_frame_request() -> bool {
 /// 输入消息——它们派发时同样经过线程消息队列）到达时返回，让调用方
 /// 决定渲染与否；WM_QUIT 返回 false。
 ///
-/// timeout_ms：MsgWaitForMultipleObjects 的超时（None = 无限等待）。
-/// 超时返回 Ok(true) 但不消费消息——调用方下一轮 pump 再处理。
+/// timeout_ms：消息等待的超时（None = 无限等待）。
+/// 已被 PeekMessage 看过、但尚未派发的消息也必须立即唤醒，不能等下个定时器。
 pub fn wait_idle(timeout_ms: Option<u32>) -> bool {
     unsafe {
-        // 注意：windows 0.58 里 MsgWaitForMultipleObjects 挂在
-        // WindowsAndMessaging 模块（非 System::Threading），参数顺序也是
-        // (handles, wait_all, timeout, wake_mask)。
-        use windows::Win32::UI::WindowsAndMessaging::{MsgWaitForMultipleObjects, QS_ALLINPUT};
-        let dw_wake_mask = QS_ALLINPUT;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            MsgWaitForMultipleObjectsEx, MWMO_INPUTAVAILABLE, QS_ALLINPUT,
+        };
         let timeout = timeout_ms.unwrap_or(u32::MAX);
-        let r = MsgWaitForMultipleObjects(None, false, timeout, dw_wake_mask);
+        // The pump intentionally handles one message per input-diff boundary.
+        // PeekMessage marks the remaining queue as already seen. The non-Ex
+        // wait only wakes for *new* input, stranding queued keys/clicks for the
+        // entire idle timeout (50/500ms). INPUTAVAILABLE also sees that backlog.
+        let r = MsgWaitForMultipleObjectsEx(None, timeout, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
         let _ = r;
         // 消息的实际派发由调用方 pump_messages_once 完成；这里只负责唤醒。
         true
@@ -1540,6 +1553,31 @@ pub fn set_topmost(hwnd: HWND, on: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn idle_wait_does_not_sleep_over_observed_queued_input() {
+        // A separate thread gives this test its own Win32 message queue and
+        // avoids consuming another window test's input/WM_QUIT.
+        std::thread::spawn(|| unsafe {
+            use windows::Win32::System::Threading::GetCurrentThreadId;
+            use windows::Win32::UI::WindowsAndMessaging::{
+                PostThreadMessageW, PM_NOREMOVE, WM_APP,
+            };
+            let mut msg = MSG::default();
+            let marker = WM_APP + 91;
+            let _ = PeekMessageW(&mut msg, None, 0, 0, PM_NOREMOVE);
+            PostThreadMessageW(GetCurrentThreadId(), marker, WPARAM(0), LPARAM(0)).unwrap();
+            // Observing without removing is the case that defeated the old wait.
+            assert!(PeekMessageW(&mut msg, None, marker, marker, PM_NOREMOVE).as_bool());
+            let started = std::time::Instant::now();
+            assert!(wait_idle(Some(1000)));
+            assert!(started.elapsed() < std::time::Duration::from_millis(200));
+            assert!(PeekMessageW(&mut msg, None, marker, marker, PM_REMOVE).as_bool());
+            assert_eq!(msg.message, marker);
+        })
+        .join()
+        .unwrap();
+    }
 
     #[test]
     fn mouse_queue_roundtrip() {

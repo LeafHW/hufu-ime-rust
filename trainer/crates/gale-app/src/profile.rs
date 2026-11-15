@@ -8,6 +8,9 @@ const MAX_PROFILE: u64 = 1024 * 1024;
 pub struct State {
     local_identity: Value,
     local_config: Value,
+    /// 本机这份配置所对应的云档内容时刻：load 时记录、每次成功写入后刷新。
+    /// 冲突判定必须用它作为基线，不能用 config.toml 的 mtime（见 save 内注释）。
+    base_ms: u64,
 }
 
 pub struct Loaded {
@@ -27,7 +30,15 @@ fn read(path: &Path) -> Result<Option<Value>, String> {
         Err(e) => return Err(format!("读取跟打器同步配置失败：{e}")),
     };
     if raw.len() as u64 > MAX_PROFILE { return Err("跟打器同步配置超过 1 MiB".into()); }
-    let v: Value = serde_json::from_slice(&raw).map_err(|_| "跟打器同步配置 JSON 损坏".to_string())?;
+    // 【审计 C05】档被写坏时先尝试恢复链（.recover / .bak / .bak-<pid>）再报错。
+    let v: Value = match serde_json::from_slice(&raw) {
+        Ok(v) => v,
+        Err(_) => match gale_core::score::read_with_recovery(path) {
+            Some(bytes) => serde_json::from_slice(&bytes)
+                .map_err(|_| "跟打器同步配置 JSON 损坏".to_string())?,
+            None => return Err("跟打器同步配置 JSON 损坏".into()),
+        },
+    };
     if v["version"].as_u64() != Some(1) { return Err("跟打器同步配置版本不支持".into()); }
     if v.get("online_user").is_some_and(|x| !x.is_string()) || v.get("online_password").is_some_and(|x| !x.is_string()) {
         return Err("跟打器同步账号格式无效".into());
@@ -49,34 +60,80 @@ fn mtime(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).ok()?.modified().ok()
 }
 
+fn mtime_ms(path: &Path) -> u64 {
+    mtime(path)
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+// 云档的“内容时刻”。下载器会把 profile.json 的文件 mtime 设成远端时间，
+// 但云端偶尔会下发内容很旧的档（例如另一台设备很久以前上传的版本）。
+// 判断新旧必须看档内 updated_at_ms，不能只看文件 mtime。
+fn profile_stamp_ms(v: &Value, path: &Path) -> u64 {
+    v.get("updated_at_ms").and_then(Value::as_u64)
+        .or_else(|| v.get("updated_at").and_then(Value::as_u64).map(|s| s.saturating_mul(1000)))
+        .unwrap_or_else(|| mtime_ms(path))
+}
+
 pub fn load(dir: &Path) -> Result<Loaded, String> {
     let cfg_path = dir.join("config.toml");
     // Capture absence/mtime BEFORE load_or_create creates a fresh default file.
     let local_time = mtime(&cfg_path);
+    let local_ms = mtime_ms(&cfg_path);
     let path = dir.join("profile.json");
     let (profile, warning) = match read(&path) {
         Ok(v) => (v, None),
         Err(e) => (None, Some(format!("已跳过同步配置，使用本机设置：{e}"))),
     };
     let mut cfg = Config::load_or_create(&cfg_path).map_err(|e| e.to_string())?;
+    // 本机配置对应的云档版本：不论随后采用云档还是保留本机设置，这次 load
+    // 都算"已看过"该版本，保存时以它为合并基线（审计 C01）。
+    let profile_stamp = profile.as_ref().map(|v| profile_stamp_ms(v, &path)).unwrap_or(0);
     if let Some(v) = &profile {
-        if local_time.is_none() || mtime(&path).is_some_and(|t| Some(t) >= local_time) {
-            cfg = config(v)?;
+        // 旧云档不能覆盖本机较新的设置：用档内 updated_at_ms 与 config.toml
+        // 的 mtime 比较，而不能只看 profile.json 的文件时间（下载器会把
+        // 文件 mtime 设成远端时间，内容可能仍旧）。
+        let profile_time = profile_stamp_ms(v, &path);
+        if local_time.is_none() || profile_time >= local_ms {
+            let mut from_profile = config(v)?;
+            // 练字记录只增不减：云档可以带来别的设备打过的字数，但不能把
+            // 本机已累计的日/总量覆盖小（其余设置仍按原 LWW 语义）。
+            from_profile.merge_practice_max(&cfg);
+            cfg = from_profile;
             cfg.save(&cfg_path).map_err(|e| e.to_string())?;
+        } else {
+            cfg.merge_practice_max(&config(v)?);
         }
     }
     let v = profile.as_ref().unwrap_or(&Value::Null);
+    // 审计 C04：旧版本把密码/令牌写进过同步档，这里一律不认——读出来就当没有，
+    // 下一次保存会把它们从文件里抹掉（新版本也从不写）。
     let account = if v["online_account"].is_null() { None } else {
-        Some(serde_json::from_value(v["online_account"].clone()).map_err(|_| "跟打器同步账号损坏".to_string())?)
+        let mut account: WenlaiAccount = serde_json::from_value(v["online_account"].clone()).map_err(|_| "跟打器同步账号损坏".to_string())?;
+        account.jwt_token.clear();
+        Some(account)
     };
+    let identity_account = without_token(v["online_account"].clone());
     Ok(Loaded {
         user: v["online_user"].as_str().unwrap_or("").to_string(),
-        password: v["online_password"].as_str().unwrap_or("").to_string(),
+        password: String::new(),
         account,
         warning,
-        state: State { local_identity: json!([v["online_user"].as_str().unwrap_or(""), v["online_password"].as_str().unwrap_or(""), v["online_account"]]), local_config: serde_json::to_value(&cfg).map_err(|e| e.to_string())? },
+        state: State { local_identity: json!([v["online_user"].as_str().unwrap_or(""), "", identity_account]), local_config: serde_json::to_value(&cfg).map_err(|e| e.to_string())?, base_ms: profile_stamp },
         config: cfg,
     })
+}
+
+/// 审计 C04：令牌等效于云端登录凭据。同步档随用户自己的 WebDAV 离开本机，
+/// 界面也承诺「密码不保存」，所以落档的账号里令牌永远留空。
+fn without_token(mut account: Value) -> Value {
+    if let Some(map) = account.as_object_mut() {
+        if map.contains_key("jwt_token") {
+            map.insert("jwt_token".into(), Value::String(String::new()));
+        }
+    }
+    account
 }
 
 fn merge_config(base: &Value, local: &Value, remote: &Value) -> Result<Config, String> {
@@ -89,34 +146,58 @@ fn merge_config(base: &Value, local: &Value, remote: &Value) -> Result<Config, S
             object.insert(key.clone(), value.clone());
         }
     }
-    serde_json::from_value(merged).map_err(|e| format!("合并跟打器配置失败：{e}"))
+    let mut merged: Config = serde_json::from_value(merged).map_err(|e| format!("合并跟打器配置失败：{e}"))?;
+    // 练字统计按日期取 max：所有设备都在本地累加，云端旧档不能把字数改小。
+    let local_cfg: Config = serde_json::from_value(local.clone()).map_err(|e| format!("合并跟打器配置失败：{e}"))?;
+    merged.merge_practice_max(&local_cfg);
+    Ok(merged)
 }
 
 impl State {
-    pub fn save(&mut self, dir: &Path, cfg: &Config, user: &str, password: &str, account: Option<WenlaiAccount>, identity_changed: bool) -> Result<(), String> {
+    /// 保存云同步档。`_password` 只为兼容调用方保留——密码绝不落档（审计 C04）。
+    pub fn save(&mut self, dir: &Path, cfg: &Config, user: &str, _password: &str, account: Option<WenlaiAccount>, identity_changed: bool) -> Result<Option<Config>, String> {
         use std::os::windows::fs::OpenOptionsExt;
         let path = dir.join("profile.json");
         let _lock = std::fs::OpenOptions::new().read(true).write(true).create(true).share_mode(0)
             .open(path.with_extension("lock")).map_err(|e| format!("云同步正在写入跟打器配置，请稍后重试：{e}"))?;
         let remote = read(&path)?;
         let local = serde_json::to_value(cfg).map_err(|e| e.to_string())?;
+        // 冲突基线 = 本机配置对应的云档版本（base_ms），不能再用 config.toml
+        // 的 mtime：设置写入器先写 config.toml 再进这里，mtime 恒等于"现在"，
+        // 运行期下载到的新云档会被误判成旧档而整份覆盖（审计 C01，已复现）。
+        let remote_stamp = remote.as_ref().map(|v| profile_stamp_ms(v, &path)).unwrap_or(0);
+        let remote_advanced = remote.is_some() && remote_stamp > self.base_ms;
         let merged = match &remote {
-            Some(v) => merge_config(&self.local_config, &local, &serde_json::to_value(config(v)?).map_err(|e| e.to_string())?)?,
+            Some(v) if remote_advanced =>
+                merge_config(&self.local_config, &local, &serde_json::to_value(config(v)?).map_err(|e| e.to_string())?)?,
+            Some(v) => {
+                let mut fresh = cfg.clone();
+                fresh.merge_practice_max(&config(v)?);
+                fresh
+            }
             None => cfg.clone(),
+        };
+        // 云档带来的字段必须回传界面：界面仍拿着旧值时，下一次保存（任意一次
+        // 偏好改动都会触发）会把刚合并进来的远端设置重新覆盖掉。
+        let adopted = match serde_json::to_value(&merged) {
+            Ok(value) if value != local => Some(merged.clone()),
+            _ => None,
         };
         // Export can be temporarily unavailable while DPAPI is being replaced.
         // Only an explicit account transition may clear the saved account.
         let account = match account {
-            Some(a) => serde_json::to_value(a).map_err(|e| e.to_string())?,
+            Some(a) => without_token(serde_json::to_value(a).map_err(|e| e.to_string())?),
             None if identity_changed => Value::Null,
             None => self.local_identity[2].clone(),
         };
-        let local_identity = json!([user, password, account]);
+        // 审计 C04/I08：同步档会经用户自己的 WebDAV 离开本机，界面也承诺
+        // 「密码不保存」——密码只活在本进程内存里，落档一律留空。
+        let local_identity = json!([user, "", account]);
         let identity = if !identity_changed && local_identity == self.local_identity {
-            remote.as_ref().map(|r| json!([r["online_user"], r["online_password"], r["online_account"]])).unwrap_or_else(|| local_identity.clone())
+            remote.as_ref().map(|r| json!([r["online_user"], "", without_token(r["online_account"].clone())])).unwrap_or_else(|| local_identity.clone())
         } else { local_identity.clone() };
         let mut value = json!({"version":1, "config_toml":merged.to_toml_text(),
-            "online_user":identity[0], "online_password":identity[1], "online_account":identity[2]});
+            "online_user":identity[0], "online_password":"", "online_account":without_token(identity[2].clone())});
         let mut old = remote.clone().unwrap_or(Value::Null);
         if let Some(o) = old.as_object_mut() { o.remove("updated_at"); o.remove("updated_at_ms"); }
         merged.save(&dir.join("config.toml")).map_err(|e| format!("保存跟打器设置失败：{e}"))?;
@@ -134,10 +215,15 @@ impl State {
             })();
             let _ = std::fs::remove_file(&tmp);
             result.map_err(|e| format!("保存跟打器同步配置失败：{e}"))?;
+            self.base_ms = value.get("updated_at_ms").and_then(Value::as_u64).unwrap_or(remote_stamp);
+        } else {
+            // 内容没变：云档仍是同一个版本，本机与它一致，基线就地固定。
+            self.base_ms = remote_stamp;
         }
         self.local_identity = local_identity;
-        self.local_config = local;
-        Ok(())
+        // 基线内容 = 已经写进云档的那一份（远端改动被采用时就是 adopted）。
+        self.local_config = serde_json::to_value(&merged).map_err(|e| e.to_string())?;
+        Ok(adopted)
     }
 }
 
@@ -150,7 +236,8 @@ mod tests {
         std::fs::create_dir_all(&path).unwrap(); path
     }
     fn fixture(cfg: &Config, user: &str) -> Value {
-        json!({"version":1,"updated_at":1,"config_toml":cfg.to_toml_text(),
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+        json!({"version":1,"updated_at":now/1000,"updated_at_ms":now,"config_toml":cfg.to_toml_text(),
             "online_user":user,"online_password":format!("password-{user}"),
             "online_account":{"domain":cfg.wenlai_domain,"username":user,"display_name":user,"user_id":1,"jwt_token":format!("token-{user}")}})
     }
@@ -176,13 +263,34 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
     #[test]
-    fn unchanged_save_keeps_profile_timestamp_and_preserves_temporarily_unavailable_account() {
+    fn unchanged_save_scrubs_legacy_credentials_then_keeps_profile_bytes_stable() {
         let dir = dir(); let cfg = Config::default(); put(&dir, &fixture(&cfg, "a"));
-        let before = std::fs::read(dir.join("profile.json")).unwrap();
         let mut loaded = load(&dir).unwrap();
+        // 旧档里带着密码/令牌：第一次保存必须把它们抹掉（审计 C04），账号身份保留。
+        loaded.state.save(&dir, &loaded.config, "a", "password-a", None, false).unwrap();
+        let value = read(&dir.join("profile.json")).unwrap().unwrap();
+        assert_eq!(value["online_password"], "");
+        assert_eq!(value["online_account"]["jwt_token"], "");
+        assert_eq!(value["online_account"]["username"], "a");
+        // 稳态：内容没变就不再重写，文件与时间戳都保持。
+        let before = std::fs::read(dir.join("profile.json")).unwrap();
         loaded.state.save(&dir, &loaded.config, "a", "password-a", None, false).unwrap();
         assert_eq!(std::fs::read(dir.join("profile.json")).unwrap(), before);
-        assert_eq!(read(&dir.join("profile.json")).unwrap().unwrap()["online_account"]["jwt_token"], "token-a");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    #[test]
+    fn credentials_never_reach_the_cloud_profile() {
+        let dir = dir();
+        let mut loaded = load(&dir).unwrap();
+        let account: WenlaiAccount = serde_json::from_value(json!({
+            "domain":"d","username":"u","display_name":"u","user_id":7,"jwt_token":"secret-token"})).unwrap();
+        loaded.state.save(&dir, &loaded.config, "u", "hunter2", Some(account), true).unwrap();
+        let text = std::fs::read_to_string(dir.join("profile.json")).unwrap();
+        assert!(!text.contains("hunter2"), "密码不得落档");
+        assert!(!text.contains("secret-token"), "令牌不得落档");
+        let value: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["online_user"], "u");
+        assert_eq!(value["online_account"]["username"], "u");
         let _ = std::fs::remove_dir_all(dir);
     }
     #[test]
@@ -192,13 +300,18 @@ mod tests {
         let mut remote = cfg.clone(); remote.font_size = 40.; remote.theme = "remote-theme".into();
         put(&dir, &fixture(&remote, "b"));
         let mut local = loaded.config.clone(); local.hint_font_size = 20.; local.win_x = -1800;
-        loaded.state.save(&dir, &local, "a", "password-a", loaded.account, false).unwrap();
+        let adopted = loaded.state.save(&dir, &local, "a", "password-a", loaded.account, false).unwrap();
         let value = read(&dir.join("profile.json")).unwrap().unwrap(); let merged = config(&value).unwrap();
         assert_eq!(merged.font_size, 40.); assert_eq!(merged.theme, "remote-theme");
         assert_eq!(merged.hint_font_size, 20.); assert_eq!(merged.win_x, -1800);
-        assert_eq!(value["online_account"]["jwt_token"], "token-b");
-        // A second save from the still-open UI must not revert the remote fields.
-        loaded.state.save(&dir, &local, "a", "password-a", None, false).unwrap();
+        // 审计 C04：合并不会把远端档里的密码/令牌带进来（落档一律留空）。
+        assert_eq!(value["online_password"], "");
+        assert_eq!(value["online_account"]["jwt_token"], "");
+        assert_eq!(value["online_account"]["username"], "b");
+        // 界面必须采用回传的合并结果（main.rs adopt_synced_config）；之后从这份
+        // 配置再保存一次，不得把远端字段顶回去。
+        let adopted = adopted.expect("合并结果必须回传界面");
+        loaded.state.save(&dir, &adopted, "a", "password-a", None, false).unwrap();
         assert_eq!(config(&read(&dir.join("profile.json")).unwrap().unwrap()).unwrap().font_size, 40.);
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -221,5 +334,65 @@ mod tests {
         assert!(loaded.state.save(&dir, &cfg, "", "", None, true).unwrap_err().contains("稍后重试"));
         assert_eq!(std::fs::read(dir.join("profile.json")).unwrap(), before);
         drop(lock); let _ = std::fs::remove_dir_all(dir);
+    }
+    #[test]
+    fn stale_cloud_profile_cannot_roll_back_newer_local_settings() {
+        let dir = dir();
+        let mut cfg = Config::default();
+        cfg.font_size = 48.;
+        cfg.save(&dir.join("config.toml")).unwrap();
+        // 内容很旧、但文件时间很新（下载器写完就是这种情况）。
+        let mut old = cfg.clone();
+        old.font_size = 40.;
+        old.theme = "old-theme".into();
+        let mut v = fixture(&old, "a");
+        v["updated_at"] = json!(1);
+        v["updated_at_ms"] = json!(1000);
+        put(&dir, &v);
+        let loaded = load(&dir).unwrap();
+        assert_eq!(loaded.config.font_size, 48., "旧云档不得覆盖本机较新的设置");
+        assert_ne!(loaded.config.theme, "old-theme");
+        let mut state = loaded.state;
+        state.save(&dir, &loaded.config, "a", "password-a", None, false).unwrap();
+        let value = read(&dir.join("profile.json")).unwrap().unwrap();
+        let merged = config(&value).unwrap();
+        assert_eq!(merged.font_size, 48.);
+        assert_ne!(merged.theme, "old-theme");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    // 审计 C01 回归：设置写入器先写 config.toml（刷新本机 mtime）再进 save()，
+    // 旧实现用 mtime 当基线，运行期下载到的新云档被当成旧档整份覆盖。
+    #[test]
+    fn newer_cloud_values_survive_the_config_mtime_refreshed_by_the_settings_writer() {
+        let dir = dir();
+        let mut cfg = Config::default();
+        cfg.font_size = 36.;
+        cfg.theme = "default".into();
+        cfg.save(&dir.join("config.toml")).unwrap();
+        let mut loaded = load(&dir).unwrap();
+        // 另一台设备上传了较新的同步档：字号 72 + 青瓷主题。
+        let mut remote = Config::default();
+        remote.font_size = 72.;
+        remote.theme = "青瓷".into();
+        put(&dir, &fixture(&remote, "a"));
+        // 用户只改了词提字号，且 config.toml 在云档之后落盘（就是写入器的顺序）。
+        let mut local = loaded.config.clone();
+        local.hint_font_size = 26.;
+        local.save(&dir.join("config.toml")).unwrap();
+        let adopted = loaded.state.save(&dir, &local, "a", "password-a", None, false).unwrap();
+        let merged = config(&read(&dir.join("profile.json")).unwrap().unwrap()).unwrap();
+        assert_eq!(merged.font_size, 72., "远端较新的字号不得被本机旧值覆盖");
+        assert_eq!(merged.theme, "青瓷");
+        assert_eq!(merged.hint_font_size, 26., "本机这次的修改必须保留");
+        let adopted = adopted.expect("合并结果必须回传界面");
+        assert_eq!(adopted.font_size, 72.);
+        assert_eq!(adopted.hint_font_size, 26.);
+        // 界面采用合并结果后再保存一次，不能把远端字段顶回去。
+        assert!(loaded.state.save(&dir, &adopted, "a", "password-a", None, false).unwrap().is_none());
+        let again = config(&read(&dir.join("profile.json")).unwrap().unwrap()).unwrap();
+        assert_eq!(again.font_size, 72.);
+        assert_eq!(again.theme, "青瓷");
+        assert_eq!(again.hint_font_size, 26.);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

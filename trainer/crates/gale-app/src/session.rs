@@ -4,7 +4,9 @@ use gale_core::rules::{
     clean_body, fingerprint, CleaningPreset, RoundMetadata, SessionRules, TrainingMode,
 };
 use gale_core::score::{DifficultyTag, ScoreRecord, VALID_MIN_CHARS};
-use gale_core::segment::{parse_group_text, split_smart, ParsedGroupText, Segment};
+use gale_core::segment::{
+    parse_group_text, split_paragraphs, split_smart, ParsedGroupText, Segment,
+};
 use gale_core::single::SingleSession;
 use gale_core::stats::{SegmentStats, StatsEngine};
 use gale_win::input_host::{BackspaceClass, BackspaceRouter, CommitCause};
@@ -79,6 +81,10 @@ pub struct Session {
     /// 旧快照缺省 0。
     #[serde(default)]
     pub normalize_count: usize,
+    /// 【五轮】规范化前后全篇字符数（before, after）——省略号收敛/标点旁
+    /// 空白删除等规则会减字符数，toast 透明化"少字"答疑。旧快照缺省 (0,0)。
+    #[serde(default)]
+    pub normalize_chars: (usize, usize),
     /// 载文难度（群文《难度》头 / 文来难度；结算时随成绩入 ScoreRecord.difficulty，
     /// 成绩单输出 `难度普(1.84)`）。旧快照缺省 None。
     #[serde(default)]
@@ -144,6 +150,7 @@ impl Session {
             cleaned: false,
             pasted: false,
             normalize_count: 0,
+            normalize_chars: (0, 0),
             difficulty: None,
             default_seg_chars: seg_chars.clamp(10, 10000),
             frozen_text_hash: String::new(),
@@ -163,9 +170,9 @@ impl Session {
         // 入引号。规范结果就是跟打目标与 raw 基线；引号状态跨段携带。
         let mut quote_state = gale_core::normalize::QuoteState::default();
         let mut norm_count = 0usize;
+        let chars_before: usize = self.segments.iter().map(|s| s.text.chars().count()).sum();
         for seg in &mut self.segments {
-            let (text, changed) =
-                gale_core::normalize::normalize_text(&seg.text, &mut quote_state);
+            let (text, changed) = gale_core::normalize::normalize_text(&seg.text, &mut quote_state);
             seg.text = text;
             norm_count += changed;
         }
@@ -173,6 +180,11 @@ impl Session {
         self.index = 0;
         self.raw_segments = self.segments.clone();
         self.normalize_working_newlines();
+        // CRLF 归并也算进 after（每对 \r\n → \n 少 1 字符）
+        self.normalize_chars = (
+            chars_before,
+            self.segments.iter().map(|s| s.text.chars().count()).sum(),
+        );
         self.results = vec![None; self.segments.len()];
         self.cleaned = false;
         self.difficulty = None;
@@ -207,8 +219,22 @@ impl Session {
         if parsed.segments.iter().any(|seg| !seg.mark.is_empty()) {
             self.load_group(parsed);
         } else {
-            self.load_book("自定义文字", text);
+            self.load_plain(text);
         }
+    }
+    /// 【七轮】纯文本（无群文段标）按原文段落整段载入：不按段长切碎，
+    /// 换行只作段落边界、不进比对目标（段内 \n 会让 Enter 永远打不过去）。
+    pub fn load_plain(&mut self, text: &str) {
+        self.segments = split_paragraphs(text);
+        if self.segments.is_empty() {
+            self.segments.push(Segment {
+                mark: "1".into(),
+                text: text.trim().into(),
+            });
+        }
+        self.title = "自定义文字".into();
+        self.source = SessionSource::Library("自定义文字".into());
+        self.loaded();
     }
     pub fn load_book(&mut self, title: &str, text: &str) {
         self.segments = split_smart(text, self.default_seg_chars);
@@ -413,18 +439,28 @@ impl Session {
         self.started_ms = Some(now);
         self.comparer.started_at = Some(now);
     }
-    pub fn feed_input(&mut self, ev: InputEvent, now_ms: u64) {
+    /// 返回本次实际上屏的字符数（练字记录按此计数；退格/无提交返回 0）。
+    pub fn feed_input(&mut self, ev: InputEvent, now_ms: u64) -> usize {
         if self.current_segment().text.is_empty()
             || self.phase == Phase::Done
             || self.paused_at.is_some()
         {
-            return;
+            // 【暂停丢字 2026-11-14】暂停/完成期到达的 Commit 静默丢弃是设计
+            // 行为，但排障时无痕；输入诊断日志开着时补一条可观测记录。
+            if let (InputEvent::Commit { chars }, Some(at)) = (&ev, self.paused_at) {
+                gale_win::input_host::diag_log(&format!(
+                    "session drop Commit({} ch) paused_at={}ms",
+                    chars.len(),
+                    at
+                ));
+            }
+            return 0;
         }
         let now = self.clock(now_ms);
         let meaningful = matches!(&ev,InputEvent::Commit {chars} if !chars.is_empty())
             || matches!(ev, InputEvent::Backspace) && self.comparer.pos > 0;
         if !meaningful {
-            return;
+            return 0;
         }
         self.begin(now);
         // Event intervals use the same active-time axis as the headline duration.
@@ -451,6 +487,11 @@ impl Session {
         if self.comparer.finished_with_correct_last_char() {
             self.finished_ms = Some(now);
             self.phase = Phase::Done;
+        }
+        if matches!(ev, InputEvent::Commit { .. }) {
+            out.len()
+        } else {
+            0
         }
     }
     pub fn on_key(&mut self, vk: u32, now_ms: u64) {
@@ -1059,14 +1100,43 @@ mod tests {
         assert_eq!(s.title, "自定义文字");
         assert_eq!(s.source, SessionSource::Library("自定义文字".into()));
         assert!(s.difficulty.is_none());
-        assert!(s.total_segments() > 1);
+        // 【七轮】纯文本按原文段落切段：换行是段落边界不是跟打目标，
+        // 段首尾空白修剪；不按段长切碎（段长 5 不再生效）。
+        assert_eq!(s.total_segments(), 3);
+        let texts: Vec<&str> = s.segments.iter().map(|seg| seg.text.as_str()).collect();
+        assert_eq!(texts, vec!["《这是正文》", "正文空格保留。", "下一行。"]);
+        assert!(s.segments.iter().all(|seg| !seg.text.contains('\n')));
+    }
+
+    /// 【七轮】m02334：一段 580+ 字的多段落文本剪贴板载文"只有86字"。
+    /// 根因一：split_smart 按段长 100 切碎成 7 段，跟打器只显示第 1 段 86 字；
+    /// 根因二：换行留在比对目标里，而 Enter 被"下一段"截走——打段内 \n 永远
+    /// 打不过去。修复后：段落=段，单行长文不切碎，任何段都不含 \n。
+    #[test]
+    fn plain_text_loads_whole_paragraphs_without_newline_targets() {
+        let blob = "很多政府优先考虑的开支项目是具有网络功能的系统。".repeat(13);
+        let mut s = Session::new(100);
+        s.load_text(&blob);
+        assert_eq!(s.total_segments(), 1, "single blob: no 100-char chopping");
+        assert_eq!(s.segments[0].text.chars().count(), blob.chars().count());
+
+        let multi = "第一段正文，句末。\r\n\r\n第二段正文。\r\n第三段紧跟着。";
+        let mut s2 = Session::new(100);
+        s2.load_text(multi);
+        assert_eq!(s2.total_segments(), 3);
+        assert!(s2.segments.iter().all(|seg| !seg.text.contains('\n')));
         assert_eq!(
-            s.segments
+            s2.segments
                 .iter()
                 .map(|seg| seg.text.as_str())
                 .collect::<String>(),
-            normalize_newlines(raw)
+            "第一段正文，句末。第二段正文。第三段紧跟着。"
         );
+        // 群文路径不受影响：尾标仍在走 load_group
+        let group = "[普(1.84)]标题 [字数6]\n正文。\n-----第2-277101段-晴发文";
+        let mut s3 = Session::new(100);
+        s3.load_text(group);
+        assert_eq!(s3.source, SessionSource::Group);
     }
     /// 逐字一键 + 末尾整段 commit：首键开表（started=start），elapsed = end−start。
     fn round(s: &mut Session, start: u64, end: u64, text: &str) {
@@ -1912,6 +1982,90 @@ mod tests {
         assert_eq!(s.stats.keys, 3);
         assert_eq!(s.stats.composing_keys, 3);
         assert!(s.preedit.is_empty());
+    }
+
+    /// 练字记录口径：只认实际上屏的提交字符；退格/暂停/段末之后都不再计数。
+    #[test]
+    fn feed_input_returns_committed_char_count_for_practice_ledger() {
+        let mut s = Session::new(100);
+        s.load_book("练字", "甲乙");
+        s.on_key(0x41, 100);
+        assert_eq!(
+            s.feed_input(
+                InputEvent::Commit {
+                    chars: "甲".into()
+                },
+                150
+            ),
+            1
+        );
+        s.on_key(0x42, 250);
+        assert_eq!(
+            s.feed_input(
+                InputEvent::Commit {
+                    chars: "乙".into()
+                },
+                300
+            ),
+            1
+        );
+        // 完成后的多余提交不计数（阶段已 Done）。
+        assert_eq!(
+            s.feed_input(
+                InputEvent::Commit {
+                    chars: "丙".into()
+                },
+                350
+            ),
+            0
+        );
+
+        // 退格本身不产生上屏字符；回改后重打仍按实际提交计数。
+        let mut back = Session::new(100);
+        back.load_book("练字", "甲乙");
+        back.on_key(0x41, 100);
+        assert_eq!(
+            back.feed_input(
+                InputEvent::Commit {
+                    chars: "甲".into()
+                },
+                150
+            ),
+            1
+        );
+        assert_eq!(back.feed_input(InputEvent::Backspace, 200), 0);
+        assert_eq!(
+            back.feed_input(
+                InputEvent::Commit {
+                    chars: "甲".into()
+                },
+                250
+            ),
+            1
+        );
+        assert_eq!(
+            back.feed_input(
+                InputEvent::Commit {
+                    chars: "乙".into()
+                },
+                300
+            ),
+            1
+        );
+
+        let mut paused = Session::new(100);
+        paused.load_book("练字", "甲乙");
+        paused.on_key(0x41, 100); // 先进入 Typing，暂停只在回合进行中生效
+        paused.set_paused(true, 120);
+        assert_eq!(
+            paused.feed_input(
+                InputEvent::Commit {
+                    chars: "甲".into()
+                },
+                150
+            ),
+            0
+        );
     }
 
     #[test]

@@ -216,6 +216,16 @@ impl Comparer {
             .count()
     }
 
+    /// The next target scalar. Normal typing uses the cached target in O(1);
+    /// deserialized snapshots can query before their first feed rebuilds it.
+    pub fn next_target_char(&self) -> Option<char> {
+        if self.target_chars.len() == self.states.len() {
+            self.target_chars.get(self.pos).copied()
+        } else {
+            self.text.chars().nth(self.pos)
+        }
+    }
+
     /// 当前光标前最后一个字符（用于候选窗锚定等）
     pub fn current_char(&self) -> Option<char> {
         if self.pos == 0 {
@@ -367,5 +377,22 @@ mod tests {
         assert_eq!(c.pos, 4);
         feed_commit(&mut c, "\n");
         assert!(c.is_done());
+    }
+
+    #[test]
+    fn next_target_scalar_tracks_newlines_undo_and_restored_snapshots() {
+        let mut c = Comparer::new("甲\r\n😀");
+        assert_eq!(c.next_target_char(), Some('甲'));
+        feed_commit(&mut c, "甲");
+        assert_eq!(c.next_target_char(), Some('\n'));
+        let restored: Comparer = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+        assert_eq!(restored.next_target_char(), Some('\n'));
+        feed_commit(&mut c, "\n😀");
+        assert_eq!(c.next_target_char(), None);
+        c.feed(&InputEvent::Backspace, 10);
+        assert_eq!(c.next_target_char(), Some('😀'));
+        c.feed(&InputEvent::Backspace, 20);
+        assert_eq!(c.next_target_char(), Some('\n'));
+        assert_eq!(Comparer::new("").next_target_char(), None);
     }
 }

@@ -2,7 +2,7 @@
 //!
 //! 管线（对照 _research/web-survey.md）：
 //! D3D11 设备 → 合成交换链(FLIP_SEQUENTIAL, 预乘 alpha) → DComp 视图挂到 HWND
-//! → D2D 设备上下文包裹交换链缓冲 → 每帧按 Frame 指令绘制 → Present(1,0)。
+//! → D2D 设备上下文包裹交换链缓冲 → 每帧按 Frame 指令绘制 → Present(0,0)。
 //!
 //! 预乘 alpha 交换链是"磨砂/毛玻璃看见背后桌面"的关键：窗口像素 alpha=0 处
 //! DWM 显示 backdrop（Acrylic/Blur 由 window.rs 的材质调用控制）。
@@ -38,7 +38,7 @@ use windows::Win32::Graphics::DirectComposition::{
 use windows::Win32::Graphics::DirectWrite::{
     DWriteCreateFactory, IDWriteFactory, IDWriteFontCollection, IDWriteFontFamily,
     IDWriteLocalizedStrings, IDWriteTextFormat, IDWriteTextLayout, DWRITE_FACTORY_TYPE_SHARED,
-    DWRITE_FONT_WEIGHT_NORMAL, DWRITE_MEASURING_MODE_NATURAL, DWRITE_PARAGRAPH_ALIGNMENT_NEAR,
+    DWRITE_FONT_WEIGHT_NORMAL, DWRITE_PARAGRAPH_ALIGNMENT_NEAR,
     DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TEXT_ALIGNMENT_TRAILING,
     DWRITE_TEXT_METRICS, DWRITE_WORD_WRAPPING_NO_WRAP,
 };
@@ -623,11 +623,34 @@ pub struct Renderer {
     pub height: f32,
     /// 拖动尺寸期间的同步填充色（on_window_size_sync_fill）
     resize_fill: [f32; 4],
+    /// 绘制偏移（DIP）：overlay 只显示主帧的一块区域时，把该区域左上角
+    /// 挪到窗口原点（present_region 用）。
+    draw_offset: (f32, f32),
     /// 最近一帧（WM_SIZE 同步重放用；draw_frame 时记录）
     last_frame: Option<Frame>,
     last_frame_size: RenderSize,
+    /// 【帧缓存 2026-11-14】false 时 draw_frame 不再深拷贝命令表进
+    /// last_frame（overlay 的 WM_SIZE 由 set_rect 立即补帧，重放缓存
+    /// 无消费者——省掉每帧整表克隆；None 时重放退纯底色，安全）。
+    keep_last_frame: bool,
     /// A failed optional effect must not prevent subsequent normal frames.
     blur_unavailable: bool,
+    /// 【TextLayout 缓存 2026-11-14】对照模式 StyledLine 的布局缓存：
+    /// 键 = hash(文本, 字号位, 行宽位, spans 全量指纹)。布局含
+    /// SetDrawingEffect 副作用，spans 必须进键；超 256 条整体清空重建。
+    styled_layouts: HashMap<u64, IDWriteTextLayout>,
+    /// span 着色画刷按 RGBA 位缓存（主题色板有限，量级恒定）。
+    span_brushes: HashMap<u32, ID2D1SolidColorBrush>,
+    /// 【字形缓存 2026-11-14】字贴模式 draw_char 的单字布局缓存：
+    /// 键 = (char, 字号量化)。DrawText 每次内建 layout（分析+整形+字形运行）
+    /// 是字贴逐字绘制的热点；缓存后 DrawTextLayout 直绘，像素口径不变
+    /// （DrawText = 以 rect 为盒建 layout 再从 (left,top) 画，此处同参复刻）。
+    /// 超 1024 条整体清空（单页去重字符 ≪ 该量级）。
+    char_layouts: HashMap<(u32, u32), IDWriteTextLayout>,
+    /// UI labels/codes are stable across hover/animation frames. DrawText builds
+    /// a fresh layout every call; retain those layouts too, independently of
+    /// position and brush color so moving/recoloring never makes them stale.
+    run_layouts: HashMap<(FontFamily, u32, u8, String), IDWriteTextLayout>,
 }
 
 /// 单字符 UTF-16（BMP 内 1 单元；罕见增平面字给代理对，量宽/绘制都兼容）
@@ -775,12 +798,18 @@ impl Renderer {
                 width: w as f32,
                 height: h as f32,
                 resize_fill: [0.149, 0.149, 0.165, 1.0], // #2626 2a 近似（主题加载后覆盖）
+                draw_offset: (0.0, 0.0),
                 last_frame: None,
+                keep_last_frame: true,
                 last_frame_size: RenderSize {
                     w: w as f32,
                     h: h as f32,
                 },
                 blur_unavailable: false,
+                styled_layouts: HashMap::new(),
+                span_brushes: HashMap::new(),
+                char_layouts: HashMap::new(),
+                run_layouts: HashMap::new(),
             };
             r.rebind_target().map_err(|e| {
                 eprintln!("[d2d] rebind_target 失败: {e:?}");
@@ -910,6 +939,30 @@ impl Renderer {
         self.resize_fill = c;
     }
 
+    /// 【帧缓存 2026-11-14】关闭后 draw_frame 不缓存命令表（overlay 用：
+    /// set_rect 每帧同步几何后立即补帧，last_frame 无消费者，省整表深拷贝）。
+    pub fn set_keep_last_frame(&mut self, keep: bool) {
+        self.keep_last_frame = keep;
+        if !keep {
+            self.last_frame = None;
+        }
+    }
+
+    /// 【字体缓存失效 2026-11-14】换正文字体族时，除 FontKit 自带的
+    /// fmt_cache/width_cache 外，还要清掉 Renderer 层的布局缓存——
+    /// styled_layouts/char_layouts 的键不含字体族，不清会继续用旧
+    /// TextFormat 建的 layout 画旧字形。
+    pub fn set_body_family(&mut self, requested: &str) -> bool {
+        if self.fonts.set_body_family(requested) {
+            self.styled_layouts.clear();
+            self.char_layouts.clear();
+            self.run_layouts.clear();
+            true
+        } else {
+            false
+        }
+    }
+
     /// WM_SIZE 同步真帧绘制（gale-app 重建的完整 UI 帧直绘）：
     /// resize 缓冲 → 按指令绘制 → Present。供 set_size_rebuild_callback
     /// 回调末端调用（比 on_window_size_sync_fill 的位图重放质量高：
@@ -1035,7 +1088,17 @@ impl Renderer {
     }
 
     /// 渲染一帧（指令消费 + Present）
+    pub fn set_draw_offset(&mut self, dx: f32, dy: f32) {
+        self.draw_offset = (dx, dy);
+    }
+
     pub fn draw_frame(&mut self, frame: &Frame) -> windows::core::Result<()> {
+        // Opt-in profiling: no clocks, formatting or I/O on the normal path.
+        static TRACE: OnceLock<bool> = OnceLock::new();
+        let trace = *TRACE.get_or_init(|| {
+            std::env::var("GALE_RENDER_TRACE").is_ok_and(|v| v == "1")
+        });
+        let started = trace.then(std::time::Instant::now);
         unsafe {
             self.d2d_ctx.BeginDraw();
             // 整帧清成透明（alpha=0 处透出 DWM backdrop —— 磨砂/毛玻璃的关键）
@@ -1057,8 +1120,8 @@ impl Renderer {
                     M12: 0.0,
                     M21: 0.0,
                     M22: sc,
-                    M31: 0.0,
-                    M32: 0.0,
+                    M31: -self.draw_offset.0 * sc,
+                    M32: -self.draw_offset.1 * sc,
                 });
 
             // 白条猎捕（GALE_BARHUNT=3）：Clear 后立刻画不透明黑全窗幕布——
@@ -1098,19 +1161,29 @@ impl Renderer {
                     M31: 0.0,
                     M32: 0.0,
                 });
-            // 记录本帧（WM_SIZE 同步补帧重放用）
-            self.last_frame = Some(Frame {
-                size: frame.size,
-                cmds: frame.cmds.clone(),
-            });
+            // 记录本帧（WM_SIZE 同步补帧重放用；overlay 关掉重放缓存省深拷贝）
+            if self.keep_last_frame {
+                self.last_frame = Some(Frame {
+                    size: frame.size,
+                    cmds: frame.cmds.clone(),
+                });
+            }
             self.last_frame_size = frame.size;
             // SyncInterval=0：不等待垂直同步。E2E/后台桌面实测：窗口不在
             // 交互桌面（无 DWM 合成）时 Present(1) 永久阻塞且内部泵消息，
             // 造成"主循环假死但 WM_CHAR 仍被处理"的诡象（e2e-run9 诊断定论）。
             // 不等 VBlank 在前台桌面代价是多耗一点 GPU，跟打器 120fps 节流
             // 由上层 6e 的 8ms 门限负责。
+            let before_present = started.map(|_| std::time::Instant::now());
             self.swapchain.Present(0, DXGI_PRESENT(0)).ok()?;
-            self.rebind_target()
+            let after_present = started.map(|_| std::time::Instant::now());
+            let result = self.rebind_target();
+            if let (Some(start), Some(before), Some(after)) = (started, before_present, after_present) {
+                eprintln!("[render] hwnd={:x} cmds={} draw_us={} present_us={} total_us={}",
+                    self.hwnd, frame.cmds.len(), before.duration_since(start).as_micros(),
+                    after.duration_since(before).as_micros(), start.elapsed().as_micros());
+            }
+            result
         }
     }
 
@@ -1129,6 +1202,21 @@ impl Renderer {
         self.render_export_frame()?;
         let dib = self.read_target_dib(crop)?;
         crate::clipboard_bridge::try_write_dib(self.hwnd, &dib)
+    }
+
+    /// 【截图复制 2026-11-15】把渲染表面（可选裁剪）导出成 32 位 BI_RGB DIB。
+    /// 供调用方自己做多屏拼接：拼好后再交给 `write_dib_to_clipboard`。
+    pub fn export_dib(
+        &mut self,
+        crop: Option<(u32, u32, u32, u32)>,
+    ) -> Result<Vec<u8>, String> {
+        self.render_export_frame()?;
+        self.read_target_dib(crop)
+    }
+
+    /// 把调用方拼好的 DIB 直接写进剪贴板（内部统一转 24 位）。
+    pub fn write_dib_to_clipboard(&mut self, dib: &[u8]) -> Result<(), String> {
+        crate::clipboard_bridge::try_write_dib(self.hwnd, dib)
     }
 
     fn render_export_frame(&mut self) -> Result<(), String> {
@@ -1155,8 +1243,8 @@ impl Renderer {
                     M12: 0.,
                     M21: 0.,
                     M22: sc,
-                    M31: 0.,
-                    M32: 0.,
+                    M31: -self.draw_offset.0 * sc,
+                    M32: -self.draw_offset.1 * sc,
                 });
             self.exec_cmds(&cmds);
             let result = self.d2d_ctx.EndDraw(None, None);
@@ -1326,6 +1414,32 @@ impl Renderer {
         self.brush.SetColor(&D2D1_COLOR_F { r, g, b, a });
     }
 
+    /// 【TextLayout 缓存 2026-11-14】span 画刷按 RGBA 位取缓存；未建则
+    /// CreateSolidColorBrush 一次并常驻（颜色来自主题色板，量级恒定）。
+    unsafe fn span_brush(&mut self, c: &[f32; 4]) -> Option<ID2D1SolidColorBrush> {
+        let key = c[0].to_bits()
+            ^ c[1].to_bits().rotate_left(8)
+            ^ c[2].to_bits().rotate_left(16)
+            ^ c[3].to_bits().rotate_left(24);
+        if let Some(hit) = self.span_brushes.get(&key) {
+            return Some(hit.clone());
+        }
+        let made = self
+            .d2d_ctx
+            .CreateSolidColorBrush(
+                &D2D1_COLOR_F {
+                    r: c[0],
+                    g: c[1],
+                    b: c[2],
+                    a: c[3],
+                },
+                None,
+            )
+            .ok()?;
+        self.span_brushes.insert(key, made.clone());
+        Some(made)
+    }
+
     /// 指令消费（draw_frame / draw_sync_frame / replay_frame 共用）
     unsafe fn exec_cmds(&mut self, cmds: &[DrawCmd]) {
         self.exec_cmds_inner(cmds, true);
@@ -1446,43 +1560,61 @@ impl Renderer {
                 } => {
                     self.set_brush(*color);
                     if let Ok(fmt) = self.fonts.format(FontFamily::Lxgw, *size) {
-                        let ws: Vec<u16> = text.encode_utf16().collect();
-                        if let Ok(layout) =
-                            self.fonts
-                                .dwrite
-                                .CreateTextLayout(&ws, &fmt, *w + 4.0, *size * 1.5)
-                        {
-                            let mut effects = Vec::new();
-                            for (start, len, c) in spans {
-                                if let Ok(b) = self.d2d_ctx.CreateSolidColorBrush(
-                                    &D2D1_COLOR_F {
-                                        r: c[0],
-                                        g: c[1],
-                                        b: c[2],
-                                        a: c[3],
-                                    },
-                                    None,
-                                ) {
-                                    let _ = layout.SetDrawingEffect(
-                                        &b,
-                                        windows::Win32::Graphics::DirectWrite::DWRITE_TEXT_RANGE {
-                                            startPosition: *start,
-                                            length: *len,
-                                        },
-                                    );
-                                    effects.push(b);
-                                }
+                        // 【TextLayout 缓存 2026-11-14】每帧每行原本重建
+                        // CreateTextLayout + 每 span 新建画刷；改为命中缓存
+                        // 直接复用（键含 spans 指纹，SetDrawingEffect 副作用安全）。
+                        use std::hash::{Hash, Hasher};
+                        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                        text.hash(&mut hasher);
+                        size.to_bits().hash(&mut hasher);
+                        w.to_bits().hash(&mut hasher);
+                        for (s, l, c) in spans {
+                            s.hash(&mut hasher);
+                            l.hash(&mut hasher);
+                            for f in c.iter() {
+                                f.to_bits().hash(&mut hasher);
                             }
-                            self.d2d_ctx.DrawTextLayout(
-                                windows::Win32::Graphics::Direct2D::Common::D2D_POINT_2F {
-                                    x: *x,
-                                    y: *y,
-                                },
-                                &layout,
-                                &self.brush,
-                                D2D1_DRAW_TEXT_OPTIONS_NONE,
-                            );
                         }
+                        let key = hasher.finish();
+                        if self.styled_layouts.len() > 256 {
+                            self.styled_layouts.clear();
+                        }
+                        let layout = match self.styled_layouts.get(&key) {
+                            Some(hit) => hit.clone(),
+                            None => {
+                                let ws: Vec<u16> = text.encode_utf16().collect();
+                                let Ok(layout) = self.fonts.dwrite.CreateTextLayout(
+                                    &ws,
+                                    &fmt,
+                                    *w + 4.0,
+                                    *size * 1.5,
+                                ) else {
+                                    continue;
+                                };
+                                for (start, len, c) in spans {
+                                    if let Some(b) = self.span_brush(c) {
+                                        let _ = layout.SetDrawingEffect(
+                                            &b,
+                                            windows::Win32::Graphics::DirectWrite::DWRITE_TEXT_RANGE {
+                                                startPosition: *start,
+                                                length: *len,
+                                            },
+                                        );
+                                    }
+                                }
+                                self.styled_layouts.insert(key, layout.clone());
+                                layout
+                            }
+                        };
+                        self.d2d_ctx.DrawTextLayout(
+                            windows::Win32::Graphics::Direct2D::Common::D2D_POINT_2F {
+                                x: *x,
+                                y: *y,
+                            },
+                            &layout,
+                            &self.brush,
+                            D2D1_DRAW_TEXT_OPTIONS_NONE,
+                        );
                     }
                 }
                 DrawCmd::Glyphs { .. } => {
@@ -1621,25 +1753,41 @@ impl Renderer {
             Ok(f) => f,
             Err(_) => return,
         };
-        let s: Vec<u16> = utf16_of(ch);
         // 字符格内按实际 advance 居中：格宽 w，字形宽 char_width(w)，
         // 左缘 = x + (w - adv)/2。CJK adv≈w（几乎顶格），ASCII adv≈0.5w
         // （居中后两侧对称，不再贴左缘挤成一团）。
         let adv = self.fonts.char_width(FontFamily::Lxgw, h, ch);
         let gx = x + ((w - adv) / 2.0).max(0.0);
-        let rect = D2D_RECT_F {
-            left: gx,
-            top: y,
-            right: gx + adv + 8.0,
-            bottom: y + h * 1.4,
+        // 【字形缓存 2026-11-14】DrawText 等价于「以 rect 为盒内建 layout
+        // 再从 (left,top) 起画」；此处按同参建单字 layout 并缓存，命中后
+        // DrawTextLayout 直绘——省掉每字每帧的文本分析+整形+字形运行重建。
+        let q = (h * 4.0).round() as u32;
+        let key = (ch as u32, q);
+        if self.char_layouts.len() > 1024 {
+            self.char_layouts.clear();
+        }
+        let layout = match self.char_layouts.get(&key) {
+            Some(l) => l.clone(),
+            None => {
+                let s: Vec<u16> = utf16_of(ch);
+                let made =
+                    match self
+                        .fonts
+                        .dwrite
+                        .CreateTextLayout(&s, &fmt, adv + 8.0, h * 1.4)
+                    {
+                        Ok(l) => l,
+                        Err(_) => return,
+                    };
+                self.char_layouts.insert(key, made.clone());
+                made
+            }
         };
-        let _ = self.d2d_ctx.DrawText(
-            &s,
-            &fmt,
-            &rect,
+        let _ = self.d2d_ctx.DrawTextLayout(
+            windows::Win32::Graphics::Direct2D::Common::D2D_POINT_2F { x: gx, y },
+            &layout,
             &self.brush,
             D2D1_DRAW_TEXT_OPTIONS_NONE,
-            DWRITE_MEASURING_MODE_NATURAL,
         );
     }
 
@@ -1654,38 +1802,40 @@ impl Renderer {
         align: Align,
         font: FontFamily,
     ) {
-        let fmt = match self.fonts.format(font, h) {
-            Ok(f) => f,
-            Err(_) => return,
+        if text.is_empty() {
+            return;
+        }
+        let (alignment, left, tag) = match align {
+            Align::Left => (DWRITE_TEXT_ALIGNMENT_LEADING, x, 0),
+            Align::Center => (DWRITE_TEXT_ALIGNMENT_CENTER, x - 2048.0, 1),
+            Align::Right => (DWRITE_TEXT_ALIGNMENT_TRAILING, x - 4096.0, 2),
         };
-        let _ = fmt.SetTextAlignment(match align {
-            Align::Left => DWRITE_TEXT_ALIGNMENT_LEADING,
-            Align::Center => DWRITE_TEXT_ALIGNMENT_CENTER,
-            Align::Right => DWRITE_TEXT_ALIGNMENT_TRAILING,
-        });
-        let ws: Vec<u16> = text.encode_utf16().collect();
-        // 锚点语义：Left=x 左缘 / Center=x 中心 / Right=x 右缘（NO_WRAP 不折行）
-        let (l, r) = match align {
-            Align::Left => (x, x + 4096.0),
-            Align::Center => (x - 2048.0, x + 2048.0),
-            Align::Right => (x - 4096.0, x),
+        let key = (font, h.to_bits(), tag, text.to_owned());
+        // Dynamic counters/input codes must not let the UI cache grow forever.
+        if self.run_layouts.len() >= 1024 && !self.run_layouts.contains_key(&key) {
+            self.run_layouts.clear();
+        }
+        let layout = match self.run_layouts.get(&key) {
+            Some(hit) => hit.clone(),
+            None => {
+                let Ok(fmt) = self.fonts.format(font, h) else { return };
+                let ws: Vec<u16> = text.encode_utf16().collect();
+                let Ok(layout) = self.fonts.dwrite.CreateTextLayout(
+                    &ws, &fmt, 4096.0, h * 1.4,
+                ) else { return };
+                let _ = layout.SetTextAlignment(alignment);
+                self.run_layouts.insert(key, layout.clone());
+                layout
+            }
         };
-        let rect = D2D_RECT_F {
-            left: l,
-            top: y,
-            right: r,
-            bottom: y + h * 1.4,
-        };
-        let _ = self.d2d_ctx.DrawText(
-            &ws,
-            &fmt,
-            &rect,
+        // Same 4096-DIP NO_WRAP box and anchor as the former DrawText path.
+        // Set alignment on the layout, never on the shared cached TextFormat.
+        self.d2d_ctx.DrawTextLayout(
+            windows::Win32::Graphics::Direct2D::Common::D2D_POINT_2F { x: left, y },
+            &layout,
             &self.brush,
             D2D1_DRAW_TEXT_OPTIONS_NONE,
-            DWRITE_MEASURING_MODE_NATURAL,
         );
-        // format 是缓存共享对象，用完恢复默认（避免污染缓存键）
-        let _ = fmt.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
     }
 }
 
@@ -1797,6 +1947,137 @@ mod tests {
         // 没有跨行词时也走快路径
         let lines2 = vec![line(0, "ABCD"), line(4, "EF")];
         assert!(rewrap_words(&lines2, &[(0, 2), (2, 2), (4, 2)]).is_none());
+    }
+
+    #[test]
+    #[ignore = "Native D3D/DWrite pixel comparison; requires a Windows desktop"]
+    fn cached_ui_runs_match_direct_text_and_invalidate_on_font_change() {
+        let _com = crate::window::ComSta::new().unwrap();
+        let window = crate::window::MainWindow::create("UI text cache parity", 640, 480).unwrap();
+        let mut renderer = Renderer::new(window.hwnd, 640, 480).unwrap();
+        let text = "词提 M2 / 0123";
+        let fonts = [FontFamily::Ui, FontFamily::Mono, FontFamily::Lxgw];
+        let aligns = [Align::Left, Align::Center, Align::Right];
+        for (offset, color) in [(0.0, [0.8, 0.6, 0.2, 1.0]), (11.0, [0.2, 0.7, 0.9, 1.0])] {
+            let draw = |r: &mut Renderer, cached: bool| unsafe {
+                r.d2d_ctx.BeginDraw();
+                r.d2d_ctx.Clear(Some(&D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 1.0 }));
+                r.set_brush(color);
+                for (fi, font) in fonts.iter().enumerate() {
+                    for (ai, align) in aligns.iter().enumerate() {
+                        let x = 300.0 + offset;
+                        let y = 12.0 + (fi * 3 + ai) as f32 * 42.0;
+                        let h = 19.5;
+                        if cached {
+                            r.draw_run(x, y, h, text, *align, *font);
+                        } else {
+                            let fmt = r.fonts.format(*font, h).unwrap();
+                            let alignment = match align {
+                                Align::Left => DWRITE_TEXT_ALIGNMENT_LEADING,
+                                Align::Center => DWRITE_TEXT_ALIGNMENT_CENTER,
+                                Align::Right => DWRITE_TEXT_ALIGNMENT_TRAILING,
+                            };
+                            fmt.SetTextAlignment(alignment).unwrap();
+                            let left = match align { Align::Left => x, Align::Center => x - 2048.0, Align::Right => x - 4096.0 };
+                            let rect = D2D_RECT_F { left, top: y, right: left + 4096.0, bottom: y + h * 1.4 };
+                            let ws: Vec<u16> = text.encode_utf16().collect();
+                            r.d2d_ctx.DrawText(&ws, &fmt, &rect, &r.brush, D2D1_DRAW_TEXT_OPTIONS_NONE,
+                                windows::Win32::Graphics::DirectWrite::DWRITE_MEASURING_MODE_NATURAL);
+                            fmt.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING).unwrap();
+                        }
+                    }
+                }
+                r.d2d_ctx.EndDraw(None, None).unwrap();
+            };
+            draw(&mut renderer, false);
+            let direct = renderer.read_target_dib(None).unwrap();
+            draw(&mut renderer, true);
+            let cached = renderer.read_target_dib(None).unwrap();
+            assert_eq!(direct, cached, "cached text moved or recolored differently");
+            assert_eq!(renderer.run_layouts.len(), 9, "positions/colors must reuse the same layouts");
+        }
+        assert!(renderer.set_body_family("Arial"));
+        assert!(renderer.run_layouts.is_empty());
+    }
+
+    #[test]
+    #[ignore = "Native D3D/D2D readback fixture; requires a Windows desktop"]
+    fn native_dib_export_preserves_nonzero_draw_offset() {
+        use windows::core::w;
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, WINDOW_EX_STYLE, WS_POPUP,
+        };
+
+        struct HiddenSurface(HWND);
+        impl Drop for HiddenSurface {
+            fn drop(&mut self) {
+                unsafe {
+                    let _ = DestroyWindow(self.0);
+                }
+            }
+        }
+
+        let _com = crate::window::ComSta::new().unwrap();
+        crate::window::enable_per_monitor_dpi_awareness();
+        // A hidden private system-class window avoids foreground changes and
+        // the application's singleton WndProc/WM_QUIT lifecycle.
+        let surface = HiddenSurface(unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0), w!("STATIC"), w!("Offset export regression"),
+                WS_POPUP, 0, 0, 64, 48, None, None, None, None,
+            ).unwrap()
+        });
+        let mut renderer = Renderer::new(surface.0.0 as isize, 64, 48).unwrap();
+        let scale = crate::window::dpi_scale();
+        for (px, py) in [(37.0, 211.0), (-19.0, -83.0)] {
+            let (dx, dy) = (px / scale, py / scale);
+            renderer.set_draw_offset(dx, dy);
+            let mut frame = Frame::new(640.0 / scale, 480.0 / scale);
+            for (x, y, w, h, color) in [
+                (0.0, 0.0, 64.0, 48.0, [1.0, 0.0, 0.0, 1.0]),
+                (32.0, 24.0, 32.0, 24.0, [0.0, 0.0, 1.0, 1.0]),
+            ] {
+                frame.push(DrawCmd::Rect {
+                    x: dx + x / scale,
+                    y: dy + y / scale,
+                    w: w / scale,
+                    h: h / scale,
+                    color,
+                });
+            }
+            frame.push(DrawCmd::PushClip {
+                x: dx + 12.0 / scale,
+                y: dy + 8.0 / scale,
+                w: 8.0 / scale,
+                h: 6.0 / scale,
+            });
+            frame.push(DrawCmd::Rect {
+                x: dx,
+                y: dy,
+                w: 64.0 / scale,
+                h: 48.0 / scale,
+                color: [0.0, 1.0, 0.0, 1.0],
+            });
+            frame.push(DrawCmd::PopClip);
+            renderer.draw_frame(&frame).unwrap();
+            renderer.render_export_frame().unwrap();
+            let dib = renderer.read_target_dib(None).unwrap();
+            assert_eq!(i32::from_le_bytes(dib[4..8].try_into().unwrap()), 64);
+            assert_eq!(i32::from_le_bytes(dib[8..12].try_into().unwrap()), -48);
+            for (x, y, expected) in [
+                (4usize, 4usize, [0, 0, 255, 255]),
+                (16, 10, [0, 255, 0, 255]),
+                (40, 30, [255, 0, 0, 255]),
+            ] {
+                let start = 40 + (y * 64 + x) * 4;
+                assert_eq!(&dib[start..start + 4], &expected,
+                    "export moved the visible region or its clip for offset ({dx},{dy}) at ({x},{y})");
+            }
+            let crop = renderer.read_target_dib(Some((12, 8, 8, 6))).unwrap();
+            assert!(crop[40..].chunks_exact(4).all(|pixel| pixel == [0, 255, 0, 255]),
+                "local overlay crops must retain the translated clip");
+        }
     }
 
     #[test]

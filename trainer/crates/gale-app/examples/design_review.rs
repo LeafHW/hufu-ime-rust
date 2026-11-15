@@ -5,6 +5,8 @@
 //! Append a screen filter such as `77..80` or `72,75,77` to render only those screens.
 //! `87..90` compares consecutive same-colour words at 100/36px in dark/light themes,
 //! with code/rank rows hidden so bracket boundaries are the only grouping cue.
+//! `120..151` covers preedit at the first row, real DirectWrite wrap boundaries,
+//! committed prefixes, whole-sentence composition and 100px fonts in both modes.
 //!
 //! This program creates one hidden render surface. It does not capture the desktop,
 //! create an InputHost, connect to QQ/online services, or read/write user settings.
@@ -47,7 +49,7 @@ use gale_core::{
     wenlai::{Difficulty, WenlaiArticle},
 };
 use gale_win::{
-    d2d::{DrawCmd, Renderer},
+    d2d::{Align, DrawCmd, FontFamily, Frame, Renderer},
     window::{ComSta, MainWindow},
 };
 use modals::{HintWord, Modal, Model};
@@ -66,6 +68,7 @@ const WIDTH: f32 = 1280.;
 const HEIGHT: f32 = 800.;
 const NOW_MS: u64 = 14_300;
 const UNIX_FIXTURE: u64 = 1_794_008_400;
+const LAST_SCREEN: usize = 217;
 const CHAR_DICT: &str = include_str!("../../../../assets/码表/虎码单字/tiger.dict.yaml");
 const PARAGRAPHS: [&str; 4] = [
     "庆历四年春，滕子京谪守巴陵郡。越明年，政通人和，百废具兴。乃重修岳阳楼，增其旧制，刻唐贤今人诗赋于其上。属予作文以记之。",
@@ -443,6 +446,187 @@ fn consecutive_word_fixture(m: &mut Model, words: &[&str]) -> Session {
     sess
 }
 
+#[derive(Clone, Copy, Debug)]
+enum CompositionAnchor {
+    First,
+    Prefix(usize),
+    BeforeWrap,
+    AfterWrap,
+    SecondLineMiddle,
+}
+
+#[derive(Clone, Copy)]
+struct CompositionScene {
+    name: &'static str,
+    kind: &'static str,
+    anchor: CompositionAnchor,
+    text: &'static str,
+    width: f32,
+    height: f32,
+    body_size: f32,
+    preedit_size: f32,
+    preedit_offset: f32,
+    line_gap: f32,
+    minimal: bool,
+    show_preedit: bool,
+    split: bool,
+}
+
+fn composition_scene(screen: usize) -> Option<CompositionScene> {
+    const NAMES: [&str; 32] = [
+        "120-copybook-first-latin.bmp", "121-split-first-latin.bmp",
+        "122-copybook-first-sentence.bmp", "123-split-first-sentence.bmp",
+        "124-copybook-first-long-sentence.bmp", "125-split-first-long-sentence.bmp",
+        "126-copybook-first-100px-800x600.bmp", "127-split-first-100px-800x600.bmp",
+        "128-copybook-before-wrap-latin.bmp", "129-split-before-wrap-latin.bmp",
+        "130-copybook-before-wrap-sentence.bmp", "131-split-before-wrap-sentence.bmp",
+        "132-copybook-after-wrap-sentence.bmp", "133-split-after-wrap-sentence.bmp",
+        "134-copybook-second-row-mixed.bmp", "135-split-second-row-mixed.bmp",
+        "136-copybook-committed-hints.bmp", "137-split-committed-hints.bmp",
+        "138-copybook-partial-word-preedit.bmp", "139-split-partial-word-preedit.bmp",
+        "140-copybook-minimal-first-100px.bmp", "141-split-minimal-first-100px.bmp",
+        "142-copybook-tight-lines-preedit.bmp", "143-split-tight-lines-preedit.bmp",
+        "144-copybook-first-negative-offset.bmp", "145-split-first-negative-offset.bmp",
+        "146-copybook-first-long-latin.bmp", "147-split-first-long-latin.bmp",
+        "148-copybook-preedit-disabled.bmp", "149-split-preedit-disabled.bmp",
+        "150-copybook-first-100px-640x420.bmp", "151-split-first-100px-640x420.bmp",
+    ];
+    let index = screen.checked_sub(120)?;
+    let name = *NAMES.get(index)?;
+    let mut scene = CompositionScene {
+        name, kind: "first-latin", anchor: CompositionAnchor::First, text: "abcd",
+        width: WIDTH, height: HEIGHT, body_size: 54., preedit_size: 26.,
+        preedit_offset: 0., line_gap: 0.66, minimal: false, show_preedit: true,
+        split: index % 2 == 1,
+    };
+    const SENTENCE: &str = "春天来到这里我们一起去看山河湖泊";
+    const LONG_SENTENCE: &str = "春天来到这里我们一起去看山河湖泊青青草地明月小楼欢声笑语春天来到这里我们一起去看山河湖泊";
+    match index / 2 {
+        0 => { scene.body_size = 36.; scene.preedit_size = 18.; }
+        1 => { scene.kind = "first-sentence"; scene.text = SENTENCE; }
+        2 => { scene.kind = "first-long-sentence"; scene.text = LONG_SENTENCE; }
+        3 | 15 => {
+            scene.kind = "first-100px"; scene.body_size = 100.; scene.preedit_size = 100.;
+            scene.text = "春天来到这里";
+            (scene.width, scene.height) = if index / 2 == 15 { (640., 420.) } else { (800., 600.) };
+        }
+        4 => {
+            scene.kind = "before-wrap-latin"; scene.anchor = CompositionAnchor::BeforeWrap;
+            (scene.width, scene.height) = (800., 600.);
+        }
+        5 | 6 => {
+            scene.kind = if index / 2 == 5 { "before-wrap-sentence" } else { "after-wrap-sentence" };
+            scene.anchor = if index / 2 == 5 { CompositionAnchor::BeforeWrap } else { CompositionAnchor::AfterWrap };
+            scene.text = SENTENCE; (scene.width, scene.height) = (800., 600.);
+        }
+        7 => {
+            scene.kind = "second-row-mixed"; scene.anchor = CompositionAnchor::SecondLineMiddle;
+            scene.text = "春天abc😀来到这里";
+        }
+        8 => { scene.kind = "committed-hints"; scene.anchor = CompositionAnchor::Prefix(12); scene.text = ""; }
+        9 => { scene.kind = "partial-word-preedit"; scene.anchor = CompositionAnchor::Prefix(1); }
+        10 => {
+            scene.kind = "minimal-first-100px"; scene.minimal = true; scene.body_size = 100.;
+            scene.preedit_size = 100.; scene.text = SENTENCE; (scene.width, scene.height) = (800., 600.);
+        }
+        11 => {
+            scene.kind = "tight-lines-preedit"; scene.anchor = CompositionAnchor::AfterWrap;
+            scene.line_gap = -0.35; scene.preedit_size = 40.; scene.text = "春天abc😀来到这里";
+        }
+        12 => {
+            scene.kind = "first-negative-offset"; scene.preedit_size = 54.; scene.preedit_offset = -40.;
+            scene.text = "春天来到这里"; (scene.width, scene.height) = (800., 600.);
+        }
+        13 => {
+            scene.kind = "first-long-latin"; scene.text = "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwx";
+            (scene.width, scene.height) = (800., 600.);
+        }
+        14 => { scene.kind = "preedit-disabled"; scene.text = SENTENCE; scene.show_preedit = false; }
+        _ => unreachable!(),
+    }
+    Some(scene)
+}
+
+/// Unique artificial codes let the manifest identify a committed word's hint
+/// without inferring anything about the live server or current dictionary.
+fn composition_fixture(m: &mut Model) -> Session {
+    let words = ["春天", "来到", "这里", "我们", "一起", "去看", "山河", "湖泊", "青青", "草地", "明月", "小楼", "欢声笑语"];
+    let mut sess = Session::new(100);
+    *m = Model::default();
+    m.hints = true;
+    m.max_code_length = 4;
+    m.status = "键入串与提交后词提 · 人工布局样本".into();
+    let mut body = String::new();
+    let mut start = 0;
+    for (index, word) in words.into_iter().cycle().take(52).enumerate() {
+        let len = word.chars().count();
+        m.words.push(HintWord {
+            text: word.into(), code: Some(format!("{}{}", (b'a' + (index / 26) as u8) as char, (b'a' + (index % 26) as u8) as char)),
+            rank: if index % 3 == 0 { 2 } else { 1 }, start, len, ..HintWord::default()
+        });
+        body.push_str(word);
+        start += len;
+    }
+    sess.set_rules(SessionRules { mode: TrainingMode::Practice, word_hints: true, ..SessionRules::default() }).unwrap();
+    sess.load_group(ParsedGroupText { title: "键入与提交视觉样本".into(), difficulty: None,
+        segments: vec![Segment { mark: "1".into(), text: body }] });
+    sess
+}
+
+fn apply_composition_scene(sess: &mut Session, scene: CompositionScene, lines: &[(usize, String, Vec<f32>)]) {
+    let next_row = lines.get(1).expect("composition fixture must really wrap");
+    let count = match scene.anchor {
+        CompositionAnchor::First => 0,
+        CompositionAnchor::Prefix(count) => count,
+        CompositionAnchor::BeforeWrap => next_row.0.saturating_sub(1),
+        CompositionAnchor::AfterWrap => next_row.0 + usize::from(scene.split),
+        CompositionAnchor::SecondLineMiddle => next_row.0 + next_row.1.chars().count() / 2,
+    };
+    if count > 0 { type_fixture(sess, count, 2_000, None, None); }
+    sess.set_composing(!scene.text.is_empty());
+    sess.set_preedit(scene.text.into());
+}
+
+fn composition_trace(frame: &Frame, sess: &Session, model: &Model, renderer: &mut Renderer) -> serde_json::Value {
+    let mut clips = vec![[0., 0., frame.size.w, frame.size.h]];
+    let mut preedit_runs = Vec::new();
+    let mut codes_drawn = BTreeSet::new();
+    for cmd in &frame.cmds {
+        let run = match cmd {
+            DrawCmd::PushClip { x, y, w, h } => {
+                let [left, top, right, bottom] = *clips.last().unwrap();
+                clips.push([left.max(*x), top.max(*y), right.min(x + w), bottom.min(y + h)]);
+                None
+            }
+            DrawCmd::PopClip => { clips.pop(); None }
+            DrawCmd::TextRun { x, y, h, text, font, align, .. } => {
+                if matches!(font, FontFamily::Mono) { codes_drawn.insert(text.clone()); }
+                Some((*x, *y, *h, text, *font, *align))
+            }
+            DrawCmd::StyledLine { x, y, size, text, .. } => Some((*x, *y, *size, text, FontFamily::Lxgw, Align::Left)),
+            _ => None,
+        };
+        let Some((x, y, size, text, font, align)) = run else { continue };
+        // Composition uses Mono and is either complete or a leading ellipsis
+        // followed by its latest tail. Article text can contain the same words.
+        let is_tail = text.starts_with('…') && sess.preedit.ends_with(text.trim_start_matches('…'));
+        if sess.preedit.is_empty() || !matches!(font, FontFamily::Mono)
+            || (text != &sess.preedit && !is_tail) { continue; }
+        let width = renderer.fonts.text_width(font, size, text);
+        let left = match align { Align::Left => x, Align::Center => x - width / 2., Align::Right => x - width };
+        preedit_runs.push(serde_json::json!({
+            "text": text, "font": format!("{font:?}"), "font_size": size,
+            "layout_bounds": [left, y, width, size], "active_clip_ltrb": clips.last(),
+        }));
+    }
+    serde_json::json!({
+        "preedit": sess.preedit, "committed_chars": sess.comparer.pos,
+        "committed_hint_codes_still_drawn": model.words.iter().filter(|word| word.start + word.len <= sess.comparer.pos)
+            .filter_map(|word| word.code.as_ref()).filter(|code| codes_drawn.contains(*code)).collect::<Vec<_>>(),
+        "preedit_draw_candidates": preedit_runs,
+    })
+}
+
 fn drill_fixture() -> Session {
     let tables = builtin_tables();
     let (title, text) = tables[0];
@@ -557,6 +741,7 @@ fn seed_preferences(cfg: &Config, m: &mut Model, theme: &gale_core::theme::Theme
     for (key, value) in [
         ("hint_show_code", cfg.hint_show_code),
         ("hint_show_rank", cfg.hint_show_rank),
+        ("show_preedit", cfg.show_preedit),
         ("hint_color_words", cfg.hint_color_words),
         ("hint_dynamic", cfg.hint_dynamic),
         ("score_auto_copy", cfg.score_auto_copy),
@@ -566,6 +751,14 @@ fn seed_preferences(cfg: &Config, m: &mut Model, theme: &gale_core::theme::Theme
     }
     m.fields
         .insert("hint_font_size".into(), cfg.hint_font_size.to_string());
+    for (key, value) in [
+        ("hint_code_offset", cfg.hint_code_offset),
+        ("hint_rank_offset", cfg.hint_rank_offset),
+        ("preedit_font_size", cfg.preedit_font_size),
+        ("preedit_offset", cfg.preedit_offset),
+    ] {
+        m.fields.insert(key.into(), value.to_string());
+    }
     m.fields
         .insert("hint_strategy".into(), cfg.hint_strategy.as_str().into());
     m.fields
@@ -658,7 +851,7 @@ fn paint_field_fixtures(
     height: f32,
 ) {
     let p = ui::tokens(t);
-    for field in modals::fields(m, width, height) {
+    for field in modals::fields(m, width, height, None) {
         if field.h <= 0. || field.w <= 0. {
             continue;
         }
@@ -714,14 +907,14 @@ fn main() -> Result<(), Box<dyn Error>> {
                     (number, number)
                 }
             };
-            if start < 1 || end > 117 || start > end {
-                return Err("screen filter must select numbers in 1..117".into());
+            if start < 1 || end > LAST_SCREEN || start > end {
+                return Err(format!("screen filter must select numbers in 1..{LAST_SCREEN}").into());
             }
             selected.extend(start..=end);
         }
         selected
     } else {
-        (1..=117).collect()
+        (1..=LAST_SCREEN).collect()
     };
     std::fs::create_dir_all(&output)?;
     unsafe {
@@ -753,7 +946,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             motion_level: 2,
             ..Config::default()
         };
-        let (width, height) = match screen {
+        let composition_scene = composition_scene(screen);
+        let (width, height) = if let Some(scene) = composition_scene { (scene.width, scene.height) } else { match screen {
             21..=25
             | 29
             | 34..=38
@@ -775,10 +969,15 @@ fn main() -> Result<(), Box<dyn Error>> {
             | 81 => (640., 420.),
             99 => (640., 420.),
             111 => (1300., 900.),
+            119 => (1579., 800.),
+            156..=163 | 168..=169 => (640., 420.),
+            166..=167 => (800., 600.),
+            178..=185 | 195..=196 | 200 | 203 | 207 | 211 => (800., 600.),
+            186..=193 | 198 | 201 | 202 | 204 | 205 | 208 | 209 | 212 | 213 | 215..=217 => (640., 420.),
             95 => (800., 600.),
             26..=28 | 30 | 39 | 41..=47 | 51 | 54 | 56 | 59 | 60 | 71 | 82 => (800., 600.),
             _ => (WIDTH, HEIGHT),
-        };
+        }};
         let mut theme_name = "墨玉";
         let name = match screen {
             1 => "01-main-practice-dark.bmp",
@@ -1174,7 +1373,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
             }
             // 【视图体系 2026-11-12】字贴/对照 × 极简 × 右键菜单 × 新设置页。
-            91..=117 => {
+            91..=119 => {
                 let split = matches!(screen, 91 | 92 | 95 | 97 | 99 | 102 | 111);
                 cfg.display_mode = if split {
                     DisplayMode::Split
@@ -1188,7 +1387,18 @@ fn main() -> Result<(), Box<dyn Error>> {
                     full_analysis_fixture(&mut sess);
                     m.analysis_dock = true;
                 }
-                // 114：外观与颜色页（字号 / 行距 / 字间距 同排）。
+                // 118：数据与关于页（练字记录卡）；119：1579 宽字贴，验证正文跟随窗口。
+                if screen == 118 {
+                    m.open(Modal::Preferences);
+                    m.fields.insert("pref_tab".into(), "4".into());
+                    cfg.practice_days.insert("2026-11-14".into(), 1284);
+                    cfg.practice_days.insert("2026-11-13".into(), 960);
+                    cfg.practice_days.insert("2026-11-10".into(), 1120);
+                    cfg.practice_total = 184_300;
+                }
+                if screen == 119 {
+                    cfg.display_mode = DisplayMode::Copybook;
+                }
                 if screen == 114 {
                     theme_name = "宣纸";
                     m.open(Modal::Preferences);
@@ -1253,11 +1463,178 @@ fn main() -> Result<(), Box<dyn Error>> {
                     114 => "114-preferences-appearance-light-1280x800.bmp",
                     115 => "115-preferences-practice-hint-layout-dark-1280x800.bmp",
                     116 => "116-preferences-shortcuts-dark-1280x800.bmp",
-                    _ => "117-preferences-shortcuts-recording-dark-1280x800.bmp",
+                    117 => "117-preferences-shortcuts-recording-dark-1280x800.bmp",
+                    118 => "118-preferences-data-dark-1280x800.bmp",
+                    _ => "119-copybook-wide-1579x800.bmp",
+                }
+            }
+            120..=151 => {
+                let scene = composition_scene.unwrap();
+                sess = composition_fixture(&mut m);
+                cfg.display_mode = if scene.split { DisplayMode::Split } else { DisplayMode::Copybook };
+                cfg.font_size = scene.body_size;
+                cfg.preedit_font_size = scene.preedit_size;
+                cfg.preedit_offset = scene.preedit_offset;
+                cfg.hint_font_size = 22.;
+                cfg.show_preedit = scene.show_preedit;
+                cfg.hint_show_code = true;
+                cfg.hint_show_rank = true;
+                cfg.hint_color_words = true;
+                cfg.hint_underline = true;
+                cfg.line_gap = scene.line_gap;
+                cfg.minimal = scene.minimal;
+                scene.name
+            }
+            152..=163 => {
+                const NAMES: [&str; 12] = [
+                    "152-compact-online-closed.bmp", "153-compact-online-login.bmp",
+                    "154-compact-online-register.bmp", "155-compact-online-active.bmp",
+                    "156-compact-online-closed-640.bmp", "157-compact-online-login-640.bmp",
+                    "158-compact-online-register-640.bmp", "159-compact-online-active-640.bmp",
+                    "160-compact-online-closed-640-scrolled.bmp", "161-compact-online-login-640-scrolled.bmp",
+                    "162-compact-online-register-640-scrolled.bmp", "163-compact-online-active-640-scrolled.bmp",
+                ];
+                online_fixture(&mut m);
+                let state = (screen - 152) % 4;
+                m.online_authenticated = state == 3;
+                m.online_expired = false;
+                m.online_login_expanded = state == 1 || state == 2;
+                m.online_register_mode = state == 2;
+                m.online_status = "布局样本 · 此页不发起网络请求".into();
+                m.fields.insert("reg_email".into(), "fixture@example.invalid".into());
+                m.fields.insert("reg_code".into(), "123456".into());
+                m.open(Modal::Online);
+                if screen >= 160 {
+                    m.panel_scroll = modals::panel_scroll_max(&m, width, height, height);
+                }
+                NAMES[screen - 152]
+            }
+            164..=169 => {
+                cleaning_fixture(&mut cfg, &mut m);
+                m.open(Modal::Rules);
+                if screen == 165 { theme_name = "宣纸"; }
+                if matches!(screen, 167 | 169) {
+                    m.panel_scroll = modals::panel_scroll_max(&m, width, height, height);
+                }
+                match screen {
+                    164 => "164-compact-rules-dark.bmp",
+                    165 => "165-compact-rules-light.bmp",
+                    166 => "166-compact-rules-800.bmp",
+                    167 => "167-compact-rules-800-scrolled.bmp",
+                    168 => "168-compact-rules-640.bmp",
+                    _ => "169-compact-rules-640-scrolled.bmp",
+                }
+            }
+            170..=201 => {
+                const NAMES: [&str; 32] = [
+                    "170-compact-groups-empty-1280.bmp", "171-compact-groups-many-1280.bmp",
+                    "172-compact-groups-scrolled-1280.bmp", "173-compact-more-text-1280.bmp",
+                    "174-compact-more-single-1280.bmp", "175-compact-heatmap-1280.bmp",
+                    "176-compact-confirm-1280.bmp", "177-compact-analysis-1280.bmp",
+                    "178-compact-groups-empty-800.bmp", "179-compact-groups-many-800.bmp",
+                    "180-compact-groups-scrolled-800.bmp", "181-compact-more-text-800.bmp",
+                    "182-compact-more-single-800.bmp", "183-compact-heatmap-800.bmp",
+                    "184-compact-confirm-800.bmp", "185-compact-analysis-800.bmp",
+                    "186-compact-groups-empty-640.bmp", "187-compact-groups-many-640.bmp",
+                    "188-compact-groups-scrolled-640.bmp", "189-compact-more-text-640.bmp",
+                    "190-compact-more-single-640.bmp", "191-compact-heatmap-640.bmp",
+                    "192-compact-confirm-640.bmp", "193-compact-analysis-640.bmp",
+                    "194-compact-groups-light.bmp", "195-compact-more-light.bmp",
+                    "196-compact-heatmap-light.bmp", "197-compact-analysis-light.bmp",
+                    "198-compact-analysis-640-light.bmp", "199-compact-analysis-dock-1280.bmp",
+                    "200-compact-analysis-dock-800.bmp", "201-compact-analysis-dock-640.bmp",
+                ];
+                let kind = if screen <= 193 { (screen - 170) % 8 } else { match screen {
+                    194 => 1, 195 => 3, 196 => 5, _ => 7,
+                }};
+                if (194..=198).contains(&screen) { theme_name = "宣纸"; }
+                match kind {
+                    0..=2 => {
+                        m.groups = if kind == 0 { Vec::new() } else {
+                            (1..=15).map(|i| format!("虎符跟打交流群 {i:02} · 长群名布局样本")).collect()
+                        };
+                        m.bound = if kind == 0 { None } else { Some(if kind == 2 { 14 } else { 0 }) };
+                        m.open(Modal::Groups);
+                        if kind == 2 {
+                            let ph = modals::panel_for_model(&m, width, height).3;
+                            m.scroll = m.groups.len().saturating_sub(modals::groups_visible_rows(ph)) as f32;
+                        }
+                    }
+                    3..=4 => {
+                        if kind == 4 { sess = drill_fixture(); }
+                        m.open(Modal::More);
+                    }
+                    5 => {
+                        sess = completed_fixture(&mut m, TrainingMode::Practice, 2);
+                        m.open(Modal::Heatmap);
+                    }
+                    6 => {
+                        m.confirm = "当前文章还没有打完。要载入新的文章吗？当前输入将结束，已完成的成绩会保留。".into();
+                        m.open(Modal::Confirm);
+                    }
+                    _ => {
+                        full_analysis_fixture(&mut sess);
+                        if screen >= 199 { m.analysis_dock = true; } else { m.open(Modal::Analysis); }
+                    }
+                }
+                NAMES[screen - 170]
+            }
+            202..=209 => {
+                full_analysis_fixture(&mut sess);
+                m.analysis_dock = true;
+                if matches!(screen, 202 | 203 | 205) {
+                    m.fields.insert("analysis_font".into(), "36".into());
+                }
+                if matches!(screen, 204 | 205) {
+                    m.analysis_dock_scroll = modals::analysis_scroll_max(&sess, &m, width, height);
+                }
+                if (206..=208).contains(&screen) {
+                    m.fields.insert("analysis_view".into(), "heatmap".into());
+                }
+                if screen == 209 { theme_name = "宣纸"; }
+                match screen {
+                    202 => "202-compact-dock-font36-640.bmp",
+                    203 => "203-compact-dock-font36-800.bmp",
+                    204 => "204-compact-dock-scrolled-640.bmp",
+                    205 => "205-compact-dock-font36-scrolled-640.bmp",
+                    206 => "206-compact-dock-heatmap-1280.bmp",
+                    207 => "207-compact-dock-heatmap-800.bmp",
+                    208 => "208-compact-dock-heatmap-640.bmp",
+                    _ => "209-compact-dock-640-light.bmp",
+                }
+            }
+            210..=217 => {
+                full_analysis_fixture(&mut sess);
+                m.open(Modal::Analysis);
+                m.fields.insert("analysis_font".into(), if screen == 214 { "20" } else { "36" }.into());
+                if matches!(screen, 213 | 214) {
+                    let (_, total, body_h) = modals::analysis_modal_fit_metrics(&sess, &m, width, height).unwrap();
+                    m.analysis_dock_scroll = (total - body_h).max(0.);
+                }
+                if matches!(screen, 215 | 216) { theme_name = "宣纸"; }
+                if screen == 216 { m.fields.insert("analysis_view".into(), "heatmap".into()); }
+                if screen == 217 {
+                    sess.full_analysis = None;
+                    m.fields.insert("analysis_loading".into(), "true".into());
+                }
+                match screen {
+                    210 => "210-readable-analysis-font36-1280.bmp",
+                    211 => "211-readable-analysis-font36-800.bmp",
+                    212 => "212-readable-analysis-font36-640.bmp",
+                    213 => "213-readable-analysis-font36-640-scrolled.bmp",
+                    214 => "214-readable-analysis-font20-1280-scrolled.bmp",
+                    215 => "215-readable-analysis-font36-640-light.bmp",
+                    216 => "216-readable-analysis-heatmap-640-light.bmp",
+                    _ => "217-readable-analysis-loading-640.bmp",
                 }
             }
             _ => unreachable!(),
         };
+        let analysis_dock_requested = m.analysis_dock;
+        if screen >= 199 && m.analysis_dock && !modals::analysis_dock_fits(&m, &cfg, width, height) {
+            m.analysis_dock = false;
+            m.open(Modal::Analysis);
+        }
         if m.ledger_open {
             m.ledger_scroll = m.ledger_scroll.min(crate::history::scroll_max(&cfg, &m, height));
         }
@@ -1311,6 +1688,16 @@ fn main() -> Result<(), Box<dyn Error>> {
                 lines = wrapped;
             }
         }
+        if let Some(scene) = composition_scene {
+            if scene.split {
+                // The input pane wraps committed text without article word-boundary
+                // reflow. Anchor its tests to those real DirectWrite rows instead.
+                let input_reference = renderer.wrap_text(&sess.current_segment().text, font_size, body_w);
+                apply_composition_scene(&mut sess, scene, &input_reference);
+            } else {
+                apply_composition_scene(&mut sess, scene, &lines);
+            }
+        }
         let mut animation = ui::Animation {
             wrong_at: -100.,
             correct_at: -100.,
@@ -1322,6 +1709,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         } else {
             Vec::new()
         };
+        if composition_scene.is_some_and(|scene| scene.split && matches!(scene.anchor,
+            CompositionAnchor::AfterWrap | CompositionAnchor::SecondLineMiddle)) {
+            assert!(input_lines.len() > 1, "split wrap scenario must contain a genuinely wrapped committed input row");
+        }
         let mut hits = Vec::new();
         let mut frame = ui::build_with_input(
             &sess,
@@ -1347,6 +1738,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             width,
             height,
             frame_now as f64 / 1000.,
+            false,
+            None,
         );
         // 【视图体系 2026-11-12】右键菜单与产品同层：面板之后、渲染之前。
         if m.modal == Modal::None && m.menu.is_some() {
@@ -1357,13 +1750,22 @@ fn main() -> Result<(), Box<dyn Error>> {
         renderer
             .save_bmp(&output.join(name))
             .map_err(std::io::Error::other)?;
-        let field_manifest: Vec<_> = modals::fields(&m, width, height).into_iter().map(|field|
+        let composition_trace = composition_scene.map(|scene| serde_json::json!({
+            "scenario":scene.kind, "anchor":format!("{:?}",scene.anchor),
+            "show_preedit":cfg.show_preedit, "preedit_font_size":cfg.preedit_font_size,
+            "preedit_offset":cfg.preedit_offset, "caret":animation.caret_target,
+            "article_line_starts":lines.iter().map(|line|line.0).collect::<Vec<_>>(),
+            "input_line_starts":input_lines.iter().map(|line|line.0).collect::<Vec<_>>(),
+            "draw_trace":composition_trace(&frame,&sess,&m,&mut renderer),
+        }));
+        let field_manifest: Vec<_> = modals::fields(&m, width, height, None).into_iter().map(|field|
             serde_json::json!({"id":field.id,"rect":[field.x,field.y,field.w,field.h],"multiline":field.multi,"password":field.password})
         ).collect();
         manifest.push(serde_json::json!({
             "screen":screen,"file":name,"logical_size":[width,height],"pixel_size":[width as u32,height as u32],
             "theme":theme_name,"modal":format!("{:?}",m.modal),"phase":format!("{:?}",sess.phase),
             "font_size":cfg.font_size,"single_character_hints":single,"report_tab":m.field("report_tab"),"ledger_open":m.ledger_open,"analysis_dock":m.analysis_dock,"ledger_scroll":m.ledger_scroll,"analysis_scroll":m.analysis_dock_scroll,
+            "analysis_dock_requested":analysis_dock_requested,"analysis_dock_fits":modals::analysis_dock_fits(&m,&cfg,width,height),"analysis_font":m.field("analysis_font"),"analysis_view":m.field("analysis_view"),"analysis_modal_metrics":if m.modal == Modal::Analysis { modals::analysis_modal_fit_metrics(&sess,&m,width,height) } else { None },
             "hint_show_code":cfg.hint_show_code,"hint_show_rank":cfg.hint_show_rank,
             "requested_font_family":cfg.font_family,"resolved_font_family":gale_win::d2d::resolved_cjk_family(&cfg.font_family),
             "hint_strategy":cfg.hint_strategy.as_str(),"hint_dynamic":cfg.hint_dynamic,"hint_settings_locked":m.field("hint_settings_locked"),
@@ -1371,6 +1773,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             "hint_spans":m.words.iter().map(|word| serde_json::json!({"text":word.text,"code":word.code,"rank":word.rank,"tail":word.tail,"start":word.start,"len":word.len,"color_class":word.code.as_deref().and_then(|code| analysis::word_color_class(&word.text,code)).map(|class|format!("{class:?}"))})).collect::<Vec<_>>(),
             "panel_scroll":m.panel_scroll,"list_scroll":m.scroll,"selected_history":m.selected_history,"history_records":m.history.len(),
             "draw_commands":frame.cmds.len(),"hit_targets":hits.len(),
+            "composition_review":composition_trace,
             "visible_native_field_rectangles":field_manifest,"native_field_values_painted_by_d2d":true
         }));
         println!("S{screen}: {}", output.join(name).display());

@@ -119,6 +119,11 @@ pub fn from_value(v: &Value) -> Result<Theme, String> {
     );
     let surface = blend(bg, fg, 0.065);
     let wrong = readable(Color::rgb(202, 107, 93), bg, 3.0);
+    // 【审计 V02】跟随虎符时必须补齐次级背景/次级文字/输入框边框：以前这三项
+    // 缺省，Theme::get 落到 #C8C8C8 与近白底，浅色皮肤上只有 1.50:1。
+    let surface2 = blend(bg, fg, 0.12);
+    let secondary = readable(blend(bg, fg, 0.62), bg, 4.5);
+    let field_border = readable(blend(bg, fg, 0.45), bg, 3.0);
     let mut t = Theme::default();
     t.name = format!("跟随虎符 · {}", v["name"].as_str().unwrap_or("当前皮肤"));
     for (key, value) in [
@@ -127,6 +132,9 @@ pub fn from_value(v: &Value) -> Result<Theme, String> {
         ("菜单背景色", surface),
         ("按钮背景色", surface),
         ("边框色", surface),
+        ("次级背景色", surface2),
+        ("次级文字色", secondary),
+        ("输入框边框色", field_border),
         ("窗体字体色", fg),
         ("跟打区字体色", fg),
         ("菜单字体色", fg),
@@ -165,5 +173,23 @@ mod tests {
         .unwrap();
         assert!(contrast(t.get("窗体字体色"), t.get("窗体背景色")) >= 4.5);
         assert!(contrast(t.get("光标色"), t.get("窗体背景色")) >= 3.0);
+    }
+
+    /// 【审计 V02】跟随虎符的浅色皮肤也必须给出次级背景/次级文字/输入框边框，
+    /// 且文字达 4.5:1、边框达 3.0:1（以前三项缺失落到 1.50:1 的硬编码兜底）。
+    #[test]
+    fn followed_skin_fills_the_secondary_tokens() {
+        let paper = from_value(&serde_json::json!({"dark":false,"name":"浅色皮",
+            "colors":{"back_color":"#F5F2EAFF","candidate_text_color":"#211A10FF",
+            "hilited_mark_color":"#A8741AFF"}}))
+        .unwrap();
+        let bg = paper.get("窗体背景色");
+        assert!(contrast(paper.get("次级文字色"), bg) >= 4.5);
+        assert!(contrast(paper.get("输入框边框色"), bg) >= 3.0);
+        assert_ne!(paper.get("次级背景色"), bg);
+        let night = from_value(&serde_json::json!({"dark":true,
+            "colors":{"back_color":"#131417FF","candidate_text_color":"#E9E6E0FF"}}))
+        .unwrap();
+        assert!(contrast(night.get("次级文字色"), night.get("窗体背景色")) >= 4.5);
     }
 }

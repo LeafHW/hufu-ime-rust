@@ -492,6 +492,71 @@ pub fn backup_path(path: &Path) -> PathBuf {
 }
 /// Portable replace with a synced staging file and one recoverable previous copy.
 /// Readers may use `.bak` if interrupted between the two renames on Windows.
+/// 【审计 C05】主文件被截断/写坏时，按 .recover → .bak → 同目录最新 .bak-<pid>/ .tmp-<pid>
+/// 依次回退，取第一个能读出的非空内容（不读主文件本身：主文件坏掉才调用）。durable_replace 走"原地截断写"兜底时
+/// 会先把旧内容留成 .recover，因此崩溃后仍能取回上一份可用设置。
+pub fn read_with_recovery(path: &Path) -> Option<Vec<u8>> {
+    // 只读恢复副本：主文件能读时调用方不会走到这里。
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    let recover = with_suffix(path, ".recover");
+    let backup = backup_path(path);
+    candidates.push(recover);
+    candidates.push(backup);
+    if let (Some(parent), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str())) {
+        if let Ok(entries) = std::fs::read_dir(parent) {
+            let prefix_bak = format!("{name}.bak-");
+            let prefix_tmp = format!("{name}.tmp-");
+            let mut extra: Vec<(std::time::SystemTime, std::path::PathBuf)> = entries
+                .flatten()
+                .filter_map(|e| {
+                    let name = e.file_name();
+                    let name = name.to_string_lossy();
+                    if name.starts_with(&prefix_bak) || name.starts_with(&prefix_tmp) {
+                        let at = e.metadata().and_then(|m| m.modified()).ok()?;
+                        Some((at, e.path()))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            extra.sort_by(|a, b| b.0.cmp(&a.0));
+            candidates.extend(extra.into_iter().map(|(_, p)| p));
+        }
+    }
+    candidates
+        .into_iter()
+        .find_map(|c| std::fs::read(&c).ok().filter(|b| !b.is_empty()))
+}
+
+fn with_suffix(path: &Path, suffix: &str) -> std::path::PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(suffix);
+    std::path::PathBuf::from(name)
+}
+
+/// 【审计 C05】原地截断写前先留一份 .recover，写完成功再删；崩溃时不会两头空。
+fn write_inplace_guarded(path: &Path, bytes: &[u8]) -> bool {
+    use std::io::Write;
+    let recover = with_suffix(path, ".recover");
+    if let Ok(old) = std::fs::read(path) {
+        if !old.is_empty() {
+            if let Ok(mut f) = std::fs::File::create(&recover) {
+                let _ = f.write_all(&old);
+                let _ = f.sync_all();
+            }
+        }
+    }
+    let Ok(mut direct) = std::fs::File::create(path) else {
+        return false;
+    };
+    if direct.write_all(bytes).is_ok() && direct.sync_all().is_ok() {
+        drop(direct);
+        let _ = std::fs::remove_file(&recover);
+        return true;
+    }
+    false
+}
+
 pub fn durable_replace(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let _guard = FILE_REPLACE_LOCK
         .lock()
@@ -535,22 +600,18 @@ pub fn durable_replace(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
                     let _ = std::fs::rename(&backup, path);
                 }
                 // Some filter drivers deny rename-over but allow truncate.
-                if let Ok(mut direct) = std::fs::File::create(path) {
-                    if direct.write_all(bytes).is_ok() && direct.sync_all().is_ok() {
-                        let _ = std::fs::remove_file(&staged);
-                        return Ok(());
-                    }
+                if write_inplace_guarded(path, bytes) {
+                    let _ = std::fs::remove_file(&staged);
+                    return Ok(());
                 }
                 return Err(error);
             }
         }
     }
     // Rename to backup failed (locked backup or target). Try a direct write.
-    if let Ok(mut direct) = std::fs::File::create(path) {
-        if direct.write_all(bytes).is_ok() && direct.sync_all().is_ok() {
-            let _ = std::fs::remove_file(&staged);
-            return Ok(());
-        }
+    if write_inplace_guarded(path, bytes) {
+        let _ = std::fs::remove_file(&staged);
+        return Ok(());
     }
     Err(std::io::Error::new(
         std::io::ErrorKind::PermissionDenied,

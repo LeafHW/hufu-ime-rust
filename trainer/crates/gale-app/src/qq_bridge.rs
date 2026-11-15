@@ -274,11 +274,80 @@ pub fn focus_chat(chat: &ChatWindow) -> bool {
     activate(chat.hwnd)
 }
 
+/// 发送结果（审计 C03）：粘贴+回车执行成功 ≠ QQ 真的收下了这条消息。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SendStatus {
+    /// UIA 在目标群消息区读到了刚发出的内容。
+    Confirmed,
+    /// 粘贴+回车已执行，但读不到消息区，无法确认是否真的发出。
+    Unconfirmed,
+}
+
+/// 剪掉 QQ 会话标题的装饰后缀（未读数/草稿/免打扰）。只剥装饰，不做包含匹配。
+fn trim_chat_decor(title: &str) -> String {
+    let mut text = title.trim().to_string();
+    loop {
+        let mut changed = false;
+        for stem in ["免打扰", "有新消息", "草稿"] {
+            if let Some(rest) = text.strip_suffix(stem) {
+                text = rest.trim_end().to_string();
+                changed = true;
+            }
+        }
+        for (open, close) in [('(', ')'), ('（', '）'), ('[', ']'), ('【', '】')] {
+            if let Some(rest) = text.strip_suffix(close) {
+                if let Some(index) = rest.rfind(open) {
+                    let inner = &rest[index + open.len_utf8()..];
+                    if !inner.is_empty() && inner.chars().all(|c| c.is_ascii_digit()) {
+                        text = rest[..index].trim_end().to_string();
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if !changed {
+            return text;
+        }
+    }
+}
+
+/// 当前会话必须是目标群本身（审计 C02）：`contains` 会把「训练」放行到
+/// 「训练闲聊」，内容就发错群了。
+fn same_chat(current: &str, target: &str) -> bool {
+    let current = trim_chat_decor(current);
+    let target = trim_chat_decor(target);
+    !target.is_empty() && current == target
+}
+
+fn squash(text: &str) -> String {
+    text.split_whitespace().collect()
+}
+
+/// 用刚发出的内容核对消息区（审计 C03）：旧实现只比对前 24 字、只看最近三条，
+/// 历史里出现同样开头就会被误判成「已发送」。这里要求整条内容相等，或长文
+/// 的内容同时含首 48 字与尾 24 字。
+fn body_matches(text: &str, bodies: &[String]) -> bool {
+    let want = squash(&text.chars().take(400).collect::<String>());
+    if want.is_empty() {
+        return false;
+    }
+    let chars: Vec<char> = want.chars().collect();
+    let prefix: String = chars.iter().take(48).collect();
+    let suffix: String = chars.iter().skip(chars.len().saturating_sub(24)).collect();
+    bodies.iter().rev().take(3).any(|body| {
+        let body = squash(body);
+        if body == want {
+            return true;
+        }
+        chars.len() > 48 && body.contains(&prefix) && body.contains(&suffix)
+    })
+}
+
 /// 【群三件套 2026-11-09】增强发送（可行性报告 · 通道C 增强模式③）：
 /// 复制 → 激活 QQ → UIA 校验当前会话标题 → Ctrl+V → 回车。
 /// 任一步失败立即中止并保留剪贴板，绝不错发到别的群。
 /// 首次 UIA 连接可能返回不完整树，故激活后等待再校验（200ms 级）。
-pub fn send_message_enhanced(chat: &ChatWindow, text: &str) -> Result<(), String> {
+pub fn send_message_enhanced(chat: &ChatWindow, text: &str) -> Result<SendStatus, String> {
     if text.is_empty() || text.len() > 1024 * 1024 {
         return Err("待发送内容为空或过大".into());
     }
@@ -297,7 +366,7 @@ pub fn send_message_enhanced(chat: &ChatWindow, text: &str) -> Result<(), String
     thread::sleep(Duration::from_millis(220));
     let cur = crate::uia_bridge::current_session_title(chat.hwnd);
     match cur {
-        Some(name) if name == chat.title || name.contains(&chat.title) => {}
+        Some(name) if same_chat(&name, &chat.title) => {}
         Some(other) => {
             return Err(format!(
                 "已中止：QQ 当前会话是「{other}」不是「{}」，内容已留在剪贴板",
@@ -311,17 +380,11 @@ pub fn send_message_enhanced(chat: &ChatWindow, text: &str) -> Result<(), String
     // 4) 粘贴 + 回车；等 QQ 真正收下消息再返回，否则调用方立刻切回跟打器
     //    会把 Ctrl+V / Enter 抢走，成绩和文章就发不出去。
     gale_win::keys::paste_and_enter();
-    let marker: String = text.chars().take(24).collect();
     let mut confirmed = false;
     for _ in 0..6 {
         thread::sleep(Duration::from_millis(200));
         if let Some(bodies) = crate::uia_bridge::read_message_bodies(chat.hwnd) {
-            if bodies
-                .iter()
-                .rev()
-                .take(3)
-                .any(|body| body.contains(&marker))
-            {
+            if body_matches(text, &bodies) {
                 confirmed = true;
                 break;
             }
@@ -329,9 +392,11 @@ pub fn send_message_enhanced(chat: &ChatWindow, text: &str) -> Result<(), String
     }
     if !confirmed {
         // UIA 读不到消息区时也把粘贴链路等完；不再重复粘贴，避免发两遍。
+        // 但必须如实报告"无法确认"，不能把拿不到回执当成发送成功（审计 C03）。
         thread::sleep(Duration::from_millis(600));
+        return Ok(SendStatus::Unconfirmed);
     }
-    Ok(())
+    Ok(SendStatus::Confirmed)
 }
 
 /// UIA-only reading replaces unsafe Ctrl+A/C injection (which can copy an old
@@ -343,4 +408,34 @@ pub fn fetch_text_from(chat_hwnd: isize, _gale_hwnd: isize) -> Result<String, St
     let title = crate::uia_bridge::current_session_title(chat_hwnd)
         .ok_or("QQ当前版本无法读取会话，请手动复制跟打文")?;
     crate::uia_bridge::read_current_article(chat_hwnd, &title)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn chat_title_match_is_exact_after_stripping_decorations() {
+        assert!(same_chat("训练", "训练"));
+        assert!(same_chat("训练(3)", "训练"));
+        assert!(same_chat("训练（12）", "训练"));
+        assert!(same_chat(" 训练 ", "训练"));
+        // 审计 C02：子串不是同一个群，绝不能把内容发进「训练闲聊」。
+        assert!(!same_chat("训练闲聊", "训练"));
+        assert!(!same_chat("训练", "训练闲聊"));
+        assert!(!same_chat("", "训练"));
+        assert!(!same_chat("训练", ""));
+    }
+    #[test]
+    fn confirmation_needs_the_whole_message_not_a_shared_prefix() {
+        let text = "第1段成绩 8000 字 92 正确率";
+        assert!(body_matches(text, &["别人的消息".into(), text.into()]));
+        // 旧实现只比对前 24 字，历史里同样开头的旧消息会被误判成已发送。
+        assert!(!body_matches(
+            "长文本成绩单开头相同",
+            &["长文本成绩单开头相同但其实是历史消息".into()]
+        ));
+        let long = format!("{}尾标记", "很长的一段成绩文本".repeat(8));
+        assert!(body_matches(&long, &[format!("前缀 {long}")]));
+        assert!(!body_matches(&long, &[long.chars().take(30).collect::<String>()]));
+    }
 }
