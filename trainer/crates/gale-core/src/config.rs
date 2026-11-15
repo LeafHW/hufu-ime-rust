@@ -568,7 +568,9 @@ impl Config {
             hint_rank_bold: get("hint_rank_bold", "false") == "true",
             hint_rank_offset: clamp_finite(get("hint_rank_offset", "0"), 0., -100., 100.),
             letter_spacing: clamp_finite(get("letter_spacing", "0"), 0., 0., 12.),
-            ledger_panel_h: clamp_finite(get("ledger_panel_h", "0"), 0., 0., 900.),
+            // 建构期只做有限值净化；真实上限随窗高在函数尾部统一推导（旧固定
+            // 900 会先在这里把大窗面板截掉）。【全面排查 2026-11-16】
+            ledger_panel_h: clamp_finite(get("ledger_panel_h", "0"), 0., 0., 65535.),
             shortcuts: {
                 let mut map = BTreeMap::new();
                 for (id, _, default) in SHORTCUT_DEFAULTS {
@@ -705,7 +707,15 @@ impl Config {
             d.caret_speed
         };
         cfg.win_w = cfg.win_w.clamp(640, 7680);
-        cfg.win_h = cfg.win_h.clamp(480, 4320);
+        // 【全面排查 2026-11-16】420=window.rs 的最小 track 高：load 下限与
+        // UI 实际可拖到的下限对齐，矮窗重启不再被悄悄抬回 480"长高"。
+        cfg.win_h = cfg.win_h.clamp(420, 4320);
+        // 【全面排查 2026-11-16】成绩账本面板高度上限与 UI 拖拽同式推导
+        // （UI=(客户区高-140).max(160)；窗高≥客户区高，此界不冤枉 UI 写入
+        // 的任何值）：大窗用户把面板拖过 900 后重启不再被固定 900 压回缩水。
+        cfg.ledger_panel_h = cfg
+            .ledger_panel_h
+            .clamp(0., (cfg.win_h as f32 - 140.).max(160.));
         cfg.auto_next = cfg.auto_next.min(1);
         cfg.auto_next_delay_ms = cfg.auto_next_delay_ms.min(10000);
         Ok(cfg)
@@ -968,6 +978,19 @@ mod tests {
         let cfg = Config::from_toml_text("opacity = 5\nseg_chars = 99999\n").unwrap();
         assert_eq!(cfg.opacity, 10);
         assert_eq!(cfg.seg_chars, 1000);
+    }
+
+    #[test]
+    fn window_height_and_ledger_panel_bounds_match_ui() {
+        // 【全面排查 2026-11-16】边界与 UI 对齐：窗口最小可拖到 420
+        // （window.rs track），重启不抬回 480；账本面板高度上限随窗高推导
+        // （UI 拖拽=(客户区高-140).max(160)），不再被固定 900 压回缩水。
+        let low = Config::from_toml_text("win_h = 420\n").unwrap();
+        assert_eq!(low.win_h, 420);
+        let tall = Config::from_toml_text("win_h = 1400\nledger_panel_h = 1100\n").unwrap();
+        assert_eq!(tall.ledger_panel_h, 1100.);
+        let small = Config::from_toml_text("win_h = 500\nledger_panel_h = 1100\n").unwrap();
+        assert_eq!(small.ledger_panel_h, 360.);
     }
 
     /// jifeng1 实拍权威默认值（界面组解剖定值）
@@ -1239,7 +1262,9 @@ mod tests {
         .unwrap();
         assert_eq!(bad.hint_rank_offset, 100.);
         assert_eq!(bad.letter_spacing, 0.);
-        assert_eq!(bad.ledger_panel_h, 900.);
+        // 默认窗高 800 → 账本面板上限=(800-140).max(160)=660（随窗高推导，
+        // 不再固定 900）。【全面排查 2026-11-16】
+        assert_eq!(bad.ledger_panel_h, 660.);
         assert_eq!(
             Config::from_toml_text("letter_spacing = NaN")
                 .unwrap()

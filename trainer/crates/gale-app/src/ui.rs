@@ -805,22 +805,48 @@ pub fn harmonize(
     fixed
 }
 
-/// 【用户反馈 2026-11-16】选色与重启装配对称化：调色盘选完深色当场生效，
-/// 重启后却被 harmonize 抬亮——看起来像"颜色被改回去了"。
-/// 此包装对**单个**覆盖键当场做与重启装配完全相同的保底，被抬亮时返回
-/// 保底后的 hex（小写无 #），调用方写回 color_overrides 落盘，所见即所得。
-pub fn harmonize_key_hex(
+/// 【用户反馈 2026-11-16 + 全面排查】选色与重启装配对称化：调色盘选完深色
+/// 当场生效，重启后却被 harmonize 抬亮——看起来像"颜色被改回去了"。
+/// 此变体对**活主题**（跟随皮肤时基座也是皮肤派生值）跑与重启装配同一套
+/// 全量 harmonize，再把被抬亮的键值写回 overrides：保存值与下次重启装配
+/// 值严格一致；先前随背景变化而失效的保底键（跨键场景）一并校准落盘。
+pub fn harmonize_persist(
     t: &mut Theme,
-    overrides: &std::collections::BTreeMap<String, String>,
-    key: &str,
-) -> Option<String> {
-    let base = interface_bg(t);
-    let card = t.get("次级背景色");
-    if !lift_to_readable(t, overrides, key, 3.0, card, base) {
-        return None;
+    overrides: &mut std::collections::BTreeMap<String, String>,
+) -> usize {
+    let fixed = harmonize(t, overrides);
+    if fixed == 0 {
+        return 0;
     }
+    for key in [
+        "未打文字色",
+        "打对字色",
+        "次级文字色",
+        "跟打区字体色",
+        "窗体字体色",
+    ] {
+        write_back_lifted(t, overrides, key);
+    }
+    for key in HINT_RANK_COLOR_KEYS {
+        write_back_lifted(t, overrides, key);
+    }
+    fixed
+}
+
+/// 把 t 中已被保底抬亮的键值同步回 overrides（值未变=未被抬亮则跳过）。
+fn write_back_lifted(
+    t: &Theme,
+    overrides: &mut std::collections::BTreeMap<String, String>,
+    key: &str,
+) {
+    let Some(stored) = overrides.get(key).cloned() else {
+        return;
+    };
     let c = t.get(key);
-    Some(format!("{:02x}{:02x}{:02x}", c.0, c.1, c.2))
+    let hex = format!("{:02x}{:02x}{:02x}", c.0, c.1, c.2);
+    if hex != stored {
+        overrides.insert(key.to_string(), hex);
+    }
 }
 
 fn lift_to_readable(
@@ -5498,29 +5524,39 @@ mod tests {
     }
 
     #[test]
-    fn harmonize_key_hex_matches_restart_lift_and_reports_it() {
+    fn harmonize_persist_matches_restart_lift_and_writes_it_back() {
         // 复刻 2026-11-16 现场：灰砖 + 词提2选色=2d0000（对 #4a4a4a 卡面仅
-        // 2.13:1）。选色时当场做与重启装配同一套保底，返回的 hex 必须在双底
-        // 上 ≥3.0 且不等于原值；达标的 3 选 c8b07a 原样保留（None）。
+        // 2.13:1）。当场全量保底后，覆盖表写回的就是保底值——双底 ≥3.0 且
+        // 不等于原值；达标的 3 选 c8b07a 原样保留；写回值再装配一遍不再
+        // 变化（== 重启装配严格一致）；跨键换深卡面后保底自动再校准。
         let mut o = std::collections::BTreeMap::new();
         o.insert("词提2选色".to_string(), "2d0000".to_string());
         o.insert("词提3选色".to_string(), "c8b07a".to_string());
-        let mut t = theme("灰砖");
+        let mut t = theme_with_overrides("灰砖", &o);
         t.set("词提2选色", Color::from_hex_no_hash("2d0000").unwrap());
         t.set("词提3选色", Color::from_hex_no_hash("c8b07a").unwrap());
-        let lifted = harmonize_key_hex(&mut t, &o, "词提2选色")
-            .expect("深红在灰砖上不可读，应被抬亮并返回新值");
-        assert_ne!(lifted, "2d0000");
-        let lc = Color::from_hex_no_hash(&lifted).unwrap();
+        let fixed = harmonize_persist(&mut t, &mut o);
+        assert_eq!(fixed, 1, "只有深红一处需要保底");
+        assert_ne!(o["词提2选色"], "2d0000", "深红在灰砖上不可读，保底值要写回覆盖表");
+        assert_eq!(o["词提3选色"], "c8b07a", "达标色不动");
         let cr = gale_core::theme::contrast_ratio;
-        let card = t.get("次级背景色");
-        let field = interface_bg(&t);
-        assert!(cr(lc, card) >= 3.0, "抬亮后的色在文章卡上要可读");
-        assert!(cr(lc, field) >= 3.0, "抬亮后的色在输入卡上要可读");
-        assert_eq!(
-            harmonize_key_hex(&mut t, &o, "词提3选色"),
-            None,
-            "达标色不动"
+        let lc = Color::from_hex_no_hash(&o["词提2选色"]).unwrap();
+        assert!(cr(lc, t.get("次级背景色")) >= 3.0, "抬亮后的色在文章卡上要可读");
+        assert!(cr(lc, interface_bg(&t)) >= 3.0, "抬亮后的色在输入卡上要可读");
+        // 幂等：写回后的覆盖表再走一遍装配+保底，值不再变化（== 重启装配）。
+        let mut t2 = theme_with_overrides("灰砖", &o);
+        let mut o2 = o.clone();
+        assert_eq!(harmonize_persist(&mut t2, &mut o2), 0, "保底幂等");
+        assert_eq!(o2, o, "写回值与重启装配严格一致");
+        // 跨键：卡面换深后重新装配，先前保底的键要在新卡面上仍然可读。
+        let mut o3 = o.clone();
+        o3.insert("次级背景色".to_string(), "141414".to_string());
+        let mut t3 = theme_with_overrides("灰砖", &o3);
+        harmonize_persist(&mut t3, &mut o3);
+        let c3 = Color::from_hex_no_hash(&o3["词提2选色"]).unwrap();
+        assert!(
+            cr(c3, t3.get("次级背景色")) >= 3.0,
+            "换深卡面后词提 2 选色仍要可读（保底自动再校准）"
         );
     }
 

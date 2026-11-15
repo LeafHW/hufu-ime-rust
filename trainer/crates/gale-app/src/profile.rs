@@ -100,6 +100,15 @@ pub fn load(dir: &Path) -> Result<Loaded, String> {
             // 练字记录只增不减：云档可以带来别的设备打过的字数，但不能把
             // 本机已累计的日/总量覆盖小（其余设置仍按原 LWW 语义）。
             from_profile.merge_practice_max(&cfg);
+            // 【全面排查 2026-11-16】窗口几何属于本机显示器布局，不随云档走
+            // （与运行期 merge_config 的 win_ 前缀本地优先同语义）：云档较新
+            // 被整份采纳时保留本机五键，多机同步重启后窗口不再跳到另一台
+            // 机器的位置/尺寸。
+            from_profile.win_x = cfg.win_x;
+            from_profile.win_y = cfg.win_y;
+            from_profile.win_w = cfg.win_w;
+            from_profile.win_h = cfg.win_h;
+            from_profile.win_position_physical = cfg.win_position_physical;
             cfg = from_profile;
             cfg.save(&cfg_path).map_err(|e| e.to_string())?;
         } else {
@@ -260,6 +269,31 @@ mod tests {
         assert_eq!(loaded.config.font_size, 42.);
         assert!(loaded.warning.unwrap().contains("已跳过"));
         assert_eq!(std::fs::read(dir.join("profile.json")).unwrap(), b"truncated");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn newer_cloud_profile_keeps_local_window_geometry() {
+        // 【全面排查 2026-11-16】云档较新被整份采纳时，窗口几何五键保留本机
+        // 值（几何是本机显示器布局的属性，与运行期 merge_config 的 win_
+        // 本地优先同语义）；其余设置仍按云档 LWW 采纳。
+        let dir = dir();
+        let mut local = Config::default();
+        local.win_x = -777; local.win_y = 88; local.win_w = 1234; local.win_h = 567;
+        local.win_position_physical = true;
+        local.save(&dir.join("config.toml")).unwrap();
+        let mut remote = Config::default();
+        remote.win_x = 1; remote.win_y = 2; remote.win_w = 3200; remote.win_h = 2000;
+        remote.win_position_physical = false;
+        remote.font_size = 42.;
+        put(&dir, &fixture(&remote, "a"));
+        let loaded = load(&dir).unwrap();
+        assert_eq!(loaded.config.win_x, -777);
+        assert_eq!(loaded.config.win_y, 88);
+        assert_eq!(loaded.config.win_w, 1234);
+        assert_eq!(loaded.config.win_h, 567);
+        assert!(loaded.config.win_position_physical);
+        assert_eq!(loaded.config.font_size, 42., "非几何设置仍按云档");
         let _ = std::fs::remove_dir_all(dir);
     }
     #[test]

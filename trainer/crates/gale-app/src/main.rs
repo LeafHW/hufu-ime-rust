@@ -2509,7 +2509,10 @@ impl App {
     /// 结果，否则任意一次后续偏好保存都会拿旧界面值把远端改动覆盖回去。
     fn adopt_synced_config(&mut self, synced: Config) {
         self.cfg = synced;
-        self.model.reduced_motion = gale_win::edit::reduced_motion();
+        // 【全面排查 2026-11-16】与启动装配（main.rs 1333）同口径：用户把
+        // 动效调成"关"（motion_level==0）时，采纳云档瞬间也要维持动效关闭。
+        self.model.reduced_motion =
+            gale_win::edit::reduced_motion() || self.cfg.motion_level == 0;
         self.theme = ui::theme_with_overrides(&self.cfg.theme, &self.cfg.color_overrides);
         self.apply_style();
         self.invalidate_live_hints(false);
@@ -3006,18 +3009,20 @@ impl App {
                 else {
                     return;
                 };
+                let raw = format!("{r:02x}{g:02x}{b:02x}");
+                self.cfg.color_overrides.insert((*key).into(), raw.clone());
                 self.theme.set(key, gale_core::theme::Color(r, g, b, 255));
-                self.cfg
-                    .color_overrides
-                    .insert((*key).into(), format!("{r:02x}{g:02x}{b:02x}"));
-                // 【用户反馈 2026-11-16】重启装配会做 ≥3.0:1 可读性保底；
-                // 选色时当场做同一套保底并落盘保底后的值，所见即所得，
-                // 不再出现"选完深红、重启变淡粉"的静默漂移。
-                if let Some(hex) = ui::harmonize_key_hex(&mut self.theme, &self.cfg.color_overrides, key)
-                {
-                    self.cfg.color_overrides.insert((*key).into(), hex.clone());
+                // 【用户反馈 2026-11-16 + 全面排查】当场对活主题（跟随皮肤时
+                // 基座=皮肤派生值）跑与重启装配同一套全量 harmonize，并把保底
+                // 结果写回覆盖值落盘：当前键所见即所得；先前随背景变化而失效
+                // 的保底键一并校准——保存值==重启装配值，跨键不再漂移。
+                let mut overrides = self.cfg.color_overrides.clone();
+                ui::harmonize_persist(&mut self.theme, &mut overrides);
+                if overrides.get(*key) != Some(&raw) {
+                    let hex = overrides.get(*key).cloned().unwrap_or_default();
                     self.toast(&format!("对比度过低，已调亮为 {hex} 并保存"));
                 }
+                self.cfg.color_overrides = overrides;
                 self.save_config();
                 self.apply_style();
             }
@@ -6162,6 +6167,9 @@ impl App {
                 });
                 self.model.rule_selected = self.cfg.cleaning_preset.rules.len() - 1;
                 self.sync_rule_model();
+                // 【全面排查 2026-11-16】新增行立即落盘：不点保存就被 kill
+                // 也不再丢这行（正常退出链本有兜底，这里补齐异常退出路径）。
+                self.save_config();
             }
             Action::RuleDelete => {
                 let i = self.model.rule_selected;
