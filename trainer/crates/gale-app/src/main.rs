@@ -3010,19 +3010,11 @@ impl App {
                     return;
                 };
                 let raw = format!("{r:02x}{g:02x}{b:02x}");
-                self.cfg.color_overrides.insert((*key).into(), raw.clone());
+                self.cfg.color_overrides.insert((*key).into(), raw);
                 self.theme.set(key, gale_core::theme::Color(r, g, b, 255));
-                // 【用户反馈 2026-11-16 + 全面排查】当场对活主题（跟随皮肤时
-                // 基座=皮肤派生值）跑与重启装配同一套全量 harmonize，并把保底
-                // 结果写回覆盖值落盘：当前键所见即所得；先前随背景变化而失效
-                // 的保底键一并校准——保存值==重启装配值，跨键不再漂移。
-                let mut overrides = self.cfg.color_overrides.clone();
-                ui::harmonize_persist(&mut self.theme, &mut overrides);
-                if overrides.get(*key) != Some(&raw) {
-                    let hex = overrides.get(*key).cloned().unwrap_or_default();
-                    self.toast(&format!("对比度过低，已调亮为 {hex} 并保存"));
-                }
-                self.cfg.color_overrides = overrides;
+                // 【用户拍板 2026-11-16】自选颜色原样保存，不做对比度保底
+                // （默认主题配色仍按可读标准设计）：选到什么，保存与重启
+                // 后就是什么，不再提示、不再调亮。
                 self.save_config();
                 self.apply_style();
             }

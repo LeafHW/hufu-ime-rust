@@ -763,127 +763,22 @@ pub fn theme_with_overrides(
     t
 }
 
-/// 把 color_overrides 套到已有主题（跟随虎符皮肤也走这里），返回修过的项数。
+/// 把 color_overrides 套到已有主题（跟随虎符皮肤也走这里），返回套上的项数。
+/// 【用户拍板 2026-11-16】覆盖值原样套用，不做对比度保底：默认主题配色
+/// 按可读标准设计；用户自己改的颜色不阻止、不抬亮——选到什么，装配出来
+/// 就是什么（所见即所得）。
 pub fn apply_overrides(
     t: &mut Theme,
     overrides: &std::collections::BTreeMap<String, String>,
 ) -> usize {
+    let mut applied = 0;
     for (key, value) in overrides {
         if let Some(color) = Color::from_hex_no_hash(value) {
             t.set(key, color);
+            applied += 1;
         }
     }
-    harmonize(t, overrides)
-}
-
-/// 卡面与字色统一（只在用户**显式覆盖过**的项上动手，主题自带层次不动）：
-/// 覆盖过的阅读色低于 3.0:1 时往窗体字体色拉，够不着再退纯白/纯黑，
-/// 直到在本区与文章卡上都看得清。卡面本身不派生：主题是什么样就画什么样。
-pub fn harmonize(
-    t: &mut Theme,
-    overrides: &std::collections::BTreeMap<String, String>,
-) -> usize {
-    let base = interface_bg(t);
-    let mut fixed = 0;
-    let card = t.get("次级背景色");
-    for key in [
-        "未打文字色",
-        "打对字色",
-        "次级文字色",
-        "跟打区字体色",
-        "窗体字体色",
-    ] {
-        if lift_to_readable(t, overrides, key, 3.0, card, base) {
-            fixed += 1;
-        }
-    }
-    for key in HINT_RANK_COLOR_KEYS {
-        if lift_to_readable(t, overrides, key, 3.0, card, base) {
-            fixed += 1;
-        }
-    }
-    fixed
-}
-
-/// 【用户反馈 2026-11-16 + 全面排查】选色与重启装配对称化：调色盘选完深色
-/// 当场生效，重启后却被 harmonize 抬亮——看起来像"颜色被改回去了"。
-/// 此变体对**活主题**（跟随皮肤时基座也是皮肤派生值）跑与重启装配同一套
-/// 全量 harmonize，再把被抬亮的键值写回 overrides：保存值与下次重启装配
-/// 值严格一致；先前随背景变化而失效的保底键（跨键场景）一并校准落盘。
-pub fn harmonize_persist(
-    t: &mut Theme,
-    overrides: &mut std::collections::BTreeMap<String, String>,
-) -> usize {
-    let fixed = harmonize(t, overrides);
-    if fixed == 0 {
-        return 0;
-    }
-    for key in [
-        "未打文字色",
-        "打对字色",
-        "次级文字色",
-        "跟打区字体色",
-        "窗体字体色",
-    ] {
-        write_back_lifted(t, overrides, key);
-    }
-    for key in HINT_RANK_COLOR_KEYS {
-        write_back_lifted(t, overrides, key);
-    }
-    fixed
-}
-
-/// 把 t 中已被保底抬亮的键值同步回 overrides（值未变=未被抬亮则跳过）。
-fn write_back_lifted(
-    t: &Theme,
-    overrides: &mut std::collections::BTreeMap<String, String>,
-    key: &str,
-) {
-    let Some(stored) = overrides.get(key).cloned() else {
-        return;
-    };
-    let c = t.get(key);
-    let hex = format!("{:02x}{:02x}{:02x}", c.0, c.1, c.2);
-    if hex != stored {
-        overrides.insert(key.to_string(), hex);
-    }
-}
-
-fn lift_to_readable(
-    t: &mut Theme,
-    overrides: &std::collections::BTreeMap<String, String>,
-    key: &str,
-    floor: f64,
-    card: Color,
-    field: Color,
-) -> bool {
-    if !overrides.contains_key(key) {
-        return false;
-    }
-    let cur = t.get(key);
-    let ok = |c: Color| {
-        gale_core::theme::contrast_ratio(c, card) >= floor
-            && gale_core::theme::contrast_ratio(c, field) >= floor
-    };
-    if ok(cur) {
-        return false;
-    }
-    // 往窗体字体色拉是真·主题内的统一；但底色是用户硬改的（浅主题 + 灰底）
-    // 时，深色字体再拉也够不着对比度，于是再退到纯白/纯黑里能读的那个。
-    let fg = t.get("窗体字体色");
-    for target in [fg, Color(0xff, 0xff, 0xff, 255), Color(0, 0, 0, 255)] {
-        let mut f = 0.0_f32;
-        while f < 1.0 {
-            f = (f + 0.08).min(1.0);
-            let next = gale_core::theme::mix(cur, target, f);
-            if ok(next) {
-                t.set(key, next);
-                return true;
-            }
-        }
-    }
-    false
-
+    applied
 }
 
 /// Match editable color values to the resolved palette, including schema/skin defaults.
@@ -5505,59 +5400,32 @@ mod tests {
     }
 
 
+    /// 【用户拍板 2026-11-16】去掉覆盖色的对比度保底：用户自选颜色原样
+    /// 套用——深红就是深红，重启后还是深红。默认主题配色的可读性由主题
+    /// 侧测试保证（gray_theme_keeps_ink_black_text_readable 等）。
     #[test]
-    fn overridden_palette_is_lifted_back_to_readable() {
-        // 复刻用户现场：墨玉底改成中灰、打对/未打字色改成纯黑、词提 2 选改暗红。
-        let mut o = std::collections::BTreeMap::new();
-        o.insert("跟打区背景色".to_string(), "474747".to_string());
-        o.insert("打对字色".to_string(), "000000".to_string());
-        o.insert("未打文字色".to_string(), "000000".to_string());
-        o.insert("词提2选色".to_string(), "410304".to_string());
-        let t = theme_with_overrides("墨玉", &o);
-        let card = t.get("次级背景色");
-        let field = interface_bg(&t);
-        let cr = gale_core::theme::contrast_ratio;
-        assert!(cr(t.get("打对字色"), card) >= 3.0, "打对字色在文章卡上不可读");
-        assert!(cr(t.get("未打文字色"), card) >= 3.0, "未打文字色在文章卡上不可读");
-        assert!(cr(t.get("未打文字色"), field) >= 3.0, "未打文字色在输入卡上不可读");
-        assert!(cr(t.get("词提2选色"), card) >= 3.0, "词提 2 选色不可读");
-    }
-
-    #[test]
-    fn harmonize_persist_matches_restart_lift_and_writes_it_back() {
-        // 复刻 2026-11-16 现场：灰砖 + 词提2选色=2d0000（对 #4a4a4a 卡面仅
-        // 2.13:1）。当场全量保底后，覆盖表写回的就是保底值——双底 ≥3.0 且
-        // 不等于原值；达标的 3 选 c8b07a 原样保留；写回值再装配一遍不再
-        // 变化（== 重启装配严格一致）；跨键换深卡面后保底自动再校准。
+    fn user_overridden_colors_apply_verbatim_without_lift() {
         let mut o = std::collections::BTreeMap::new();
         o.insert("词提2选色".to_string(), "2d0000".to_string());
         o.insert("词提3选色".to_string(), "c8b07a".to_string());
-        let mut t = theme_with_overrides("灰砖", &o);
-        t.set("词提2选色", Color::from_hex_no_hash("2d0000").unwrap());
-        t.set("词提3选色", Color::from_hex_no_hash("c8b07a").unwrap());
-        let fixed = harmonize_persist(&mut t, &mut o);
-        assert_eq!(fixed, 1, "只有深红一处需要保底");
-        assert_ne!(o["词提2选色"], "2d0000", "深红在灰砖上不可读，保底值要写回覆盖表");
-        assert_eq!(o["词提3选色"], "c8b07a", "达标色不动");
-        let cr = gale_core::theme::contrast_ratio;
-        let lc = Color::from_hex_no_hash(&o["词提2选色"]).unwrap();
-        assert!(cr(lc, t.get("次级背景色")) >= 3.0, "抬亮后的色在文章卡上要可读");
-        assert!(cr(lc, interface_bg(&t)) >= 3.0, "抬亮后的色在输入卡上要可读");
-        // 幂等：写回后的覆盖表再走一遍装配+保底，值不再变化（== 重启装配）。
-        let mut t2 = theme_with_overrides("灰砖", &o);
-        let mut o2 = o.clone();
-        assert_eq!(harmonize_persist(&mut t2, &mut o2), 0, "保底幂等");
-        assert_eq!(o2, o, "写回值与重启装配严格一致");
-        // 跨键：卡面换深后重新装配，先前保底的键要在新卡面上仍然可读。
-        let mut o3 = o.clone();
-        o3.insert("次级背景色".to_string(), "141414".to_string());
-        let mut t3 = theme_with_overrides("灰砖", &o3);
-        harmonize_persist(&mut t3, &mut o3);
-        let c3 = Color::from_hex_no_hash(&o3["词提2选色"]).unwrap();
-        assert!(
-            cr(c3, t3.get("次级背景色")) >= 3.0,
-            "换深卡面后词提 2 选色仍要可读（保底自动再校准）"
+        o.insert("打对字色".to_string(), "000000".to_string());
+        let t = theme_with_overrides("灰砖", &o);
+        assert_eq!(
+            t.get("词提2选色"),
+            Color::from_hex_no_hash("2d0000").unwrap(),
+            "深红不被抬亮"
         );
+        assert_eq!(
+            t.get("词提3选色"),
+            Color::from_hex_no_hash("c8b07a").unwrap()
+        );
+        assert_eq!(
+            t.get("打对字色"),
+            Color::from_hex_no_hash("000000").unwrap()
+        );
+        // 再装配一遍值不变（重启后颜色不变）。
+        let t2 = theme_with_overrides("灰砖", &o);
+        assert_eq!(t2.get("词提2选色"), t.get("词提2选色"));
     }
 
     #[test]
@@ -5590,6 +5458,5 @@ mod tests {
             t.get("次级背景色"),
             Color::from_hex_no_hash("efe9dd").unwrap()
         );
-        assert_eq!(harmonize(&mut Theme::default(), &Default::default()), 0);
     }
 }
