@@ -545,6 +545,12 @@ fn form_edit_class(class: &str) -> bool {
     )
 }
 
+/// 【Ctrl+M 放行 2026-11-16】IME「来回切最近方案」控制键放行判定（纯函数
+/// 便于测试；调用点在 capture_physical_key 的自设快捷键表之后，见下注）。
+fn ime_recent_schema_passthrough(vk: u32, ctrl: bool, alt: bool) -> bool {
+    ctrl && !alt && vk == 0x4D
+}
+
 /// Pretranslate shortcuts and count only physical typing keys. Returning true
 /// suppresses TranslateMessage too, preventing a command's WM_CHAR leaking ahead.
 pub fn capture_physical_key(msg: &windows::Win32::UI::WindowsAndMessaging::MSG) -> bool {
@@ -604,6 +610,17 @@ pub fn capture_physical_key(msg: &windows::Win32::UI::WindowsAndMessaging::MSG) 
             push_cmd(CommandKey::MenuKey);
             return true;
         }
+    }
+    // 【Ctrl+M 放行 2026-11-16】Ctrl+M=输入法「来回切最近方案」（虎符
+    // switch_recent_schema；用户实锤「跟打器里切不了、别处能切」：旧路径在
+    // 下方 relay Ctrl 兜底「其余吞掉防漏字」处被吃，泵的 capture 先于
+    // tsf_filter 执行，TSF 键链零触达）。与 Ctrl+Space 同为 IME 控制键：
+    // 放行给 tsf_filter→TIP→引擎（TestDown 预吞+KeyDown 由引擎定夺）；
+    // 输入法未启用该键时 TIP 直通，relay WndProc 的 Ctrl 兜底再吞（无副
+    // 作用）。置于自设快捷键表之后——用户把 Ctrl+M 绑成跟打器快捷键时
+    // 以表为准。
+    if ime_recent_schema_passthrough(vk, ctrl, alt) {
+        return false;
     }
     // Ctrl+V 是固定编辑键（不受自设表影响）：仍走载文动作；但焦点在表单原生
     // 输入框时必须放行，否则会把正在填的账号/昵称/数值替换成整篇文章（审计 I01）。
@@ -2458,6 +2475,18 @@ mod tests {
             push_cmd(CommandKey::Enter);
         }
         assert!(drain_cmds().len() <= 64);
+    }
+
+    // ── Ctrl+M 放行判定（2026-11-16 回归）──
+    // 跟打器里 Ctrl+M 切不了方案（别处能切）。根因=泵的 capture_physical_key
+    // 对未知 Ctrl 组合「其余吞掉防漏字」，键到不了 TSF 键链。放行判定须恰好
+    // 命中 Ctrl+M（无 Alt）；Ctrl+Space 有自己的通道（:568 早期放行），不在此判。
+    #[test]
+    fn ctrl_m_passes_through_to_ime_recent_schema_switch() {
+        assert!(ime_recent_schema_passthrough(0x4D, true, false), "Ctrl+M 放行");
+        assert!(!ime_recent_schema_passthrough(0x4D, false, false), "裸 M 不走此通道");
+        assert!(!ime_recent_schema_passthrough(0x4D, true, true), "Ctrl+Alt+M 不抢");
+        assert!(!ime_recent_schema_passthrough(0x20, true, false), "Ctrl+Space 走既有通道");
     }
 
     // ── 组字判定矩阵（嫌疑1修复的规格：双通道任一非空 = 组字中）──
