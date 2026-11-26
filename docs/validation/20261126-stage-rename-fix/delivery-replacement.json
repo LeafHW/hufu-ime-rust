@@ -1,0 +1,25 @@
+{
+  "removed": [
+    {
+      "path": "交付/HuFuSetup-1.9.9.10.exe",
+      "sha256": "d46200ef856b2246ec5e3dc1fac7237ae1842ed4b8af678bb4d93046c7657cd1",
+      "size": 39502283
+    },
+    {
+      "path": "交付/HuFuSetup-1.9.9.10.exe.artifact.json",
+      "sha256": "1282785772ef895529e4f8b77d96f19751ec2b1a7a18b7c082e0e43acd897d97",
+      "size": 139
+    },
+    {
+      "path": "交付/HuFuSetup-1.9.9.10.exe.sha256",
+      "sha256": "b64ab0cdc4e8343ab230565e7141a7bba8714da2fe79ee33b64cbe070428567c",
+      "size": 89
+    }
+  ],
+  "current": {
+    "path": "交付/HuFuSetup-1.9.9.11.exe",
+    "size": 39500181,
+    "sha256": "10168059b866827b09fd74b98bda9d0209f3955134b130c2b32d7d707e944748"
+  },
+  "old_installer_closed_by_user": true
+}

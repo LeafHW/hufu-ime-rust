@@ -267,3 +267,32 @@ unsafe fn sid_matches_admin(sid: *mut core::ffi::c_void) -> bool {
     let s1 = *sub.add(1) as u32;
     s0 == ADM_SUB0 && s1 == ADM_SUB1
 }
+
+/// Verify the parent's phase log is writable under this token before mutating state.
+pub fn prepare_phase_log(path: &Path, phase: &str) -> std::io::Result<()> {
+    if !path.is_absolute() {
+        return Err(std::io::Error::other("machine log path must be absolute"));
+    }
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    writeln!(file, "machine phase {phase}: log opened")?;
+    file.flush()
+}
+
+#[cfg(test)]
+mod phase_log_tests {
+    use super::*;
+    #[test]
+    fn phase_log_keeps_previous_evidence_and_rejects_unwritable_path() {
+        let base = std::env::temp_dir().join(format!("hufu-phase-log-{}", std::process::id()));
+        std::fs::create_dir(&base).unwrap();
+        let log = base.join("parent log 日志.txt");
+        std::fs::write(&log, "previous evidence\n").unwrap();
+        prepare_phase_log(&log, "rollback-machine").unwrap();
+        let text = std::fs::read_to_string(&log).unwrap();
+        assert!(text.starts_with("previous evidence\n"));
+        assert!(text.contains("rollback-machine"));
+        assert!(prepare_phase_log(&base, "install-elevated").is_err());
+        assert!(prepare_phase_log(Path::new("relative.log"), "install-elevated").is_err());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+}

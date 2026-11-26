@@ -1,0 +1,47 @@
+﻿{
+    "files":  [
+                  {
+                      "path":  "hufu_tsf.dll",
+                      "sha256":  "269abcbd24025eccb6a6643223d9b008931a3827262fe83af7045e017ffa3085",
+                      "machine":  "0xAA64",
+                      "size":  20480,
+                      "role":  "tsf-facade"
+                  },
+                  {
+                      "path":  "hufu_tsf_arm64_9949fdde6439d2333d80.dll",
+                      "sha256":  "0029c85092776b510f5dc1ede9f5e4e1b697867ce707766f10775fa911752f26",
+                      "machine":  "0xAA64",
+                      "size":  2854400,
+                      "role":  "tsf-arm64-implementation"
+                  },
+                  {
+                      "path":  "hufu_tsf_x64_9949fdde6439d2333d80.dll",
+                      "sha256":  "52078842c6745d9e2b25e7df24d9191ec15176928c6e6019c045965521c84456",
+                      "machine":  "0x8664",
+                      "size":  43094528,
+                      "role":  "tsf-x64-implementation"
+                  }
+              ],
+    "build_id":  "9949fdde6439d2333d80",
+    "schema":  1,
+    "exports":  [
+                    "DllCanUnloadNow",
+                    "DllGetClassObject",
+                    "DllRegisterServer",
+                    "DllUnregisterServer",
+                    "hufu_probe_registration_path",
+                    "hufu_test_addword",
+                    "hufu_test_anim_scales",
+                    "hufu_test_candwin2",
+                    "hufu_test_d2d_stats",
+                    "hufu_test_fs_frames",
+                    "hufu_test_key",
+                    "hufu_test_key_burst",
+                    "hufu_test_pad_dump",
+                    "hufu_test_reset",
+                    "hufu_test_skin_dump",
+                    "hufu_test_skin_hot",
+                    "hufu_test_sound_burst",
+                    "hufu_test_stretch_corner"
+                ]
+}

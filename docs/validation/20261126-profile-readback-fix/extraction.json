@@ -1,0 +1,27 @@
+{
+  "schema": 1,
+  "scope": "independent extraction; no installation",
+  "artifact": {
+    "file": "HuFuSetup-1.9.9.12.exe",
+    "size": 39508495,
+    "sha256": "4787a4294babbc643b22c68d1e2b9b58329c86bfd1a193da00faab50338d92b1"
+  },
+  "architectures": {
+    "x64": {
+      "files": 25,
+      "manifest_sha256": "776cdc57097e0d2337bfd2d77ee230081566ea6b5ad4fd405ee725f5941043d3",
+      "version": "1.9.9.12"
+    },
+    "arm64": {
+      "files": 28,
+      "manifest_sha256": "2e813cb65696cb0982c39d05b7c50f47bf4536652f7cc9f19ca7144db5233ff7",
+      "version": "1.9.9.12"
+    }
+  },
+  "resources": {
+    "files": 102,
+    "bytes": 31409256,
+    "source_hashes_preserved": true
+  },
+  "passed": true
+}

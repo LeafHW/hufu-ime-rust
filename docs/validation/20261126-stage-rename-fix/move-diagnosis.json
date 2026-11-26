@@ -1,0 +1,49 @@
+{
+  "sandbox": "C:\\Users\\yc\\AppData\\Local\\Temp\\hufu-move-diagnosis-1iuy4dcb",
+  "results": [
+    {
+      "name": "no-probe",
+      "probes": [],
+      "source": "C:\\Users\\yc\\AppData\\Local\\Temp\\hufu-move-diagnosis-1iuy4dcb\\no-probe",
+      "rename": "ok"
+    },
+    {
+      "name": "native-arm64",
+      "probes": [
+        {
+          "exe": "hufu-tsf-smoke.exe",
+          "exit": 0,
+          "stderr": ""
+        }
+      ],
+      "source": "C:\\Users\\yc\\AppData\\Local\\Temp\\hufu-move-diagnosis-1iuy4dcb\\native-arm64",
+      "rename": "ok"
+    },
+    {
+      "name": "x86",
+      "probes": [
+        {
+          "exe": "hufu-tsf-smoke32.exe",
+          "exit": 0,
+          "stderr": ""
+        }
+      ],
+      "source": "C:\\Users\\yc\\AppData\\Local\\Temp\\hufu-move-diagnosis-1iuy4dcb\\x86",
+      "rename": "[WinError 5] 拒绝访问。: 'C:\\\\Users\\\\yc\\\\AppData\\\\Local\\\\Temp\\\\hufu-move-diagnosis-1iuy4dcb\\\\x86' -> 'C:\\\\Users\\\\yc\\\\AppData\\\\Local\\\\Temp\\\\hufu-move-diagnosis-1iuy4dcb\\\\x86-published'",
+      "retry_after_2s": "ok"
+    },
+    {
+      "name": "emulated-x64",
+      "probes": [
+        {
+          "exe": "hufu-tsf-smoke-x64.exe",
+          "exit": 0,
+          "stderr": ""
+        }
+      ],
+      "source": "C:\\Users\\yc\\AppData\\Local\\Temp\\hufu-move-diagnosis-1iuy4dcb\\emulated-x64",
+      "rename": "[WinError 5] 拒绝访问。: 'C:\\\\Users\\\\yc\\\\AppData\\\\Local\\\\Temp\\\\hufu-move-diagnosis-1iuy4dcb\\\\emulated-x64' -> 'C:\\\\Users\\\\yc\\\\AppData\\\\Local\\\\Temp\\\\hufu-move-diagnosis-1iuy4dcb\\\\emulated-x64-published'",
+      "retry_after_2s": "ok"
+    }
+  ]
+}

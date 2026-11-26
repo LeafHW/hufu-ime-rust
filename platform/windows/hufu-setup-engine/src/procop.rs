@@ -7,7 +7,7 @@
 //! - Stop-Process -Force → OpenProcess(PROCESS_TERMINATE)+TerminateProcess(1)，
 //!   与 PS 同款无权限兜底（杀不动的项不计入击杀数）。
 //! - Start-Process -WindowStyle Hidden -PassThru + WaitForExit(ms)（超时 Kill，
-//!   Invoke-SmokeReg L74-82 语义：超时杀掉按 0/跳过处理）→ spawn_wait_hidden /
+//!   新维护契约：超时杀掉并确认退出，调用者必须按失败处理）→ spawn_wait_hidden /
 //!   spawn_capture。
 //! - Start-Process -Verb RunAs -Wait → spawn_runas_wait（UAC 弹窗必须可见）。
 //! - Start-Process（无等待）/ explorer.exe 中转降权（install.ps1 L510-518）→
@@ -109,6 +109,14 @@ fn entry_name(e: &PROCESSENTRY32W) -> String {
 }
 
 /// 等待+超时收尸（隐藏/捕获启动共用；Invoke-SmokeReg 超时 Kill 语义）。
+unsafe fn confirm_exit(h: HANDLE) {
+    // No rollback is allowed while a registration child may still be alive.
+    // On a wait error retain the handle and retry instead of reporting a false exit.
+    while WaitForSingleObject(h, 1000).0 != WAIT_OBJECT_0.0 {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
 unsafe fn wait_reap(h: HANDLE, timeout_ms: u32) -> SpawnResult {
     match WaitForSingleObject(h, timeout_ms).0 {
         v if v == WAIT_OBJECT_0.0 => {
@@ -120,12 +128,17 @@ unsafe fn wait_reap(h: HANDLE, timeout_ms: u32) -> SpawnResult {
             }
         }
         v if v == WAIT_TIMEOUT.0 => {
-            // 超时击杀 + 100ms 收尸（Stop-Process -Force 后不留僵尸句柄）
+            // 超时击杀并等待确认退出，再允许调用者回退注册。
             let _ = TerminateProcess(h, 1);
-            let _ = WaitForSingleObject(h, 100);
+            // Never return while the helper can still mutate registration.
+            confirm_exit(h);
             SpawnResult::Timeout
         }
-        _ => SpawnResult::Fail, // WAIT_FAILED 等
+        _ => {
+            let _ = TerminateProcess(h, 1);
+            confirm_exit(h);
+            SpawnResult::Fail
+        } // WAIT_FAILED: do not expose a still-running child to rollback
     }
 }
 
@@ -220,6 +233,45 @@ pub fn spawn_wait_hidden(exe: &Path, args: &str, timeout_ms: u32) -> SpawnResult
     unsafe { spawn_with_redir(exe, args, timeout_ms, None) }
 }
 
+/// Capture a maintenance helper's diagnostics without a predictable log file
+/// that an elevated process could overwrite. The inherited file is exclusive,
+/// create-new, and deleted automatically when its final handle closes.
+pub fn spawn_diagnostic(exe: &Path, args: &str, timeout_ms: u32) -> (SpawnResult, String) {
+    use std::io::{Read, Seek, SeekFrom};
+    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use windows::Win32::Foundation::{SetHandleInformation, HANDLE_FLAG_INHERIT};
+    static SERIAL: AtomicU64 = AtomicU64::new(0);
+    let path = std::env::temp_dir().join(format!(
+        "hufu-helper-{}-{}-{}.log",
+        std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos(),
+        SERIAL.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut file = match std::fs::OpenOptions::new().read(true).write(true)
+        .create_new(true).share_mode(0).custom_flags(0x04000000) // FILE_FLAG_DELETE_ON_CLOSE
+        .open(&path) {
+        Ok(file) => file,
+        Err(error) => return (SpawnResult::Fail, format!("create diagnostic capture: {error}")),
+    };
+    let handle = HANDLE(file.as_raw_handle());
+    let result = unsafe {
+        if let Err(error) = SetHandleInformation(handle, HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT) {
+            return (SpawnResult::Fail, format!("inherit diagnostic capture: {error}"));
+        }
+        spawn_with_redir(exe, args, timeout_ms, Some(handle))
+    };
+    let mut bytes = Vec::new();
+    if let Err(error) = file.seek(SeekFrom::Start(0)).and_then(|_| (&mut file).take(65537).read_to_end(&mut bytes)) {
+        return (SpawnResult::Fail, format!("{result:?}; read diagnostic capture: {error}"));
+    }
+    let truncated = bytes.len() > 65536;
+    bytes.truncate(65536);
+    let mut output = String::from_utf8_lossy(&bytes).into_owned();
+    if truncated { output.push_str("\n[helper output truncated at 64 KiB]"); }
+    (result, output)
+}
+
 /// 同 spawn_wait_hidden，但子进程 stdout/stderr 重定向到 out_file
 /// （install.ps1 L437-444 smoke enable 输出文件判据：CREATE_ALWAYS 覆盖，
 /// 父进程创建→子继承→父立刻 CloseHandle，不留锁文件的活句柄）。
@@ -295,8 +347,16 @@ pub fn spawn_runas_wait(exe: &Path, args: &str, timeout_ms: u32) -> SpawnResult 
                     SpawnResult::Fail
                 }
             }
-            v if v == WAIT_TIMEOUT.0 => SpawnResult::Timeout, // 不杀：非提权父进程无权 TERMINATE 提权子进程
-            _ => SpawnResult::Fail,
+            v if v == WAIT_TIMEOUT.0 => {
+                // The unelevated parent cannot terminate an elevated helper.
+                // Wait for its definitive exit before the caller attempts rollback.
+                confirm_exit(sei.hProcess);
+                SpawnResult::Timeout
+            }
+            _ => {
+                confirm_exit(sei.hProcess);
+                SpawnResult::Fail
+            }
         };
         let _ = CloseHandle(sei.hProcess);
         r
@@ -370,6 +430,66 @@ pub fn spawn_detached(exe: &str, arg: &str) {
         if ok {
             let _ = CloseHandle(pi.hThread); // 不等待：火忘，句柄即刻放掉
             let _ = CloseHandle(pi.hProcess);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    #[ignore = "spawned only by diagnostic_capture_preserves_both_streams_and_exit_code"]
+    fn diagnostic_child() {
+        println!("registration stdout marker");
+        eprintln!("registration stderr hresult=0x80004005");
+        std::process::exit(7);
+    }
+    #[test]
+    fn diagnostic_capture_preserves_both_streams_and_exit_code() {
+        let (result, output) = spawn_diagnostic(
+            &std::env::current_exe().unwrap(),
+            "--exact procop::tests::diagnostic_child --ignored --nocapture", 5000);
+        assert_eq!(result, SpawnResult::Exit(7));
+        assert!(output.contains("registration stdout marker"));
+        assert!(output.contains("registration stderr hresult=0x80004005"));
+    }
+    #[test]
+    #[ignore = "spawned only by timeout_confirms_child_exit"]
+    fn timeout_child() {
+        println!("child_pid={}", std::process::id());
+        std::thread::sleep(std::time::Duration::from_secs(30));
+    }
+    #[test]
+    fn timeout_confirms_child_exit() {
+        let (result, text) = spawn_diagnostic(
+            &std::env::current_exe().unwrap(),
+            "--exact procop::tests::timeout_child --ignored --nocapture",
+            2000,
+        );
+        assert_eq!(result, SpawnResult::Timeout);
+        let pid = text
+            .lines()
+            .find_map(|s| s.strip_prefix("child_pid="))
+            .expect("child actually started")
+            .trim()
+            .parse::<u32>()
+            .unwrap();
+        unsafe {
+            use windows::Win32::System::Threading::{
+                PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+            };
+            if let Ok(handle) = OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                false,
+                pid,
+            ) {
+                assert_eq!(
+                    WaitForSingleObject(handle, 0).0,
+                    WAIT_OBJECT_0.0,
+                    "registration child still running after timeout return"
+                );
+                let _ = CloseHandle(handle);
+            }
         }
     }
 }

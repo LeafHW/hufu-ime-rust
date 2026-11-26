@@ -1,0 +1,46 @@
+{
+  "schema": 1,
+  "inputs": {
+    "baseline_probe": {
+      "path": "C:\\Workspace\\hufu-build-tools\\sentence\\x64\\Release\\hufu-native-score-probe.exe",
+      "sha256": "f0715ce9313f4bbfbb7f435c2bdafafcbd5e8a4c994864afd547f8800194e246"
+    },
+    "baseline_dll": {
+      "path": "C:\\Workspace\\hufu-ime-rust\\_tmp\\arm64\\baseline\\extracted\\app\\TigerClaw.Sentence.Native.dll",
+      "sha256": "e41677d27d3d4f804e8dd7d5e6183d14d355c94c4308a0793e0676c02e7c0a50"
+    },
+    "candidate_probe": {
+      "path": "C:\\Workspace\\hufu-build-tools\\sentence\\arm64-scalar\\Release\\hufu-native-score-probe.exe",
+      "sha256": "a782d5350fb5e13e795d03263dc9c680c3b3f45c89857056d7ce6e2739548043"
+    },
+    "candidate_dll": {
+      "path": "C:\\Workspace\\hufu-build-tools\\sentence\\arm64-scalar\\Release\\TigerClaw.Sentence.Native.dll",
+      "sha256": "837a083a2963cf12d55e1b9d864c3d03814532cacce6cb9c09380e3af2a405b2"
+    },
+    "model": {
+      "path": "C:\\Workspace\\whitetiger\\resources\\Models\\sentence-qwen-q8.gguf",
+      "sha256": "ebb25a17e79b1f43834410fb711ac3dc985364eb875b45914181f55b9993f2d0"
+    },
+    "cases": {
+      "path": "C:\\Workspace\\hufu-ime-rust\\native\\sentence\\tests\\candidates-extended.txt",
+      "sha256": "9aac062c9e269fb1b21ebd2a33ca863f9a0bfa3b33178cc5055719a039b63d57"
+    }
+  },
+  "cases": 125,
+  "group_size": 5,
+  "finite": true,
+  "max_absolute_difference": 1.6467622351817397,
+  "absolute_tolerance": 0.0001,
+  "relative_tolerance": 1e-06,
+  "numeric_passed": false,
+  "ranking_passed": false,
+  "passed": false,
+  "installed": false,
+  "ranking_mismatch_groups": [
+    10,
+    24
+  ],
+  "top1_mismatch_groups": [
+    10
+  ]
+}

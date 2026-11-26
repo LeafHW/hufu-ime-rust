@@ -48,8 +48,13 @@ PrivilegesRequired=lowest
 ; 64 位安装模式：setup 进程为 x64 → {sys}=真 System32，
 ; 派生的 PowerShell 为 64 位（避免 HKLM 写入被 WOW64 重定向进 32 位视图）
 ; 仅 x64：x64os = 拒绝 ARM64 仿真（装载层硬门禁，R47；比 [Code] 判断更早）
+#ifdef UNIVERSAL
+ArchitecturesAllowed=x64compatible and x86compatible
+ArchitecturesInstallIn64BitMode=x64compatible
+#else
 ArchitecturesAllowed=x64os
 ArchitecturesInstallIn64BitMode=x64os
+#endif
 MinVersion=10.0.14393
 OutputDir={#DistDir}
 OutputBaseFilename=HuFuSetup-{#SetupVersion}
@@ -75,8 +80,8 @@ Name: "chinesesimplified"; MessagesFile: "lang\ChineseSimplified.isl"
 [CustomMessages]
 chinesesimplified.MutexRunning=另一个 HuFu 安装程序正在运行，请先完成或关闭它。
 chinesesimplified.WildRemnant=检测到本机有虎符的残留注册信息（原目录已不存在）。%n%n本次将按全新安装处理，残留注册会被自动覆盖；如遇异常请把日志发给开发者。
-chinesesimplified.EngineFailed=系统注册引擎执行失败（退出码 %s）。详细日志：%s。输入法文件已就位，但注册可能不完整；请重新运行本安装程序，或把日志发给开发者。
-chinesesimplified.DataCopyFailed=数据文件安装出现问题（退出码 %s）。程序与注册仍会继续，但码表可能不完整；请重新运行安装程序。详见：%s
+chinesesimplified.EngineFailed=系统注册引擎执行失败（退出码 %s）。安装未完成，请查看恢复结果及日志：%s。
+chinesesimplified.DataCopyFailed=数据文件安装失败（退出码 %s），已停止后续注册。详见：%s
 chinesesimplified.DirChanged=检测到旧版安装在其它目录，本次已按你的选择安装到新目录。%n%n旧目录未做任何改动；如需迁移数据，请手动把旧目录中的 码表\、数据\、模型\、码表导出\ 复制到新目录后重跑安装。
 chinesesimplified.UninstBackupAsk=卸载前请确认数据已备份（码表\、码表导出\、数据\、模型\ 都在安装目录；跟打文章和成绩在 %LOCALAPPDATA%\HuFu\trainer，建议分别复制到别处保存）。%n%n【是】= 已备份，开始卸载%n【否】= 先不卸了，我先去备份（将打开安装文件夹并退出卸载）
 chinesesimplified.UninstAborted=已退出卸载（未做任何更改）。备份完成后可再次运行卸载。
@@ -106,6 +111,10 @@ Type: files; Name: "{app}\设置.bat"
 #endif
 
 [Files]
+#ifdef UNIVERSAL
+#include "staging-programs.inc"
+Source: "staging\program-files.lst"; Flags: dontcopy
+#else
 ; ---------- 程序文件（进卸载日志：卸载时删除） ----------
 Source: "staging\hufu-server.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "staging\hufu-settings.exe"; DestDir: "{app}"; Flags: ignoreversion
@@ -145,6 +154,7 @@ Source: "staging\更新日志.txt"; DestDir: "{app}"; Flags: ignoreversion
 Source: "staging\图标.ico"; DestDir: "{app}"; Flags: ignoreversion
 Source: "staging\version.txt"; DestDir: "{app}"; Flags: ignoreversion
 Source: "staging\licenses\*"; DestDir: "{app}\licenses"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
+#endif
 ; ---------- 数据文件（解压到 {tmp}，由 [Code] 差异备份后拷入；不进卸载日志） ----------
 Source: "staging\hufu-files.lst"; DestDir: "{tmp}"; Flags: deleteafterinstall skipifsourcedoesntexist
 Source: "staging\hufu-files-upgrade.lst"; DestDir: "{tmp}"; Flags: deleteafterinstall skipifsourcedoesntexist
@@ -154,7 +164,7 @@ Source: "staging\hufu-files-upgrade.lst"; DestDir: "{tmp}"; Flags: deleteafterin
 const
   CLSID = '{8F5C2A10-3E77-4B9C-A1D4-9E0B7C2F5A88}';
   PROFILEGUID = '{8F5C2A11-3E77-4B9C-A1D4-9E0B7C2F5A88}';
-  PEFiles = 'hufu-server.exe,hufu-trainer.exe,hufu_tsf.dll,hufu_tsf32.dll,hufu-tsf-smoke.exe,TigerClaw.Sentence.Native.dll,hufu-render-helper.exe';
+  PEFiles = 'hufu-server.exe,hufu-settings.exe,WebView2Loader.dll,hufu-trainer.exe,hufu_tsf.dll,hufu_tsf32.dll,hufu-tsf-smoke.exe,hufu-setup-engine.exe,TigerClaw.Sentence.Native.dll,hufu-render-helper.exe';
 
 var
   UpgradeMode: Boolean;
@@ -168,6 +178,10 @@ var
   UninstallReallyStarted: Boolean;
   EngineExitCode: Integer;
   MutexHandle: Longword;
+
+#ifdef UNIVERSAL
+#include "universal-code.iss"
+#endif
 
 function CreateMutexW(lpMutexAttributes: Longword; bInitialOwner: Boolean;
   lpName: String): Longword;
@@ -321,6 +335,9 @@ end;
 function InitializeSetup(): Boolean;
 var
   M: Longword;
+#ifdef UNIVERSAL
+  WindowsVersion: TWindowsVersion;
+#endif
 begin
   Result := False;
 
@@ -333,12 +350,21 @@ begin
   end;
   MutexHandle := M;
 
+#ifdef UNIVERSAL
+  GetWindowsVersionEx(WindowsVersion);
+  if IsArm64System() and (WindowsVersion.Build < 22000) then begin
+    SuppressibleMsgBox('ARM64 版本需要 Windows 11 或更高版本。', mbError, MB_OK, IDOK);
+    exit;
+  end;
+#else
   // S1（审计 R47）：x64 包在 ARM64 仿真下"能装不能用"——明示拦截
   if ProcessorArchitecture = paARM64 then begin
     SuppressibleMsgBox('检测到 ARM64 Windows：虎符当前仅支持 x64 系统，' +
       'ARM 仿真下输入法无法工作，已停止安装。', mbError, MB_OK, IDOK);
     exit;
   end;
+
+#endif
 
   NoHKLMMode := CmdLineHas('/NOHKLM');
   SelectDirMode := CmdLineHas('/SELECTDIR');
@@ -629,6 +655,10 @@ end;
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
   Result := '';
+#ifdef UNIVERSAL
+  Result := UniversalPrepare();
+  if Result <> '' then exit;
+#endif
   // 【清场 2026-10-14 用户指令】确认安装的第一时间：杀 server（含 TSF 重生兜底循环）
   // → 清场一切安装目录进程（smoke/unins000/bat 控制台/任何 {app} 进程）
   KillServerInline();
@@ -636,8 +666,10 @@ begin
   // S4（审计）：野残留=死 HKCU TIP 键。先清掉，install.ps1 的 $tipAlready
   // 才会判"全新安装"→走首装路径（含 ctfmon 刷新），装完即可切换输入法。
   if WildRemnant then begin
+#ifndef UNIVERSAL
     RegDeleteKeyIncludingSubkeys(HKCU, 'Software\Microsoft\CTF\TIP\' + CLSID);
     LogLine('野残留：已预清死 TIP 键，引擎按全新安装处理');
+#endif
   end;
   CleanStaleOldFiles();
   // 铁律口径（2026-10-13）：exe 体系不装 安装.bat（已装目录无此入口）。
@@ -680,13 +712,14 @@ begin
   // 【0 PowerShell 2026-10-21】数据差异备份也走 Rust 引擎（等价实现：
   // hufu-setup-tools.ps1 -BackupDiff L227-348）——此前是安装流程里唯一
   // 无条件启动 powershell.exe 的地方（火绒等安全软件会拦/告警）。
-  Exec(WizardDirValue + '\hufu-setup-engine.exe',
+  Code := -1;
+  if not Exec(WizardDirValue + '\hufu-setup-engine.exe',
     'backup-diff --manifest "' + ManifestPath + '"' +
     ' --src "' + ExpandConstant('{tmp}') + '\hufu-pkg"' +
     ' --dst "' + WizardDirValue + '"' +
     ' --backup "' + BackupRoot + '"' +
     ' --log "' + WizardDirValue + '\setup-engine.log"',
-    WizardDirValue, SW_HIDE, ewWaitUntilTerminated, Code);
+    WizardDirValue, SW_HIDE, ewWaitUntilTerminated, Code) then Code := -1;
 #else
   Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
     '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' +
@@ -722,9 +755,10 @@ begin
   // Rust 引擎轨：零 PowerShell 子进程。引擎自身把进度写 setup-engine.log
   //（--log 参数），退出码语义与 PS 轨一致（0=成功；1=致命；提权失败仅告警
   // 不置败——install.ps1 L344/352 同款语义）。
-  Exec(WizardDirValue + '\hufu-setup-engine.exe',
+  Code := -1;
+  if not Exec(WizardDirValue + '\hufu-setup-engine.exe',
     'install' + Extra + ' --log "' + WizardDirValue + '\setup-engine.log"',
-    WizardDirValue, SW_HIDE, ewWaitUntilTerminated, Code);
+    WizardDirValue, SW_HIDE, ewWaitUntilTerminated, Code) then Code := -1;
   EngineExitCode := Code;
   Result := (Code = 0);
   if not Result then begin
@@ -786,11 +820,21 @@ var
   N, I: Integer;
 begin
   if CurStep = ssPostInstall then begin
+#ifdef UNIVERSAL
+    try
+#endif
     // 1) 数据文件：差异备份 → 拷入（不进卸载日志）；升级时码表/皮肤整目录
     //    冻结不写入（清单由 RunBackupDiff 按模式挑选）
     if FileExists(ExpandConstant('{tmp}') + '\hufu-files.lst') or
        FileExists(ExpandConstant('{tmp}') + '\hufu-files-upgrade.lst') then
-      RunBackupDiff()
+      begin
+        if not RunBackupDiff() then begin
+#ifdef UNIVERSAL
+          UniversalFailed := True;
+#endif
+          RaiseException('数据安装失败，已停止注册。请查看 setup-engine.log。');
+        end;
+      end
     else
       LogLine('无数据清单（空数据包），跳过数据拷贝');
 
@@ -800,7 +844,25 @@ begin
 
     // 2) 系统注册：零修改复用 install.ps1（内部自带 UAC 提权段 +
     //    语言列表 enable + 默认输入法覆盖 + 自启 + 降权启动 server）
-    RunInstallEngine();
+    if not RunInstallEngine() then begin
+#ifdef UNIVERSAL
+      UniversalFailed := True;
+#endif
+      RaiseException('安装维护失败。恢复结果和保留备份位置见 setup-engine.log。');
+    end;
+
+#ifdef UNIVERSAL
+    // Core registration committed. Convenience actions below cannot roll it back.
+    UniversalCommitted := True;
+    except
+      UniversalFailed := True;
+      UniversalFailureMessage := GetExceptionMessage();
+      LogLine('安装未完成：' + UniversalFailureMessage);
+      UniversalRestorePrograms();
+      exit;
+    end;
+    try
+#endif
 
     // 2b) S6（审计）：机器级注册缺失（提权被拒等）要浮出水面，不能只躺日志
     if (not NoHKLMMode) and
@@ -861,11 +923,19 @@ begin
     if UpgradeMode and (PrevDir <> '') and (PrevDir <> WizardDirValue) and
        (not WizardSilent()) then
       MsgBox(ExpandConstant('{cm:DirChanged}'), mbInformation, MB_OK);
+#ifdef UNIVERSAL
+    except
+      LogLine('核心安装已完成；后续辅助操作失败：' + GetExceptionMessage());
+    end;
+#endif
   end;
 end;
 
 function NeedRestart(): Boolean;
 begin
+#ifdef UNIVERSAL
+  if UniversalFailed then begin Result := False; exit; end;
+#endif
   // 腾位发生（旧 PE 待重启清理）或覆盖升级（新 DLL 需全进程加载）
   // 或野残留首装（预清后走首装路径，msctf 列表刷新需重启兜底）
   Result := (RenamedOldCount > 0) or UpgradeMode or WildRemnant;
@@ -874,8 +944,25 @@ end;
 procedure CurPageChanged(CurPageID: Integer);
 begin
   // 完成页重启提示：字号加大（2026-10-13 用户定稿，默认 9pt 偏小）
-  if CurPageID = wpFinished then
+  if CurPageID = wpFinished then begin
     WizardForm.FinishedLabel.Font.Size := 12;
+#ifdef UNIVERSAL
+    if UniversalFailed then begin
+      WizardForm.FinishedHeadingLabel.Caption := '安装未完成';
+      WizardForm.FinishedLabel.Caption := UniversalFailureMessage + #13#10 + #13#10;
+      if UniversalRestored then
+        WizardForm.FinishedLabel.Caption := WizardForm.FinishedLabel.Caption + '程序文件和卸载登记已恢复。'
+      else
+        WizardForm.FinishedLabel.Caption := WizardForm.FinishedLabel.Caption + '部分文件或卸载登记尚未恢复，请保留备份。';
+      WizardForm.FinishedLabel.Caption := WizardForm.FinishedLabel.Caption + #13#10 +
+        '系统注册恢复结果见 setup-engine.log。' + #13#10 + '备份：' + UniversalBackupDir;
+      WizardForm.YesRadio.Visible := False;
+      WizardForm.NoRadio.Visible := False;
+      WizardForm.RunList.Visible := False;
+      WizardForm.NextButton.Caption := '关闭';
+    end;
+#endif
+  end;
 end;
 
 // ============================ 卸载 ============================
@@ -939,6 +1026,7 @@ begin
     end;
     UninstallReallyStarted := True; // 已过系统确认框+备份确认：真正开始卸载
 
+#ifndef UNIVERSAL
     // 0a) 修实证债务 R16：清默认输入法覆盖（必须先于语言列表减法）
     //    S2（审计）：只清"指向虎符"的覆盖，他人输入法的默认设置不碰
 #ifdef RUST_ENGINE
@@ -960,6 +1048,7 @@ begin
     RegDeleteValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\RunOnce',
       'HuFuPostBoot');
 
+#endif
     // 1) 杀 server（uninstall.ps1 也会杀；先杀减一次复活窗口）+ 清场安装目录进程
     //    （卸载时残留的设置.bat 窗口/smoke 等也会锁文件；保护 unins000 自身）
     KillServerInline();
@@ -970,6 +1059,16 @@ begin
     //    全部三件；PS 轨=tools 内部以管理员运行 uninstall.ps1，
     //    它检测到已是管理员即不再二次自提权）
 #ifdef RUST_ENGINE
+#ifdef UNIVERSAL
+    Code := -1;
+    if not Exec(AppDir + '\hufu-setup-engine.exe',
+      'uninstall --log "' + AppDir + '\setup-engine.log"',
+      AppDir, SW_HIDE, ewWaitUntilTerminated, Code) then Code := -1;
+    if Code <> 0 then begin
+      UninstallReallyStarted := False;
+      RaiseException('卸载维护失败，程序文件保留。请查看 setup-engine.log 中的恢复结果。');
+    end;
+#else
     ElevatedOk := ShellExec('runas',
       AppDir + '\hufu-setup-engine.exe',
       'uninstall --log "' + AppDir + '\setup-engine.log"',
@@ -983,6 +1082,7 @@ begin
     end else if Code <> 0 then
       LogLine('引擎卸载尾 退出码 ' + IntToStr(Code) +
         '（4=HKLM 残留，详见 setup-engine.log）');
+#endif
 #else
     ElevatedOk := ShellExec('runas',
       ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),

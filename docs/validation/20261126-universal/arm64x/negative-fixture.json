@@ -1,0 +1,6 @@
+{
+  "original_test_path": "docs/validation/20261126-universal/arm64x/missing-implementation/hufu_tsf.dll",
+  "retained_binary": "_tmp/arm64/validation-fixtures/payload-95b54d2fba2246e98c97fe7f937d54e8/missing-implementation/hufu_tsf.dll",
+  "sha256": "a86eefc8686f29902e63906be922924fb97bb34a569bcf631b4e86fe89c71fce",
+  "note": "Moved after successful test; logs preserve actual invocation path. Binary excluded from source evidence."
+}

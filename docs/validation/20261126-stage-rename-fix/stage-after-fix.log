@@ -1,0 +1,19 @@
+   Compiling hufu-setup-engine v0.1.0 (C:\Workspace\hufu-ime-rust\platform\windows\hufu-setup-engine)
+warning: function `create_url_shortcut` is never used
+  --> hufu-setup-engine\src\lnk.rs:36:8
+   |
+36 | pub fn create_url_shortcut(lnk_path: &Path, url: &str, icon: &Path) -> bool {
+   |        ^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `hufu-setup-engine` (bin "hufu-setup-engine" test) generated 1 warning
+    Finished `release` profile [optimized] target(s) in 4.15s
+     Running unittests src\main.rs (C:\Workspace\hufu-ime-rust\_tmp\arm64\build\target\aarch64-pc-windows-msvc\release\build\hufu-setup-engine/8cd93731ff1b02b9\out\hufu_setup_engine-8cd93731ff1b02b9.exe)
+
+running 1 test
+isolated staging root: C:\Users\yc\AppData\Local\Temp\hufu-stage-test-19932-1795661529436597000
+test deployment::tests::generation_stage_keeps_source_and_final_payload_consistent ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 1.41s
+

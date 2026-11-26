@@ -1,0 +1,64 @@
+{
+  "hufu_tsf.dll": {
+    "sha256": "269abcbd24025eccb6a6643223d9b008931a3827262fe83af7045e017ffa3085",
+    "imports": []
+  },
+  "hufu_tsf_arm64_9949fdde6439d2333d80.dll": {
+    "sha256": "0029c85092776b510f5dc1ede9f5e4e1b697867ce707766f10775fa911752f26",
+    "imports": [
+      "ADVAPI32.dll",
+      "KERNEL32.dll",
+      "USER32.dll",
+      "WINMM.dll",
+      "bcryptprimitives.dll",
+      "api-ms-win-core-synch-l1-2-0.dll",
+      "oleaut32.dll",
+      "oleacc.dll",
+      "imm32.dll",
+      "dcomp.dll",
+      "gdi32.dll",
+      "d3d11.dll",
+      "d2d1.dll",
+      "dxgi.dll",
+      "dwrite.dll",
+      "ws2_32.dll",
+      "ole32.dll",
+      "ntdll.dll"
+    ]
+  },
+  "hufu_tsf_x64_9949fdde6439d2333d80.dll": {
+    "sha256": "52078842c6745d9e2b25e7df24d9191ec15176928c6e6019c045965521c84456",
+    "imports": [
+      "api-ms-win-core-synch-l1-2-0.dll",
+      "d2d1.dll",
+      "d3d11.dll",
+      "dcomp.dll",
+      "dwrite.dll",
+      "dxgi.dll",
+      "gdi32.dll",
+      "imm32.dll",
+      "ntdll.dll",
+      "ole32.dll",
+      "oleacc.dll",
+      "oleaut32.dll",
+      "ws2_32.dll",
+      "ADVAPI32.dll",
+      "KERNEL32.dll",
+      "msvcrt.dll",
+      "USER32.dll",
+      "WINMM.dll",
+      "bcryptprimitives.dll"
+    ]
+  },
+  "hufu-tsf-smoke.exe": {
+    "sha256": "a3e301c8e9c6e2e780aa6c470cffe959a281bd175b7ed5d22f35064b02071922",
+    "imports": [
+      "kernel32.dll",
+      "ws2_32.dll",
+      "ole32.dll",
+      "oleaut32.dll",
+      "api-ms-win-core-synch-l1-2-0.dll",
+      "ntdll.dll"
+    ]
+  }
+}

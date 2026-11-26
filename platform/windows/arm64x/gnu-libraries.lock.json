@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "builder": "Fedora 44 aarch64",
+  "gcc_directory": "16.1.1",
+  "packages": [
+    "mingw32-crt-13.0.0-3.fc44.noarch",
+    "mingw64-crt-13.0.0-3.fc44.noarch",
+    "mingw32-gcc-16.1.1-1.fc44.aarch64",
+    "mingw64-gcc-16.1.1-1.fc44.aarch64",
+    "mingw32-winpthreads-13.0.0-3.fc44.noarch",
+    "mingw64-winpthreads-13.0.0-3.fc44.noarch",
+    "mingw32-winpthreads-static-13.0.0-3.fc44.noarch",
+    "mingw64-winpthreads-static-13.0.0-3.fc44.noarch"
+  ],
+  "source_repositories": [
+    "https://src.fedoraproject.org/rpms/mingw-crt",
+    "https://src.fedoraproject.org/rpms/mingw-gcc",
+    "https://src.fedoraproject.org/rpms/mingw-winpthreads"
+  ]
+}

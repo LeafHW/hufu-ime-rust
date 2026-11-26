@@ -1,0 +1,8 @@
+﻿CurrentUser/Registry64/Software\Classes\CLSID\{8F5C2A10-3E77-4B9C-A1D4-9E0B7C2F5A88}=<missing>
+CurrentUser/Registry64/Software\Microsoft\CTF\TIP\{8F5C2A10-3E77-4B9C-A1D4-9E0B7C2F5A88}=<missing>
+CurrentUser/Registry32/Software\Classes\CLSID\{8F5C2A10-3E77-4B9C-A1D4-9E0B7C2F5A88}=<missing>
+CurrentUser/Registry32/Software\Microsoft\CTF\TIP\{8F5C2A10-3E77-4B9C-A1D4-9E0B7C2F5A88}=<missing>
+LocalMachine/Registry64/Software\Classes\CLSID\{8F5C2A10-3E77-4B9C-A1D4-9E0B7C2F5A88}=<missing>
+LocalMachine/Registry64/Software\Microsoft\CTF\TIP\{8F5C2A10-3E77-4B9C-A1D4-9E0B7C2F5A88}=<missing>
+LocalMachine/Registry32/Software\Classes\CLSID\{8F5C2A10-3E77-4B9C-A1D4-9E0B7C2F5A88}=<missing>
+LocalMachine/Registry32/Software\Microsoft\CTF\TIP\{8F5C2A10-3E77-4B9C-A1D4-9E0B7C2F5A88}=<missing>

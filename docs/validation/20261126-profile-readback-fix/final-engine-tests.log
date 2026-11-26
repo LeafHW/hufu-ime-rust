@@ -1,0 +1,71 @@
+warning: function `create_url_shortcut` is never used
+  --> hufu-setup-engine\src\lnk.rs:36:8
+   |
+36 | pub fn create_url_shortcut(lnk_path: &Path, url: &str, icon: &Path) -> bool {
+   |        ^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `hufu-setup-engine` (bin "hufu-setup-engine" test) generated 1 warning
+    Finished `release` profile [optimized] target(s) in 0.04s
+     Running unittests src\main.rs (C:\Workspace\hufu-ime-rust\_tmp\arm64\build\target\aarch64-pc-windows-msvc\release\build\hufu-setup-engine/8cd93731ff1b02b9\out\hufu_setup_engine-8cd93731ff1b02b9.exe)
+
+running 1 test
+isolated staging root: C:\Users\yc\AppData\Local\Temp\hufu-stage-test-39660-1795663129702752500
+test deployment::tests::generation_stage_keeps_source_and_final_payload_consistent ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 22 filtered out; finished in 1.40s
+
+   Compiling hufu-setup-engine v0.1.0 (C:\Workspace\hufu-ime-rust\platform\windows\hufu-setup-engine)
+warning: function `create_url_shortcut` is never used
+  --> hufu-setup-engine\src\lnk.rs:36:8
+   |
+36 | pub fn create_url_shortcut(lnk_path: &Path, url: &str, icon: &Path) -> bool {
+   |        ^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `hufu-setup-engine` (bin "hufu-setup-engine" test) generated 1 warning
+    Finished `release` profile [optimized] target(s) in 3.03s
+     Running unittests src\main.rs (C:\Workspace\hufu-ime-rust\_tmp\arm64\build\target\x86_64-pc-windows-gnu\release\build\hufu-setup-engine/7226e0becc85db1d\out\hufu_setup_engine-7226e0becc85db1d.exe)
+
+running 23 tests
+test deployment::tests::generation_stage_keeps_source_and_final_payload_consistent ... ignored, requires HUFU_STAGE_TEST_PAYLOAD pointing to a built native payload
+test procop::tests::diagnostic_child ... ignored, spawned only by diagnostic_capture_preserves_both_streams_and_exit_code
+test deployment::tests::profile_readback_does_not_retry_process_failure_or_timeout ... ok
+test deployment::tests::profile_readback_is_bounded_and_preserves_diagnostics ... ok
+test procop::tests::timeout_child ... ignored, spawned only by timeout_confirms_child_exit
+test deployment::tests::profile_readback_retries_only_observation_until_visible ... ok
+test common::phase_log_tests::phase_log_keeps_previous_evidence_and_rejects_unwritable_path ... ok
+BackupDiff: 用户码表区在场（码表\非空/数据\在场 之一）——码表\ 全域冻结，剔除清单 0 项（零写入/零补缺/零复活）
+BackupDiff: 用户码表区在场（码表\非空/数据\在场 之一）——码表\ 全域冻结，剔除清单 1 项（零写入/零补缺/零复活）
+BackupDiff: 跳过（! 目标已在）: x.bin
+BackupDiff: 用户码表区在场（码表\非空/数据\在场 之一）——码表\ 全域冻结，剔除清单 0 项（零写入/零补缺/零复活）
+RESULT: BackupDiff 拷入=0 跳过=1（相同0/已存在1）已备份=0 失败=0 exit=0
+BackupDiff: 拷入: 数据\config.json
+RESULT: BackupDiff 拷入=1 跳过=0（相同0/已存在0）已备份=0 失败=0 exit=0
+BackupDiff: 拷入: 数据\a.txt
+BackupDiff: 跳过（内容相同，保 mtime）: 数据\b.txt
+RESULT: BackupDiff 拷入=1 跳过=1（相同1/已存在0）已备份=0 失败=0 exit=0
+test registry_tx::tests::user_list_rollback_keeps_concurrent_other_ime_changes ... ok
+test registry_tx::tests::rollback_restores_owned_trees_without_rewriting_other_input_methods ... ok
+test backupdiff::tests::only_missing_prefix_skips_existing_target ... ok
+test registry_tx::inno_tests::inno_snapshot_preserves_raw_types_absence_sid_and_other_product ... ok
+BackupDiff: 已备份+覆盖: 数据\c.txt → 备份 C:\Users\yc\AppData\Local\Temp\hufu-bd-overwrite-31820\bak\数据\c.txt
+BackupDiff: 源缺失: C:\Users\yc\AppData\Local\Temp\hufu-bd-overwrite-31820\pkg\数据\nope.txt
+RESULT: BackupDiff 拷入=1 跳过=0（相同0/已存在0）已备份=1 失败=1 exit=5 失败清单: 数据\nope.txt（源缺失）
+test backupdiff::tests::dict_zone_is_frozen_when_user_zone_present ... ok
+test backupdiff::tests::copies_new_backs_up_changed_and_skips_same ... ok
+test backupdiff::tests::backups_overwritten_file_and_flags_missing_source ... ok
+test package::tests::corrupted_pe_is_rejected_even_with_matching_hash ... ok
+test package::tests::hashes_and_native_architecture_are_admission_gates ... ok
+test package::tests::program_data_subdirectories_are_safe_and_hashed ... ok
+test package::tests::generation_changes_with_manifest_and_system_requires_all_nonprogram_files ... ok
+test package::tests::arm_emulation_is_limited_to_three_program_names ... ok
+test procop::tests::diagnostic_capture_preserves_both_streams_and_exit_code ... ok
+test package::tests::arm_requires_both_impl_views_and_x64_probe ... ok
+test package::tests::rejects_windows_aliases_traversal_and_duplicate_case ... ok
+test procop::tests::timeout_confirms_child_exit ... ok
+
+test result: ok. 20 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 2.03s
+

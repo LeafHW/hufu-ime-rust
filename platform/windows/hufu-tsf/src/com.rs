@@ -64,6 +64,22 @@ fn self_path() -> String {
     }
 }
 
+/// ARM64X implementations must never register their generation-specific path.
+/// The build opts into this contract; ordinary GNU builds keep their own path.
+pub fn registration_path() -> std::result::Result<String, HRESULT> {
+    let own = self_path();
+    match option_env!("HUFU_TSF_REGISTRATION_DLL") {
+        Some(name) if cfg!(target_pointer_width = "64") => {
+            let facade = std::path::Path::new(&own).with_file_name(name);
+            if !facade.is_file() {
+                return Err(HRESULT(0x8007_0002u32 as i32));
+            }
+            Ok(facade.to_string_lossy().into_owned())
+        }
+        _ => Ok(own),
+    }
+}
+
 fn reg_set(subkey: &str, name: Option<&str>, value: &str) -> WIN32_ERROR {
     unsafe {
         let mut hkey = HKEY::default();
@@ -138,13 +154,17 @@ fn reg_del_tree(subkey: &str) -> WIN32_ERROR {
 
 /// CLSID + TSF TIP 注册（HKCU，无需管理员）。
 pub fn register_server() -> HRESULT {
+    let dll = match registration_path() {
+        Ok(path) => path,
+        Err(hr) => return hr,
+    };
     let clsid_key = format!(r"Software\Classes\CLSID\{CLSID_STR}");
     let ips_key = format!(r"Software\Classes\CLSID\{CLSID_STR}\InprocServer32");
     let hr = reg_set(&clsid_key, None, "HuFu TSF Service");
     if hr != WIN32_ERROR(0) {
         return HRESULT((hr.0 | 0x8007_0000) as i32);
     }
-    let _ = reg_set(&ips_key, None, &self_path());
+    let _ = reg_set(&ips_key, None, &dll);
     let _ = reg_set(&ips_key, Some("ThreadingModel"), "Apartment");
     let tip = r"Software\Microsoft\CTF\TIP";
     let tip_root = format!(r"{tip}\{CLSID_STR}");
@@ -174,7 +194,7 @@ pub fn register_server() -> HRESULT {
                                              // IconFile 指向 DLL 自身（内嵌虎符图标资源，IconIndex=0）——路径无关，
                                              // 开发目录/安装目录通吃；msctf 原生库登记由安装器传独立 .ico。
     let _ = reg_set_dword(&lp, "IconIndex", 0);
-    let _ = reg_set(&lp, Some("IconFile"), &self_path());
+    let _ = reg_set(&lp, Some("IconFile"), &dll);
     // 【类别注册补课 2026-10-09】display attribute provider 类别——
     // msctf 解析属性 GUID→TIP 的唯一发现机制（官方 Providing Display
     // Attributes 第一步）。注册表键不是机制（本机微拼无键也有线）；

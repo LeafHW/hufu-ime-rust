@@ -1,0 +1,20 @@
+{
+  "platform/windows/.cargo/config.toml": "29a48df86d214c98772074368616879cab4048fabdde0d6570b80858b1b6237a",
+  "platform/windows/arm64x/.gitignore": "32dae3052f331ee34d628ef535709b301259a45df7c7522c4d35dcf49873f00b",
+  "platform/windows/arm64x/Build-Forwarder.ps1": "5006dc74ac869c8eb6bc3e78ec80a836fe5415b496460545e0d9ad37230baed3",
+  "platform/windows/arm64x/Build-Tsf.ps1": "602f3919e916abc535fb06790231990329e49abfd94108e3df25d3d9037a3f96",
+  "platform/windows/arm64x/Initialize-Toolchain.ps1": "ec0cd9b97815982ccbc2c3f3fc511f1921230306e72b60da1366a8548c5623cb",
+  "platform/windows/arm64x/README.md": "b38c007d6707b1939c61a15e759430bbb2b71f5229b6dd545ad8814c2de56ddc",
+  "platform/windows/arm64x/Verify-Forwarder.ps1": "d585b49e046ad8ddcd77014f9d9269b3fc85a06c05fa97598a4bec5a18cc88e7",
+  "platform/windows/arm64x/gnu-libraries.lock.json": "d2e7cec746ab59006f21066e244e94eac524de2930e14390d3624d267c5b21d9",
+  "platform/windows/arm64x/gnu-link.cpp": "7d9fd96e9469061fcb2779c20d92f6736c7bc031d55946ac0e96b423b479dc4e",
+  "platform/windows/arm64x/prepare-gnu-libraries.py": "693c20202b4650e896770a457498ebfb912c60402db54b4b9b21438e65197be1",
+  "platform/windows/arm64x/test_verify_forwarder.py": "ec7b24f3586de4889eee92ac19349740931bfa77a2b69183e2a7ca27b8b61091",
+  "platform/windows/arm64x/verify_forwarder.py": "9cdfe688fed856f081736af9056a4a6b8dbbb1cdd87940cce861d8b209ea86bc",
+  "platform/windows/hufu-tsf/build.rs": "e85c5a020509c8c771ffa0d6e9af5e08b099183ca58099b10d7083346280a689",
+  "platform/windows/hufu-tsf/src/candwin2.rs": "6f018452254ccf9546416c0c53c758f23dce77f9439fe620084b7420cfc04dbc",
+  "platform/windows/hufu-tsf/src/com.rs": "c4758df6efc6d9b3fd7b6d7e2d3d4cef6d5ebbba61ccd46a96debed443c56772",
+  "platform/windows/hufu-tsf/src/lib.rs": "b59d66d1f2c788633750fac93efa11199807f2c84ab19907cfc9f5603e95b89f",
+  "platform/windows/hufu-tsf-smoke/src/main.rs": "52765ff0cfbc5953f7b047cb163b0e115942b82fd7058df20c46f79c415c18db",
+  "platform/windows/hufu-tsf-smoke/src/probe.rs": "8ff75f05fb728b5822f43d954a88dbf4c3e5198f0e7960f3fe4bb857e6c7201e"
+}

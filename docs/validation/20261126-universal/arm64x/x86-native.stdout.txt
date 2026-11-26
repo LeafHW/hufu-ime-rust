@@ -1,0 +1,9 @@
+﻿probe_status=ok
+host_arch=x86
+image_machine=0x014C
+exports_resolved=18
+implementation=C:\Workspace\hufu-ime-rust\_tmp\arm64\build\payload-95b54d2fba2246e98c97fe7f937d54e8\arm64\hufu_tsf32.dll
+registration=C:\Workspace\hufu-ime-rust\_tmp\arm64\build\payload-95b54d2fba2246e98c97fe7f937d54e8\arm64\hufu_tsf32.dll
+registry_writes=0
+profile_activation=0
+server_calls=0

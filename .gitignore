@@ -19,6 +19,8 @@ target-build/
 target-release/
 platform/windows/install/install.log
 _tmp
+/交付/
+__pycache__/
 
 # docs/corpus 测试集源料（大文件不入仓：cnews 130MB 原始 + 转换 jsonl + 评论 CSV；
 # 成品 test_sentences_50k*.txt 与脚本入仓，源料取回法见 prepare_corpus_50k.py 注释）

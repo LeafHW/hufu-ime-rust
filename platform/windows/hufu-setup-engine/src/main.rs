@@ -15,12 +15,16 @@
 mod acl;
 mod backupdiff;
 mod common;
+mod deployment;
 mod install;
 mod lnk;
+mod package;
 mod pfro;
 mod postboot;
+mod preflight;
 mod procop;
 mod purge;
+mod registry_tx;
 mod regop;
 mod uninstall;
 
@@ -48,6 +52,7 @@ fn main() {
     let mut user_only = false;
     let mut log: Option<PathBuf> = None;
     let mut manifest: Option<String> = None;
+    let mut snapshot: Option<PathBuf> = None;
     let mut src_root: Option<String> = None;
     let mut dst_root: Option<String> = None;
     let mut backup_root: Option<String> = None;
@@ -56,12 +61,13 @@ fn main() {
         match args[i].as_str() {
             "--no-hklm" => no_hklm = true,
             "--user-only" => user_only = true,
-            "--log" | "--manifest" | "--src" | "--dst" | "--backup" => {
+            "--log" | "--manifest" | "--src" | "--dst" | "--backup" | "--snapshot" => {
                 if i + 1 < args.len() {
                     let v = args[i + 1].clone();
                     match args[i].as_str() {
                         "--log" => log = Some(PathBuf::from(&v)),
                         "--manifest" => manifest = Some(v),
+                        "--snapshot" => snapshot = Some(PathBuf::from(v)),
                         "--src" => src_root = Some(v),
                         "--dst" => dst_root = Some(v),
                         _ => backup_root = Some(v),
@@ -75,14 +81,76 @@ fn main() {
     }
     // 提权子阶段默认落 %TEMP%\hufu-install-elevated.log（install.ps1 L347-349 契约：
     // 父进程读回该文件逐行回显）
-    if cmd == "install-elevated" && log.is_none() {
-        log = Some(common::elevated_log());
+    let machine_phase = matches!(
+        cmd.as_str(),
+        "install-elevated"
+            | "rollback-machine"
+            | "uninstall-machine"
+            | "rollback-uninstall-machine"
+    );
+    if machine_phase {
+        if log.is_none() {
+            log = Some(common::elevated_log());
+        }
+        // An alternate administrator may lack access to the caller's chosen path.
+        // Stop before any registration mutation instead of losing recovery evidence.
+        if let Err(error) = common::prepare_phase_log(log.as_deref().expect("machine log"), &cmd) {
+            eprintln!("ERROR: cannot write machine phase log before mutation: {error}");
+            std::process::exit(1);
+        }
     }
     let mut out = Out::new(log);
     let code = match cmd.as_str() {
-        "install" => install::run_install(&mut out, no_hklm, user_only),
-        "install-elevated" => install::run_phase_elevated(&mut out),
-        "uninstall" => uninstall::run_uninstall(&mut out, no_hklm),
+        "snapshot-inno" | "restore-inno" => {
+            let result = snapshot
+                .as_deref()
+                .ok_or_else(|| std::io::Error::other("missing --snapshot"))
+                .and_then(|p| registry_tx::inno_snapshot(p, cmd == "restore-inno"));
+            match result {
+                Ok(()) => {
+                    out.line("OK current-user Inno key snapshot operation");
+                    0
+                }
+                Err(e) => {
+                    out.line(&format!("ERROR: {e}"));
+                    1
+                }
+            }
+        }
+        "architecture" => match preflight::architecture() {
+            Ok(a) => {
+                out.line(&format!("{{\"system_architecture\":\"{a}\"}}"));
+                0
+            }
+            Err(e) => {
+                out.line(&e);
+                1
+            }
+        },
+        "preflight" => preflight::run(
+            &mut out,
+            &src_root
+                .map(PathBuf::from)
+                .unwrap_or_else(common::install_dir),
+        ),
+        "install" => dispatch_package(
+            &mut out,
+            |out| deployment::install(out, no_hklm, user_only),
+            |out| install::run_install(out, no_hklm, user_only),
+        ),
+        "install-elevated" => dispatch_package(
+            &mut out,
+            deployment::machine_install,
+            install::run_phase_elevated,
+        ),
+        "rollback-machine" => deployment::rollback_machine(&mut out),
+        "uninstall-machine" => deployment::uninstall_machine(&mut out),
+        "rollback-uninstall-machine" => deployment::rollback_uninstall_machine(&mut out),
+        "uninstall" => dispatch_package(
+            &mut out,
+            |out| deployment::uninstall(out, no_hklm),
+            |out| uninstall::run_uninstall(out, no_hklm),
+        ),
         "postboot" => {
             // 铁律：恒静默恒 0（hufu-postboot.ps1 薄壳契约）
             let rc = postboot::run_postboot(&mut out);
@@ -130,4 +198,28 @@ fn main() {
         }
     };
     std::process::exit(code);
+}
+
+/// Absence alone selects legacy x64. Corruption/access errors never select fallback.
+fn dispatch_package(
+    out: &mut Out,
+    current: impl FnOnce(&mut Out) -> i32,
+    legacy: impl FnOnce(&mut Out) -> i32,
+) -> i32 {
+    match std::fs::symlink_metadata(common::install_dir().join(package::MANIFEST)) {
+        Ok(_) => current(out),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => match preflight::architecture() {
+            Ok("x64") => legacy(out),
+            _ => {
+                out.line("ERROR: legacy payload without architecture manifest is x64-only");
+                1
+            }
+        },
+        Err(e) => {
+            out.line(&format!(
+                "ERROR: architecture manifest is inaccessible: {e}"
+            ));
+            1
+        }
+    }
 }

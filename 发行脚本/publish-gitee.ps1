@@ -67,16 +67,6 @@ function Invoke-Native {
 $Version = $Version.Trim().TrimStart('v', 'V')
 $Tag = "v$Version"
 
-if (-not (Test-Path $TokenFile)) {
-    Write-Host "找不到令牌文件：$TokenFile" -ForegroundColor Red
-    exit 1
-}
-$Token = (Get-Content $TokenFile -Raw).Trim()
-if ($Token.Length -lt 16) {
-    Write-Host "令牌文件内容无效（长度 $($Token.Length)）" -ForegroundColor Red
-    exit 1
-}
-
 if (-not $ExePath) {
     $ExePath = "E:\DSH-KF\hufu-发行\HuFuSetup-$Version.exe"
 }
@@ -89,6 +79,19 @@ $ExeName  = $ExeItem.Name
 $Sha256   = (Get-FileHash $ExePath -Algorithm SHA256).Hash.ToLower()
 $Size     = $ExeItem.Length
 $SizeMB   = [math]::Round($Size / 1MB, 1)
+
+. (Join-Path $PSScriptRoot 'update-package-guard.ps1')
+Assert-HufuUpdatePackage $ExePath
+
+if (-not (Test-Path $TokenFile)) {
+    Write-Host "找不到令牌文件：$TokenFile" -ForegroundColor Red
+    exit 1
+}
+$Token = (Get-Content $TokenFile -Raw).Trim()
+if ($Token.Length -lt 16) {
+    Write-Host "令牌文件内容无效（长度 $($Token.Length)）" -ForegroundColor Red
+    exit 1
+}
 
 Write-Step "版本 $Tag · $ExeName · $SizeMB MB · sha256 $($Sha256.Substring(0,16))…"
 

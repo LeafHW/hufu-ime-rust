@@ -239,6 +239,8 @@ if ($LASTEXITCODE -ne 0) { Fail("iscc 编译失败（退出码 $LASTEXITCODE）"
 
 $outExe = Join-Path $DistDir ("HuFuSetup-{0}.exe" -f $Version)
 if (-not (Test-Path $outExe)) { Fail("编译器报告成功但未找到产物：$outExe") }
+. (Join-Path $setupRoot '..\..\..\发行脚本\update-package-guard.ps1')
+Assert-HufuUpdatePackage $outExe
 $hash = (Get-FileHash $outExe -Algorithm SHA256).Hash
 $sizeMB = [math]::Round((Get-Item $outExe).Length/1MB,2)
 Ok("产物：$outExe（${sizeMB}MB）")

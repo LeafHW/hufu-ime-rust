@@ -1,0 +1,72 @@
+{
+  "schema": 1,
+  "installed": false,
+  "tests": [
+    {
+      "skin": "虎娘-绯绒小恶魔.ssf",
+      "source_sha256": "a27fefea200d26601bb88895b426923aad738dd5ee3ecd7c732ebbdb85f1c13d",
+      "returncode": 0,
+      "bmp_sha256": "6df02434e8306ee383979d622ab5491720c7ee644190326f8f70b4948c59f623",
+      "width": 385,
+      "height": 292,
+      "pixel_colors": 21110,
+      "bytes": 449818,
+      "passed": true
+    },
+    {
+      "skin": "虎娘-莓糖小恶魔.ssf",
+      "source_sha256": "18c042e9de1c85fffc85aa9959211ac028c98727e32bfaf64c346b2c0a3c8185",
+      "returncode": 0,
+      "bmp_sha256": "fee7b5a1044ad4dc908078ae9e31918e83d320b6e85c3d12dcd4970a65acab3b",
+      "width": 369,
+      "height": 313,
+      "pixel_colors": 17809,
+      "bytes": 462126,
+      "passed": true
+    },
+    {
+      "skin": "蜜桃虎娘.ssf",
+      "source_sha256": "a61d068ac3a3b691118cfe5eaad59236d2ed00cf6136e63193b33c2f458b9326",
+      "returncode": 0,
+      "bmp_sha256": "86b939b2df22c9d841d3d37f3cecf3ddead104f88155ca4cbda07cec842b030e",
+      "width": 281,
+      "height": 336,
+      "pixel_colors": 6120,
+      "bytes": 377802,
+      "passed": true
+    },
+    {
+      "skin": "鲸鱼娘.ssf",
+      "source_sha256": "19d053c1975748eac9b7aa22ebdea172862858539b96533fab5acd4730018d4a",
+      "returncode": 0,
+      "bmp_sha256": "6109b063cd2bd5edb146e397afc87ba275f67479a9e12dbabe13b3ec0d9c4b55",
+      "width": 276,
+      "height": 329,
+      "pixel_colors": 9871,
+      "bytes": 363354,
+      "passed": true
+    }
+  ],
+  "preflight_blockers": [],
+  "payload_manifest_sha256": "941c26356ebbd932e69040ad9a35b1c517acc44c5114b304786ba377a217d812",
+  "binary_hashes": {
+    "hufu-render-helper.exe": "45fc1f1f15a92af5c421f498c8bbaaaffe027c2a73d24c1171766f80f1943149",
+    "hufu-server.exe": "387acb45b831a5acbf8a61d87640f4be60268af1aec75f06f16ec4af9c5b7891",
+    "hufu-settings.exe": "a608b3d19d66bdf37de73ad098ef5919a2cca3cda94628037f4b0b255014dd56",
+    "hufu-setup-engine.exe": "46a302d488b7fd030b7c2337e39fa8c01334d0fbc38640037a3eeda8e4a519c7",
+    "hufu-trainer.exe": "9b55d295154bb225d88a7c7441cc3c2268a2c49d8d8069fd2aa18789ce374ee9",
+    "hufu-tsf-smoke-x64.exe": "3384ee0b52e042b0a72eb2aacb6a8b97ade5de85729a53cf19c52ab1e95cea49",
+    "hufu-tsf-smoke.exe": "08b28f638caaf862b38a00e841706e08300c431d30f53ce608aebff56b9db59d",
+    "hufu-tsf-smoke32.exe": "546e3b6d3ca3b3933e5557a48ea4ed94c7273f9cfc171e16d2a570f9b6073a24",
+    "hufu_tsf.dll": "a86eefc8686f29902e63906be922924fb97bb34a569bcf631b4e86fe89c71fce",
+    "hufu_tsf32.dll": "a3ad6bc034513cd9b808377d507151a36b32b382abd3be60e5180390b7078ac7",
+    "hufu_tsf_arm64_42747a9bd16467ba422c.dll": "9d94b09e17ee7db3e8db14c809d1939246db9f5a8be7f6fa5b270a82cd5dd335",
+    "hufu_tsf_x64_42747a9bd16467ba422c.dll": "9a4474cbbb78ba3b3a2d0912a74cd39537c832c0b5917b40b499a09ca17f702d",
+    "TigerClaw.Sentence.Native.dll": "374f9847c5bf0a79f79fa274b699a37c273cc3aad75dfc0e04dc3553396f43bd",
+    "WebView2Loader.dll": "d3fce90bdeecb08596e377dea6a316354dd8949e32ff09b89d51be00c14e21b6"
+  },
+  "passed": true,
+  "postflight_blockers": [],
+  "source_resources_unchanged": true,
+  "source_payload_unchanged": true
+}

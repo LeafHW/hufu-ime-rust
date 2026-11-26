@@ -1,0 +1,23 @@
+{
+  "arm64": {
+    "total_files": 28,
+    "changed": [
+      "hufu-setup-engine.exe",
+      "hufu-tsf-smoke-x64.exe",
+      "hufu-tsf-smoke.exe",
+      "hufu-tsf-smoke32.exe",
+      "package-architecture.json",
+      "version.txt"
+    ]
+  },
+  "x64": {
+    "total_files": 25,
+    "changed": [
+      "hufu-setup-engine.exe",
+      "hufu-tsf-smoke.exe",
+      "hufu-tsf-smoke32.exe",
+      "package-architecture.json",
+      "version.txt"
+    ]
+  }
+}

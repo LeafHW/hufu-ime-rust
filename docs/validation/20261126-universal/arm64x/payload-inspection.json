@@ -1,0 +1,867 @@
+{
+  "payload": "_tmp/arm64/build/payload-95b54d2fba2246e98c97fe7f937d54e8",
+  "hybrid": {
+    "arm64x": true,
+    "generation": "42747a9bd16467ba422c",
+    "chpe_metadata": true,
+    "dynamic_relocation_symbol": 6,
+    "fixups": [
+      {
+        "rva": 236,
+        "size": 2,
+        "kind": 1
+      },
+      {
+        "rva": 368,
+        "size": 4,
+        "kind": 1
+      },
+      {
+        "rva": 372,
+        "size": 4,
+        "kind": 1
+      },
+      {
+        "rva": 392,
+        "size": 4,
+        "kind": 1
+      },
+      {
+        "rva": 396,
+        "size": 4,
+        "kind": 1
+      },
+      {
+        "rva": 448,
+        "size": 4,
+        "kind": 1
+      },
+      {
+        "rva": 452,
+        "size": 4,
+        "kind": 1
+      },
+      {
+        "rva": 16640,
+        "size": 4,
+        "kind": 1
+      },
+      {
+        "rva": 16644,
+        "size": 4,
+        "kind": 1
+      }
+    ],
+    "exports": [
+      "DllCanUnloadNow",
+      "DllGetClassObject",
+      "DllRegisterServer",
+      "DllUnregisterServer",
+      "hufu_probe_registration_path",
+      "hufu_test_addword",
+      "hufu_test_anim_scales",
+      "hufu_test_candwin2",
+      "hufu_test_d2d_stats",
+      "hufu_test_fs_frames",
+      "hufu_test_key",
+      "hufu_test_key_burst",
+      "hufu_test_pad_dump",
+      "hufu_test_reset",
+      "hufu_test_skin_dump",
+      "hufu_test_skin_hot",
+      "hufu_test_sound_burst",
+      "hufu_test_stretch_corner"
+    ],
+    "implementations": {
+      "arm64": {
+        "name": "hufu_tsf_arm64_42747a9bd16467ba422c.dll",
+        "sha256": "9d94b09e17ee7db3e8db14c809d1939246db9f5a8be7f6fa5b270a82cd5dd335"
+      },
+      "x64": {
+        "name": "hufu_tsf_x64_42747a9bd16467ba422c.dll",
+        "sha256": "9a4474cbbb78ba3b3a2d0912a74cd39537c832c0b5917b40b499a09ca17f702d"
+      }
+    }
+  },
+  "bridge_matches_payload": {
+    "hufu_tsf.dll": "a86eefc8686f29902e63906be922924fb97bb34a569bcf631b4e86fe89c71fce",
+    "hufu_tsf_arm64_42747a9bd16467ba422c.dll": "9d94b09e17ee7db3e8db14c809d1939246db9f5a8be7f6fa5b270a82cd5dd335",
+    "hufu_tsf_x64_42747a9bd16467ba422c.dll": "9a4474cbbb78ba3b3a2d0912a74cd39537c832c0b5917b40b499a09ca17f702d"
+  },
+  "pe_images": {
+    "arm64": [
+      {
+        "file": "TigerClaw.Sentence.Native.dll",
+        "sha256": "374f9847c5bf0a79f79fa274b699a37c273cc3aad75dfc0e04dc3553396f43bd",
+        "machine": "0xaa64",
+        "imports": [
+          "KERNEL32.dll",
+          "ADVAPI32.dll"
+        ],
+        "delay_imports": [],
+        "resource_types": [
+          24
+        ]
+      },
+      {
+        "file": "WebView2Loader.dll",
+        "sha256": "d3fce90bdeecb08596e377dea6a316354dd8949e32ff09b89d51be00c14e21b6",
+        "machine": "0x8664",
+        "imports": [
+          "KERNEL32.dll"
+        ],
+        "delay_imports": [
+          "ole32.dll",
+          "ADVAPI32.dll"
+        ],
+        "resource_types": [
+          16
+        ]
+      },
+      {
+        "file": "hufu-render-helper.exe",
+        "sha256": "45fc1f1f15a92af5c421f498c8bbaaaffe027c2a73d24c1171766f80f1943149",
+        "machine": "0xaa64",
+        "imports": [
+          "KERNEL32.dll",
+          "ntdll.dll",
+          "api-ms-win-core-synch-l1-2-0.dll"
+        ],
+        "delay_imports": [],
+        "resource_types": []
+      },
+      {
+        "file": "hufu-server.exe",
+        "sha256": "387acb45b831a5acbf8a61d87640f4be60268af1aec75f06f16ec4af9c5b7891",
+        "machine": "0xaa64",
+        "imports": [
+          "USER32.dll",
+          "GDI32.dll",
+          "KERNEL32.dll",
+          "ADVAPI32.dll",
+          "SHELL32.dll",
+          "ole32.dll",
+          "bcryptprimitives.dll",
+          "crypt32.dll",
+          "bcrypt.dll",
+          "ntdll.dll",
+          "secur32.dll",
+          "api-ms-win-core-synch-l1-2-0.dll",
+          "ws2_32.dll",
+          "api-ms-win-shcore-scaling-l1-1-1.dll"
+        ],
+        "delay_imports": [],
+        "resource_types": [
+          3,
+          14
+        ]
+      },
+      {
+        "file": "hufu-settings.exe",
+        "sha256": "a608b3d19d66bdf37de73ad098ef5919a2cca3cda94628037f4b0b255014dd56",
+        "machine": "0x8664",
+        "imports": [
+          "GDI32.dll",
+          "KERNEL32.dll",
+          "msvcrt.dll",
+          "ntdll.dll",
+          "ole32.dll",
+          "api-ms-win-core-synch-l1-2-0.dll",
+          "USER32.dll",
+          "WS2_32.dll"
+        ],
+        "delay_imports": [],
+        "resource_types": [
+          3,
+          14
+        ]
+      },
+      {
+        "file": "hufu-setup-engine.exe",
+        "sha256": "46a302d488b7fd030b7c2337e39fa8c01334d0fbc38640037a3eeda8e4a519c7",
+        "machine": "0xaa64",
+        "imports": [
+          "KERNEL32.dll",
+          "bcryptprimitives.dll",
+          "advapi32.dll",
+          "ole32.dll",
+          "oleaut32.dll",
+          "shell32.dll",
+          "api-ms-win-core-synch-l1-2-0.dll",
+          "ntdll.dll"
+        ],
+        "delay_imports": [],
+        "resource_types": []
+      },
+      {
+        "file": "hufu-trainer.exe",
+        "sha256": "9b55d295154bb225d88a7c7441cc3c2268a2c49d8d8069fd2aa18789ce374ee9",
+        "machine": "0x8664",
+        "imports": [
+          "api-ms-win-core-synch-l1-2-0.dll",
+          "api-ms-win-shcore-scaling-l1-1-1.dll",
+          "comdlg32.dll",
+          "crypt32.dll",
+          "d2d1.dll",
+          "d3d11.dll",
+          "dcomp.dll",
+          "dwmapi.dll",
+          "dwrite.dll",
+          "dxgi.dll",
+          "gdi32.dll",
+          "imm32.dll",
+          "kernel32.dll",
+          "ntdll.dll",
+          "ole32.dll",
+          "oleaut32.dll",
+          "propsys.dll",
+          "shell32.dll",
+          "user32.dll",
+          "uxtheme.dll",
+          "winhttp.dll",
+          "ws2_32.dll",
+          "KERNEL32.dll",
+          "msvcrt.dll",
+          "bcryptprimitives.dll"
+        ],
+        "delay_imports": [],
+        "resource_types": [
+          3,
+          14
+        ]
+      },
+      {
+        "file": "hufu-tsf-smoke-x64.exe",
+        "sha256": "3384ee0b52e042b0a72eb2aacb6a8b97ade5de85729a53cf19c52ab1e95cea49",
+        "machine": "0x8664",
+        "imports": [
+          "api-ms-win-core-synch-l1-2-0.dll",
+          "kernel32.dll",
+          "ntdll.dll",
+          "ole32.dll",
+          "oleaut32.dll",
+          "ws2_32.dll",
+          "KERNEL32.dll",
+          "msvcrt.dll"
+        ],
+        "delay_imports": [],
+        "resource_types": []
+      },
+      {
+        "file": "hufu-tsf-smoke.exe",
+        "sha256": "08b28f638caaf862b38a00e841706e08300c431d30f53ce608aebff56b9db59d",
+        "machine": "0xaa64",
+        "imports": [
+          "kernel32.dll",
+          "ws2_32.dll",
+          "ole32.dll",
+          "oleaut32.dll",
+          "api-ms-win-core-synch-l1-2-0.dll",
+          "ntdll.dll"
+        ],
+        "delay_imports": [],
+        "resource_types": []
+      },
+      {
+        "file": "hufu-tsf-smoke32.exe",
+        "sha256": "546e3b6d3ca3b3933e5557a48ea4ed94c7273f9cfc171e16d2a570f9b6073a24",
+        "machine": "0x14c",
+        "imports": [
+          "api-ms-win-core-synch-l1-2-0.dll",
+          "kernel32.dll",
+          "ntdll.dll",
+          "ole32.dll",
+          "oleaut32.dll",
+          "ws2_32.dll",
+          "msvcrt.dll"
+        ],
+        "delay_imports": [],
+        "resource_types": []
+      },
+      {
+        "file": "hufu_tsf.dll",
+        "sha256": "a86eefc8686f29902e63906be922924fb97bb34a569bcf631b4e86fe89c71fce",
+        "machine": "0xaa64",
+        "imports": [],
+        "delay_imports": [],
+        "resource_types": [
+          3,
+          14
+        ]
+      },
+      {
+        "file": "hufu_tsf32.dll",
+        "sha256": "a3ad6bc034513cd9b808377d507151a36b32b382abd3be60e5180390b7078ac7",
+        "machine": "0x14c",
+        "imports": [
+          "api-ms-win-core-synch-l1-2-0.dll",
+          "d2d1.dll",
+          "d3d11.dll",
+          "dcomp.dll",
+          "dwrite.dll",
+          "dxgi.dll",
+          "gdi32.dll",
+          "imm32.dll",
+          "ntdll.dll",
+          "ole32.dll",
+          "oleacc.dll",
+          "oleaut32.dll",
+          "ws2_32.dll",
+          "ADVAPI32.dll",
+          "KERNEL32.dll",
+          "msvcrt.dll",
+          "USER32.dll",
+          "WINMM.DLL",
+          "bcryptprimitives.dll"
+        ],
+        "delay_imports": [],
+        "resource_types": [
+          3,
+          14
+        ]
+      },
+      {
+        "file": "hufu_tsf_arm64_42747a9bd16467ba422c.dll",
+        "sha256": "9d94b09e17ee7db3e8db14c809d1939246db9f5a8be7f6fa5b270a82cd5dd335",
+        "machine": "0xaa64",
+        "imports": [
+          "ADVAPI32.dll",
+          "KERNEL32.dll",
+          "USER32.dll",
+          "WINMM.dll",
+          "bcryptprimitives.dll",
+          "api-ms-win-core-synch-l1-2-0.dll",
+          "oleaut32.dll",
+          "oleacc.dll",
+          "imm32.dll",
+          "dcomp.dll",
+          "gdi32.dll",
+          "d3d11.dll",
+          "d2d1.dll",
+          "dxgi.dll",
+          "dwrite.dll",
+          "ole32.dll",
+          "ws2_32.dll",
+          "ntdll.dll"
+        ],
+        "delay_imports": [],
+        "resource_types": [
+          3,
+          14
+        ]
+      },
+      {
+        "file": "hufu_tsf_x64_42747a9bd16467ba422c.dll",
+        "sha256": "9a4474cbbb78ba3b3a2d0912a74cd39537c832c0b5917b40b499a09ca17f702d",
+        "machine": "0x8664",
+        "imports": [
+          "api-ms-win-core-synch-l1-2-0.dll",
+          "d2d1.dll",
+          "d3d11.dll",
+          "dcomp.dll",
+          "dwrite.dll",
+          "dxgi.dll",
+          "gdi32.dll",
+          "imm32.dll",
+          "ntdll.dll",
+          "ole32.dll",
+          "oleacc.dll",
+          "oleaut32.dll",
+          "ws2_32.dll",
+          "ADVAPI32.dll",
+          "KERNEL32.dll",
+          "msvcrt.dll",
+          "USER32.dll",
+          "WINMM.dll",
+          "bcryptprimitives.dll"
+        ],
+        "delay_imports": [],
+        "resource_types": [
+          3,
+          14
+        ]
+      }
+    ],
+    "x64": [
+      {
+        "file": "TigerClaw.Sentence.Native.dll",
+        "sha256": "fd5cfbba681d0d5c55d82a5f5efee9bdeccd73c96558f4cb5fe8c2302301bc7e",
+        "machine": "0x8664",
+        "imports": [
+          "KERNEL32.dll",
+          "ADVAPI32.dll"
+        ],
+        "delay_imports": [],
+        "resource_types": [
+          24
+        ]
+      },
+      {
+        "file": "WebView2Loader.dll",
+        "sha256": "d3fce90bdeecb08596e377dea6a316354dd8949e32ff09b89d51be00c14e21b6",
+        "machine": "0x8664",
+        "imports": [
+          "KERNEL32.dll"
+        ],
+        "delay_imports": [
+          "ole32.dll",
+          "ADVAPI32.dll"
+        ],
+        "resource_types": [
+          16
+        ]
+      },
+      {
+        "file": "hufu-render-helper.exe",
+        "sha256": "9c853ddfea5d7d0944943c87445775c4597c49e490844c55af64fb25b6e41d9d",
+        "machine": "0x8664",
+        "imports": [
+          "KERNEL32.dll",
+          "msvcrt.dll",
+          "ntdll.dll",
+          "api-ms-win-core-synch-l1-2-0.dll"
+        ],
+        "delay_imports": [],
+        "resource_types": []
+      },
+      {
+        "file": "hufu-server.exe",
+        "sha256": "1a836c3c86b21ac6f652b9b3e0e9df80ed79b308cdb76a6306e9e4f99d2e669d",
+        "machine": "0x8664",
+        "imports": [
+          "api-ms-win-core-synch-l1-2-0.dll",
+          "api-ms-win-shcore-scaling-l1-1-1.dll",
+          "ntdll.dll",
+          "ws2_32.dll",
+          "ADVAPI32.dll",
+          "GDI32.dll",
+          "KERNEL32.dll",
+          "msvcrt.dll",
+          "ntdll.dll",
+          "ole32.dll",
+          "SHELL32.dll",
+          "USER32.dll",
+          "ntdll.dll",
+          "secur32.dll",
+          "bcrypt.dll",
+          "crypt32.dll",
+          "bcryptprimitives.dll"
+        ],
+        "delay_imports": [],
+        "resource_types": [
+          3,
+          14
+        ]
+      },
+      {
+        "file": "hufu-settings.exe",
+        "sha256": "a608b3d19d66bdf37de73ad098ef5919a2cca3cda94628037f4b0b255014dd56",
+        "machine": "0x8664",
+        "imports": [
+          "GDI32.dll",
+          "KERNEL32.dll",
+          "msvcrt.dll",
+          "ntdll.dll",
+          "ole32.dll",
+          "api-ms-win-core-synch-l1-2-0.dll",
+          "USER32.dll",
+          "WS2_32.dll"
+        ],
+        "delay_imports": [],
+        "resource_types": [
+          3,
+          14
+        ]
+      },
+      {
+        "file": "hufu-setup-engine.exe",
+        "sha256": "dbe4e102d918ed39e2ebf5a96b90656dd63a0cf2fb4a19787642070d3db5d4cb",
+        "machine": "0x8664",
+        "imports": [
+          "advapi32.dll",
+          "api-ms-win-core-synch-l1-2-0.dll",
+          "ntdll.dll",
+          "ole32.dll",
+          "oleaut32.dll",
+          "shell32.dll",
+          "KERNEL32.dll",
+          "msvcrt.dll",
+          "bcryptprimitives.dll"
+        ],
+        "delay_imports": [],
+        "resource_types": []
+      },
+      {
+        "file": "hufu-trainer.exe",
+        "sha256": "9b55d295154bb225d88a7c7441cc3c2268a2c49d8d8069fd2aa18789ce374ee9",
+        "machine": "0x8664",
+        "imports": [
+          "api-ms-win-core-synch-l1-2-0.dll",
+          "api-ms-win-shcore-scaling-l1-1-1.dll",
+          "comdlg32.dll",
+          "crypt32.dll",
+          "d2d1.dll",
+          "d3d11.dll",
+          "dcomp.dll",
+          "dwmapi.dll",
+          "dwrite.dll",
+          "dxgi.dll",
+          "gdi32.dll",
+          "imm32.dll",
+          "kernel32.dll",
+          "ntdll.dll",
+          "ole32.dll",
+          "oleaut32.dll",
+          "propsys.dll",
+          "shell32.dll",
+          "user32.dll",
+          "uxtheme.dll",
+          "winhttp.dll",
+          "ws2_32.dll",
+          "KERNEL32.dll",
+          "msvcrt.dll",
+          "bcryptprimitives.dll"
+        ],
+        "delay_imports": [],
+        "resource_types": [
+          3,
+          14
+        ]
+      },
+      {
+        "file": "hufu-tsf-smoke.exe",
+        "sha256": "3384ee0b52e042b0a72eb2aacb6a8b97ade5de85729a53cf19c52ab1e95cea49",
+        "machine": "0x8664",
+        "imports": [
+          "api-ms-win-core-synch-l1-2-0.dll",
+          "kernel32.dll",
+          "ntdll.dll",
+          "ole32.dll",
+          "oleaut32.dll",
+          "ws2_32.dll",
+          "KERNEL32.dll",
+          "msvcrt.dll"
+        ],
+        "delay_imports": [],
+        "resource_types": []
+      },
+      {
+        "file": "hufu-tsf-smoke32.exe",
+        "sha256": "546e3b6d3ca3b3933e5557a48ea4ed94c7273f9cfc171e16d2a570f9b6073a24",
+        "machine": "0x14c",
+        "imports": [
+          "api-ms-win-core-synch-l1-2-0.dll",
+          "kernel32.dll",
+          "ntdll.dll",
+          "ole32.dll",
+          "oleaut32.dll",
+          "ws2_32.dll",
+          "msvcrt.dll"
+        ],
+        "delay_imports": [],
+        "resource_types": []
+      },
+      {
+        "file": "hufu_tsf.dll",
+        "sha256": "9a4474cbbb78ba3b3a2d0912a74cd39537c832c0b5917b40b499a09ca17f702d",
+        "machine": "0x8664",
+        "imports": [
+          "api-ms-win-core-synch-l1-2-0.dll",
+          "d2d1.dll",
+          "d3d11.dll",
+          "dcomp.dll",
+          "dwrite.dll",
+          "dxgi.dll",
+          "gdi32.dll",
+          "imm32.dll",
+          "ntdll.dll",
+          "ole32.dll",
+          "oleacc.dll",
+          "oleaut32.dll",
+          "ws2_32.dll",
+          "ADVAPI32.dll",
+          "KERNEL32.dll",
+          "msvcrt.dll",
+          "USER32.dll",
+          "WINMM.dll",
+          "bcryptprimitives.dll"
+        ],
+        "delay_imports": [],
+        "resource_types": [
+          3,
+          14
+        ]
+      },
+      {
+        "file": "hufu_tsf32.dll",
+        "sha256": "a3ad6bc034513cd9b808377d507151a36b32b382abd3be60e5180390b7078ac7",
+        "machine": "0x14c",
+        "imports": [
+          "api-ms-win-core-synch-l1-2-0.dll",
+          "d2d1.dll",
+          "d3d11.dll",
+          "dcomp.dll",
+          "dwrite.dll",
+          "dxgi.dll",
+          "gdi32.dll",
+          "imm32.dll",
+          "ntdll.dll",
+          "ole32.dll",
+          "oleacc.dll",
+          "oleaut32.dll",
+          "ws2_32.dll",
+          "ADVAPI32.dll",
+          "KERNEL32.dll",
+          "msvcrt.dll",
+          "USER32.dll",
+          "WINMM.DLL",
+          "bcryptprimitives.dll"
+        ],
+        "delay_imports": [],
+        "resource_types": [
+          3,
+          14
+        ]
+      }
+    ]
+  },
+  "icons": {
+    "arm64/hufu-server.exe": {
+      "groups": 1,
+      "images": 5,
+      "matches": "platform/windows/setup/icons/虎符.ico",
+      "image_sha256": [
+        "042e25dbefadb07b36d36d6b83ae9fc6775bbcf02b4c3404c1b3548d62911d9a",
+        "493660c46302ad7c15b60e035555e977ee9fac70195e293f5d91b2276a5fe784",
+        "74c81045e4b4517e8280e0ccc052dac64a8692467e5107fe9cb554013698e089",
+        "b6b4f4b4f29281d121a56755ef00063e3f778980243a9b67733cd388ac6f0a6e",
+        "f6c36a50e8deb34f7308f29b836ee7692df1797b01625f5932619c7f326de907"
+      ],
+      "resource_tree_depths": [
+        3
+      ],
+      "group_data_bytes": [
+        76
+      ],
+      "legacy_gnu_resource": false
+    },
+    "arm64/hufu-settings.exe": {
+      "groups": 1,
+      "images": 5,
+      "matches": "platform/windows/setup/icons/虎符.ico",
+      "image_sha256": [
+        "042e25dbefadb07b36d36d6b83ae9fc6775bbcf02b4c3404c1b3548d62911d9a",
+        "493660c46302ad7c15b60e035555e977ee9fac70195e293f5d91b2276a5fe784",
+        "74c81045e4b4517e8280e0ccc052dac64a8692467e5107fe9cb554013698e089",
+        "b6b4f4b4f29281d121a56755ef00063e3f778980243a9b67733cd388ac6f0a6e",
+        "f6c36a50e8deb34f7308f29b836ee7692df1797b01625f5932619c7f326de907"
+      ],
+      "resource_tree_depths": [
+        3
+      ],
+      "group_data_bytes": [
+        76
+      ],
+      "legacy_gnu_resource": false
+    },
+    "arm64/hufu-trainer.exe": {
+      "groups": 1,
+      "images": 5,
+      "matches": "platform/windows/setup/icons/虎符.ico",
+      "image_sha256": [
+        "042e25dbefadb07b36d36d6b83ae9fc6775bbcf02b4c3404c1b3548d62911d9a",
+        "493660c46302ad7c15b60e035555e977ee9fac70195e293f5d91b2276a5fe784",
+        "74c81045e4b4517e8280e0ccc052dac64a8692467e5107fe9cb554013698e089",
+        "b6b4f4b4f29281d121a56755ef00063e3f778980243a9b67733cd388ac6f0a6e",
+        "f6c36a50e8deb34f7308f29b836ee7692df1797b01625f5932619c7f326de907"
+      ],
+      "resource_tree_depths": [
+        3
+      ],
+      "group_data_bytes": [
+        76
+      ],
+      "legacy_gnu_resource": false
+    },
+    "arm64/hufu_tsf.dll": {
+      "groups": 1,
+      "images": 6,
+      "matches": "platform/windows/hufu-tsf/assets/hufu.ico",
+      "image_sha256": [
+        "1b454b1949999379571904535cc2b5d3821dd22b632f9ef3d94128346fc7cb25",
+        "8a596d9b4f9927c4740a3c1c989a1c178c26d4a7cfba660454279849ebd7d1fc",
+        "e331fa98ae459fa0b46e898d83fb8732070ae704d6d8014e4d7d3ab0ddbc70bb",
+        "e55aff385f9caaaa44eb9a9ef925a549151fe36f2b29114c550a78f7af13c4ad",
+        "ef7ed03849e18d8e8986677294c28c30376ca3faed703130e7789717d9a9eba0",
+        "fd56ce6916fdd2abdeb1028c0556f5b0fabc29dab5a280bc37dda26f08dea357"
+      ],
+      "resource_tree_depths": [
+        3
+      ],
+      "group_data_bytes": [
+        90
+      ],
+      "legacy_gnu_resource": false
+    },
+    "arm64/hufu_tsf32.dll": {
+      "groups": 1,
+      "images": 3,
+      "matches": "platform/windows/hufu-tsf/assets/hufu_rsrc32.o",
+      "image_sha256": [
+        "52125e80a10a7bf2a8aee075d8361b7ae93ec06c0033e7abf50ab25c01a6e875",
+        "dffda841912c8b66ea45986a048f41355bb0320c45d7c92df29f93e82b6b9b1f",
+        "ff84462685d956e31a31cbd859d27052ddf7e1ba497a402c45b301a900e14372"
+      ],
+      "resource_tree_depths": [
+        2
+      ],
+      "group_data_bytes": [
+        44
+      ],
+      "legacy_gnu_resource": true
+    },
+    "arm64/hufu_tsf_arm64_42747a9bd16467ba422c.dll": {
+      "groups": 1,
+      "images": 6,
+      "matches": "platform/windows/hufu-tsf/assets/hufu.ico",
+      "image_sha256": [
+        "1b454b1949999379571904535cc2b5d3821dd22b632f9ef3d94128346fc7cb25",
+        "8a596d9b4f9927c4740a3c1c989a1c178c26d4a7cfba660454279849ebd7d1fc",
+        "e331fa98ae459fa0b46e898d83fb8732070ae704d6d8014e4d7d3ab0ddbc70bb",
+        "e55aff385f9caaaa44eb9a9ef925a549151fe36f2b29114c550a78f7af13c4ad",
+        "ef7ed03849e18d8e8986677294c28c30376ca3faed703130e7789717d9a9eba0",
+        "fd56ce6916fdd2abdeb1028c0556f5b0fabc29dab5a280bc37dda26f08dea357"
+      ],
+      "resource_tree_depths": [
+        3
+      ],
+      "group_data_bytes": [
+        90
+      ],
+      "legacy_gnu_resource": false
+    },
+    "arm64/hufu_tsf_x64_42747a9bd16467ba422c.dll": {
+      "groups": 1,
+      "images": 3,
+      "matches": "platform/windows/hufu-tsf/assets/hufu_rsrc.o",
+      "image_sha256": [
+        "52125e80a10a7bf2a8aee075d8361b7ae93ec06c0033e7abf50ab25c01a6e875",
+        "dffda841912c8b66ea45986a048f41355bb0320c45d7c92df29f93e82b6b9b1f",
+        "ff84462685d956e31a31cbd859d27052ddf7e1ba497a402c45b301a900e14372"
+      ],
+      "resource_tree_depths": [
+        2
+      ],
+      "group_data_bytes": [
+        44
+      ],
+      "legacy_gnu_resource": true
+    },
+    "x64/hufu-server.exe": {
+      "groups": 1,
+      "images": 5,
+      "matches": "platform/windows/setup/icons/虎符.ico",
+      "image_sha256": [
+        "042e25dbefadb07b36d36d6b83ae9fc6775bbcf02b4c3404c1b3548d62911d9a",
+        "493660c46302ad7c15b60e035555e977ee9fac70195e293f5d91b2276a5fe784",
+        "74c81045e4b4517e8280e0ccc052dac64a8692467e5107fe9cb554013698e089",
+        "b6b4f4b4f29281d121a56755ef00063e3f778980243a9b67733cd388ac6f0a6e",
+        "f6c36a50e8deb34f7308f29b836ee7692df1797b01625f5932619c7f326de907"
+      ],
+      "resource_tree_depths": [
+        3
+      ],
+      "group_data_bytes": [
+        76
+      ],
+      "legacy_gnu_resource": false
+    },
+    "x64/hufu-settings.exe": {
+      "groups": 1,
+      "images": 5,
+      "matches": "platform/windows/setup/icons/虎符.ico",
+      "image_sha256": [
+        "042e25dbefadb07b36d36d6b83ae9fc6775bbcf02b4c3404c1b3548d62911d9a",
+        "493660c46302ad7c15b60e035555e977ee9fac70195e293f5d91b2276a5fe784",
+        "74c81045e4b4517e8280e0ccc052dac64a8692467e5107fe9cb554013698e089",
+        "b6b4f4b4f29281d121a56755ef00063e3f778980243a9b67733cd388ac6f0a6e",
+        "f6c36a50e8deb34f7308f29b836ee7692df1797b01625f5932619c7f326de907"
+      ],
+      "resource_tree_depths": [
+        3
+      ],
+      "group_data_bytes": [
+        76
+      ],
+      "legacy_gnu_resource": false
+    },
+    "x64/hufu-trainer.exe": {
+      "groups": 1,
+      "images": 5,
+      "matches": "platform/windows/setup/icons/虎符.ico",
+      "image_sha256": [
+        "042e25dbefadb07b36d36d6b83ae9fc6775bbcf02b4c3404c1b3548d62911d9a",
+        "493660c46302ad7c15b60e035555e977ee9fac70195e293f5d91b2276a5fe784",
+        "74c81045e4b4517e8280e0ccc052dac64a8692467e5107fe9cb554013698e089",
+        "b6b4f4b4f29281d121a56755ef00063e3f778980243a9b67733cd388ac6f0a6e",
+        "f6c36a50e8deb34f7308f29b836ee7692df1797b01625f5932619c7f326de907"
+      ],
+      "resource_tree_depths": [
+        3
+      ],
+      "group_data_bytes": [
+        76
+      ],
+      "legacy_gnu_resource": false
+    },
+    "x64/hufu_tsf.dll": {
+      "groups": 1,
+      "images": 3,
+      "matches": "platform/windows/hufu-tsf/assets/hufu_rsrc.o",
+      "image_sha256": [
+        "52125e80a10a7bf2a8aee075d8361b7ae93ec06c0033e7abf50ab25c01a6e875",
+        "dffda841912c8b66ea45986a048f41355bb0320c45d7c92df29f93e82b6b9b1f",
+        "ff84462685d956e31a31cbd859d27052ddf7e1ba497a402c45b301a900e14372"
+      ],
+      "resource_tree_depths": [
+        2
+      ],
+      "group_data_bytes": [
+        44
+      ],
+      "legacy_gnu_resource": true
+    },
+    "x64/hufu_tsf32.dll": {
+      "groups": 1,
+      "images": 3,
+      "matches": "platform/windows/hufu-tsf/assets/hufu_rsrc32.o",
+      "image_sha256": [
+        "52125e80a10a7bf2a8aee075d8361b7ae93ec06c0033e7abf50ab25c01a6e875",
+        "dffda841912c8b66ea45986a048f41355bb0320c45d7c92df29f93e82b6b9b1f",
+        "ff84462685d956e31a31cbd859d27052ddf7e1ba497a402c45b301a900e14372"
+      ],
+      "resource_tree_depths": [
+        2
+      ],
+      "group_data_bytes": [
+        44
+      ],
+      "legacy_gnu_resource": true
+    }
+  },
+  "embedded_ui": {
+    "arm64": {
+      "assets/index-BBCUUKHT.css": "3981295ecc1c4c4ed5c0a68b4f167e91dacc27e238d76ac9f12e4ce8eac5b797",
+      "assets/index-x9HWseto.js": "c816314367ecaed9c164b763ace4c6dff73455b96871cfb4d3801557c0877161",
+      "hufu-icon-q-256.png": "bfc9c0db7f4e9e417de087073bcfc390fe4dfcb215a3bfcc620c771d74f5c955",
+      "index.html": "f0bdd1f9685b62273268097b83496d12bdee75898160ab78388a707ee221e34c"
+    },
+    "x64": {
+      "assets/index-BBCUUKHT.css": "3981295ecc1c4c4ed5c0a68b4f167e91dacc27e238d76ac9f12e4ce8eac5b797",
+      "assets/index-x9HWseto.js": "c816314367ecaed9c164b763ace4c6dff73455b96871cfb4d3801557c0877161",
+      "hufu-icon-q-256.png": "bfc9c0db7f4e9e417de087073bcfc390fe4dfcb215a3bfcc620c771d74f5c955",
+      "index.html": "f0bdd1f9685b62273268097b83496d12bdee75898160ab78388a707ee221e34c"
+    }
+  },
+  "scope": "Static ordinary/delay imports, icon group references and exact image bytes, exact UI bytes; WebView2 runtime remains an external system prerequisite."
+}

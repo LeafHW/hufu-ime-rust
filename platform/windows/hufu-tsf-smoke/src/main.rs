@@ -4,6 +4,8 @@
 //!            → 我们的 Activate 落标记文件 → TestKeyDown 全链路
 //! [引擎链] hufu_test_key 直驱（VK → 管道 → hufu-server 引擎 → consumed）
 
+mod probe;
+
 use windows::Win32::Foundation::{BOOL, HMODULE, LPARAM, WPARAM};
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, IClassFactory};
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
@@ -23,6 +25,28 @@ type TestKeyFn = unsafe extern "system" fn(u32) -> i32;
 fn main() {
     std::env::set_var("HUFU_TSF_SMOKE", "1"); // 【二十四修】前台门冒烟豁免
     let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(|s| s.as_str()) == Some("probe-dll") {
+        let result = args.get(2).ok_or_else(|| "usage: probe-dll <absolute-dll-path>".to_string()).and_then(|dll| probe::run(dll));
+        if let Err(error) = result { eprintln!("probe_status=failed\nerror={error}"); std::process::exit(2); }
+        return;
+    }
+    if args.get(1).map(|s| s.as_str()) == Some("inspect-profile") {
+        unsafe {
+            let _ = OleInitialize(None);
+            let mgr: ITfInputProcessorProfileMgr = CoCreateInstance(&CLSID_TF_InputProcessorProfiles, None, CLSCTX_INPROC_SERVER).expect("msctf profiles 不可用");
+            let mut profile = TF_INPUTPROCESSORPROFILE::default();
+            if let Err(error) = mgr.GetProfile(TF_PROFILETYPE_INPUTPROCESSOR, 0x0804, &CLSID_HUFU, &PROFILE_GUID, HKL(std::ptr::null_mut()), &mut profile) {
+                eprintln!("profile_registered=0\noperation=GetProfile\nhresult=0x{:08X}\nerror={error}", error.code().0 as u32);
+                std::process::exit(2);
+            }
+            let profiles: ITfInputProcessorProfiles = CoCreateInstance(&CLSID_TF_InputProcessorProfiles, None, CLSCTX_INPROC_SERVER).expect("msctf profiles 不可用");
+            match profiles.IsEnabledLanguageProfile(&CLSID_HUFU, 0x0804, &PROFILE_GUID) {
+                Ok(enabled) => println!("profile_registered=1\nprofile_enabled={}", i32::from(enabled.as_bool())),
+                Err(error) => { eprintln!("profile_registered=1\noperation=IsEnabledLanguageProfile\nhresult=0x{:08X}\nerror={error}", error.code().0 as u32); std::process::exit(2); }
+            }
+        }
+        return;
+    }
     // 提权注销模式：hufu-tsf-smoke.exe unreg —— 卸载器专用，
     // 从 msctf 原生库移除语言档案（注册表项由卸载脚本删）。
     if args.get(1).map(|s| s.as_str()) == Some("unreg") {
@@ -33,7 +57,7 @@ fn main() {
                     .expect("msctf profiles 不可用");
             match mgr.UnregisterProfile(&CLSID_HUFU, 0x0804, &PROFILE_GUID, 0) {
                 Ok(()) => println!("✓ msctf 档案已注销"),
-                Err(e) => println!("注销返回：{e:?}（未登记也算成功）"),
+                Err(e) => { eprintln!("注销失败：{e:?}"); std::process::exit(2); },
             }
         }
         return;
@@ -44,18 +68,25 @@ fn main() {
     // 只启用自己的 profile，物理上碰不到其他输入法的任何条目
     //（2026-10-09 结构根治：替代安装器里的 Set-WinUserLanguageList
     // 整表重写——该重写曾反复把别人机器上的其他输入法固化删除）。
-    if args.get(1).map(|s| s.as_str()) == Some("enable") {
+    if matches!(args.get(1).map(|s| s.as_str()), Some("enable" | "disable")) {
+        let enable = args[1] == "enable";
         unsafe {
             let _ = OleInitialize(None);
             let profiles: ITfInputProcessorProfiles =
                 CoCreateInstance(&CLSID_TF_InputProcessorProfiles, None, CLSCTX_INPROC_SERVER)
                     .expect("msctf profiles 不可用");
-            match profiles.EnableLanguageProfile(&CLSID_HUFU, 0x0804, &PROFILE_GUID, BOOL(1)) {
-                Ok(()) => println!("OK 虎符已加入语言列表（EnableLanguageProfile）"),
+            match profiles.EnableLanguageProfile(&CLSID_HUFU, 0x0804, &PROFILE_GUID, BOOL(i32::from(enable))) {
+                Ok(()) => println!("OK EnableLanguageProfile={enable}"),
                 Err(e) => {
                     println!("EnableLanguageProfile 失败：{e:?}");
                     std::process::exit(2);
                 }
+            }
+            drop(profiles);
+            let fresh: ITfInputProcessorProfiles = CoCreateInstance(&CLSID_TF_InputProcessorProfiles, None, CLSCTX_INPROC_SERVER).expect("msctf profiles 不可用");
+            match fresh.IsEnabledLanguageProfile(&CLSID_HUFU, 0x0804, &PROFILE_GUID) {
+                Ok(actual) if actual.as_bool() == enable => println!("profile_enabled={}", i32::from(enable)),
+                result => { eprintln!("启用状态读回不一致：{result:?}"); std::process::exit(2); }
             }
         }
         return;
@@ -95,6 +126,7 @@ fn main() {
                 0,
             ));
             println!("RegisterProfile(带图标 {icon_path}) → 0x{hr:08X}");
+            if hr != 0 { std::process::exit(2); }
             // 全局分类注册（caps 来源；切换器/系统枚举依赖）：
             // TFCAT_TIP_KEYBOARD + 键盘汇编分类 {34745C63}
             let cat: windows::core::Result<ITfCategoryMgr> =
@@ -109,24 +141,11 @@ fn main() {
                         code(cat.RegisterCategory(&CLSID_HUFU, &TFCAT_TIP_KEYBOARD, &CLSID_HUFU));
                     let c2 = code(cat.RegisterCategory(&CLSID_HUFU, &TFCAT_ASM_KBD, &CLSID_HUFU));
                     println!("RegisterCategory(kbd) → 0x{c1:08X} (asm) → 0x{c2:08X}");
+                    if c1 != 0 || c2 != 0 { std::process::exit(2); }
                 }
-                Err(e) => println!("CategoryMgr 不可用：{e:?}"),
+                Err(e) => { eprintln!("CategoryMgr 不可用：{e:?}"); std::process::exit(2); },
             }
-            const TF_PROFILETYPE_INPUTPROCESSOR: u32 = 1;
-            match mgr.ActivateProfile(
-                TF_PROFILETYPE_INPUTPROCESSOR,
-                0x0804,
-                &CLSID_HUFU,
-                &PROFILE_GUID,
-                HKL(std::ptr::null_mut()),
-                0,
-            ) {
-                Ok(()) => println!("✓ 激活成功，安装注册完成"),
-                Err(e) => {
-                    println!("✗ ActivateProfile 失败：{e:?}");
-                    std::process::exit(1);
-                }
-            }
+            println!("共享档案登记完成；当前用户启用由未提权 enable 独立执行");
         }
         return;
     }

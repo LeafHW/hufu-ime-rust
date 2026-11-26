@@ -1,0 +1,2 @@
+﻿probe_status=failed
+error=LoadLibraryEx: %1 不是有效的 Win32 应用程序。 (0x800700C1)

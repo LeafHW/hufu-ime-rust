@@ -1,0 +1,57 @@
+{
+  "schema": 1,
+  "tigerclaw_repository": "https://github.com/lvyww/tigerclaw",
+  "tigerclaw_commit": "d3a723c0f6727407696bb5281924dc6dd2855815",
+  "license": "GPL-3.0-only",
+  "historical_shared_commit": "f38e813c7f7878b7776803a50b8fb4807013896a",
+  "historical_files": [
+    {
+      "path": "upstream/SentenceQwenNative.cpp",
+      "url": "https://raw.githubusercontent.com/lvyww/tigerclaw/f38e813c7f7878b7776803a50b8fb4807013896a/next/TigerClaw.Sentence.Native/SentenceQwenNative.cpp",
+      "sha256": "722ef147738ebb24b922fe974425cb1ca2c95db9a80c12829eea43b0bac7b8ac"
+    },
+    {
+      "path": "upstream/SentenceQwenNative.h",
+      "url": "https://raw.githubusercontent.com/lvyww/tigerclaw/f38e813c7f7878b7776803a50b8fb4807013896a/next/TigerClaw.Sentence.Native/SentenceQwenNative.h",
+      "sha256": "71d4eef9582c672bd0bb50d1d245e74ed68b51832555ae913090fd932e5ad315"
+    },
+    {
+      "path": "upstream/CMakeLists.txt",
+      "url": "https://raw.githubusercontent.com/lvyww/tigerclaw/f38e813c7f7878b7776803a50b8fb4807013896a/next/TigerClaw.Sentence.Native/CMakeLists.txt",
+      "sha256": "531faa911a54e5ed77db2b4b0a07329abd9f0c7a1da7162d891ea179baadf27b"
+    }
+  ],
+  "llama_commit": "9b05354ec6fb58b4e665e9a39ebc40285c015638",
+  "files": [
+    {
+      "path": "upstream/SentenceQwenNative.cpp",
+      "source_path": "next/TigerClaw.Sentence.Native/SentenceQwenNative.cpp",
+      "sha256": "623d0461a58bcc814a1c123e4f1301b641ac4daf24e03abcb2be522598f64769"
+    },
+    {
+      "path": "upstream/SentenceQwenNative.h",
+      "source_path": "next/TigerClaw.Sentence.Native/SentenceQwenNative.h",
+      "sha256": "a7ad9dcaff52e36cab89f3c8f85aebbd5d4dd5c051909929a6f9cd792289587f"
+    },
+    {
+      "path": "upstream/CMakeLists.txt",
+      "source_path": "next/TigerClaw.Sentence.Native/CMakeLists.txt",
+      "sha256": "59768a4118c5393acdafb387e962d30e6dcc7503c9c3d3adf42761c8046c08e5"
+    },
+    {
+      "path": "licenses/TigerClaw-LICENSE",
+      "source_path": "LICENSE",
+      "sha256": "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986"
+    },
+    {
+      "path": "licenses/TigerClaw-README.md",
+      "source_path": "README.md",
+      "sha256": "4a8e8d1067706f06d2c480291244a4b802fe42e0a8292cf01128a31722526e68"
+    }
+  ],
+  "llama_archive": {
+    "url": "https://codeload.github.com/ggml-org/llama.cpp/tar.gz/9b05354ec6fb58b4e665e9a39ebc40285c015638",
+    "sha256": "3757add5ecea48727edf81b56d3e233eb82332d30ac475f23aa3efec4c647d1c"
+  },
+  "llama_license_sha256": "94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d"
+}

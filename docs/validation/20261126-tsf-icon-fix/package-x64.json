@@ -1,0 +1,151 @@
+{
+  "schema": 1,
+  "system_architecture": "x64",
+  "version": "1.9.9.13",
+  "files": [
+    {
+      "path": "hufu-render-helper.exe",
+      "machine": "x64",
+      "sha256": "9c853ddfea5d7d0944943c87445775c4597c49e490844c55af64fb25b6e41d9d",
+      "role": "render-helper"
+    },
+    {
+      "path": "hufu-server.exe",
+      "machine": "x64",
+      "sha256": "1a836c3c86b21ac6f652b9b3e0e9df80ed79b308cdb76a6306e9e4f99d2e669d",
+      "role": "program"
+    },
+    {
+      "path": "hufu-settings.exe",
+      "machine": "x64",
+      "sha256": "a608b3d19d66bdf37de73ad098ef5919a2cca3cda94628037f4b0b255014dd56",
+      "role": "program"
+    },
+    {
+      "path": "hufu-setup-engine.exe",
+      "machine": "x64",
+      "sha256": "9931e7eb31b57f315529c1ffc5659ef8f63af4c3407567a6b22f81b7d86503cf",
+      "role": "program"
+    },
+    {
+      "path": "hufu-trainer.exe",
+      "machine": "x64",
+      "sha256": "9b55d295154bb225d88a7c7441cc3c2268a2c49d8d8069fd2aa18789ce374ee9",
+      "role": "program"
+    },
+    {
+      "path": "hufu-tsf-smoke.exe",
+      "machine": "x64",
+      "sha256": "e6709dcbfb4d60868ed4bddecbb6f505b452b7e7a95586f6a79ab7f6da5faa82",
+      "role": "registration-native"
+    },
+    {
+      "path": "hufu-tsf-smoke32.exe",
+      "machine": "x86",
+      "sha256": "159cd7c2fc8375ca325320c5b878fbf7a34b66f546155086385f63c775967576",
+      "role": "registration-x86"
+    },
+    {
+      "path": "hufu_tsf.dll",
+      "machine": "x64",
+      "sha256": "8c5f6db27cec933fd9655cf76294da725c82246fd351d7d90d1d912204ac3dab",
+      "role": "tsf-native"
+    },
+    {
+      "path": "hufu_tsf32.dll",
+      "machine": "x86",
+      "sha256": "1ab3da52675b74038bdc7316e85cbde0cef404f7a4b9134752df9eaf20f0349f",
+      "role": "tsf-x86"
+    },
+    {
+      "path": "licenses/hufu-LICENSE.txt",
+      "machine": "data",
+      "sha256": "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986",
+      "role": "program"
+    },
+    {
+      "path": "licenses/llama.cpp-LICENSE.txt",
+      "machine": "data",
+      "sha256": "94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d",
+      "role": "program"
+    },
+    {
+      "path": "licenses/native-sentence/llama.cpp-LICENSE",
+      "machine": "data",
+      "sha256": "94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d",
+      "role": "program"
+    },
+    {
+      "path": "licenses/native-sentence/TigerClaw-LICENSE",
+      "machine": "data",
+      "sha256": "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986",
+      "role": "program"
+    },
+    {
+      "path": "licenses/native-sentence/TigerClaw-README.md",
+      "machine": "data",
+      "sha256": "4a8e8d1067706f06d2c480291244a4b802fe42e0a8292cf01128a31722526e68",
+      "role": "program"
+    },
+    {
+      "path": "licenses/Qwen3-LICENSE.txt",
+      "machine": "data",
+      "sha256": "832dd9e00a68dd83b3c3fb9f5588dad7dcf337a0db50f7d9483f310cd292e92e",
+      "role": "program"
+    },
+    {
+      "path": "licenses/trainer/NOTICE.md",
+      "machine": "data",
+      "sha256": "5d695c36dcc2fdd6bc40fcc1b5bcee74dff755d603d5959edd2610390e8777e8",
+      "role": "program"
+    },
+    {
+      "path": "licenses/trainer/zhouzhou-LICENSE.txt",
+      "machine": "data",
+      "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+      "role": "program"
+    },
+    {
+      "path": "licenses/trainer/zhouzhou-NOTICE.txt",
+      "machine": "data",
+      "sha256": "279f6af536e3c54fac2f164e554c79e1a560456156c33870e7739ee11a0f7d01",
+      "role": "program"
+    },
+    {
+      "path": "TigerClaw.Sentence.Native.dll",
+      "machine": "x64",
+      "sha256": "fd5cfbba681d0d5c55d82a5f5efee9bdeccd73c96558f4cb5fe8c2302301bc7e",
+      "role": "program"
+    },
+    {
+      "path": "version.txt",
+      "machine": "data",
+      "sha256": "4a04cd8e6e4ef890b01d746d753f42b7f0c4c450bc6e9fea39ddb9e1da878a61",
+      "role": "program"
+    },
+    {
+      "path": "WebView2Loader.dll",
+      "machine": "x64",
+      "sha256": "d3fce90bdeecb08596e377dea6a316354dd8949e32ff09b89d51be00c14e21b6",
+      "role": "program"
+    },
+    {
+      "path": "使用说明.txt",
+      "machine": "data",
+      "sha256": "dc10e288ea477eac4e8e6e6d4d4dc80a7ea482e13b0ae0d2cd23e43c2ad5289d",
+      "role": "program"
+    },
+    {
+      "path": "图标.ico",
+      "machine": "data",
+      "sha256": "0244a889f33fd61c03135b2af5f53eb9381a6cdef26e8a5c583028754a4e68fb",
+      "role": "tsf-resource"
+    },
+    {
+      "path": "更新日志.txt",
+      "machine": "data",
+      "sha256": "4455524ab9ded86787a6ec1004731e9dc90a8bfefbdec209387cc71780cbdfa4",
+      "role": "program"
+    }
+  ]
+}

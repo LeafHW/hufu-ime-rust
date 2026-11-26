@@ -1,0 +1,189 @@
+{
+  "schema": 1,
+  "baseline_sha256": "2638031e7a1f922ac1b8379e49cf995bced3b29edf243b7b11d86c6a9a6dcc91",
+  "installed": false,
+  "tests": [
+    {
+      "name": "new-version-discovery",
+      "passed": true,
+      "response": {
+        "current": "1.9.9.9",
+        "download_url": "http://127.0.0.1:56121/ok/hufu-update-test-5f391b7233e44834b7c35d1e73b8c0f6.exe",
+        "has_update": true,
+        "latest": "1.9.9.10",
+        "ok": true,
+        "page_url": "http://127.0.0.1:56121/page",
+        "sha256": "c131128f9bb3bcc09f8cbc01ec6ba8ff28c49ba4fbc2946635b059317d621ef1",
+        "size": 5376,
+        "source": "manifest",
+        "sources": [
+          {
+            "url": "http://127.0.0.1:56121/ok/hufu-update-test-5f391b7233e44834b7c35d1e73b8c0f6.exe"
+          }
+        ]
+      }
+    },
+    {
+      "name": "wrong-sha-rejected",
+      "passed": true,
+      "status": {
+        "active": false,
+        "artifact_ok": true,
+        "attempt": 0,
+        "dest": "C:\\Workspace\\hufu-ime-rust\\_tmp\\arm64\\legacy-update-final-02\\USERPROFILE\\Downloads\\hufu-update-test-5f391b7233e44834b7c35d1e73b8c0f6.exe",
+        "dir": "C:\\Workspace\\hufu-ime-rust\\_tmp\\arm64\\legacy-update-final-02\\USERPROFILE\\Downloads",
+        "downloaded": 5376,
+        "elapsed_ms": 11,
+        "error": "全部 1 个下载源均失败；最后错误：sha256 校验不符，已拒绝保存（期望 0000000000000000000000000000000000000000000000000000000000000000，实际 c131128f9bb3bcc09f8cbc01ec6ba8ff28c49ba4fbc2946635b059317d621ef1）",
+        "file": "hufu-update-test-5f391b7233e44834b7c35d1e73b8c0f6.exe",
+        "latest": "1.9.9.10",
+        "ok": true,
+        "phase": "error",
+        "sha256_expect": "0000000000000000000000000000000000000000000000000000000000000000",
+        "sha256_got": "c131128f9bb3bcc09f8cbc01ec6ba8ff28c49ba4fbc2946635b059317d621ef1",
+        "total": 5376
+      },
+      "requests": [
+        "/update.json",
+        "/ok/hufu-update-test-5f391b7233e44834b7c35d1e73b8c0f6.exe"
+      ],
+      "download_sha256": null
+    },
+    {
+      "name": "first-mirror-fallback",
+      "passed": true,
+      "status": {
+        "active": false,
+        "artifact_ok": true,
+        "attempt": 2,
+        "dest": "C:\\Workspace\\hufu-ime-rust\\_tmp\\arm64\\legacy-update-final-02\\USERPROFILE\\Downloads\\hufu-update-test-5f391b7233e44834b7c35d1e73b8c0f6.exe",
+        "dir": "C:\\Workspace\\hufu-ime-rust\\_tmp\\arm64\\legacy-update-final-02\\USERPROFILE\\Downloads",
+        "downloaded": 5376,
+        "elapsed_ms": 12,
+        "error": "",
+        "file": "hufu-update-test-5f391b7233e44834b7c35d1e73b8c0f6.exe",
+        "latest": "1.9.9.10",
+        "ok": true,
+        "phase": "done",
+        "sha256_expect": "c131128f9bb3bcc09f8cbc01ec6ba8ff28c49ba4fbc2946635b059317d621ef1",
+        "sha256_got": "c131128f9bb3bcc09f8cbc01ec6ba8ff28c49ba4fbc2946635b059317d621ef1",
+        "total": 5376
+      },
+      "requests": [
+        "/update.json",
+        "/fail/hufu-update-test-5f391b7233e44834b7c35d1e73b8c0f6.exe",
+        "/ok/hufu-update-test-5f391b7233e44834b7c35d1e73b8c0f6.exe"
+      ],
+      "download_sha256": "c131128f9bb3bcc09f8cbc01ec6ba8ff28c49ba4fbc2946635b059317d621ef1"
+    },
+    {
+      "name": "exact-64m-accepted",
+      "passed": true,
+      "status": {
+        "active": false,
+        "artifact_ok": true,
+        "attempt": 0,
+        "dest": "C:\\Workspace\\hufu-ime-rust\\_tmp\\arm64\\legacy-update-final-02\\USERPROFILE\\Downloads\\hufu-update-test-5f391b7233e44834b7c35d1e73b8c0f6.exe",
+        "dir": "C:\\Workspace\\hufu-ime-rust\\_tmp\\arm64\\legacy-update-final-02\\USERPROFILE\\Downloads",
+        "downloaded": 67108864,
+        "elapsed_ms": 687,
+        "error": "",
+        "file": "hufu-update-test-5f391b7233e44834b7c35d1e73b8c0f6.exe",
+        "latest": "1.9.9.10",
+        "ok": true,
+        "phase": "done",
+        "sha256_expect": "3b6a07d0d404fab4e23b6d34bc6696a6a312dd92821332385e5af7c01c421351",
+        "sha256_got": "3b6a07d0d404fab4e23b6d34bc6696a6a312dd92821332385e5af7c01c421351",
+        "total": 67108864
+      },
+      "requests": [
+        "/update.json",
+        "/ok/hufu-update-test-5f391b7233e44834b7c35d1e73b8c0f6.exe"
+      ],
+      "download_sha256": "3b6a07d0d404fab4e23b6d34bc6696a6a312dd92821332385e5af7c01c421351"
+    },
+    {
+      "name": "over-64m-rejected",
+      "passed": true,
+      "status": {
+        "active": false,
+        "artifact_ok": true,
+        "attempt": 0,
+        "dest": "C:\\Workspace\\hufu-ime-rust\\_tmp\\arm64\\legacy-update-final-02\\USERPROFILE\\Downloads\\hufu-update-test-5f391b7233e44834b7c35d1e73b8c0f6.exe",
+        "dir": "C:\\Workspace\\hufu-ime-rust\\_tmp\\arm64\\legacy-update-final-02\\USERPROFILE\\Downloads",
+        "downloaded": 67107568,
+        "elapsed_ms": 460,
+        "error": "安装包超上限（64MiB），已中止",
+        "file": "hufu-update-test-5f391b7233e44834b7c35d1e73b8c0f6.exe",
+        "latest": "1.9.9.10",
+        "ok": true,
+        "phase": "error",
+        "sha256_expect": "91990977345985aaf03af1358f4f989d7eaf985b58529efb72f613c588f6599a",
+        "sha256_got": "",
+        "total": 67108865
+      },
+      "requests": [
+        "/update.json",
+        "/ok/hufu-update-test-5f391b7233e44834b7c35d1e73b8c0f6.exe"
+      ],
+      "download_sha256": null
+    },
+    {
+      "name": "final-universal-exe-download",
+      "passed": true,
+      "status": {
+        "active": false,
+        "artifact_ok": true,
+        "attempt": 2,
+        "dest": "C:\\Workspace\\hufu-ime-rust\\_tmp\\arm64\\legacy-update-final-02\\USERPROFILE\\Downloads\\hufu-update-test-5f391b7233e44834b7c35d1e73b8c0f6.exe",
+        "dir": "C:\\Workspace\\hufu-ime-rust\\_tmp\\arm64\\legacy-update-final-02\\USERPROFILE\\Downloads",
+        "downloaded": 39502283,
+        "elapsed_ms": 394,
+        "error": "",
+        "file": "hufu-update-test-5f391b7233e44834b7c35d1e73b8c0f6.exe",
+        "latest": "1.9.9.10",
+        "ok": true,
+        "phase": "done",
+        "sha256_expect": "d46200ef856b2246ec5e3dc1fac7237ae1842ed4b8af678bb4d93046c7657cd1",
+        "sha256_got": "d46200ef856b2246ec5e3dc1fac7237ae1842ed4b8af678bb4d93046c7657cd1",
+        "total": 39502283
+      },
+      "requests": [
+        "/update.json",
+        "/fail/hufu-update-test-5f391b7233e44834b7c35d1e73b8c0f6.exe",
+        "/ok/hufu-update-test-5f391b7233e44834b7c35d1e73b8c0f6.exe"
+      ],
+      "download_sha256": "d46200ef856b2246ec5e3dc1fac7237ae1842ed4b8af678bb4d93046c7657cd1"
+    }
+  ],
+  "preflight_blockers": [],
+  "download_paths": [
+    "C:\\Users\\yc\\Downloads\\hufu-update-test-5f391b7233e44834b7c35d1e73b8c0f6.exe",
+    "C:\\Users\\yc\\Downloads\\.hufu-update-test-5f391b7233e44834b7c35d1e73b8c0f6.exe.part",
+    "C:\\Workspace\\hufu-ime-rust\\_tmp\\arm64\\legacy-update-final-02\\USERPROFILE\\Downloads\\hufu-update-test-5f391b7233e44834b7c35d1e73b8c0f6.exe",
+    "C:\\Workspace\\hufu-ime-rust\\_tmp\\arm64\\legacy-update-final-02\\USERPROFILE\\Downloads\\.hufu-update-test-5f391b7233e44834b7c35d1e73b8c0f6.exe.part"
+  ],
+  "artifact": {
+    "path": "C:\\Workspace\\hufu-ime-rust\\_tmp\\arm64\\delivery\\20261126-arm64-dev\\HuFuSetup-1.9.9.10.exe",
+    "sha256": "d46200ef856b2246ec5e3dc1fac7237ae1842ed4b8af678bb4d93046c7657cd1"
+  },
+  "passed": true,
+  "download_cleanup": true,
+  "postflight_blockers": [],
+  "http_requests": [
+    "/update.json",
+    "/update.json",
+    "/ok/hufu-update-test-5f391b7233e44834b7c35d1e73b8c0f6.exe",
+    "/update.json",
+    "/fail/hufu-update-test-5f391b7233e44834b7c35d1e73b8c0f6.exe",
+    "/ok/hufu-update-test-5f391b7233e44834b7c35d1e73b8c0f6.exe",
+    "/update.json",
+    "/ok/hufu-update-test-5f391b7233e44834b7c35d1e73b8c0f6.exe",
+    "/update.json",
+    "/ok/hufu-update-test-5f391b7233e44834b7c35d1e73b8c0f6.exe",
+    "/update.json",
+    "/fail/hufu-update-test-5f391b7233e44834b7c35d1e73b8c0f6.exe",
+    "/ok/hufu-update-test-5f391b7233e44834b7c35d1e73b8c0f6.exe"
+  ],
+  "server_exitcode": 1
+}

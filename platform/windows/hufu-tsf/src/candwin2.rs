@@ -1449,12 +1449,19 @@ struct AccentPolicy {
 struct WinCompAttrData {
     attribute: u32,
     data: *mut core::ffi::c_void,
-    size_of_data: u32,
+    size_of_data: usize,
 }
 
-#[link(name = "user32")]
-unsafe extern "system" {
-    fn SetWindowCompositionAttribute(hwnd: HWND, data: *mut WinCompAttrData) -> BOOL;
+fn composition_attribute_api() -> Option<unsafe extern "system" fn(HWND, *mut WinCompAttrData) -> BOOL> {
+    // This optional API is exported by user32 but absent from the MSVC SDK's
+    // import library. Resolve once at runtime, as the trainer already does.
+    type SetAttribute = unsafe extern "system" fn(HWND, *mut WinCompAttrData) -> BOOL;
+    static API: std::sync::OnceLock<Option<SetAttribute>> = std::sync::OnceLock::new();
+    *API.get_or_init(|| unsafe {
+        use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+        let module = GetModuleHandleW(windows_core::w!("user32.dll")).ok()?;
+        GetProcAddress(module, windows_core::s!("SetWindowCompositionAttribute")).map(|function| std::mem::transmute(function))
+    })
 }
 
 fn apply_accent(hwnd: HWND, state: u32, tint: [u8; 4]) {
@@ -1472,10 +1479,12 @@ fn apply_accent(hwnd: HWND, state: u32, tint: [u8; 4]) {
     let mut data = WinCompAttrData {
         attribute: WCA_ACCENT_POLICY,
         data: &mut policy as *mut AccentPolicy as *mut core::ffi::c_void,
-        size_of_data: std::mem::size_of::<AccentPolicy>() as u32,
+        size_of_data: std::mem::size_of::<AccentPolicy>(),
     };
     unsafe {
-        let _ = SetWindowCompositionAttribute(hwnd, &mut data);
+        if let Some(set_attribute) = composition_attribute_api() {
+            let _ = set_attribute(hwnd, &mut data);
+        }
     }
 }
 

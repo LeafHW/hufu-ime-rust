@@ -1,0 +1,326 @@
+[
+  {
+    "file": "arm64/hufu-server.exe",
+    "group_resource_found": true,
+    "resource_error": 0,
+    "sizes": [
+      {
+        "size": 16,
+        "icons_extracted": 1,
+        "valid_hicon": true
+      },
+      {
+        "size": 32,
+        "icons_extracted": 1,
+        "valid_hicon": true
+      },
+      {
+        "size": 48,
+        "icons_extracted": 1,
+        "valid_hicon": true
+      },
+      {
+        "size": 256,
+        "icons_extracted": 1,
+        "valid_hicon": true
+      }
+    ]
+  },
+  {
+    "file": "arm64/hufu-settings.exe",
+    "group_resource_found": true,
+    "resource_error": 0,
+    "sizes": [
+      {
+        "size": 16,
+        "icons_extracted": 1,
+        "valid_hicon": true
+      },
+      {
+        "size": 32,
+        "icons_extracted": 1,
+        "valid_hicon": true
+      },
+      {
+        "size": 48,
+        "icons_extracted": 1,
+        "valid_hicon": true
+      },
+      {
+        "size": 256,
+        "icons_extracted": 1,
+        "valid_hicon": true
+      }
+    ]
+  },
+  {
+    "file": "arm64/hufu-trainer.exe",
+    "group_resource_found": true,
+    "resource_error": 0,
+    "sizes": [
+      {
+        "size": 16,
+        "icons_extracted": 1,
+        "valid_hicon": true
+      },
+      {
+        "size": 32,
+        "icons_extracted": 1,
+        "valid_hicon": true
+      },
+      {
+        "size": 48,
+        "icons_extracted": 1,
+        "valid_hicon": true
+      },
+      {
+        "size": 256,
+        "icons_extracted": 1,
+        "valid_hicon": true
+      }
+    ]
+  },
+  {
+    "file": "arm64/hufu_tsf.dll",
+    "group_resource_found": true,
+    "resource_error": 0,
+    "sizes": [
+      {
+        "size": 16,
+        "icons_extracted": 1,
+        "valid_hicon": true
+      },
+      {
+        "size": 32,
+        "icons_extracted": 1,
+        "valid_hicon": true
+      },
+      {
+        "size": 48,
+        "icons_extracted": 1,
+        "valid_hicon": true
+      },
+      {
+        "size": 256,
+        "icons_extracted": 1,
+        "valid_hicon": true
+      }
+    ]
+  },
+  {
+    "file": "arm64/hufu_tsf32.dll",
+    "group_resource_found": true,
+    "resource_error": 0,
+    "sizes": [
+      {
+        "size": 16,
+        "icons_extracted": 1,
+        "valid_hicon": true
+      },
+      {
+        "size": 32,
+        "icons_extracted": 1,
+        "valid_hicon": true
+      },
+      {
+        "size": 48,
+        "icons_extracted": 1,
+        "valid_hicon": true
+      },
+      {
+        "size": 256,
+        "icons_extracted": 1,
+        "valid_hicon": true
+      }
+    ]
+  },
+  {
+    "file": "arm64/hufu_tsf_arm64_42747a9bd16467ba422c.dll",
+    "group_resource_found": true,
+    "resource_error": 0,
+    "sizes": [
+      {
+        "size": 16,
+        "icons_extracted": 1,
+        "valid_hicon": true
+      },
+      {
+        "size": 32,
+        "icons_extracted": 1,
+        "valid_hicon": true
+      },
+      {
+        "size": 48,
+        "icons_extracted": 1,
+        "valid_hicon": true
+      },
+      {
+        "size": 256,
+        "icons_extracted": 1,
+        "valid_hicon": true
+      }
+    ]
+  },
+  {
+    "file": "arm64/hufu_tsf_x64_42747a9bd16467ba422c.dll",
+    "group_resource_found": true,
+    "resource_error": 0,
+    "sizes": [
+      {
+        "size": 16,
+        "icons_extracted": 1,
+        "valid_hicon": true
+      },
+      {
+        "size": 32,
+        "icons_extracted": 1,
+        "valid_hicon": true
+      },
+      {
+        "size": 48,
+        "icons_extracted": 1,
+        "valid_hicon": true
+      },
+      {
+        "size": 256,
+        "icons_extracted": 1,
+        "valid_hicon": true
+      }
+    ]
+  },
+  {
+    "file": "x64/hufu-server.exe",
+    "group_resource_found": true,
+    "resource_error": 0,
+    "sizes": [
+      {
+        "size": 16,
+        "icons_extracted": 1,
+        "valid_hicon": true
+      },
+      {
+        "size": 32,
+        "icons_extracted": 1,
+        "valid_hicon": true
+      },
+      {
+        "size": 48,
+        "icons_extracted": 1,
+        "valid_hicon": true
+      },
+      {
+        "size": 256,
+        "icons_extracted": 1,
+        "valid_hicon": true
+      }
+    ]
+  },
+  {
+    "file": "x64/hufu-settings.exe",
+    "group_resource_found": true,
+    "resource_error": 0,
+    "sizes": [
+      {
+        "size": 16,
+        "icons_extracted": 1,
+        "valid_hicon": true
+      },
+      {
+        "size": 32,
+        "icons_extracted": 1,
+        "valid_hicon": true
+      },
+      {
+        "size": 48,
+        "icons_extracted": 1,
+        "valid_hicon": true
+      },
+      {
+        "size": 256,
+        "icons_extracted": 1,
+        "valid_hicon": true
+      }
+    ]
+  },
+  {
+    "file": "x64/hufu-trainer.exe",
+    "group_resource_found": true,
+    "resource_error": 0,
+    "sizes": [
+      {
+        "size": 16,
+        "icons_extracted": 1,
+        "valid_hicon": true
+      },
+      {
+        "size": 32,
+        "icons_extracted": 1,
+        "valid_hicon": true
+      },
+      {
+        "size": 48,
+        "icons_extracted": 1,
+        "valid_hicon": true
+      },
+      {
+        "size": 256,
+        "icons_extracted": 1,
+        "valid_hicon": true
+      }
+    ]
+  },
+  {
+    "file": "x64/hufu_tsf.dll",
+    "group_resource_found": true,
+    "resource_error": 0,
+    "sizes": [
+      {
+        "size": 16,
+        "icons_extracted": 1,
+        "valid_hicon": true
+      },
+      {
+        "size": 32,
+        "icons_extracted": 1,
+        "valid_hicon": true
+      },
+      {
+        "size": 48,
+        "icons_extracted": 1,
+        "valid_hicon": true
+      },
+      {
+        "size": 256,
+        "icons_extracted": 1,
+        "valid_hicon": true
+      }
+    ]
+  },
+  {
+    "file": "x64/hufu_tsf32.dll",
+    "group_resource_found": true,
+    "resource_error": 0,
+    "sizes": [
+      {
+        "size": 16,
+        "icons_extracted": 1,
+        "valid_hicon": true
+      },
+      {
+        "size": 32,
+        "icons_extracted": 1,
+        "valid_hicon": true
+      },
+      {
+        "size": 48,
+        "icons_extracted": 1,
+        "valid_hicon": true
+      },
+      {
+        "size": 256,
+        "icons_extracted": 1,
+        "valid_hicon": true
+      }
+    ]
+  }
+]

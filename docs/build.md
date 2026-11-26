@@ -15,6 +15,9 @@ cargo run -p hufu-cli -- repl --dict ../assets/码表/虎码单字
 
 ## Windows TSF 前端（需要 Windows；x86_64-pc-windows-gnu 工具链）
 
+ARM64/x64 通用 EXE 的独立构建入口、工具链和验收边界见
+[Windows ARM64 开发验证](windows-arm64.md)。现有 x64 构建方式保留。
+
 ```powershell
 cd platform/windows
 cargo build --release          # hufu_tsf.dll + hufu-tsf-smoke.exe

@@ -1,0 +1,9 @@
+﻿probe_status=ok
+host_arch=aarch64
+image_machine=0xAA64
+exports_resolved=18
+implementation=C:\Workspace\hufu-ime-rust\_tmp\tsf-arm64x\final-facade\hufu_tsf_arm64_9949fdde6439d2333d80.DLL
+registration=C:\Workspace\hufu-ime-rust\_tmp\tsf-arm64x\final-facade\hufu_tsf.dll
+registry_writes=0
+profile_activation=0
+server_calls=0
