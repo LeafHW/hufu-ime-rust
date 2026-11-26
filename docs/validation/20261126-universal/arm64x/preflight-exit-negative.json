@@ -1,0 +1,6 @@
+{
+  "new_engine_against_old_rejected_payload": true,
+  "pipeline_exit_code": 1,
+  "script_exit_code": 0,
+  "reason": "registration-native probe failed: Exit(2)"
+}

@@ -1,0 +1,2 @@
+﻿probe_status=failed
+error=registration target differs from requested facade: C:\Workspace\hufu-ime-rust\_tmp\arm64\build\payload-95b54d2fba2246e98c97fe7f937d54e8\arm64\hufu_tsf.dll

@@ -1,0 +1,112 @@
+{
+  "timestamp_utc": "2026-11-26T02:39:30.842315+00:00",
+  "authorization": "User requested removal of intermediate test installers",
+  "state": "complete",
+  "final": {
+    "old_path": "_tmp/arm64/delivery/20261126-arm64-dev/HuFuSetup-1.9.9.10.exe",
+    "path": "交付/HuFuSetup-1.9.9.10.exe",
+    "sha256": "d46200ef856b2246ec5e3dc1fac7237ae1842ed4b8af678bb4d93046c7657cd1",
+    "size": 39502283,
+    "classification": "development validation package"
+  },
+  "removed_files": [
+    {
+      "path": "_tmp/arm64/delivery/HuFuSetup-1.9.9.10.exe",
+      "size": 39129217,
+      "sha256": "87502a241fdd756d26f0ad0a2e698a62b5415e572e9c508e3db1b7493f94aa15"
+    },
+    {
+      "path": "_tmp/arm64/delivery/HuFuSetup-1.9.9.10.exe.artifact.json",
+      "size": 290,
+      "sha256": "937a54e9441a1c747224ed28fc0b36c4b300cda8b16ec3cf1191d6f01dc1d268"
+    },
+    {
+      "path": "_tmp/arm64/delivery/HuFuSetup-1.9.9.10.exe.sha256",
+      "size": 89,
+      "sha256": "db28db21096aa67d7040accca18e9ba5f4903b0210170ae535cdf4b30fdc4d40"
+    },
+    {
+      "path": "_tmp/arm64/delivery/final/HuFuSetup-1.9.9.10.exe",
+      "size": 39497447,
+      "sha256": "2ad1017ddae51d936f26fc6fd5c480ecc88549dfb20abc6e57768442bc3dcb7c"
+    },
+    {
+      "path": "_tmp/arm64/delivery/final/HuFuSetup-1.9.9.10.exe.artifact.json",
+      "size": 139,
+      "sha256": "e228bd2a5f0814152f8c74debf9896b2a8e8ab91c9931c48585b97a8104c7b8d"
+    },
+    {
+      "path": "_tmp/arm64/delivery/final/HuFuSetup-1.9.9.10.exe.sha256",
+      "size": 89,
+      "sha256": "a75011563ef6794253bb3a165f927bd666d86d72809505ca78f88dacecd815ed"
+    },
+    {
+      "path": "_tmp/arm64/delivery/verified/HuFuSetup-1.9.9.10.exe",
+      "size": 39507156,
+      "sha256": "d91bb9048661950e231ed9ca8ca96d59618e0d4e3f264b54a069685d4bae0d1e"
+    },
+    {
+      "path": "_tmp/arm64/delivery/verified/HuFuSetup-1.9.9.10.exe.artifact.json",
+      "size": 139,
+      "sha256": "844a43adeb968d7030121ad630ab23c3aeab90fb97fe9b797da903678323c9d6"
+    },
+    {
+      "path": "_tmp/arm64/delivery/verified/HuFuSetup-1.9.9.10.exe.sha256",
+      "size": 89,
+      "sha256": "efc9c553c4da9efa6c41280b1cb5e59788245cc17d4bc4e03f0b9361b9e65006"
+    },
+    {
+      "path": "_tmp/arm64/delivery/reviewed/HuFuSetup-1.9.9.10.exe",
+      "size": 39507258,
+      "sha256": "f3338addbca45cdeec759d7b2099c9e7ddfdcda9aa43de688a67f81b3af19f8c"
+    },
+    {
+      "path": "_tmp/arm64/delivery/reviewed/HuFuSetup-1.9.9.10.exe.artifact.json",
+      "size": 139,
+      "sha256": "999cd706663db60716c441fa6896228cd4fd140063f4877e73fc0d8999a939c0"
+    },
+    {
+      "path": "_tmp/arm64/delivery/reviewed/HuFuSetup-1.9.9.10.exe.sha256",
+      "size": 89,
+      "sha256": "67bf8c0f4d6a9ec57ab9473e0690ce179267a846e66f8a8d66fb61343ec2a899"
+    },
+    {
+      "path": "_tmp/arm64/inno-fixture/out/HuFuSetup-1.9.9.10.exe",
+      "size": 2302471,
+      "sha256": "324f4b344555cb189d30385798e3f1deaa87620157c12a206a109568bb9ff308"
+    },
+    {
+      "path": "_tmp/arm64/inno-fixture/out/HuFuSetup-1.9.9.10.exe.artifact.json",
+      "size": 288,
+      "sha256": "1575227340d74554bb11f993fc862564b0abd4eda5ceb5969f7105f5ac70a37a"
+    },
+    {
+      "path": "_tmp/arm64/inno-fixture/out/HuFuSetup-1.9.9.10.exe.sha256",
+      "size": 89,
+      "sha256": "df4fd35d30e72375d731896e4d23a0f0bc87bbd959e59f0d12204bb36ede42de"
+    },
+    {
+      "path": "_tmp/arm64/inno-fixture/out-v2/HuFuSetup-1.9.9.10.exe",
+      "size": 2303244,
+      "sha256": "f7926ae7af1fd69939accad7e06bfd2f498eac90710a301db6d896595811c1a0"
+    },
+    {
+      "path": "_tmp/arm64/inno-fixture/out-v2/HuFuSetup-1.9.9.10.exe.artifact.json",
+      "size": 288,
+      "sha256": "5c17fefe02c3dd23820f3a536287e68c7201774f5ae1f841a7b107a3df3e6b96"
+    },
+    {
+      "path": "_tmp/arm64/inno-fixture/out-v2/HuFuSetup-1.9.9.10.exe.sha256",
+      "size": 89,
+      "sha256": "d063e4a806bdab9d2a1718f96c98dfd69a04d4900d31f59870a1e6fe7d4ed879"
+    }
+  ],
+  "installer_count": 6,
+  "preserved": [
+    "source changes",
+    "validation logs and reports",
+    "build caches and staging",
+    "original 1.9.9.9 comparison baseline"
+  ],
+  "freed_bytes": 162248610
+}

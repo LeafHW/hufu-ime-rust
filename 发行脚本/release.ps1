@@ -17,7 +17,14 @@ param(
     [switch]$NoGitee,
     # 【P2-27】应急开关：日志顶部不含本版本时默认直接失败（护栏，不是提示）
     [switch]$SkipChangelogCheck,
-    [string]$ReleaseRoot = 'E:\DSH-KF\hufu-发行'
+    [string]$ReleaseRoot = 'E:\DSH-KF\hufu-发行',
+    [switch]$Universal,
+    [string]$DataSource = '',
+    [string]$BuildRoot = '',
+    [string]$ToolsRoot = 'C:\Workspace\hufu-build-tools',
+    [string]$Iscc = '',
+    [switch]$UseExistingUi,
+    [switch]$Publish
 )
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
@@ -28,6 +35,29 @@ $zip  = Join-Path $rel "HuFu虎符输入法-v$Version-无模型.zip"
 $exe  = Join-Path $rel "HuFuSetup-$Version.exe"
 $pack = Join-Path $ScriptDir 'pack.ps1'
 $setup= Join-Path $RepoRoot 'platform\windows\setup\build-setup.ps1'
+
+# Universal is EXE-only. Publication is explicit; local builds never change an update channel.
+if ($Universal) {
+    . (Join-Path $ScriptDir 'update-package-guard.ps1')
+    if ($Publish -and $NoGitee) { throw '-Publish and -NoGitee cannot be combined.' }
+    if (!$VerifyOnly) {
+        if (!$DataSource) { $DataSource = Join-Path $rel '打包源' }
+        & (Join-Path $RepoRoot 'platform\windows\setup\build-universal.ps1') `
+            -Version $Version -DataSource $DataSource -BuildRoot $BuildRoot -DistDir $rel `
+            -ToolsRoot $ToolsRoot -Iscc $Iscc -UseExistingUi:$UseExistingUi
+        if (!$?) { throw 'Universal build failed.' }
+    }
+    Assert-HufuUpdatePackage $exe
+    $receipt = Get-Content -LiteralPath "$exe.artifact.json" -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ($receipt.sha256 -ne (Get-FileHash $exe -Algorithm SHA256).Hash.ToLowerInvariant() -or
+        $receipt.size -ne (Get-Item $exe).Length) { throw 'Universal EXE differs from its build receipt.' }
+    if ($Publish) {
+        & (Join-Path $ScriptDir 'publish-gitee.ps1') -Version $Version -ExePath $exe -PublishSite
+        if (!$?) { throw 'Publication failed.' }
+    }
+    Write-Output "Universal EXE verified: $exe"
+    return
+}
 
 # 【P2-27 2026-11-04】核验升级：原来 -VerifyOnly 只查「文件在不在 + 哈希」，
 # 版本号写错、zip 里装的是上一版、装了个空壳 exe 都验不出来（护栏只是提示）。

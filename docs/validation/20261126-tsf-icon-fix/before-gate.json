@@ -1,0 +1,257 @@
+{
+  "reference": "C:\\Workspace\\hufu-ime-rust\\platform\\windows\\setup\\icons\\虎符.ico",
+  "reference_sha256": "0244a889f33fd61c03135b2af5f53eb9381a6cdef26e8a5c583028754a4e68fb",
+  "files": [
+    {
+      "file": "arm64/hufu_tsf.dll",
+      "groups": [
+        {
+          "group": 1,
+          "language": 1033,
+          "frames": 6,
+          "matches_reference": false
+        }
+      ],
+      "errors": [],
+      "rendered": [
+        {
+          "size": 16,
+          "matches_reference": false,
+          "bgra_sha256": "0f022bb08754b8e649dba61994d215f2462e6a3319571c3626ca94a6751d060b"
+        },
+        {
+          "size": 24,
+          "matches_reference": false,
+          "bgra_sha256": "52a6f970560effddffa7bb5aee3ceb3e3be155d0375e0932252bfa4bd859f535"
+        },
+        {
+          "size": 32,
+          "matches_reference": false,
+          "bgra_sha256": "9fadf33eceb0e1aa8cea0829a5f62c59c2d57a5fcf3083eb308ee37cb8c87257"
+        },
+        {
+          "size": 48,
+          "matches_reference": false,
+          "bgra_sha256": "001429ef2836dfceeeef2cd4a89545b08f0cc0b1abdc583fca6f81cac1f9edb0"
+        },
+        {
+          "size": 64,
+          "matches_reference": false,
+          "bgra_sha256": "3d83c9abadcfe6c6fbd735edc07a73c56b33bd11b99ed65cd4ec6cf8f52c9ca3"
+        },
+        {
+          "size": 256,
+          "matches_reference": false,
+          "bgra_sha256": "c714fe46755c178355be3cf02acc54efb110e682592c8e9faef4f69c59ef721a"
+        }
+      ],
+      "passed": false
+    },
+    {
+      "file": "arm64/hufu_tsf32.dll",
+      "groups": [],
+      "errors": [
+        "EnumResourceLanguagesW: 1814"
+      ],
+      "rendered": [
+        {
+          "size": 16,
+          "matches_reference": false,
+          "bgra_sha256": "6f342d2f76d2d9b9ce9e6f192cd4c041591bec0d300521679f8b1c1d6523db04"
+        },
+        {
+          "size": 24,
+          "matches_reference": false,
+          "bgra_sha256": "b4db7dac25dad2dfe638d8a3a80f56b7d8dc85852703909b1ed6b477948d9146"
+        },
+        {
+          "size": 32,
+          "matches_reference": false,
+          "bgra_sha256": "44fbd7c7edf0cf99ebf566b875a8d246c9ac840f73b82d8d1e7f1a8080c459b2"
+        },
+        {
+          "size": 48,
+          "matches_reference": false,
+          "bgra_sha256": "889b5f261bf22c085922ed312b3e693f34f2884364b5ca0e7ba0903093cf557d"
+        },
+        {
+          "size": 64,
+          "matches_reference": false,
+          "bgra_sha256": "b1317ad01d2291b468ecc9052233c3f8d9aace631c32cc5116faca8db1ce9b6f"
+        },
+        {
+          "size": 256,
+          "matches_reference": false,
+          "bgra_sha256": "27ae8c269eee341baacd69f02b556e57787b1fdc58b9877082a83d798a4babf0"
+        }
+      ],
+      "passed": false
+    },
+    {
+      "file": "arm64/hufu_tsf_arm64_42747a9bd16467ba422c.dll",
+      "groups": [
+        {
+          "group": 1,
+          "language": 1033,
+          "frames": 6,
+          "matches_reference": false
+        }
+      ],
+      "errors": [],
+      "rendered": [
+        {
+          "size": 16,
+          "matches_reference": false,
+          "bgra_sha256": "0f022bb08754b8e649dba61994d215f2462e6a3319571c3626ca94a6751d060b"
+        },
+        {
+          "size": 24,
+          "matches_reference": false,
+          "bgra_sha256": "52a6f970560effddffa7bb5aee3ceb3e3be155d0375e0932252bfa4bd859f535"
+        },
+        {
+          "size": 32,
+          "matches_reference": false,
+          "bgra_sha256": "9fadf33eceb0e1aa8cea0829a5f62c59c2d57a5fcf3083eb308ee37cb8c87257"
+        },
+        {
+          "size": 48,
+          "matches_reference": false,
+          "bgra_sha256": "001429ef2836dfceeeef2cd4a89545b08f0cc0b1abdc583fca6f81cac1f9edb0"
+        },
+        {
+          "size": 64,
+          "matches_reference": false,
+          "bgra_sha256": "3d83c9abadcfe6c6fbd735edc07a73c56b33bd11b99ed65cd4ec6cf8f52c9ca3"
+        },
+        {
+          "size": 256,
+          "matches_reference": false,
+          "bgra_sha256": "c714fe46755c178355be3cf02acc54efb110e682592c8e9faef4f69c59ef721a"
+        }
+      ],
+      "passed": false
+    },
+    {
+      "file": "arm64/hufu_tsf_x64_42747a9bd16467ba422c.dll",
+      "groups": [],
+      "errors": [
+        "EnumResourceLanguagesW: 1814"
+      ],
+      "rendered": [
+        {
+          "size": 16,
+          "matches_reference": false,
+          "bgra_sha256": "6f342d2f76d2d9b9ce9e6f192cd4c041591bec0d300521679f8b1c1d6523db04"
+        },
+        {
+          "size": 24,
+          "matches_reference": false,
+          "bgra_sha256": "b4db7dac25dad2dfe638d8a3a80f56b7d8dc85852703909b1ed6b477948d9146"
+        },
+        {
+          "size": 32,
+          "matches_reference": false,
+          "bgra_sha256": "44fbd7c7edf0cf99ebf566b875a8d246c9ac840f73b82d8d1e7f1a8080c459b2"
+        },
+        {
+          "size": 48,
+          "matches_reference": false,
+          "bgra_sha256": "889b5f261bf22c085922ed312b3e693f34f2884364b5ca0e7ba0903093cf557d"
+        },
+        {
+          "size": 64,
+          "matches_reference": false,
+          "bgra_sha256": "b1317ad01d2291b468ecc9052233c3f8d9aace631c32cc5116faca8db1ce9b6f"
+        },
+        {
+          "size": 256,
+          "matches_reference": false,
+          "bgra_sha256": "27ae8c269eee341baacd69f02b556e57787b1fdc58b9877082a83d798a4babf0"
+        }
+      ],
+      "passed": false
+    },
+    {
+      "file": "x64/hufu_tsf.dll",
+      "groups": [],
+      "errors": [
+        "EnumResourceLanguagesW: 1814"
+      ],
+      "rendered": [
+        {
+          "size": 16,
+          "matches_reference": false,
+          "bgra_sha256": "6f342d2f76d2d9b9ce9e6f192cd4c041591bec0d300521679f8b1c1d6523db04"
+        },
+        {
+          "size": 24,
+          "matches_reference": false,
+          "bgra_sha256": "b4db7dac25dad2dfe638d8a3a80f56b7d8dc85852703909b1ed6b477948d9146"
+        },
+        {
+          "size": 32,
+          "matches_reference": false,
+          "bgra_sha256": "44fbd7c7edf0cf99ebf566b875a8d246c9ac840f73b82d8d1e7f1a8080c459b2"
+        },
+        {
+          "size": 48,
+          "matches_reference": false,
+          "bgra_sha256": "889b5f261bf22c085922ed312b3e693f34f2884364b5ca0e7ba0903093cf557d"
+        },
+        {
+          "size": 64,
+          "matches_reference": false,
+          "bgra_sha256": "b1317ad01d2291b468ecc9052233c3f8d9aace631c32cc5116faca8db1ce9b6f"
+        },
+        {
+          "size": 256,
+          "matches_reference": false,
+          "bgra_sha256": "27ae8c269eee341baacd69f02b556e57787b1fdc58b9877082a83d798a4babf0"
+        }
+      ],
+      "passed": false
+    },
+    {
+      "file": "x64/hufu_tsf32.dll",
+      "groups": [],
+      "errors": [
+        "EnumResourceLanguagesW: 1814"
+      ],
+      "rendered": [
+        {
+          "size": 16,
+          "matches_reference": false,
+          "bgra_sha256": "6f342d2f76d2d9b9ce9e6f192cd4c041591bec0d300521679f8b1c1d6523db04"
+        },
+        {
+          "size": 24,
+          "matches_reference": false,
+          "bgra_sha256": "b4db7dac25dad2dfe638d8a3a80f56b7d8dc85852703909b1ed6b477948d9146"
+        },
+        {
+          "size": 32,
+          "matches_reference": false,
+          "bgra_sha256": "44fbd7c7edf0cf99ebf566b875a8d246c9ac840f73b82d8d1e7f1a8080c459b2"
+        },
+        {
+          "size": 48,
+          "matches_reference": false,
+          "bgra_sha256": "889b5f261bf22c085922ed312b3e693f34f2884364b5ca0e7ba0903093cf557d"
+        },
+        {
+          "size": 64,
+          "matches_reference": false,
+          "bgra_sha256": "b1317ad01d2291b468ecc9052233c3f8d9aace631c32cc5116faca8db1ce9b6f"
+        },
+        {
+          "size": 256,
+          "matches_reference": false,
+          "bgra_sha256": "27ae8c269eee341baacd69f02b556e57787b1fdc58b9877082a83d798a4babf0"
+        }
+      ],
+      "passed": false
+    }
+  ],
+  "passed": false
+}

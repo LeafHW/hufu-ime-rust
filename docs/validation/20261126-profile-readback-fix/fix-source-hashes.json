@@ -1,0 +1,5 @@
+{
+  "platform/windows/hufu-setup-engine/src/deployment.rs": "511e395e00c6606f43e79d914403ee72d27426fe8aae7974bccc0c15605db701",
+  "platform/windows/hufu-setup-engine/src/procop.rs": "96ee869ff1227a4e74d4bf8d289291568bcd36671583d176ffd15b879043a504",
+  "platform/windows/hufu-tsf-smoke/src/main.rs": "a7014b285cc2d4c7e5f3c096d1d76b4db324bebdde20b3d39d97f48a7045e772"
+}

@@ -1,0 +1,166 @@
+[
+  {
+    "file": "platform/windows/hufu-tsf/assets/hufu.ico",
+    "sha256": "3f816afdff0f973e72af164bd361069eb5f2ade8b57713de870d4688236cc7ea",
+    "sizes": [
+      [
+        16,
+        16
+      ],
+      [
+        20,
+        20
+      ],
+      [
+        24,
+        24
+      ],
+      [
+        32,
+        32
+      ],
+      [
+        48,
+        48
+      ],
+      [
+        64,
+        64
+      ]
+    ],
+    "alpha_bbox": [
+      2,
+      2,
+      30,
+      30
+    ]
+  },
+  {
+    "file": "platform/windows/setup/icons/虎符.ico",
+    "sha256": "0244a889f33fd61c03135b2af5f53eb9381a6cdef26e8a5c583028754a4e68fb",
+    "sizes": [
+      [
+        16,
+        16
+      ],
+      [
+        32,
+        32
+      ],
+      [
+        48,
+        48
+      ],
+      [
+        64,
+        64
+      ],
+      [
+        256,
+        256
+      ]
+    ],
+    "alpha_bbox": [
+      0,
+      1,
+      32,
+      31
+    ]
+  },
+  {
+    "file": "platform/windows/install/hufu-current.ico",
+    "sha256": "0244a889f33fd61c03135b2af5f53eb9381a6cdef26e8a5c583028754a4e68fb",
+    "sizes": [
+      [
+        16,
+        16
+      ],
+      [
+        32,
+        32
+      ],
+      [
+        48,
+        48
+      ],
+      [
+        64,
+        64
+      ],
+      [
+        256,
+        256
+      ]
+    ],
+    "alpha_bbox": [
+      0,
+      1,
+      32,
+      31
+    ]
+  },
+  {
+    "file": "platform/windows/install/hufu.ico",
+    "sha256": "0244a889f33fd61c03135b2af5f53eb9381a6cdef26e8a5c583028754a4e68fb",
+    "sizes": [
+      [
+        16,
+        16
+      ],
+      [
+        32,
+        32
+      ],
+      [
+        48,
+        48
+      ],
+      [
+        64,
+        64
+      ],
+      [
+        256,
+        256
+      ]
+    ],
+    "alpha_bbox": [
+      0,
+      1,
+      32,
+      31
+    ]
+  },
+  {
+    "file": "/mnt/c/Users/yc/AppData/Local/Programs/HuFu/图标.ico",
+    "sha256": "0244a889f33fd61c03135b2af5f53eb9381a6cdef26e8a5c583028754a4e68fb",
+    "sizes": [
+      [
+        16,
+        16
+      ],
+      [
+        32,
+        32
+      ],
+      [
+        48,
+        48
+      ],
+      [
+        64,
+        64
+      ],
+      [
+        256,
+        256
+      ]
+    ],
+    "alpha_bbox": [
+      0,
+      1,
+      32,
+      31
+    ]
+  }
+]

@@ -52,6 +52,9 @@ extern "system" fn DllGetClassObject(
     // create_dir_all+覆写盘（COM 激活路径的同步磁盘 IO）。
     static LOAD_MARK: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     LOAD_MARK.get_or_init(|| {
+        // The installation probe only checks COM construction. It must not
+        // write diagnostic files or create installed product directories.
+        if std::env::var_os("HUFU_TSF_PROBE_ONLY").is_some() { return; }
         let _ = std::fs::create_dir_all(r"C:\ProgramData\HuFu\diag");
         let _ = std::fs::write(
             format!(r"C:\ProgramData\HuFu\diag\load-{}.txt", std::process::id()),
@@ -89,6 +92,18 @@ extern "system" fn DllRegisterServer() -> HRESULT {
 #[no_mangle]
 extern "system" fn DllUnregisterServer() -> HRESULT {
     com::unregister_server()
+}
+
+/// Read-only registration-path diagnostic; no registry or TSF mutations.
+/// Returns the UTF-16 length including NUL, or zero on failure.
+#[no_mangle]
+unsafe extern "system" fn hufu_probe_registration_path(out: *mut u16, capacity: u32) -> u32 {
+    let Ok(path) = com::registration_path() else { return 0; };
+    let wide: Vec<u16> = path.encode_utf16().chain([0]).collect();
+    if !out.is_null() && capacity as usize >= wide.len() {
+        std::ptr::copy_nonoverlapping(wide.as_ptr(), out, wide.len());
+    }
+    wide.len() as u32
 }
 
 /// 测试钩子：绕过 msctf 直接驱动「VK → 管道 → hufu-server 引擎」链。

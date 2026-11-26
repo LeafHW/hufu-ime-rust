@@ -22,6 +22,7 @@ mod overlay;
 mod pipe;
 mod platform;
 mod scheduling;
+mod render_paths;
 mod skin_files;
 mod ssf;
 mod sync;
@@ -1643,62 +1644,9 @@ fn render_fingerprint(dir: &std::path::Path, with_config: bool) -> u64 {
     h.finish()
 }
 
-/// 安装目录里的同名文件（server 与 helper/dll 同目录是最常见布局）。
-fn exe_sibling(name: &str) -> Option<std::path::PathBuf> {
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-        .map(|d| d.join(name))
-        .filter(|p| p.is_file())
-}
-
-/// 渲染用 TSF DLL：安装目录优先（hufu_tsf_render.dll 专供渲染、可热替换），
-/// 再回落 SystemIME 与旧默认 D:\HuFu。旧实现把 D:\HuFu 写死——装到别的
-/// 盘/目录的机器会直接找不到 DLL/helper，进而触发已废弃的 PowerShell 链。
-fn find_tsf_dll() -> Option<String> {
-    for name in ["hufu_tsf_render.dll", "hufu_tsf.dll"] {
-        if let Some(p) = exe_sibling(name) {
-            return Some(p.to_string_lossy().into_owned());
-        }
-    }
-    // 【审计 P3 2026-11-05】兜底候选补回 render 副本（2026-11-05b 收窄时
-    // 丢失）：server 与 render.dll 不同目录的混合布局下退到被 TSF 进程
-    // 锁住的 hufu_tsf.dll 仍可渲染，但失去热替换；每个目录先 render 后正
-    // 本，与 exe_sibling 优先序一致。
-    [
-        r"C:\Windows\SystemIME\HuFu\hufu_tsf_render.dll",
-        r"C:\Windows\SystemIME\HuFu\hufu_tsf.dll",
-        r"D:\HuFu\hufu_tsf_render.dll",
-        r"D:\HuFu\hufu_tsf.dll",
-    ]
-    .iter()
-    .find(|p| std::path::Path::new(p).is_file())
-    .map(|s| s.to_string())
-}
-
-/// 渲染小助手（**唯一**渲染路径，不再回退 PowerShell——作者明令禁止）。
-/// 【审计 P3 2026-11-05】只缓存命中：旧 OnceLock<Option> 会把「缺失」
-/// 永久缓存——补装 helper 不重启 server 时预热/实时预览一直 501。改为
-/// 命中才缓存，miss 每次重探（代价 ≤3 次 stat）。
-static RENDER_HELPER_HIT: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
-
+/// Resolve both files from the same verified package/generation.
 fn render_helper_path() -> Option<std::path::PathBuf> {
-    if let Some(p) = RENDER_HELPER_HIT.get() {
-        return Some(p.clone());
-    }
-    let found = exe_sibling("hufu-render-helper.exe").or_else(|| {
-        [
-            r"C:\Windows\SystemIME\HuFu\hufu-render-helper.exe",
-            r"D:\HuFu\hufu-render-helper.exe",
-        ]
-        .iter()
-        .map(std::path::PathBuf::from)
-        .find(|p| p.is_file())
-    });
-    if let Some(ref p) = found {
-        let _ = RENDER_HELPER_HIT.set(p.clone());
-    }
-    found
+    render_paths::resolve().map(|p| p.helper)
 }
 
 fn log_render_helper_missing() {
@@ -1801,12 +1749,10 @@ fn ssf_render_inner(query_id: Option<&str>) -> Response {
             }
         }
     }
-    // 渲染专用副本优先（hufu_tsf_render.dll 不被 TSF 进程加载，可随时
-    // 替换更新；hufu_tsf.dll 是注册输入法本体，被 explorer/QQ 等全进程
-    // 持有，拷不进去——只做兜底）。候选按「安装目录 → SystemIME → 旧默认
-    // D:\HuFu」顺序解析。
-    let Some(dll) = find_tsf_dll() else {
-        return Response::err(404, "未找到 hufu_tsf.dll");
+    // Resolve the selected package manifest or registered SystemIME generation.
+    let Some(render_paths::RenderPaths { helper, dll }) = render_paths::resolve() else {
+        log_render_helper_missing();
+        return Response::err(501, "实时预览不可用：未找到有效且匹配的渲染组件（请重新运行安装程序）");
     };
     // Concurrent HTTP requests must never read or remove each other's output.
     let out = render_output_path();
@@ -1815,13 +1761,6 @@ fn ssf_render_inner(query_id: Option<&str>) -> Response {
     // 预热全部 ssf 皮肤时每个皮肤一个 PowerShell 进程（用户实锤），且与
     // 「产品运行时绝不拉起 PowerShell」的既定要求冲突。现在缺 helper 直接
     // 501、预热直接跳过，绝不再拉起 PowerShell。
-    let Some(helper) = render_helper_path() else {
-        log_render_helper_missing();
-        return Response::err(
-            501,
-            "实时预览不可用：安装目录缺少 hufu-render-helper.exe（重新运行安装程序即可）",
-        );
-    };
     let rendered = {
         let mut cmd = std::process::Command::new(helper); // zi-ok: helper=同目录 hufu-render-helper.exe（非解释器）
         cmd.arg(&out).arg(&dll);

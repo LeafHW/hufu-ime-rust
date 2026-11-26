@@ -1,0 +1,86 @@
+﻿{
+    "scope":  "isolated DLL load/export/COM construction only; no registration, activation, server or typing",
+    "schema":  1,
+    "registry_unchanged":  true,
+    "results":  [
+                    {
+                        "stdout":  "arm64-facade.stdout.txt",
+                        "stderr":  "arm64-facade.stderr.txt",
+                        "name":  "arm64-facade",
+                        "expected_success":  true,
+                        "exit_code":  0
+                    },
+                    {
+                        "stdout":  "x64-facade.stdout.txt",
+                        "stderr":  "x64-facade.stderr.txt",
+                        "name":  "x64-facade",
+                        "expected_success":  true,
+                        "exit_code":  0
+                    },
+                    {
+                        "stdout":  "x86-native.stdout.txt",
+                        "stderr":  "x86-native.stderr.txt",
+                        "name":  "x86-native",
+                        "expected_success":  true,
+                        "exit_code":  0
+                    },
+                    {
+                        "stdout":  "arm64-rejects-x86.stdout.txt",
+                        "stderr":  "arm64-rejects-x86.stderr.txt",
+                        "name":  "arm64-rejects-x86",
+                        "expected_success":  false,
+                        "exit_code":  2
+                    },
+                    {
+                        "stdout":  "x86-rejects-facade.stdout.txt",
+                        "stderr":  "x86-rejects-facade.stderr.txt",
+                        "name":  "x86-rejects-facade",
+                        "expected_success":  false,
+                        "exit_code":  2
+                    },
+                    {
+                        "stdout":  "arm64-rejects-missing-implementation.stdout.txt",
+                        "stderr":  "arm64-rejects-missing-implementation.stderr.txt",
+                        "name":  "arm64-rejects-missing-implementation",
+                        "expected_success":  false,
+                        "exit_code":  2
+                    },
+                    {
+                        "stdout":  "x64-rejects-missing-implementation.stdout.txt",
+                        "stderr":  "x64-rejects-missing-implementation.stderr.txt",
+                        "name":  "x64-rejects-missing-implementation",
+                        "expected_success":  false,
+                        "exit_code":  2
+                    }
+                ],
+    "binaries":  [
+                     {
+                         "sha256":  "a3e301c8e9c6e2e780aa6c470cffe959a281bd175b7ed5d22f35064b02071922",
+                         "path":  "C:\\Workspace\\hufu-ime-rust\\_tmp\\tsf-arm64x\\payload\\arm64\\hufu-tsf-smoke.exe"
+                     },
+                     {
+                         "sha256":  "31a5201a8d55e103ffb685459ec5af48d2eefbe998d5693f78985bbde55d70fe",
+                         "path":  "C:\\Workspace\\hufu-ime-rust\\_tmp\\tsf-arm64x\\payload\\x64\\hufu-tsf-smoke.exe"
+                     },
+                     {
+                         "sha256":  "9abc0e35bda3ca4b1b356fbf7bab572ff4711a869c3347b086be91ba049753fd",
+                         "path":  "C:\\Workspace\\hufu-ime-rust\\_tmp\\tsf-arm64x\\payload\\x86\\hufu-tsf-smoke.exe"
+                     },
+                     {
+                         "sha256":  "2014e52f6fb8a3ac465e0d9c010e98539e4de24f63a47c1c05315db2f6da5a1b",
+                         "path":  "C:\\Workspace\\hufu-ime-rust\\_tmp\\tsf-arm64x\\payload\\x86\\hufu_tsf32.dll"
+                     },
+                     {
+                         "sha256":  "269abcbd24025eccb6a6643223d9b008931a3827262fe83af7045e017ffa3085",
+                         "path":  "C:\\Workspace\\hufu-ime-rust\\_tmp\\tsf-arm64x\\final-facade\\hufu_tsf.dll"
+                     },
+                     {
+                         "sha256":  "0029c85092776b510f5dc1ede9f5e4e1b697867ce707766f10775fa911752f26",
+                         "path":  "C:\\Workspace\\hufu-ime-rust\\_tmp\\tsf-arm64x\\final-facade\\hufu_tsf_arm64_9949fdde6439d2333d80.dll"
+                     },
+                     {
+                         "sha256":  "52078842c6745d9e2b25e7df24d9191ec15176928c6e6019c045965521c84456",
+                         "path":  "C:\\Workspace\\hufu-ime-rust\\_tmp\\tsf-arm64x\\final-facade\\hufu_tsf_x64_9949fdde6439d2333d80.dll"
+                     }
+                 ]
+}

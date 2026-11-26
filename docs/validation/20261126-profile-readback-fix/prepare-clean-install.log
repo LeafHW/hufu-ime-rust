@@ -1,0 +1,24 @@
+﻿**********************
+Windows PowerShell 脚本开始
+开始时间: 20261126111829
+用户名: [REDACTED for public PR]
+RunAs 用户: [REDACTED for public PR]
+配置名称: 
+计算机: [REDACTED for public PR]
+主机应用程序: C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\Workspace\hufu-ime-rust\_tmp\arm64\profile-fix\prepare-clean-install.ps1
+进程 ID: 1864
+PSVersion: 5.1.28000.3501
+PSEdition: Desktop
+PSCompatibleVersions: 1.0, 2.0, 3.0, 4.0, 5.0, 5.1.28000.3501
+BuildVersion: 10.0.28000.3501
+CLRVersion: 4.0.30319.42000
+WSManStackVersion: 3.0
+PSRemotingProtocolVersion: 2.3
+SerializationVersion: 1.1.0.1
+**********************
+已启动脚本，输出文件为 C:\Workspace\hufu-ime-rust\_tmp\arm64\profile-fix\prepare-clean-install.log
+HuFu machine and user COM/TIP registration absent; ready for fresh EXE install
+**********************
+Windows PowerShell 脚本结束
+结束时间: 20261126111830
+**********************

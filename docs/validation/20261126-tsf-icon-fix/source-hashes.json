@@ -1,0 +1,6 @@
+{
+  "platform/windows/hufu-tsf/build.rs": "bd255e2a6aecbb0ffb960fde9e12558e3171e09bbcf52e9c000f04ad0cac3f9a",
+  "platform/windows/arm64x/Build-Forwarder.ps1": "6792c5eba0183eee294db51ac839fe8acb29fa73c38d3313fa445b5c5d7994a5",
+  "platform/windows/setup/build-universal.ps1": "423a9081c87554ab4e399f6430557539ba3b378f0d8347b7eead9a42b294a4f7",
+  "tools/verify_windows_icons.py": "007b4159b69a3b8e0c32d67c629d01571953f8c3954677abfc734e67195986b2"
+}

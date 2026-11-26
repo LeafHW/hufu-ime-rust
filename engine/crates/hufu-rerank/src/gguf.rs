@@ -492,12 +492,15 @@ impl GgufFile {
             GgmlDType::Q8_0 => {
                 // AVX2 向量反量化：一块 32×i8 恰为 4 组 8 lane，标量循环的
                 // ~6-8 倍（实测单候选前向 790ms 中 dequant 是大头）。
+                #[cfg(target_arch = "x86_64")]
                 static AVX2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                #[cfg(target_arch = "x86_64")]
                 let avx2 = *AVX2
                     .get_or_init(|| std::arch::is_x86_feature_detected!("avx2"));
                 let blocks = k.div_ceil(32);
                 for r in 0..pn {
                     let ro = r * rb;
+                    #[cfg(target_arch = "x86_64")]
                     if avx2 && k % 32 == 0 {
                         unsafe { Self::dequant_q8_0_row_avx2(&raw[ro..ro + blocks * 34], blocks, &mut out) };
                         continue;

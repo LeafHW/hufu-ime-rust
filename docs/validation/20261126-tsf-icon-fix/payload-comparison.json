@@ -1,0 +1,28 @@
+{
+  "arm64": {
+    "changed": [
+      "hufu_tsf.dll",
+      "hufu_tsf32.dll",
+      "package-architecture.json",
+      "version.txt"
+    ],
+    "added": [
+      "hufu_tsf_arm64_dbccc2021fbb50e29892.dll",
+      "hufu_tsf_x64_dbccc2021fbb50e29892.dll"
+    ],
+    "removed": [
+      "hufu_tsf_arm64_42747a9bd16467ba422c.dll",
+      "hufu_tsf_x64_42747a9bd16467ba422c.dll"
+    ]
+  },
+  "x64": {
+    "changed": [
+      "hufu_tsf.dll",
+      "hufu_tsf32.dll",
+      "package-architecture.json",
+      "version.txt"
+    ],
+    "added": [],
+    "removed": []
+  }
+}

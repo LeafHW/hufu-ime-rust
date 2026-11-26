@@ -1,0 +1,45 @@
+﻿**********************
+Windows PowerShell 脚本开始
+开始时间: 20261126123913
+用户名: [REDACTED for public PR]
+RunAs 用户: [REDACTED for public PR]
+配置名称: 
+计算机: [REDACTED for public PR]
+主机应用程序: powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\Workspace\hufu-ime-rust\_tmp\arm64\icon-fix\reinstall-icon.ps1
+进程 ID: 42696
+PSVersion: 5.1.28000.3501
+PSEdition: Desktop
+PSCompatibleVersions: 1.0, 2.0, 3.0, 4.0, 5.0, 5.1.28000.3501
+BuildVersion: 10.0.28000.3501
+CLRVersion: 4.0.30319.42000
+WSManStackVersion: 3.0
+PSRemotingProtocolVersion: 2.3
+SerializationVersion: 1.1.0.1
+**********************
+已启动脚本，输出文件为 C:\Workspace\hufu-ime-rust\_tmp\arm64\icon-fix\reinstall-icon.log
+action=uninstall exit=0
+action=install exit=0
+architecture=ARM64
+GetProfile=00000000 flags=00000002
+IsEnabled=00000000 enabled=1
+CoCreateInstance(registered HuFu ITfTextInputProcessorEx)=00000000
+loaded=C:\Workspace\hufu-ime-rust\_tmp\arm64\profile-fix\inspect-installed-ARM64.exe
+loaded=C:\Windows\SystemIME\HuFu\generations\1.9.9.13-75d0d4dc570e\hufu_tsf.dll
+loaded=C:\Windows\SystemIME\HuFu\generations\1.9.9.13-75d0d4dc570e\hufu_tsf_arm64_dbccc2021fbb50e29892.DLL
+architecture=x64
+GetProfile=00000000 flags=00000002
+IsEnabled=00000000 enabled=1
+CoCreateInstance(registered HuFu ITfTextInputProcessorEx)=00000000
+loaded=C:\Workspace\hufu-ime-rust\_tmp\arm64\profile-fix\inspect-installed-x64.exe
+loaded=C:\Windows\SystemIME\HuFu\generations\1.9.9.13-75d0d4dc570e\hufu_tsf.dll
+loaded=C:\Windows\SystemIME\HuFu\generations\1.9.9.13-75d0d4dc570e\hufu_tsf_x64_dbccc2021fbb50e29892.DLL
+architecture=x86
+GetProfile=00000000 flags=00000002
+IsEnabled=00000000 enabled=1
+CoCreateInstance(registered HuFu ITfTextInputProcessorEx)=00000000
+loaded=C:\Workspace\hufu-ime-rust\_tmp\arm64\profile-fix\inspect-installed-x86.exe
+loaded=C:\Windows\SystemIME\HuFu\generations\1.9.9.13-75d0d4dc570e\hufu_tsf32.dll
+**********************
+Windows PowerShell 脚本结束
+结束时间: 20261126123943
+**********************

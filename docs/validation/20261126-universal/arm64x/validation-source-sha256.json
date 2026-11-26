@@ -1,0 +1,6 @@
+{
+  "platform/windows/arm64x/Verify-Forwarder.ps1": "d585b49e046ad8ddcd77014f9d9269b3fc85a06c05fa97598a4bec5a18cc88e7",
+  "platform/windows/arm64x/verify_forwarder.py": "9cdfe688fed856f081736af9056a4a6b8dbbb1cdd87940cce861d8b209ea86bc",
+  "platform/windows/arm64x/test_verify_forwarder.py": "ec7b24f3586de4889eee92ac19349740931bfa77a2b69183e2a7ca27b8b61091",
+  "platform/windows/hufu-tsf-smoke/src/probe.rs": "8ff75f05fb728b5822f43d954a88dbf4c3e5198f0e7960f3fe4bb857e6c7201e"
+}

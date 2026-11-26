@@ -1,0 +1,39 @@
+{
+  "checks": [
+    {
+      "name": "actual-arm64x",
+      "passed": true
+    },
+    {
+      "name": "ordinary-arm64",
+      "passed": true,
+      "rejection": "missing/unsupported CHPE ARM64X metadata"
+    },
+    {
+      "name": "missing-chpe-metadata",
+      "passed": true,
+      "rejection": "missing/unsupported CHPE ARM64X metadata"
+    },
+    {
+      "name": "wrong-dynamic-relocation-symbol",
+      "passed": true,
+      "rejection": "unexpected dynamic relocation symbol; ARM64X marker required"
+    },
+    {
+      "name": "wrong-x64-export-target",
+      "passed": true,
+      "rejection": "expected one generation sidecar per architecture"
+    },
+    {
+      "name": "truncated-pe",
+      "passed": true,
+      "rejection": "PE field outside image"
+    },
+    {
+      "name": "missing-sidecar",
+      "passed": true,
+      "rejection": "[Errno 2] No such file or directory: '/tmp/hufu-arm64x-structure-1msfjll7/hufu_tsf_x64_9949fdde6439d2333d80.dll'"
+    }
+  ],
+  "passed": 7
+}

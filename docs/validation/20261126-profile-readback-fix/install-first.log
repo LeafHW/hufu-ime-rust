@@ -1,0 +1,749 @@
+﻿2026-11-26 11:18:48.670   Log opened. (Time zone: UTC+08:00)
+2026-11-26 11:18:48.670   Setup version: Inno Setup version 6.7.3
+2026-11-26 11:18:48.670   Original Setup EXE: C:\Workspace\hufu-ime-rust\_tmp\arm64\profile-fix\package\HuFuSetup-1.9.9.12.exe
+2026-11-26 11:18:48.670   Setup command line: /SL5="$170522,38216780,937472,C:\Workspace\hufu-ime-rust\_tmp\arm64\profile-fix\package\HuFuSetup-1.9.9.12.exe" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /LOG=C:\Workspace\hufu-ime-rust\_tmp\arm64\profile-fix\install-first.log 
+2026-11-26 11:18:48.670   Windows version: 10.0.28000
+2026-11-26 11:18:48.670   Windows architecture: Arm64 (64-bit)
+2026-11-26 11:18:48.677   Machine types supported by system: x86 x64 Arm64
+2026-11-26 11:18:48.677   User privileges: None
+2026-11-26 11:18:48.677   Administrative install mode: No
+2026-11-26 11:18:48.677   Install mode root key: HKEY_CURRENT_USER
+2026-11-26 11:18:48.677   64-bit install mode: Yes
+2026-11-26 11:18:48.677   RedirectionGuard status for current process: Enabled in enforcing mode
+2026-11-26 11:18:48.677   Created temporary directory: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp
+2026-11-26 11:18:48.686   -- DLL function import --
+2026-11-26 11:18:48.686   Function and DLL name: CreateMutexW@kernel32.dll
+2026-11-26 11:18:48.686   Importing the DLL function. Dest DLL name: kernel32.dll
+2026-11-26 11:18:48.686   Successfully imported the DLL function. Delay loaded? No
+2026-11-26 11:18:48.686   -- DLL function import --
+2026-11-26 11:18:48.686   Function and DLL name: GetLastError@kernel32.dll
+2026-11-26 11:18:48.686   Importing the DLL function. Dest DLL name: kernel32.dll
+2026-11-26 11:18:48.686   Successfully imported the DLL function. Delay loaded? No
+2026-11-26 11:18:48.690   HuFuSetup 1.9.9.12 Upgrade=0 PrevDir= PrevVer= WildRemnant=0 NoHKLM=0
+2026-11-26 11:18:48.819   Extracting temporary file: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-preflight\arm64\hufu-render-helper.exe
+2026-11-26 11:18:49.110   Extracting temporary file: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-preflight\arm64\hufu-server.exe
+2026-11-26 11:18:49.300   Extracting temporary file: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-preflight\arm64\hufu-settings.exe
+2026-11-26 11:18:49.403   Extracting temporary file: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-preflight\arm64\hufu-setup-engine.exe
+2026-11-26 11:18:49.689   Extracting temporary file: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-preflight\arm64\hufu-trainer.exe
+2026-11-26 11:18:49.867   Extracting temporary file: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-preflight\arm64\hufu-tsf-smoke-x64.exe
+2026-11-26 11:18:49.874   Extracting temporary file: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-preflight\arm64\hufu-tsf-smoke.exe
+2026-11-26 11:18:50.094   Extracting temporary file: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-preflight\arm64\hufu-tsf-smoke32.exe
+2026-11-26 11:18:50.247   Extracting temporary file: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-preflight\arm64\hufu_tsf.dll
+2026-11-26 11:18:50.472   Extracting temporary file: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-preflight\arm64\hufu_tsf32.dll
+2026-11-26 11:18:50.720   Extracting temporary file: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-preflight\arm64\hufu_tsf_arm64_42747a9bd16467ba422c.dll
+2026-11-26 11:18:50.926   Extracting temporary file: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-preflight\arm64\hufu_tsf_x64_42747a9bd16467ba422c.dll
+2026-11-26 11:18:51.135   Extracting temporary file: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-preflight\arm64\licenses\hufu-LICENSE.txt
+2026-11-26 11:18:51.174   Extracting temporary file: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-preflight\arm64\licenses\llama.cpp-LICENSE.txt
+2026-11-26 11:18:51.177   Extracting temporary file: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-preflight\arm64\licenses\native-sentence\llama.cpp-LICENSE
+2026-11-26 11:18:51.399   Extracting temporary file: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-preflight\arm64\licenses\native-sentence\TigerClaw-LICENSE
+2026-11-26 11:18:51.624   Extracting temporary file: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-preflight\arm64\licenses\native-sentence\TigerClaw-README.md
+2026-11-26 11:18:51.624   Extracting temporary file: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-preflight\arm64\licenses\Qwen3-LICENSE.txt
+2026-11-26 11:18:51.627   Extracting temporary file: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-preflight\arm64\licenses\trainer\NOTICE.md
+2026-11-26 11:18:51.627   Extracting temporary file: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-preflight\arm64\licenses\trainer\zhouzhou-LICENSE.txt
+2026-11-26 11:18:51.627   Extracting temporary file: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-preflight\arm64\licenses\trainer\zhouzhou-NOTICE.txt
+2026-11-26 11:18:51.628   Extracting temporary file: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-preflight\arm64\TigerClaw.Sentence.Native.dll
+2026-11-26 11:18:51.882   Extracting temporary file: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-preflight\arm64\version.txt
+2026-11-26 11:18:52.154   Extracting temporary file: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-preflight\arm64\WebView2Loader.dll
+2026-11-26 11:18:52.159   Extracting temporary file: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-preflight\arm64\使用说明.txt
+2026-11-26 11:18:52.159   Extracting temporary file: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-preflight\arm64\图标.ico
+2026-11-26 11:18:52.165   Extracting temporary file: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-preflight\arm64\更新日志.txt
+2026-11-26 11:18:52.174   Extracting temporary file: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-preflight\arm64\package-architecture.json
+2026-11-26 11:18:52.357   Extracting temporary file: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\program-files.lst
+2026-11-26 11:18:53.968   清场：目标目录进程已清净（KILLED=0 LEFT2=0）
+2026-11-26 11:18:53.968   Starting the installation process.
+2026-11-26 11:18:53.979   Directory for uninstall files: C:\Users\yc\AppData\Local\Programs\HuFu
+2026-11-26 11:18:53.983   Creating new uninstall log: C:\Users\yc\AppData\Local\Programs\HuFu\unins000.dat
+2026-11-26 11:18:53.988   -- File entry --
+2026-11-26 11:18:53.988   Dest filename: C:\Users\yc\AppData\Local\Programs\HuFu\unins000.exe
+2026-11-26 11:18:53.988   Non-default bitness: 32-bit
+2026-11-26 11:18:53.988   Time stamp of our file: 2026-11-26 11:18:48.426
+2026-11-26 11:18:53.988   Installing the file.
+2026-11-26 11:18:53.998   Successfully installed the file.
+2026-11-26 11:18:53.998   -- File entry --
+2026-11-26 11:18:53.998   Dest filename: C:\Users\yc\AppData\Local\Programs\HuFu\hufu-render-helper.exe
+2026-11-26 11:18:53.998   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:53.998   Installing the file.
+2026-11-26 11:18:54.299   Successfully installed the file.
+2026-11-26 11:18:54.299   -- File entry --
+2026-11-26 11:18:54.299   Dest filename: C:\Users\yc\AppData\Local\Programs\HuFu\hufu-server.exe
+2026-11-26 11:18:54.300   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:54.300   Installing the file.
+2026-11-26 11:18:54.507   Successfully installed the file.
+2026-11-26 11:18:54.507   -- File entry --
+2026-11-26 11:18:54.507   Dest filename: C:\Users\yc\AppData\Local\Programs\HuFu\hufu-settings.exe
+2026-11-26 11:18:54.507   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:54.507   Installing the file.
+2026-11-26 11:18:54.620   Successfully installed the file.
+2026-11-26 11:18:54.620   -- File entry --
+2026-11-26 11:18:54.620   Dest filename: C:\Users\yc\AppData\Local\Programs\HuFu\hufu-setup-engine.exe
+2026-11-26 11:18:54.620   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:54.620   Installing the file.
+2026-11-26 11:18:54.925   Successfully installed the file.
+2026-11-26 11:18:54.925   -- File entry --
+2026-11-26 11:18:54.927   Dest filename: C:\Users\yc\AppData\Local\Programs\HuFu\hufu-trainer.exe
+2026-11-26 11:18:54.927   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:54.927   Installing the file.
+2026-11-26 11:18:55.119   Successfully installed the file.
+2026-11-26 11:18:55.119   -- File entry --
+2026-11-26 11:18:55.119   Dest filename: C:\Users\yc\AppData\Local\Programs\HuFu\hufu-tsf-smoke-x64.exe
+2026-11-26 11:18:55.119   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:55.119   Installing the file.
+2026-11-26 11:18:55.125   Successfully installed the file.
+2026-11-26 11:18:55.125   -- File entry --
+2026-11-26 11:18:55.125   Dest filename: C:\Users\yc\AppData\Local\Programs\HuFu\hufu-tsf-smoke.exe
+2026-11-26 11:18:55.125   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:55.125   Installing the file.
+2026-11-26 11:18:55.370   Successfully installed the file.
+2026-11-26 11:18:55.370   -- File entry --
+2026-11-26 11:18:55.370   Dest filename: C:\Users\yc\AppData\Local\Programs\HuFu\hufu-tsf-smoke32.exe
+2026-11-26 11:18:55.370   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:55.370   Installing the file.
+2026-11-26 11:18:55.530   Successfully installed the file.
+2026-11-26 11:18:55.530   -- File entry --
+2026-11-26 11:18:55.530   Dest filename: C:\Users\yc\AppData\Local\Programs\HuFu\hufu_tsf.dll
+2026-11-26 11:18:55.530   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:55.530   Installing the file.
+2026-11-26 11:18:55.768   Successfully installed the file.
+2026-11-26 11:18:55.770   -- File entry --
+2026-11-26 11:18:55.770   Dest filename: C:\Users\yc\AppData\Local\Programs\HuFu\hufu_tsf32.dll
+2026-11-26 11:18:55.770   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:55.770   Installing the file.
+2026-11-26 11:18:56.013   Successfully installed the file.
+2026-11-26 11:18:56.013   -- File entry --
+2026-11-26 11:18:56.013   Dest filename: C:\Users\yc\AppData\Local\Programs\HuFu\hufu_tsf_arm64_42747a9bd16467ba422c.dll
+2026-11-26 11:18:56.013   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:56.013   Installing the file.
+2026-11-26 11:18:56.217   Successfully installed the file.
+2026-11-26 11:18:56.217   -- File entry --
+2026-11-26 11:18:56.217   Dest filename: C:\Users\yc\AppData\Local\Programs\HuFu\hufu_tsf_x64_42747a9bd16467ba422c.dll
+2026-11-26 11:18:56.217   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:56.217   Installing the file.
+2026-11-26 11:18:56.426   Successfully installed the file.
+2026-11-26 11:18:56.426   -- File entry --
+2026-11-26 11:18:56.429   Dest filename: C:\Users\yc\AppData\Local\Programs\HuFu\licenses\hufu-LICENSE.txt
+2026-11-26 11:18:56.429   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:56.429   Installing the file.
+2026-11-26 11:18:56.460   Successfully installed the file.
+2026-11-26 11:18:56.460   -- File entry --
+2026-11-26 11:18:56.460   Dest filename: C:\Users\yc\AppData\Local\Programs\HuFu\licenses\llama.cpp-LICENSE.txt
+2026-11-26 11:18:56.464   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:56.464   Installing the file.
+2026-11-26 11:18:56.464   Successfully installed the file.
+2026-11-26 11:18:56.464   -- File entry --
+2026-11-26 11:18:56.464   Dest filename: C:\Users\yc\AppData\Local\Programs\HuFu\licenses\native-sentence\llama.cpp-LICENSE
+2026-11-26 11:18:56.464   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:56.464   Installing the file.
+2026-11-26 11:18:56.466   Successfully installed the file.
+2026-11-26 11:18:56.466   -- File entry --
+2026-11-26 11:18:56.466   Dest filename: C:\Users\yc\AppData\Local\Programs\HuFu\licenses\native-sentence\TigerClaw-LICENSE
+2026-11-26 11:18:56.466   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:56.466   Installing the file.
+2026-11-26 11:18:56.473   Successfully installed the file.
+2026-11-26 11:18:56.473   -- File entry --
+2026-11-26 11:18:56.473   Dest filename: C:\Users\yc\AppData\Local\Programs\HuFu\licenses\native-sentence\TigerClaw-README.md
+2026-11-26 11:18:56.473   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:56.473   Installing the file.
+2026-11-26 11:18:56.474   Successfully installed the file.
+2026-11-26 11:18:56.474   -- File entry --
+2026-11-26 11:18:56.474   Dest filename: C:\Users\yc\AppData\Local\Programs\HuFu\licenses\Qwen3-LICENSE.txt
+2026-11-26 11:18:56.474   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:56.474   Installing the file.
+2026-11-26 11:18:56.474   Successfully installed the file.
+2026-11-26 11:18:56.474   -- File entry --
+2026-11-26 11:18:56.474   Dest filename: C:\Users\yc\AppData\Local\Programs\HuFu\licenses\trainer\NOTICE.md
+2026-11-26 11:18:56.475   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:56.475   Installing the file.
+2026-11-26 11:18:56.476   Successfully installed the file.
+2026-11-26 11:18:56.476   -- File entry --
+2026-11-26 11:18:56.476   Dest filename: C:\Users\yc\AppData\Local\Programs\HuFu\licenses\trainer\zhouzhou-LICENSE.txt
+2026-11-26 11:18:56.476   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:56.476   Installing the file.
+2026-11-26 11:18:56.476   Successfully installed the file.
+2026-11-26 11:18:56.476   -- File entry --
+2026-11-26 11:18:56.476   Dest filename: C:\Users\yc\AppData\Local\Programs\HuFu\licenses\trainer\zhouzhou-NOTICE.txt
+2026-11-26 11:18:56.476   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:56.476   Installing the file.
+2026-11-26 11:18:56.476   Successfully installed the file.
+2026-11-26 11:18:56.476   -- File entry --
+2026-11-26 11:18:56.476   Dest filename: C:\Users\yc\AppData\Local\Programs\HuFu\TigerClaw.Sentence.Native.dll
+2026-11-26 11:18:56.476   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:56.476   Installing the file.
+2026-11-26 11:18:56.731   Successfully installed the file.
+2026-11-26 11:18:56.731   -- File entry --
+2026-11-26 11:18:56.731   Dest filename: C:\Users\yc\AppData\Local\Programs\HuFu\version.txt
+2026-11-26 11:18:56.731   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:56.731   Installing the file.
+2026-11-26 11:18:56.995   Successfully installed the file.
+2026-11-26 11:18:56.995   -- File entry --
+2026-11-26 11:18:56.995   Dest filename: C:\Users\yc\AppData\Local\Programs\HuFu\WebView2Loader.dll
+2026-11-26 11:18:56.995   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:56.998   Installing the file.
+2026-11-26 11:18:57.003   Successfully installed the file.
+2026-11-26 11:18:57.003   -- File entry --
+2026-11-26 11:18:57.003   Dest filename: C:\Users\yc\AppData\Local\Programs\HuFu\使用说明.txt
+2026-11-26 11:18:57.003   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.003   Installing the file.
+2026-11-26 11:18:57.003   Successfully installed the file.
+2026-11-26 11:18:57.003   -- File entry --
+2026-11-26 11:18:57.003   Dest filename: C:\Users\yc\AppData\Local\Programs\HuFu\图标.ico
+2026-11-26 11:18:57.003   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.003   Installing the file.
+2026-11-26 11:18:57.007   Successfully installed the file.
+2026-11-26 11:18:57.007   -- File entry --
+2026-11-26 11:18:57.007   Dest filename: C:\Users\yc\AppData\Local\Programs\HuFu\更新日志.txt
+2026-11-26 11:18:57.007   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.007   Installing the file.
+2026-11-26 11:18:57.014   Successfully installed the file.
+2026-11-26 11:18:57.014   -- File entry --
+2026-11-26 11:18:57.014   Dest filename: C:\Users\yc\AppData\Local\Programs\HuFu\package-architecture.json
+2026-11-26 11:18:57.014   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.014   Installing the file.
+2026-11-26 11:18:57.193   Successfully installed the file.
+2026-11-26 11:18:57.193   -- File entry --
+2026-11-26 11:18:57.193   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-files.lst
+2026-11-26 11:18:57.193   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.193   Installing the file.
+2026-11-26 11:18:57.194   Successfully installed the file.
+2026-11-26 11:18:57.194   -- File entry --
+2026-11-26 11:18:57.194   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-files-upgrade.lst
+2026-11-26 11:18:57.194   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.194   Installing the file.
+2026-11-26 11:18:57.194   Successfully installed the file.
+2026-11-26 11:18:57.194   -- File entry --
+2026-11-26 11:18:57.194   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\码表\个人自用\个人存储表.txt
+2026-11-26 11:18:57.194   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.194   Installing the file.
+2026-11-26 11:18:57.194   Creating directory: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg
+2026-11-26 11:18:57.194   Creating directory: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\码表
+2026-11-26 11:18:57.194   Creating directory: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\码表\个人自用
+2026-11-26 11:18:57.197   Successfully installed the file.
+2026-11-26 11:18:57.197   -- File entry --
+2026-11-26 11:18:57.197   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\码表\个人自用\常用符号.txt
+2026-11-26 11:18:57.197   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.197   Installing the file.
+2026-11-26 11:18:57.197   Successfully installed the file.
+2026-11-26 11:18:57.197   -- File entry --
+2026-11-26 11:18:57.197   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\码表\个人自用\必看！功能模块说明.txt
+2026-11-26 11:18:57.197   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.197   Installing the file.
+2026-11-26 11:18:57.197   Successfully installed the file.
+2026-11-26 11:18:57.197   -- File entry --
+2026-11-26 11:18:57.197   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\码表\个人自用\快符.txt
+2026-11-26 11:18:57.197   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.197   Installing the file.
+2026-11-26 11:18:57.204   Successfully installed the file.
+2026-11-26 11:18:57.204   -- File entry --
+2026-11-26 11:18:57.204   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\码表\个人自用\码表.txt
+2026-11-26 11:18:57.204   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.204   Installing the file.
+2026-11-26 11:18:57.231   Successfully installed the file.
+2026-11-26 11:18:57.231   -- File entry --
+2026-11-26 11:18:57.231   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\码表\个人自用\码表.txt.bak-20261106
+2026-11-26 11:18:57.231   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.231   Installing the file.
+2026-11-26 11:18:57.235   Successfully installed the file.
+2026-11-26 11:18:57.235   -- File entry --
+2026-11-26 11:18:57.235   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\码表\五笔\必看！功能模块说明.txt
+2026-11-26 11:18:57.235   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.235   Installing the file.
+2026-11-26 11:18:57.235   Creating directory: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\码表\五笔
+2026-11-26 11:18:57.235   Successfully installed the file.
+2026-11-26 11:18:57.235   -- File entry --
+2026-11-26 11:18:57.235   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\码表\夜莺\个人存储表.txt
+2026-11-26 11:18:57.235   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.235   Installing the file.
+2026-11-26 11:18:57.235   Creating directory: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\码表\夜莺
+2026-11-26 11:18:57.235   Successfully installed the file.
+2026-11-26 11:18:57.235   -- File entry --
+2026-11-26 11:18:57.235   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\码表\夜莺\夜莺介绍.md
+2026-11-26 11:18:57.235   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.235   Installing the file.
+2026-11-26 11:18:57.235   Successfully installed the file.
+2026-11-26 11:18:57.235   -- File entry --
+2026-11-26 11:18:57.235   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\码表\夜莺\夜莺字词.txt
+2026-11-26 11:18:57.235   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.235   Installing the file.
+2026-11-26 11:18:57.286   Successfully installed the file.
+2026-11-26 11:18:57.286   -- File entry --
+2026-11-26 11:18:57.286   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\码表\夜莺\常用符号.txt
+2026-11-26 11:18:57.286   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.286   Installing the file.
+2026-11-26 11:18:57.286   Successfully installed the file.
+2026-11-26 11:18:57.286   -- File entry --
+2026-11-26 11:18:57.286   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\码表\夜莺\必看！功能模块说明.txt
+2026-11-26 11:18:57.286   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.286   Installing the file.
+2026-11-26 11:18:57.289   Successfully installed the file.
+2026-11-26 11:18:57.289   -- File entry --
+2026-11-26 11:18:57.289   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\码表\夜莺\快符.txt
+2026-11-26 11:18:57.289   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.289   Installing the file.
+2026-11-26 11:18:57.290   Successfully installed the file.
+2026-11-26 11:18:57.290   -- File entry --
+2026-11-26 11:18:57.290   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\码表\虎整句\个人存储表.txt
+2026-11-26 11:18:57.290   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.290   Installing the file.
+2026-11-26 11:18:57.290   Creating directory: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\码表\虎整句
+2026-11-26 11:18:57.290   Successfully installed the file.
+2026-11-26 11:18:57.290   -- File entry --
+2026-11-26 11:18:57.290   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\码表\虎整句\常用符号.txt
+2026-11-26 11:18:57.290   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.290   Installing the file.
+2026-11-26 11:18:57.290   Successfully installed the file.
+2026-11-26 11:18:57.290   -- File entry --
+2026-11-26 11:18:57.290   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\码表\虎整句\必看！功能模块说明.txt
+2026-11-26 11:18:57.290   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.290   Installing the file.
+2026-11-26 11:18:57.293   Successfully installed the file.
+2026-11-26 11:18:57.293   -- File entry --
+2026-11-26 11:18:57.293   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\码表\虎整句\快符.txt
+2026-11-26 11:18:57.293   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.293   Installing the file.
+2026-11-26 11:18:57.295   Successfully installed the file.
+2026-11-26 11:18:57.295   -- File entry --
+2026-11-26 11:18:57.295   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\码表\虎整句\码表.txt
+2026-11-26 11:18:57.295   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.295   Installing the file.
+2026-11-26 11:18:57.303   Successfully installed the file.
+2026-11-26 11:18:57.303   -- File entry --
+2026-11-26 11:18:57.303   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\码表\虎整句\补充语料.txt
+2026-11-26 11:18:57.303   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.303   Installing the file.
+2026-11-26 11:18:57.304   Successfully installed the file.
+2026-11-26 11:18:57.304   -- File entry --
+2026-11-26 11:18:57.304   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\码表\虎码单字\tiger.dict.yaml
+2026-11-26 11:18:57.304   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.304   Installing the file.
+2026-11-26 11:18:57.304   Creating directory: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\码表\虎码单字
+2026-11-26 11:18:57.334   Successfully installed the file.
+2026-11-26 11:18:57.334   -- File entry --
+2026-11-26 11:18:57.335   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\码表\虎码单字\个人存储表.txt
+2026-11-26 11:18:57.335   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.335   Installing the file.
+2026-11-26 11:18:57.335   Successfully installed the file.
+2026-11-26 11:18:57.335   -- File entry --
+2026-11-26 11:18:57.335   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\码表\虎码单字\常用符号.txt
+2026-11-26 11:18:57.335   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.335   Installing the file.
+2026-11-26 11:18:57.337   Successfully installed the file.
+2026-11-26 11:18:57.337   -- File entry --
+2026-11-26 11:18:57.337   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\码表\虎码单字\必看！功能模块说明.txt
+2026-11-26 11:18:57.337   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.337   Installing the file.
+2026-11-26 11:18:57.338   Successfully installed the file.
+2026-11-26 11:18:57.338   -- File entry --
+2026-11-26 11:18:57.338   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\码表\虎码单字\快符.txt
+2026-11-26 11:18:57.338   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.338   Installing the file.
+2026-11-26 11:18:57.338   Successfully installed the file.
+2026-11-26 11:18:57.338   -- File entry --
+2026-11-26 11:18:57.338   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\码表\虎码字词\tigress.dict.yaml
+2026-11-26 11:18:57.338   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.338   Installing the file.
+2026-11-26 11:18:57.338   Creating directory: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\码表\虎码字词
+2026-11-26 11:18:57.366   Successfully installed the file.
+2026-11-26 11:18:57.366   -- File entry --
+2026-11-26 11:18:57.366   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\码表\虎码字词\tigress_ci.dict.yaml
+2026-11-26 11:18:57.366   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.366   Installing the file.
+2026-11-26 11:18:57.422   Successfully installed the file.
+2026-11-26 11:18:57.422   -- File entry --
+2026-11-26 11:18:57.422   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\码表\虎码字词\tigress_simp_ci.dict.yaml
+2026-11-26 11:18:57.422   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.422   Installing the file.
+2026-11-26 11:18:57.424   Successfully installed the file.
+2026-11-26 11:18:57.424   -- File entry --
+2026-11-26 11:18:57.424   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\码表\虎码字词\个人存储表.txt
+2026-11-26 11:18:57.424   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.424   Installing the file.
+2026-11-26 11:18:57.426   Successfully installed the file.
+2026-11-26 11:18:57.426   -- File entry --
+2026-11-26 11:18:57.426   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\码表\虎码字词\常用符号.txt
+2026-11-26 11:18:57.426   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.426   Installing the file.
+2026-11-26 11:18:57.426   Successfully installed the file.
+2026-11-26 11:18:57.426   -- File entry --
+2026-11-26 11:18:57.426   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\码表\虎码字词\必看！功能模块说明.txt
+2026-11-26 11:18:57.426   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.426   Installing the file.
+2026-11-26 11:18:57.426   Successfully installed the file.
+2026-11-26 11:18:57.426   -- File entry --
+2026-11-26 11:18:57.426   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\码表\虎码字词\快符.txt
+2026-11-26 11:18:57.426   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.426   Installing the file.
+2026-11-26 11:18:57.429   Successfully installed the file.
+2026-11-26 11:18:57.429   -- File entry --
+2026-11-26 11:18:57.429   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\config.json
+2026-11-26 11:18:57.429   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.429   Installing the file.
+2026-11-26 11:18:57.429   Creating directory: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据
+2026-11-26 11:18:57.429   Successfully installed the file.
+2026-11-26 11:18:57.429   -- File entry --
+2026-11-26 11:18:57.429   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\同步教程.png
+2026-11-26 11:18:57.429   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.429   Installing the file.
+2026-11-26 11:18:57.463   Successfully installed the file.
+2026-11-26 11:18:57.463   -- File entry --
+2026-11-26 11:18:57.463   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\拆分\夜莺.拆分
+2026-11-26 11:18:57.463   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.463   Installing the file.
+2026-11-26 11:18:57.463   Creating directory: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\拆分
+2026-11-26 11:18:57.470   Successfully installed the file.
+2026-11-26 11:18:57.470   -- File entry --
+2026-11-26 11:18:57.470   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\拆分\虎码.拆分
+2026-11-26 11:18:57.470   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.470   Installing the file.
+2026-11-26 11:18:57.501   Successfully installed the file.
+2026-11-26 11:18:57.501   -- File entry --
+2026-11-26 11:18:57.501   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\拼音反查\全拼.txt
+2026-11-26 11:18:57.501   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.501   Installing the file.
+2026-11-26 11:18:57.501   Creating directory: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\拼音反查
+2026-11-26 11:18:57.648   Successfully installed the file.
+2026-11-26 11:18:57.648   -- File entry --
+2026-11-26 11:18:57.648   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\数据说明.txt
+2026-11-26 11:18:57.648   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.648   Installing the file.
+2026-11-26 11:18:57.650   Successfully installed the file.
+2026-11-26 11:18:57.650   -- File entry --
+2026-11-26 11:18:57.650   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\注释\unicode.注释
+2026-11-26 11:18:57.650   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.650   Installing the file.
+2026-11-26 11:18:57.650   Creating directory: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\注释
+2026-11-26 11:18:57.669   Successfully installed the file.
+2026-11-26 11:18:57.669   -- File entry --
+2026-11-26 11:18:57.669   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\注释\拼音.注释
+2026-11-26 11:18:57.669   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.669   Installing the file.
+2026-11-26 11:18:57.679   Successfully installed the file.
+2026-11-26 11:18:57.679   -- File entry --
+2026-11-26 11:18:57.679   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\皮肤\hufu-canghai.json
+2026-11-26 11:18:57.679   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.679   Installing the file.
+2026-11-26 11:18:57.681   Creating directory: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\皮肤
+2026-11-26 11:18:57.682   Successfully installed the file.
+2026-11-26 11:18:57.682   -- File entry --
+2026-11-26 11:18:57.682   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\皮肤\hufu-chenwu.json
+2026-11-26 11:18:57.682   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.682   Installing the file.
+2026-11-26 11:18:57.682   Successfully installed the file.
+2026-11-26 11:18:57.682   -- File entry --
+2026-11-26 11:18:57.682   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\皮肤\hufu-default.json
+2026-11-26 11:18:57.682   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.682   Installing the file.
+2026-11-26 11:18:57.684   Successfully installed the file.
+2026-11-26 11:18:57.684   -- File entry --
+2026-11-26 11:18:57.684   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\皮肤\hufu-huguang.json
+2026-11-26 11:18:57.684   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.684   Installing the file.
+2026-11-26 11:18:57.688   Successfully installed the file.
+2026-11-26 11:18:57.688   -- File entry --
+2026-11-26 11:18:57.688   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\皮肤\hufu-hupo.json
+2026-11-26 11:18:57.688   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.688   Installing the file.
+2026-11-26 11:18:57.688   Successfully installed the file.
+2026-11-26 11:18:57.688   -- File entry --
+2026-11-26 11:18:57.690   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\皮肤\hufu-luoxia.json
+2026-11-26 11:18:57.690   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.690   Installing the file.
+2026-11-26 11:18:57.690   Successfully installed the file.
+2026-11-26 11:18:57.690   -- File entry --
+2026-11-26 11:18:57.690   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\皮肤\hufu-mocha.json
+2026-11-26 11:18:57.690   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.690   Installing the file.
+2026-11-26 11:18:57.690   Successfully installed the file.
+2026-11-26 11:18:57.690   -- File entry --
+2026-11-26 11:18:57.690   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\皮肤\hufu-moyan.json
+2026-11-26 11:18:57.690   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.690   Installing the file.
+2026-11-26 11:18:57.692   Successfully installed the file.
+2026-11-26 11:18:57.692   -- File entry --
+2026-11-26 11:18:57.692   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\皮肤\hufu-mushan.json
+2026-11-26 11:18:57.692   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.692   Installing the file.
+2026-11-26 11:18:57.692   Successfully installed the file.
+2026-11-26 11:18:57.692   -- File entry --
+2026-11-26 11:18:57.692   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\皮肤\hufu-ouhe.json
+2026-11-26 11:18:57.692   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.692   Installing the file.
+2026-11-26 11:18:57.692   Successfully installed the file.
+2026-11-26 11:18:57.692   -- File entry --
+2026-11-26 11:18:57.692   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\皮肤\hufu-qingci.json
+2026-11-26 11:18:57.692   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.692   Installing the file.
+2026-11-26 11:18:57.692   Successfully installed the file.
+2026-11-26 11:18:57.692   -- File entry --
+2026-11-26 11:18:57.695   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\皮肤\hufu-rongyan.json
+2026-11-26 11:18:57.695   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.695   Installing the file.
+2026-11-26 11:18:57.695   Successfully installed the file.
+2026-11-26 11:18:57.695   -- File entry --
+2026-11-26 11:18:57.695   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\皮肤\hufu-shiyou.json
+2026-11-26 11:18:57.695   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.695   Installing the file.
+2026-11-26 11:18:57.696   Successfully installed the file.
+2026-11-26 11:18:57.696   -- File entry --
+2026-11-26 11:18:57.696   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\皮肤\hufu-songyan.json
+2026-11-26 11:18:57.696   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.696   Installing the file.
+2026-11-26 11:18:57.696   Successfully installed the file.
+2026-11-26 11:18:57.696   -- File entry --
+2026-11-26 11:18:57.696   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\皮肤\hufu-sujian.json
+2026-11-26 11:18:57.696   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.696   Installing the file.
+2026-11-26 11:18:57.696   Successfully installed the file.
+2026-11-26 11:18:57.696   -- File entry --
+2026-11-26 11:18:57.696   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\皮肤\hufu-xingyu.json
+2026-11-26 11:18:57.696   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.696   Installing the file.
+2026-11-26 11:18:57.696   Successfully installed the file.
+2026-11-26 11:18:57.696   -- File entry --
+2026-11-26 11:18:57.696   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\皮肤\hufu-xuanmo.json
+2026-11-26 11:18:57.696   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.696   Installing the file.
+2026-11-26 11:18:57.696   Successfully installed the file.
+2026-11-26 11:18:57.696   -- File entry --
+2026-11-26 11:18:57.696   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\皮肤\hufu-yingxiong.json
+2026-11-26 11:18:57.696   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.696   Installing the file.
+2026-11-26 11:18:57.698   Successfully installed the file.
+2026-11-26 11:18:57.698   -- File entry --
+2026-11-26 11:18:57.698   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\皮肤\hufu-yuebai.json
+2026-11-26 11:18:57.698   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.698   Installing the file.
+2026-11-26 11:18:57.698   Successfully installed the file.
+2026-11-26 11:18:57.698   -- File entry --
+2026-11-26 11:18:57.698   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\转换词典\emoji.json
+2026-11-26 11:18:57.698   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.698   Installing the file.
+2026-11-26 11:18:57.698   Creating directory: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\转换词典
+2026-11-26 11:18:57.698   Successfully installed the file.
+2026-11-26 11:18:57.698   -- File entry --
+2026-11-26 11:18:57.698   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\转换词典\emoji.txt
+2026-11-26 11:18:57.698   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.698   Installing the file.
+2026-11-26 11:18:57.702   Successfully installed the file.
+2026-11-26 11:18:57.702   -- File entry --
+2026-11-26 11:18:57.702   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\转换词典\hk2s.json
+2026-11-26 11:18:57.702   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.702   Installing the file.
+2026-11-26 11:18:57.702   Successfully installed the file.
+2026-11-26 11:18:57.702   -- File entry --
+2026-11-26 11:18:57.702   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\转换词典\HKVariants.txt
+2026-11-26 11:18:57.702   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.702   Installing the file.
+2026-11-26 11:18:57.702   Successfully installed the file.
+2026-11-26 11:18:57.702   -- File entry --
+2026-11-26 11:18:57.702   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\转换词典\HKVariantsPhrases.txt
+2026-11-26 11:18:57.702   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.702   Installing the file.
+2026-11-26 11:18:57.708   Successfully installed the file.
+2026-11-26 11:18:57.708   -- File entry --
+2026-11-26 11:18:57.708   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\转换词典\HKVariantsRev.txt
+2026-11-26 11:18:57.708   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.708   Installing the file.
+2026-11-26 11:18:57.709   Successfully installed the file.
+2026-11-26 11:18:57.709   -- File entry --
+2026-11-26 11:18:57.709   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\转换词典\HKVariantsRevPhrases.txt
+2026-11-26 11:18:57.709   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.709   Installing the file.
+2026-11-26 11:18:57.709   Successfully installed the file.
+2026-11-26 11:18:57.709   -- File entry --
+2026-11-26 11:18:57.709   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\转换词典\hu_cf.json
+2026-11-26 11:18:57.709   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.709   Installing the file.
+2026-11-26 11:18:57.710   Successfully installed the file.
+2026-11-26 11:18:57.710   -- File entry --
+2026-11-26 11:18:57.710   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\转换词典\hu_cf.txt
+2026-11-26 11:18:57.710   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.710   Installing the file.
+2026-11-26 11:18:57.766   Successfully installed the file.
+2026-11-26 11:18:57.766   -- File entry --
+2026-11-26 11:18:57.766   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\转换词典\JPVariants.txt
+2026-11-26 11:18:57.766   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.766   Installing the file.
+2026-11-26 11:18:57.766   Successfully installed the file.
+2026-11-26 11:18:57.766   -- File entry --
+2026-11-26 11:18:57.766   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\转换词典\pinyin.json
+2026-11-26 11:18:57.766   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.766   Installing the file.
+2026-11-26 11:18:57.766   Successfully installed the file.
+2026-11-26 11:18:57.766   -- File entry --
+2026-11-26 11:18:57.766   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\转换词典\PYCharacters.txt
+2026-11-26 11:18:57.766   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.766   Installing the file.
+2026-11-26 11:18:57.777   Successfully installed the file.
+2026-11-26 11:18:57.777   -- File entry --
+2026-11-26 11:18:57.777   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\转换词典\PYPhrases.txt
+2026-11-26 11:18:57.777   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.777   Installing the file.
+2026-11-26 11:18:57.795   Successfully installed the file.
+2026-11-26 11:18:57.795   -- File entry --
+2026-11-26 11:18:57.795   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\转换词典\s2hk.json
+2026-11-26 11:18:57.795   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.795   Installing the file.
+2026-11-26 11:18:57.795   Successfully installed the file.
+2026-11-26 11:18:57.795   -- File entry --
+2026-11-26 11:18:57.795   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\转换词典\s2t.json
+2026-11-26 11:18:57.795   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.795   Installing the file.
+2026-11-26 11:18:57.804   Successfully installed the file.
+2026-11-26 11:18:57.804   -- File entry --
+2026-11-26 11:18:57.804   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\转换词典\s2tw.json
+2026-11-26 11:18:57.804   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.804   Installing the file.
+2026-11-26 11:18:57.804   Successfully installed the file.
+2026-11-26 11:18:57.804   -- File entry --
+2026-11-26 11:18:57.804   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\转换词典\s2twp.json
+2026-11-26 11:18:57.804   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.804   Installing the file.
+2026-11-26 11:18:57.804   Successfully installed the file.
+2026-11-26 11:18:57.804   -- File entry --
+2026-11-26 11:18:57.806   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\转换词典\st_tu.json
+2026-11-26 11:18:57.806   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.806   Installing the file.
+2026-11-26 11:18:57.806   Successfully installed the file.
+2026-11-26 11:18:57.806   -- File entry --
+2026-11-26 11:18:57.806   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\转换词典\STCharacters_Tu.txt
+2026-11-26 11:18:57.806   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.806   Installing the file.
+2026-11-26 11:18:57.807   Successfully installed the file.
+2026-11-26 11:18:57.807   -- File entry --
+2026-11-26 11:18:57.807   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\转换词典\STPhrases.txt
+2026-11-26 11:18:57.807   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.807   Installing the file.
+2026-11-26 11:18:57.821   Successfully installed the file.
+2026-11-26 11:18:57.821   -- File entry --
+2026-11-26 11:18:57.821   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\转换词典\t2hk.json
+2026-11-26 11:18:57.821   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.821   Installing the file.
+2026-11-26 11:18:57.828   Successfully installed the file.
+2026-11-26 11:18:57.828   -- File entry --
+2026-11-26 11:18:57.828   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\转换词典\t2s.json
+2026-11-26 11:18:57.828   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.828   Installing the file.
+2026-11-26 11:18:57.828   Successfully installed the file.
+2026-11-26 11:18:57.828   -- File entry --
+2026-11-26 11:18:57.828   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\转换词典\t2tw.json
+2026-11-26 11:18:57.828   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.828   Installing the file.
+2026-11-26 11:18:57.828   Successfully installed the file.
+2026-11-26 11:18:57.828   -- File entry --
+2026-11-26 11:18:57.828   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\转换词典\TSCharacters.txt
+2026-11-26 11:18:57.828   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.828   Installing the file.
+2026-11-26 11:18:57.830   Successfully installed the file.
+2026-11-26 11:18:57.830   -- File entry --
+2026-11-26 11:18:57.830   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\转换词典\TSPhrases.txt
+2026-11-26 11:18:57.830   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.830   Installing the file.
+2026-11-26 11:18:57.831   Successfully installed the file.
+2026-11-26 11:18:57.831   -- File entry --
+2026-11-26 11:18:57.831   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\转换词典\tw2s.json
+2026-11-26 11:18:57.831   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.831   Installing the file.
+2026-11-26 11:18:57.831   Successfully installed the file.
+2026-11-26 11:18:57.831   -- File entry --
+2026-11-26 11:18:57.831   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\转换词典\tw2sp.json
+2026-11-26 11:18:57.831   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.831   Installing the file.
+2026-11-26 11:18:57.831   Successfully installed the file.
+2026-11-26 11:18:57.831   -- File entry --
+2026-11-26 11:18:57.831   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\转换词典\TWPhrases.txt
+2026-11-26 11:18:57.831   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.831   Installing the file.
+2026-11-26 11:18:57.833   Successfully installed the file.
+2026-11-26 11:18:57.833   -- File entry --
+2026-11-26 11:18:57.833   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\转换词典\TWPhrasesRev.txt
+2026-11-26 11:18:57.833   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.833   Installing the file.
+2026-11-26 11:18:57.834   Successfully installed the file.
+2026-11-26 11:18:57.834   -- File entry --
+2026-11-26 11:18:57.834   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\转换词典\TWVariants.txt
+2026-11-26 11:18:57.834   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.834   Installing the file.
+2026-11-26 11:18:57.835   Successfully installed the file.
+2026-11-26 11:18:57.835   -- File entry --
+2026-11-26 11:18:57.835   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\转换词典\TWVariantsRev.txt
+2026-11-26 11:18:57.835   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.835   Installing the file.
+2026-11-26 11:18:57.835   Successfully installed the file.
+2026-11-26 11:18:57.835   -- File entry --
+2026-11-26 11:18:57.835   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\转换词典\TWVariantsRevPhrases.txt
+2026-11-26 11:18:57.835   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.835   Installing the file.
+2026-11-26 11:18:57.836   Successfully installed the file.
+2026-11-26 11:18:57.836   -- File entry --
+2026-11-26 11:18:57.836   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\音效\commit.wav
+2026-11-26 11:18:57.836   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.836   Installing the file.
+2026-11-26 11:18:57.836   Creating directory: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\音效
+2026-11-26 11:18:57.836   Successfully installed the file.
+2026-11-26 11:18:57.836   -- File entry --
+2026-11-26 11:18:57.836   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\音效\key.wav
+2026-11-26 11:18:57.836   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.836   Installing the file.
+2026-11-26 11:18:57.838   Successfully installed the file.
+2026-11-26 11:18:57.838   -- File entry --
+2026-11-26 11:18:57.838   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\音效\page.wav
+2026-11-26 11:18:57.838   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.838   Installing the file.
+2026-11-26 11:18:57.838   Successfully installed the file.
+2026-11-26 11:18:57.838   -- File entry --
+2026-11-26 11:18:57.838   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\音效\select.wav
+2026-11-26 11:18:57.838   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.838   Installing the file.
+2026-11-26 11:18:57.840   Successfully installed the file.
+2026-11-26 11:18:57.840   -- File entry --
+2026-11-26 11:18:57.840   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\音效\原味\commit.wav
+2026-11-26 11:18:57.840   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.840   Installing the file.
+2026-11-26 11:18:57.840   Creating directory: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\音效\原味
+2026-11-26 11:18:57.852   Successfully installed the file.
+2026-11-26 11:18:57.852   -- File entry --
+2026-11-26 11:18:57.852   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\音效\原味\key.wav
+2026-11-26 11:18:57.852   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.852   Installing the file.
+2026-11-26 11:18:57.855   Successfully installed the file.
+2026-11-26 11:18:57.855   -- File entry --
+2026-11-26 11:18:57.855   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\音效\原味\page.wav
+2026-11-26 11:18:57.855   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.855   Installing the file.
+2026-11-26 11:18:57.865   Successfully installed the file.
+2026-11-26 11:18:57.865   -- File entry --
+2026-11-26 11:18:57.865   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\音效\原味\select.wav
+2026-11-26 11:18:57.867   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.867   Installing the file.
+2026-11-26 11:18:57.869   Successfully installed the file.
+2026-11-26 11:18:57.869   -- File entry --
+2026-11-26 11:18:57.869   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\音效\闷轴\commit.wav
+2026-11-26 11:18:57.869   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.869   Installing the file.
+2026-11-26 11:18:57.869   Creating directory: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\音效\闷轴
+2026-11-26 11:18:57.872   Successfully installed the file.
+2026-11-26 11:18:57.872   -- File entry --
+2026-11-26 11:18:57.872   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\音效\闷轴\key.wav
+2026-11-26 11:18:57.872   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.872   Installing the file.
+2026-11-26 11:18:57.872   Successfully installed the file.
+2026-11-26 11:18:57.872   -- File entry --
+2026-11-26 11:18:57.872   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\音效\闷轴\page.wav
+2026-11-26 11:18:57.872   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.872   Installing the file.
+2026-11-26 11:18:57.875   Successfully installed the file.
+2026-11-26 11:18:57.875   -- File entry --
+2026-11-26 11:18:57.875   Dest filename: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-pkg\数据\音效\闷轴\select.wav
+2026-11-26 11:18:57.875   Time stamp of our file: 2026-11-26 11:18:06.000
+2026-11-26 11:18:57.875   Installing the file.
+2026-11-26 11:18:57.877   Successfully installed the file.
+2026-11-26 11:18:57.877   Saving uninstall information.
+2026-11-26 11:18:57.877   Creating new uninstall key: HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Uninstall\{2F8A5D41-7B63-4C3E-9E15-A8D4B0C6F293}_is1
+2026-11-26 11:18:57.877   Writing uninstall key values.
+2026-11-26 11:18:57.877   Detected previous administrative 64-bit install? No
+2026-11-26 11:18:57.877   Detected previous administrative 32-bit install? No
+2026-11-26 11:18:57.882   Installation process succeeded.
+2026-11-26 11:18:57.882   BackupDiff 清单: C:\Users\yc\AppData\Local\Temp\is-U1RB5QB6CO.tmp\hufu-files.lst
+2026-11-26 11:18:57.882     全新安装：全量清单落盘
+2026-11-26 11:19:23.599   Need to restart Windows? No
+2026-11-26 11:19:23.602   Deinitializing Setup.
+2026-11-26 11:19:23.624   Log closed.

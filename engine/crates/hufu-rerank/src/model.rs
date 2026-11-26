@@ -366,6 +366,7 @@ impl Qwen3 {
                     // rhs（~1MB×196 次/前向）占绝对大头（实测 0.6 GFLOPS）。
                     // 手写 AVX2 点积：out(i,p)=dot(x_i, w_p)，K 连续 stride=1，
                     // 无 pack，直接 10~30×。
+                    #[cfg(target_arch = "x86_64")]
                     if m <= 16 && k % 8 == 0 && dot_avx2_ok() {
                         unsafe {
                             for p in 0..pn {

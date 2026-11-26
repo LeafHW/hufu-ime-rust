@@ -1,0 +1,92 @@
+﻿**********************
+Windows PowerShell 脚本开始
+开始时间: 20261126111650
+用户名: [REDACTED for public PR]
+RunAs 用户: [REDACTED for public PR]
+配置名称: 
+计算机: [REDACTED for public PR]
+主机应用程序: C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\Workspace\hufu-ime-rust\_tmp\arm64\profile-fix\test-live-convergence.ps1
+进程 ID: 35168
+PSVersion: 5.1.28000.3501
+PSEdition: Desktop
+PSCompatibleVersions: 1.0, 2.0, 3.0, 4.0, 5.0, 5.1.28000.3501
+BuildVersion: 10.0.28000.3501
+CLRVersion: 4.0.30319.42000
+WSManStackVersion: 3.0
+PSRemotingProtocolVersion: 2.3
+SerializationVersion: 1.1.0.1
+**********************
+已启动脚本，输出文件为 C:\Workspace\hufu-ime-rust\_tmp\arm64\profile-fix\live-convergence.log
+cycle=1 unregister
+✓ msctf 档案已注销
+profile_registered=1
+profile_enabled=1
+unregister elapsed_ms=22 exit=0
+profile_registered=1
+profile_enabled=1
+unregister elapsed_ms=292 exit=0
+profile_registered=0
+error=未指定的错误 (0x80004005)
+unregister elapsed_ms=560 exit=2
+RegisterProfile(带图标 C:\Windows\SystemIME\HuFu\generations\1.9.9.11-e0e7a15ec8f7\hufu_tsf.dll) → 0x00000000
+RegisterCategory(kbd) → 0x00000000 (asm) → 0x00000000
+共享档案登记完成；当前用户启用由未提权 enable 独立执行
+profile_registered=0
+error=未指定的错误 (0x80004005)
+register elapsed_ms=29 exit=2
+profile_registered=0
+error=未指定的错误 (0x80004005)
+register elapsed_ms=309 exit=2
+profile_registered=1
+profile_enabled=1
+register elapsed_ms=582 exit=0
+cycle=2 unregister
+✓ msctf 档案已注销
+profile_registered=1
+profile_enabled=1
+unregister elapsed_ms=10 exit=0
+profile_registered=1
+profile_enabled=1
+unregister elapsed_ms=266 exit=0
+profile_registered=0
+error=未指定的错误 (0x80004005)
+unregister elapsed_ms=540 exit=2
+RegisterProfile(带图标 C:\Windows\SystemIME\HuFu\generations\1.9.9.11-e0e7a15ec8f7\hufu_tsf.dll) → 0x00000000
+RegisterCategory(kbd) → 0x00000000 (asm) → 0x00000000
+共享档案登记完成；当前用户启用由未提权 enable 独立执行
+profile_registered=0
+error=未指定的错误 (0x80004005)
+register elapsed_ms=10 exit=2
+profile_registered=0
+error=未指定的错误 (0x80004005)
+register elapsed_ms=267 exit=2
+profile_registered=1
+profile_enabled=1
+register elapsed_ms=537 exit=0
+cycle=3 unregister
+✓ msctf 档案已注销
+profile_registered=1
+profile_enabled=1
+unregister elapsed_ms=10 exit=0
+profile_registered=1
+profile_enabled=1
+unregister elapsed_ms=273 exit=0
+profile_registered=0
+error=未指定的错误 (0x80004005)
+unregister elapsed_ms=546 exit=2
+RegisterProfile(带图标 C:\Windows\SystemIME\HuFu\generations\1.9.9.11-e0e7a15ec8f7\hufu_tsf.dll) → 0x00000000
+RegisterCategory(kbd) → 0x00000000 (asm) → 0x00000000
+共享档案登记完成；当前用户启用由未提权 enable 独立执行
+profile_registered=0
+error=未指定的错误 (0x80004005)
+register elapsed_ms=13 exit=2
+profile_registered=0
+error=未指定的错误 (0x80004005)
+register elapsed_ms=281 exit=2
+profile_registered=1
+profile_enabled=1
+register elapsed_ms=554 exit=0
+**********************
+Windows PowerShell 脚本结束
+结束时间: 20261126111653
+**********************

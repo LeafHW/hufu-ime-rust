@@ -1,0 +1,18 @@
+﻿[
+    {
+        "exit":  0,
+        "action":  "reinstall"
+    },
+    {
+        "exit":  0,
+        "action":  "upgrade-same-version"
+    },
+    {
+        "exit":  0,
+        "action":  "uninstall-verified"
+    },
+    {
+        "exit":  0,
+        "action":  "install-final"
+    }
+]

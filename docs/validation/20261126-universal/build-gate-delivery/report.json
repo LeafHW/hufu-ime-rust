@@ -1,0 +1,25 @@
+{
+    "scope":  "read-only preflight and process-start gate; no install/register",
+    "schema":  1,
+    "engine_sha256":  "fb36ea59518ec4fb408e70cf371ce71e3b31cc4621f9a8fd15c2ff9772d6b70e",
+    "results":  [
+                    {
+                        "accepted":  true,
+                        "error":  "",
+                        "name":  "valid-preflight",
+                        "passed":  true
+                    },
+                    {
+                        "accepted":  false,
+                        "error":  "C:\\Workspace\\hufu-ime-rust\\_tmp\\arm64\\build\\payload-e080f8d8385448229d9fe2f9a4e33973\\arm64\\hufu-setup-engine.exe failed (1): preflight --src C:\\Workspace\\hufu-ime-rust\\docs\\validation\\20261126-universal\\build-gate-delivery\\nonexistent-payload --log C:\\Workspace\\hufu-ime-rust\\docs\\validation\\20261126-universal\\build-gate-delivery\\failed-preflight.log",
+                        "name":  "failed-preflight",
+                        "passed":  true
+                    },
+                    {
+                        "accepted":  false,
+                        "error":  "无法将“C:\\Workspace\\hufu-ime-rust\\docs\\validation\\20261126-universal\\build-gate-delivery\\nonexistent-payload\\not-an-executable.exe”项识别为 cmdlet、函数、脚本文件或可运行程序的名称。请检查名称的拼写，如果包括路径，请确保路径正确，然后再试一次。",
+                        "name":  "failed-process-launch",
+                        "passed":  true
+                    }
+                ]
+}

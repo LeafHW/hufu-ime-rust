@@ -1,0 +1,28 @@
+﻿**********************
+Windows PowerShell 脚本开始
+开始时间: 20261126111455
+用户名: [REDACTED for public PR]
+RunAs 用户: [REDACTED for public PR]
+配置名称: 
+计算机: [REDACTED for public PR]
+主机应用程序: C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\Workspace\hufu-ime-rust\_tmp\arm64\profile-fix\test-live-profile.ps1
+进程 ID: 38616
+PSVersion: 5.1.28000.3501
+PSEdition: Desktop
+PSCompatibleVersions: 1.0, 2.0, 3.0, 4.0, 5.0, 5.1.28000.3501
+BuildVersion: 10.0.28000.3501
+CLRVersion: 4.0.30319.42000
+WSManStackVersion: 3.0
+PSRemotingProtocolVersion: 2.3
+SerializationVersion: 1.1.0.1
+**********************
+已启动脚本，输出文件为 C:\Workspace\hufu-ime-rust\_tmp\arm64\profile-fix\live-profile.log
+RegisterProfile(甯﹀浘鏍?C:\Windows\SystemIME\HuFu\generations\1.9.9.11-e0e7a15ec8f7\hufu_tsf.dll) 鈫?0x00000000
+RegisterCategory(kbd) 鈫?0x00000000 (asm) 鈫?0x00000000
+鍏变韩妗ｆ鐧昏瀹屾垚锛涘綋鍓嶇敤鎴峰惎鐢ㄧ敱鏈彁鏉?enable 鐙珛鎵ц
+inspect elapsed_ms=0
+PS>TerminatingError(hufu-tsf-smoke.exe):“已停止该运行的命令，因为首选项变量“ErrorActionPreference”或通用参数设置为 Stop: profile_registered=0”
+**********************
+Windows PowerShell 脚本结束
+结束时间: 20261126111456
+**********************

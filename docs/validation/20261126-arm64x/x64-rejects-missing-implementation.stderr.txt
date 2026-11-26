@@ -1,0 +1,2 @@
+﻿probe_status=failed
+error=unresolved export DllCanUnloadNow

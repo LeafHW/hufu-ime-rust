@@ -86,6 +86,7 @@ macOS 版正在开发中（预计 11 月 20 日前后上线），暂无安装包
 | [features.md](docs/features.md) | 功能总览明细 |
 | [architecture.md](docs/architecture.md) | 架构设计与数据流 |
 | [build.md](docs/build.md) | 源码构建与系统注册 |
+| [windows-arm64.md](docs/windows-arm64.md) | Windows ARM64/x64 通用 EXE 开发构建与验收边界 |
 | [status.md](docs/status.md) | 当前进度与测试基准 |
 | [dictionary-formats.md](docs/dictionary-formats.md) | 码表格式规范（含 TCSKNM02 模型布局） |
 | [asset-sources.md](docs/asset-sources.md) | 资源来源、版本与许可 |
